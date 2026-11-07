@@ -119,6 +119,7 @@ let app = Router::new()
 
 - [ ] **Prefer OIDC whenever the provider supports it.** Reach for `SocialProvider` only for IdPs that explicitly don't (GitHub user login, Twitter/X, Discord, Reddit, Spotify, …).
 - [ ] Understand the weaker security model: identity comes from a userinfo HTTPS GET, not from a signed assertion. A compromised IdP can impersonate any of its users to your service; you accept that blast radius when you adopt the provider.
+- [ ] Link or create accounts by `SocialClaims::email` only when `SocialClaims::email_verified` is `true`, and set it `true` in your claim mapper only for a provider that states it verified the address.
 - [ ] Keep PKCE on (the default). A handful of providers reject the extra parameter; `SocialProvider::without_pkce` is the opt-out and should be used sparingly.
 - [ ] Store `AuthUrl::state` and the PKCE verifier from `build_auth_url` (the provider mints both) and pass the stored and the echoed state to `exchange_code`, which compares them in constant time and refuses a PKCE verifier under 43 characters before sending anything.
 
@@ -197,7 +198,7 @@ The shipped security surface, grouped by area. Caveats live in the Notes column.
 | TOTP (RFC 6238) | Constant-time comparison, last-step replay guard, SHA-1 / SHA-256 / SHA-512, 6–8 digit codes, secret sealed at rest with a `FactorSecretCipher`. |
 | HOTP (RFC 4226) | Counter advancement, zeroized secrets, secret sealed at rest with a `FactorSecretCipher`, same algorithm options as TOTP. |
 | Email OTP | 8-digit default, Argon2-hashed codes at rest, TTL-bound, single-use. |
-| FIDO2 / WebAuthn | Registration + authentication + clone detection + discoverable / passwordless. Per-ceremony UV / attestation policy waits on `webauthn-rs` 0.6 stable; see [ROADMAP.md](ROADMAP.md). |
+| FIDO2 / WebAuthn | Registration + authentication + clone detection + discoverable / passwordless. The typed ceremony is chosen per operation (passkey, security key with UV preferred or discouraged, attested passkey against a named trust anchor), and what each factor proved (user verification, attestation trust anchor, synced or device-bound, age) reaches Cedar as `context.assurance`, so a policy can require it and a gate names the step-up a shortfall needs. See [Authentication assurance and ceremonies](docs/authorization/assurance.md). |
 | LDAP bind | Verifier over `ldap3` with TLS via rustls. Bind only; schema mapping is the application's responsibility. |
 | mTLS factor | X.509 certificate verification against a configured trust anchor; SAN URI extraction for SPIFFE / regular identity binding. |
 | JWT bearer | Generic JWT verifier with JWKS rotation, `iss` / `aud` / `exp` / `nbf` / `alg` allowlist, clock-injected for DST. |

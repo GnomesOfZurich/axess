@@ -74,8 +74,10 @@ use serde::Deserialize;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use super::backchannel_logout::{SidKey, SidMap};
+use super::backchannel_logout::SidKey;
 use super::log_field::loggable;
+use super::sid_map::SidMap;
+use super::sid_store::SidStore;
 use crate::session::extractor::AuthSession;
 use crate::session::id::SessionId;
 use crate::session::store::{SessionRevoker, note_revocation};
@@ -110,7 +112,7 @@ pub struct FrontChannelLogoutParams {
 #[derive(Clone)]
 pub struct FrontChannelLogoutHandler {
     /// Shared `sid` → `(user_id, session_id)` map.
-    sid_map: SidMap,
+    sid_map: Arc<dyn SidStore>,
     /// Session registry for invalidating sessions.
     registry: Arc<dyn SessionRevoker>,
     /// Known issuer URLs: only these can trigger logout.
@@ -134,6 +136,16 @@ pub struct BoundFrontChannelLogoutHandler {
 /// UUID or a short opaque string; a longer one is refused before it is
 /// looked up or logged.
 const MAX_PARAM_BYTES: usize = 256;
+
+impl BoundFrontChannelLogoutHandler {
+    /// Read the `sid` mappings from `store`; see
+    /// [`FrontChannelLogoutHandler::with_sid_store`].
+    #[must_use]
+    pub fn with_sid_store(mut self, store: Arc<dyn SidStore>) -> Self {
+        self.handler = self.handler.with_sid_store(store);
+        self
+    }
+}
 
 impl FrontChannelLogoutHandler {
     /// Create a front-channel logout handler bound to the caller's session:
@@ -169,10 +181,19 @@ impl FrontChannelLogoutHandler {
         known_issuers: HashSet<String>,
     ) -> Self {
         Self {
-            sid_map,
+            sid_map: Arc::new(sid_map),
             registry,
             known_issuers: Arc::new(known_issuers),
         }
+    }
+
+    /// Read the `sid` mappings from `store` instead of the [`SidMap`] the
+    /// constructor took (pass
+    /// [`AuthnService::sid_store`](crate::authn::service::AuthnService::sid_store)).
+    #[must_use]
+    pub fn with_sid_store(mut self, store: Arc<dyn SidStore>) -> Self {
+        self.sid_map = store;
+        self
     }
 
     /// The `iss` and `sid` of a request, when both are present and within
@@ -215,7 +236,18 @@ impl FrontChannelLogoutHandler {
     /// a later logout. The answer is the same empty page either way.
     async fn end_by_sid(&self, iss: &str, sid: &str, caller: Option<&SessionId>) {
         let key: SidKey = (iss.to_string(), sid.to_string());
-        let Some((user_id, session_id, _inserted_at)) = self.sid_map.get(&key) else {
+        let found = match self.sid_map.get(&key, None).await {
+            Ok(found) => found,
+            Err(e) => {
+                tracing::warn!(
+                    iss = %loggable(iss),
+                    error = %e,
+                    "front-channel logout: the sid store could not be read"
+                );
+                return;
+            }
+        };
+        let Some((user_id, session_id, _inserted_at)) = found else {
             tracing::debug!(
                 iss = %loggable(iss),
                 "front-channel logout: sid not found in sid map (session may already be invalidated)"
@@ -239,8 +271,10 @@ impl FrontChannelLogoutHandler {
             .registry
             .invalidate_session(&user_id, &session_id)
             .await;
-        if revoked.is_ok() {
-            self.sid_map.remove_if(&key, |entry| entry.1 == session_id);
+        if revoked.is_ok()
+            && let Err(e) = self.sid_map.remove_if_session(&key, &session_id).await
+        {
+            tracing::warn!(error = %e, "front-channel logout: the mapping was not removed");
         }
         note_revocation(revoked, "front-channel logout");
     }

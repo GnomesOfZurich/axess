@@ -137,21 +137,24 @@ pub trait DelegatedCredentialStore: Send + Sync + 'static {
     ///
     /// A caller that rewrites a row it read earlier without changing its
     /// meaning (re-sealing it under a new key) uses this so it cannot
-    /// overwrite a refresh token another request rotated in between. The
-    /// default answers [`CredentialSwap::Unsupported`] and writes nothing, so
-    /// a store that cannot compare-and-swap is never rewritten by such a
-    /// caller; implement it atomically (a conditional `UPDATE`, a
-    /// transaction, a lock) to take part.
+    /// overwrite a refresh token another request rotated in between, and a
+    /// refresh writes its result with it so a revoke made meanwhile (by
+    /// another process too) is not written back.
+    ///
+    /// There is no default: a store answers the question. Implement it
+    /// atomically (a conditional `UPDATE`, a transaction, a lock). A store
+    /// that cannot answers [`CredentialSwap::Unsupported`] and writes
+    /// nothing; it is then never re-sealed, a refresh falls back to an
+    /// unconditional [`save`](Self::save) with a warning naming the store type
+    /// once, and a revoke from another process during a refresh is
+    /// overwritten.
     fn save_if_unchanged(
         &self,
         tenant: &TenantId,
         user: &UserId,
         expected: &StoredDelegation,
         replacement: StoredDelegation,
-    ) -> impl std::future::Future<Output = Result<CredentialSwap, String>> + Send {
-        let _ = (tenant, user, expected, replacement);
-        async { Ok(CredentialSwap::Unsupported) }
-    }
+    ) -> impl std::future::Future<Output = Result<CredentialSwap, String>> + Send;
 
     /// Remove the credential for `(tenant, user, provider)`. Idempotent
     /// removing a non-existent record returns `Ok(())`. Adopters

@@ -20,6 +20,8 @@ type FailedAttempts = (u32, chrono::DateTime<chrono::Utc>);
 
 /// A reset token's hash and its expiry.
 type ResetToken = (String, chrono::DateTime<chrono::Utc>);
+// A user's live reset tokens.
+type ResetTokens = Vec<ResetToken>;
 
 /// In-memory [`IdentityStore`](crate::authn::IdentityStore) for unit tests.
 ///
@@ -78,7 +80,7 @@ pub struct MockIdentityStore {
     /// Password history per user: `user_id -> Vec<hash>`.
     password_history: Arc<Mutex<HashMap<String, Vec<String>>>>,
     /// Active password reset tokens: `user_id -> (token_hash, expires_at)`.
-    reset_tokens: Arc<Mutex<HashMap<String, ResetToken>>>,
+    reset_tokens: Arc<Mutex<HashMap<String, ResetTokens>>>,
     /// Per-tenant password rules: `tenant_id -> PasswordRules`. Falls back
     /// to `PasswordRules::default()` for tenants without an override.
     password_rules: Arc<Mutex<HashMap<String, crate::authn::factor::PasswordRules>>>,
@@ -644,6 +646,28 @@ impl crate::authn::store::IdentityAdmin for MockIdentityStore {
         }
         Ok(())
     }
+
+    /// The oldest candidates first, up to `limit`.
+    async fn delete_candidates_created_before(
+        &self,
+        before: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+    ) -> Result<Vec<crate::authn::types::User>, Self::Error> {
+        let mut expired: Vec<crate::authn::types::User> = lock(&self.users)
+            .values()
+            .filter(|u| {
+                matches!(u.status, crate::authn::types::EntityState::Candidate)
+                    && u.created_at < before
+            })
+            .cloned()
+            .collect();
+        expired.sort_by_key(|u| u.created_at);
+        expired.truncate(limit);
+        for user in &expired {
+            self.delete_user(&user.id).await?;
+        }
+        Ok(expired)
+    }
 }
 
 impl crate::authn::store::IdentityPasswordReset for MockIdentityStore {
@@ -652,7 +676,9 @@ impl crate::authn::store::IdentityPasswordReset for MockIdentityStore {
         user_id: &UserId,
         token_hash: &str,
         expires_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), Self::Error> {
+        now: chrono::DateTime<chrono::Utc>,
+        max_live: usize,
+    ) -> Result<bool, Self::Error> {
         note(&self.call_log, "store_reset_token");
         if self
             .fail_store_reset_token
@@ -660,8 +686,17 @@ impl crate::authn::store::IdentityPasswordReset for MockIdentityStore {
         {
             return Err(MockStoreError::NotFound);
         }
-        lock(&self.reset_tokens).insert(user_id.to_string(), (token_hash.to_string(), expires_at));
-        Ok(())
+        let mut tokens = lock(&self.reset_tokens);
+        let held = tokens.entry(user_id.to_string()).or_default();
+        held.retain(|(_, expires)| *expires > now);
+        if held.iter().any(|(hash, _)| hash == token_hash) {
+            return Ok(true);
+        }
+        if held.len() >= max_live {
+            return Ok(false);
+        }
+        held.push((token_hash.to_string(), expires_at));
+        Ok(true)
     }
 
     async fn verify_reset_token(
@@ -671,15 +706,16 @@ impl crate::authn::store::IdentityPasswordReset for MockIdentityStore {
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool, Self::Error> {
         // One atomic remove-if: of two concurrent verifications of the same
-        // token exactly one may succeed (the token is single-use). A
-        // mismatch or an expired token leaves the stored row alone.
+        // token exactly one may succeed (the token is single-use), and a
+        // match consumes every token of the user. A mismatch or an expired
+        // token leaves the stored rows alone.
         let mut tokens = lock(&self.reset_tokens);
         let key = user_id.to_string();
-        let matches = tokens
-            .get(key.as_str())
-            .is_some_and(|(stored_hash, expires_at)| {
+        let matches = tokens.get(key.as_str()).is_some_and(|held| {
+            held.iter().any(|(stored_hash, expires_at)| {
                 *expires_at > now && bool::from(stored_hash.as_bytes().ct_eq(token_hash.as_bytes()))
-            });
+            })
+        });
         if matches {
             tokens.remove(key.as_str());
         }
@@ -694,8 +730,11 @@ impl crate::authn::store::IdentityPasswordReset for MockIdentityStore {
     ) -> Result<bool, Self::Error> {
         Ok(lock(&self.reset_tokens)
             .get(user_id.to_string().as_str())
-            .is_some_and(|(stored_hash, expires_at)| {
-                *expires_at > now && bool::from(stored_hash.as_bytes().ct_eq(token_hash.as_bytes()))
+            .is_some_and(|held| {
+                held.iter().any(|(stored_hash, expires_at)| {
+                    *expires_at > now
+                        && bool::from(stored_hash.as_bytes().ct_eq(token_hash.as_bytes()))
+                })
             }))
     }
 }

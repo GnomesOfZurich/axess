@@ -29,7 +29,7 @@ pub use fapi::{
     DpopProof, DpopSigner, FAPI_ID_TOKEN_ALGS, FapiConfig, JarmResponse, ParResponse,
     SenderConstraint,
 };
-pub use jwks_refresh::{refresh_providers_jwks, spawn_jwks_refresh};
+pub use jwks_refresh::{JWKS_REFRESH_CONCURRENCY, refresh_providers_jwks, spawn_jwks_refresh};
 pub use login_options::{OAuthLoginOptions, ResponseMode};
 pub use provider::{AuthUrlResult, OAuthProvider};
 

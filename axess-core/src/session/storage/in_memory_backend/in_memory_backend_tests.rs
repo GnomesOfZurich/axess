@@ -402,7 +402,13 @@ async fn reset_token_round_trip_through_backend() {
     );
 
     backend
-        .store_reset_token(&user_id, token_hash, expires_at)
+        .store_reset_token(
+            &user_id,
+            token_hash,
+            expires_at,
+            expires_at - chrono::Duration::hours(1),
+            3,
+        )
         .await
         .unwrap();
 
@@ -442,7 +448,7 @@ async fn with_clock_stamps_records_and_judges_reset_expiry() {
     assert_eq!(user.created_at, origin);
 
     backend
-        .store_reset_token(&u(), "h", origin + chrono::Duration::minutes(10))
+        .store_reset_token(&u(), "h", origin + chrono::Duration::minutes(10), origin, 3)
         .await
         .unwrap();
     clock.advance(chrono::Duration::minutes(10));
@@ -479,7 +485,13 @@ async fn delete_user_erases_every_trace_and_the_session() {
         .await
         .unwrap();
     backend
-        .store_reset_token(&u(), "h", Utc::now() + chrono::Duration::hours(1))
+        .store_reset_token(
+            &u(),
+            "h",
+            Utc::now() + chrono::Duration::hours(1),
+            Utc::now(),
+            3,
+        )
         .await
         .unwrap();
     assert!(

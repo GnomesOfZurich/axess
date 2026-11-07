@@ -67,6 +67,7 @@ type Directory = StoredTenantOAuthProviders<MemoryTenantOAuthProviderStore>;
 
 fn directory() -> Directory {
     StoredTenantOAuthProviders::new_unencrypted(MemoryTenantOAuthProviderStore::new())
+        .with_egress_policy(axess_factors::egress::EgressPolicy::screened_allowing_loopback_http())
 }
 
 /// `n` resolutions of acme's `sso` at once; every one must build.
@@ -272,7 +273,10 @@ async fn a_record_in_the_first_binding_is_stored_in_the_current_one_on_first_use
     let (_server, issuer) = idp().await;
     let cipher = Arc::new(FactorSecretCipher::new(KEY).with_first_binding(LegacyBlobs::Accept));
     let directory =
-        StoredTenantOAuthProviders::new(MemoryTenantOAuthProviderStore::new(), cipher.clone());
+        StoredTenantOAuthProviders::new(MemoryTenantOAuthProviderStore::new(), cipher.clone())
+            .with_egress_policy(
+                axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
+            );
     let acme = tenant("acme");
     let mut probe = record("acme", &issuer, "client-1", secret());
     probe.seal(&cipher).unwrap();
@@ -360,7 +364,8 @@ async fn a_failed_re_read_is_reported_not_answered_with_the_older_record() {
         inner: MemoryTenantOAuthProviderStore::new(),
         stale: std::sync::Mutex::new(None),
         fail_get: std::sync::atomic::AtomicBool::new(false),
-    });
+    })
+    .with_egress_policy(axess_factors::egress::EgressPolicy::screened_allowing_loopback_http());
     let acme = tenant("acme");
     let first = directory
         .upsert(record("acme", &issuer, "client-old", secret()))
@@ -393,7 +398,8 @@ async fn a_directory_built_with_its_cipher_seals_a_credential_on_upsert() {
     let cipher = Arc::new(FactorSecretCipher::new(
         *b"0123456789abcdef0123456789abcdeF",
     ));
-    let directory = StoredTenantOAuthProviders::new(MemoryTenantOAuthProviderStore::new(), cipher);
+    let directory = StoredTenantOAuthProviders::new(MemoryTenantOAuthProviderStore::new(), cipher)
+        .with_egress_policy(axess_factors::egress::EgressPolicy::screened_allowing_loopback_http());
     let stored = directory
         .upsert(record("acme", "https://idp.example", "client-1", secret()))
         .await
@@ -402,4 +408,26 @@ async fn a_directory_built_with_its_cipher_seals_a_credential_on_upsert() {
         stored.credential,
         TenantClientCredential::Secret(FactorSecret::Sealed(_))
     ));
+}
+
+/// The generation the back-channel route reads moves with every change made
+/// through the directory.
+#[tokio::test]
+async fn the_generation_moves_when_a_record_is_written_removed_or_invalidated() {
+    let directory = directory();
+    let g0 = directory.generation();
+    directory
+        .upsert(record("acme", "https://idp.example", "client-a", secret()))
+        .await
+        .expect("upsert");
+    let g1 = directory.generation();
+    assert_ne!(g1, g0);
+    directory.invalidate(&tenant("acme"), "sso");
+    let g2 = directory.generation();
+    assert_ne!(g2, g1);
+    directory
+        .remove(&tenant("acme"), "sso")
+        .await
+        .expect("remove");
+    assert_ne!(directory.generation(), g2);
 }

@@ -37,15 +37,15 @@ fn cert_with_dns_san_only() -> CertificateDer<'static> {
 
 #[test]
 fn peek_spiffe_extracts_platform_shape() {
-    let cert = cert_with_san_uri("spiffe://gnomes.local/compute-worker/ekekrantz");
+    let cert = cert_with_san_uri("spiffe://gnomes.local/compute-worker/gnomes");
     let comps = peek_spiffe(&cert).expect("must extract SPIFFE components");
     assert_eq!(
         comps.workload_id.as_str(),
-        "spiffe://gnomes.local/compute-worker/ekekrantz"
+        "spiffe://gnomes.local/compute-worker/gnomes"
     );
     assert_eq!(comps.trust_domain.as_str(), "gnomes.local");
     assert_eq!(comps.service_name, "compute-worker");
-    assert_eq!(comps.tenant_slug, "ekekrantz");
+    assert_eq!(comps.tenant_slug, "gnomes");
 }
 
 #[test]
@@ -70,7 +70,7 @@ fn peek_spiffe_rejects_san_without_spiffe_uri() {
 
 #[test]
 fn peek_spiffe_rejects_uri_san_without_spiffe_scheme() {
-    let cert = cert_with_san_uri("https://example.com/compute-worker/ekekrantz");
+    let cert = cert_with_san_uri("https://example.com/compute-worker/gnomes");
     let err = peek_spiffe(&cert).expect_err("URI SAN without spiffe:// scheme must reject");
     assert!(
         matches!(err, MtlsError::NoSpiffeUri),
@@ -92,7 +92,7 @@ fn peek_spiffe_rejects_malformed_spiffe_uri() {
 
 #[test]
 fn peek_spiffe_rejects_extra_path_segments() {
-    let cert = cert_with_san_uri("spiffe://gnomes.local/region/compute-worker/ekekrantz");
+    let cert = cert_with_san_uri("spiffe://gnomes.local/region/compute-worker/gnomes");
     let err = peek_spiffe(&cert).expect_err("3-segment path must reject under platform shape");
     assert!(
         matches!(err, MtlsError::Identity(IdentityError::InvalidSpiffeId(_))),
@@ -100,9 +100,9 @@ fn peek_spiffe_rejects_extra_path_segments() {
     );
 }
 
-/// The adopter's slug-to-tenant registry: only `ekekrantz` is known.
+/// The adopter's slug-to-tenant registry: only `gnomes` is known.
 fn tenant_lookup() -> impl Fn(&str) -> Option<TenantId> + Send + Sync + 'static {
-    |slug: &str| (slug == "ekekrantz").then(sample_tenant)
+    |slug: &str| (slug == "gnomes").then(sample_tenant)
 }
 
 /// The tenant is the lookup's answer for the certificate's own slug; a slug
@@ -124,7 +124,7 @@ async fn an_unknown_tenant_slug_is_refused() {
 
 #[tokio::test]
 async fn mtls_resolver_returns_workload_principal_on_match() {
-    let cert = cert_with_san_uri("spiffe://gnomes.local/compute-worker/ekekrantz");
+    let cert = cert_with_san_uri("spiffe://gnomes.local/compute-worker/gnomes");
     let resolver = MtlsResolver::new(
         cert,
         TrustDomain::new("gnomes.local").unwrap(),
@@ -135,12 +135,12 @@ async fn mtls_resolver_returns_workload_principal_on_match() {
         Principal::Workload(w) => {
             assert_eq!(
                 w.workload_id.as_str(),
-                "spiffe://gnomes.local/compute-worker/ekekrantz"
+                "spiffe://gnomes.local/compute-worker/gnomes"
             );
             assert_eq!(w.trust_domain.as_str(), "gnomes.local");
             assert_eq!(w.issuer, Issuer::Mtls);
             assert_eq!(w.tenant_id, sample_tenant());
-            assert_eq!(w.tenant_slug, "ekekrantz");
+            assert_eq!(w.tenant_slug, "gnomes");
             assert_eq!(w.service_name, "compute-worker");
             assert!(w.attributes.is_empty());
         }
@@ -151,7 +151,7 @@ async fn mtls_resolver_returns_workload_principal_on_match() {
 #[tokio::test]
 async fn mtls_resolver_rejects_trust_domain_mismatch() {
     // Cert presents `attacker.example`; resolver pins `gnomes.local`.
-    let cert = cert_with_san_uri("spiffe://attacker.example/compute-worker/ekekrantz");
+    let cert = cert_with_san_uri("spiffe://attacker.example/compute-worker/gnomes");
     let resolver = MtlsResolver::new(
         cert,
         TrustDomain::new("gnomes.local").unwrap(),
@@ -189,7 +189,7 @@ async fn mtls_resolver_rejects_non_spiffe_cert() {
 
 #[test]
 fn peer_cert_chain_leaf_returns_first_cert() {
-    let cert = cert_with_san_uri("spiffe://gnomes.local/compute-worker/ekekrantz");
+    let cert = cert_with_san_uri("spiffe://gnomes.local/compute-worker/gnomes");
     let chain = PeerCertChain::new(vec![cert.clone()]);
     assert_eq!(chain.leaf().map(|c| c.as_ref()), Some(cert.as_ref()));
     assert_eq!(chain.as_slice().len(), 1);
@@ -209,7 +209,7 @@ fn issuer_mtls_wire_string_is_stable() {
 
 #[tokio::test]
 async fn from_chain_takes_the_leaf_and_resolves() {
-    let cert = cert_with_san_uri("spiffe://gnomes.local/compute-worker/ekekrantz");
+    let cert = cert_with_san_uri("spiffe://gnomes.local/compute-worker/gnomes");
     // A realistic chain: leaf first, then an intermediate the resolver
     // must ignore. Picking the wrong element would resolve the wrong
     // SPIFFE ID, so assert on the identity rather than on success.
@@ -226,7 +226,7 @@ async fn from_chain_takes_the_leaf_and_resolves() {
     match resolver.resolve().await.expect("must resolve") {
         Principal::Workload(w) => assert_eq!(
             w.workload_id.as_str(),
-            "spiffe://gnomes.local/compute-worker/ekekrantz"
+            "spiffe://gnomes.local/compute-worker/gnomes"
         ),
         Principal::Human(_) => panic!("expected Workload, got Human"),
     }

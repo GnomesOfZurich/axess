@@ -34,6 +34,10 @@ struct PartlyBroken {
 }
 
 impl TenantOAuthProviders for PartlyBroken {
+    fn built_providers(&self) -> Vec<std::sync::Arc<dyn axess_factors::oauth::OAuthProvider>> {
+        self.providers.iter().map(|p| p.provider.clone()).collect()
+    }
+
     fn provider<'a>(&'a self, _: &'a TenantId, _: &'a str) -> ProviderFuture<'a> {
         Box::pin(async { Ok(None) })
     }
@@ -75,6 +79,10 @@ fn offered(tenant_label: &str, issuer: &str, client_id: &str) -> TenantProvider 
 }
 
 impl TenantOAuthProviders for Source {
+    fn built_providers(&self) -> Vec<std::sync::Arc<dyn axess_factors::oauth::OAuthProvider>> {
+        self.providers.iter().map(|p| p.provider.clone()).collect()
+    }
+
     fn provider<'a>(&'a self, t: &'a TenantId, name: &'a str) -> ProviderFuture<'a> {
         Box::pin(async move {
             Ok(self
@@ -152,15 +160,17 @@ async fn login(
     sid_map: &SidMap,
     rng: &MockRng,
     user: &str,
+    tenant_label: &str,
     iss: &str,
     sid: &str,
 ) -> (crate::authn::ids::UserId, SessionId) {
     let user = axess_identity::testing::user(user);
     let session = SessionId::new(rng);
     registry.register(&user, &session).await.unwrap();
-    sid_map.insert(
+    sid_map.insert_displacing(
         (iss.to_string(), sid.to_string()),
         "idp-sub",
+        Some(tenant(tenant_label)),
         user,
         session,
         chrono::Utc::now(),
@@ -184,8 +194,11 @@ async fn a_token_from_tenant_bs_issuer_ends_only_tenant_bs_session() {
         sid_map.clone(),
     );
     let rng = MockRng::new(21);
-    let (ua, sa) = login(&registry, &sid_map, &rng, "alice", ISS_A, "same-sid").await;
-    let (ub, sb) = login(&registry, &sid_map, &rng, "bob", ISS_B, "same-sid").await;
+    let (ua, sa) = login(
+        &registry, &sid_map, &rng, "alice", "acme", ISS_A, "same-sid",
+    )
+    .await;
+    let (ub, sb) = login(&registry, &sid_map, &rng, "bob", "beta", ISS_B, "same-sid").await;
 
     let t = token(
         ISS_B,
@@ -250,7 +263,7 @@ async fn an_issuer_and_client_id_shared_by_two_tenants_is_refused_not_guessed() 
         sid_map.clone(),
     );
     let rng = MockRng::new(22);
-    let (user, session) = login(&registry, &sid_map, &rng, "alice", ISS_A, "s1").await;
+    let (user, session) = login(&registry, &sid_map, &rng, "alice", "acme", ISS_A, "s1").await;
 
     let claims = serde_json::json!({ "aud": "client-x" });
     match h.entry_for(ISS_A, &claims).await {
@@ -382,7 +395,7 @@ async fn a_broken_tenant_provider_does_not_stop_the_other_tenants_of_its_issuer(
         sid_map.clone(),
     );
     let rng = MockRng::new(23);
-    let (user, session) = login(&registry, &sid_map, &rng, "alice", ISS_A, "s1").await;
+    let (user, session) = login(&registry, &sid_map, &rng, "alice", "acme", ISS_A, "s1").await;
 
     let t = token(
         ISS_A,
@@ -406,7 +419,7 @@ async fn a_token_addressed_to_a_broken_tenant_provider_is_a_retryable_503() {
         sid_map.clone(),
     );
     let rng = MockRng::new(24);
-    let (user, session) = login(&registry, &sid_map, &rng, "bob", ISS_A, "s2").await;
+    let (user, session) = login(&registry, &sid_map, &rng, "bob", "beta", ISS_A, "s2").await;
 
     let claims = serde_json::json!({ "aud": "client-b" });
     assert!(matches!(
@@ -456,4 +469,222 @@ fn the_ambiguity_message_has_no_run_of_spaces() {
     let text = e.to_string();
     assert!(!text.contains("  "), "{text}");
     assert!(text.contains("token (global registration: true"), "{text}");
+}
+
+/// A login of `user` through the issuer, registered the way the login path
+/// does: in the subject registry, and under a `sid`.
+async fn login_with_subject(
+    registry: &MemorySessionRegistry,
+    sid_map: &SidMap,
+    rng: &MockRng,
+    user: &str,
+    tenant_label: &str,
+    sid: &str,
+) -> (crate::authn::ids::UserId, SessionId) {
+    let user = axess_identity::testing::user(user);
+    let session = SessionId::new(rng);
+    registry.register(&user, &session).await.unwrap();
+    let tenant = Some(tenant(tenant_label));
+    sid_map.register_subject_session(ISS_A, "idp-sub", tenant, user, session);
+    sid_map.insert_displacing(
+        (ISS_A.to_string(), sid.to_string()),
+        "idp-sub",
+        tenant,
+        user,
+        session,
+        chrono::Utc::now(),
+    );
+    (user, session)
+}
+
+/// Two tenants share an issuer and a subject. A token for tenant A's client
+/// that names only the `sub` ends tenant A's session; tenant B's stays.
+#[tokio::test]
+async fn a_sub_logout_ends_only_the_verifying_tenants_session() {
+    let registry = MemorySessionRegistry::new();
+    let sid_map = SidMap::new();
+    let h = tenants_only(
+        vec![
+            offered("acme", ISS_A, "client-a"),
+            offered("beta", ISS_A, "client-b"),
+        ],
+        &registry,
+        sid_map.clone(),
+    );
+    let rng = MockRng::new(23);
+    let (ua, sa) = login_with_subject(&registry, &sid_map, &rng, "alice", "acme", "sid-a").await;
+    let (ub, sb) = login_with_subject(&registry, &sid_map, &rng, "bob", "beta", "sid-b").await;
+
+    let t = token(
+        ISS_A,
+        "client-a",
+        serde_json::json!({ "sub": "idp-sub", "jti": "j1" }),
+    );
+    assert_eq!(post(&h, t).await, Ok(StatusCode::OK));
+
+    assert!(
+        !registry.is_valid(&ua, &sa).await.unwrap(),
+        "A's session ended"
+    );
+    assert!(
+        registry.is_valid(&ub, &sb).await.unwrap(),
+        "B's session belongs to a tenant whose provider did not verify the token"
+    );
+}
+
+/// A `sid` that maps to tenant B's session, in a token tenant A's provider
+/// verified, ends nothing.
+#[tokio::test]
+async fn a_sid_logout_does_not_reach_another_tenants_session() {
+    let registry = MemorySessionRegistry::new();
+    let sid_map = SidMap::new();
+    let h = tenants_only(
+        vec![
+            offered("acme", ISS_A, "client-a"),
+            offered("beta", ISS_A, "client-b"),
+        ],
+        &registry,
+        sid_map.clone(),
+    );
+    let rng = MockRng::new(24);
+    let (ub, sb) = login_with_subject(&registry, &sid_map, &rng, "bob", "beta", "sid-b").await;
+
+    let t = token(
+        ISS_A,
+        "client-a",
+        serde_json::json!({ "sid": "sid-b", "jti": "j1" }),
+    );
+    assert_eq!(post(&h, t).await, Ok(StatusCode::OK));
+
+    assert!(
+        registry.is_valid(&ub, &sb).await.unwrap(),
+        "a token verified for tenant A does not end tenant B's session"
+    );
+}
+
+/// Counts how often the tenant source is asked about an issuer.
+struct Counting(std::sync::atomic::AtomicUsize);
+
+impl TenantOAuthProviders for Counting {
+    fn built_providers(&self) -> Vec<std::sync::Arc<dyn axess_factors::oauth::OAuthProvider>> {
+        Vec::new()
+    }
+
+    fn provider<'a>(&'a self, _: &'a TenantId, _: &'a str) -> ProviderFuture<'a> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn providers_for_issuer<'a>(&'a self, _: &'a str) -> IssuerFuture<'a> {
+        Box::pin(async move {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(IssuerProviders {
+                providers: Vec::new(),
+                broken: Vec::new(),
+            })
+        })
+    }
+}
+
+/// An issuer nobody configured is looked up once per short interval, not once
+/// per unauthenticated request.
+#[tokio::test]
+async fn an_unknown_issuer_is_not_looked_up_on_every_request() {
+    use std::sync::atomic::Ordering;
+    let clock = axess_clock::testing::MockClock::now();
+    let source = Arc::new(Counting(Default::default()));
+    let h = BackChannelLogoutHandler::for_tenants(
+        source.clone(),
+        Arc::new(SessionRegistryAdapter(MemorySessionRegistry::new())),
+        SidMap::new(),
+        Arc::new(clock.clone()),
+    );
+    for n in 0..5 {
+        let t = token(
+            "https://nobody.example",
+            "client-a",
+            serde_json::json!({ "sub": "s", "jti": format!("j{n}") }),
+        );
+        assert_eq!(post(&h, t).await, Err(StatusCode::BAD_REQUEST));
+    }
+    assert_eq!(
+        source.0.load(Ordering::SeqCst),
+        1,
+        "one store read, not five"
+    );
+
+    clock.advance_secs(3600);
+    let t = token(
+        "https://nobody.example",
+        "client-a",
+        serde_json::json!({ "sub": "s", "jti": "later" }),
+    );
+    assert_eq!(post(&h, t).await, Err(StatusCode::BAD_REQUEST));
+    assert_eq!(
+        source.0.load(Ordering::SeqCst),
+        2,
+        "the answer is not remembered for ever"
+    );
+}
+
+/// With the memory turned off every request asks the source.
+#[tokio::test]
+async fn a_zero_unknown_issuer_memory_asks_the_source_every_time() {
+    use std::sync::atomic::Ordering;
+    let source = Arc::new(Counting(Default::default()));
+    let h = BackChannelLogoutHandler::for_tenants(
+        source.clone(),
+        Arc::new(SessionRegistryAdapter(MemorySessionRegistry::new())),
+        SidMap::new(),
+        Arc::new(SystemClock),
+    )
+    .with_unknown_issuer_memory(std::time::Duration::ZERO);
+    for n in 0..3 {
+        let t = token(
+            "https://nobody.example",
+            "client-a",
+            serde_json::json!({ "sub": "s", "jti": format!("j{n}") }),
+        );
+        assert_eq!(post(&h, t).await, Err(StatusCode::BAD_REQUEST));
+    }
+    assert_eq!(source.0.load(Ordering::SeqCst), 3);
+}
+
+/// A tenant provider installed in the live registry after a token for its
+/// issuer was refused is found by the next token, though the refusal is
+/// remembered: the registry's generation moved.
+#[tokio::test]
+async fn a_provider_added_to_the_live_registry_is_found_despite_a_remembered_miss() {
+    use crate::federation::oauth_tenant::LiveTenantOAuthProviders;
+    let live = Arc::new(LiveTenantOAuthProviders::new());
+    let registry = MemorySessionRegistry::new();
+    let sid_map = SidMap::new();
+    let h = BackChannelLogoutHandler::for_tenants(
+        live.clone(),
+        Arc::new(SessionRegistryAdapter(registry.clone())),
+        sid_map.clone(),
+        Arc::new(SystemClock),
+    );
+    let rng = MockRng::new(25);
+    let (user, session) = login(&registry, &sid_map, &rng, "alice", "acme", ISS_A, "s1").await;
+
+    let t = |jti: &str| {
+        token(
+            ISS_A,
+            "client-a",
+            serde_json::json!({ "sid": "s1", "jti": jti }),
+        )
+    };
+    assert_eq!(post(&h, t("j1")).await, Err(StatusCode::BAD_REQUEST));
+
+    live.set(
+        tenant("acme"),
+        "sso".into(),
+        Arc::new(
+            MockOAuthProvider::new("sso")
+                .with_issuer(ISS_A)
+                .with_client_id("client-a"),
+        ),
+    );
+    assert_eq!(post(&h, t("j2")).await, Ok(StatusCode::OK));
+    assert!(!registry.is_valid(&user, &session).await.unwrap());
 }

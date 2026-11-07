@@ -13,7 +13,7 @@ use axess_core::{
         test_session,
     },
 };
-use axess_factors::fido2::{DefaultFido2Provider, Fido2Provider, MockFido2Provider};
+use axess_factors::fido2::{DefaultFido2Provider, Fido2Ceremony, Fido2Provider, MockFido2Provider};
 use common::{session_for, test_tenant, test_user};
 use url::Url;
 use webauthn_rs::prelude::*;
@@ -25,11 +25,17 @@ fn mock_provider_returns_errors_for_all_ceremonies() {
     let mock = MockFido2Provider::new();
 
     // start_registration should fail
-    let reg = mock.start_registration(uuid::Uuid::new_v4(), "alice", "Alice", None);
+    let reg = mock.start_registration(
+        &Fido2Ceremony::Passkey,
+        uuid::Uuid::new_v4(),
+        "alice",
+        "Alice",
+        None,
+    );
     assert!(reg.is_err());
 
     // start_authentication with empty credentials; should fail
-    let auth = mock.start_authentication(&[]);
+    let auth = mock.start_authentication(&Fido2Ceremony::Passkey, &[]);
     assert!(auth.is_err());
 
     // start_discoverable_authentication; should fail

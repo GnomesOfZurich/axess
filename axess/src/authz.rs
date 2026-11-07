@@ -48,24 +48,33 @@
 //! ```
 
 pub use axess_core::authz::{
+    // Authentication assurance in the context, and the step-up refusal
+    ASSURANCE_ATTRIBUTE,
+    ASSURANCE_SCHEMA_FRAGMENT,
+    AssuranceContext,
+    AssuranceContextProvider,
     // Core types
     AuthzDecision,
     AuthzDenied,
     // Traits
     AuthzEntityProvider,
     AuthzError,
+    AuthzRefusal,
     // Concrete types
     AuthzSession,
     AuthzStore,
     BuildRequestContext,
+    FactorEvidence,
     NoContext,
     PolicyEvaluator,
     PolicyStore,
     RequestContextProvider,
     RequestEntityProvider,
+    STEP_UP_ANNOTATION,
     StandardRequestContext,
     make_action_uid,
     make_entity_uid,
+    merge_assurance_schema,
     // Live policy reload: `Reloaded`, `PolicySource`, `ReloadCoordinator`, ...
     reload,
 };

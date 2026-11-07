@@ -9,7 +9,7 @@
 //!
 //! ```toml
 //! [dev-dependencies]
-//! axess = { version = "0.17.0", features = ["testing"] }
+//! axess = { version = "0.18.0", features = ["testing"] }
 //! ```
 //!
 //! Individual mocks inside this module may carry *additional* gates tied
@@ -226,6 +226,30 @@ pub fn test_session_on_device(
         .data
         .device_id = Some(device_id);
     session
+        .0
+        .0
+        .try_write()
+        .expect("a fresh session is unshared")
+        .data
+        .device_proven = true;
+    session
+}
+
+/// [`test_session_on_device`] for a device a resolver found by fingerprint
+/// alone: the session carries the id and the lockout exemption ignores it.
+#[cfg(feature = "device")]
+pub fn test_session_on_unproven_device(
+    device_id: crate::authn::ids::DeviceId,
+) -> crate::session::extractor::AuthSession {
+    let session = test_session();
+    session
+        .0
+        .0
+        .try_write()
+        .expect("a fresh session is unshared")
+        .data
+        .device_id = Some(device_id);
+    session
 }
 
 /// Test-fixture extension trait that re-exposes the
@@ -285,6 +309,15 @@ mod session_ext {
             authn_time: DateTime<Utc>,
         ) -> impl std::future::Future<Output = ()> + Send;
 
+        /// [`advance_factor`](Self::advance_factor) recording `proof`, what
+        /// the factor proved, instead of what its kind alone proves
+        /// ([`FactorAssurance::for_kind`](crate::authn::assurance::FactorAssurance::for_kind)):
+        /// for a test that needs a user-verified or device-bound FIDO2 step.
+        fn advance_factor_with(
+            &self,
+            proof: crate::authn::assurance::FactorAssurance,
+        ) -> impl std::future::Future<Output = ()> + Send;
+
         /// Stamp a failed-attempt timestamp on the session without
         /// touching the persistent lockout counter; mirrors what the
         /// factor pipeline does on credential mismatch, but
@@ -332,7 +365,13 @@ mod session_ext {
         }
 
         async fn advance_factor(&self, kind: &FactorKind, authn_time: DateTime<Utc>) {
-            AuthSession::advance_factor(self, kind, authn_time, &[]).await;
+            let proof =
+                crate::authn::assurance::FactorAssurance::for_kind(kind.clone(), authn_time);
+            AuthSession::advance_factor(self, proof, &[]).await;
+        }
+
+        async fn advance_factor_with(&self, proof: crate::authn::assurance::FactorAssurance) {
+            AuthSession::advance_factor(self, proof, &[]).await;
         }
 
         async fn record_attempt_at(&self, now: DateTime<Utc>) {

@@ -254,6 +254,7 @@ mod tests {
                 factors_completed: Vec::new(),
                 impersonator: None,
                 ldap_groups: None,
+                assurance: Vec::new(),
             },
             ..SessionData::default()
         }

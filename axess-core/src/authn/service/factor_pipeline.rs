@@ -216,7 +216,7 @@ where
     ) -> bool {
         #[cfg(feature = "device")]
         if let (Some(devices), Some(device)) =
-            (&self.inner.known_devices, session.device_id().await)
+            (&self.inner.known_devices, session.proven_device().await)
             && devices.is_known(tenant_id, &device, user_id).await
         {
             tracing::debug!(

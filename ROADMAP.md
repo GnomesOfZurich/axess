@@ -7,23 +7,17 @@
 
 ## Planned
 
-Nothing planned beyond what the sections below list.
+- **FIDO2 example app.** Standalone example with browser-side JS demonstrating registration (Direct attestation), authentication (Preferred UV), and discoverable credentials (Required UV for step-up), and a step-up prompted by the `step_up_required` refusal. It waits on nothing else on this list.
+
+- **Cross-Device Authentication (CDA).** `begin_cross_device_authn` / `complete_cross_device_authn` on `Fido2Service` per the FIDO Alliance hybrid-transport spec (QR + BLE proximity); reference example in `examples/fido2/`. The QR code and the BLE link run between the browser and the phone; the relying party sees an ordinary ceremony, and `webauthn-rs` 0.6.2 already names the `hybrid` transport. It waits on nothing else on this list.
 
 ---
 
 ## Awaiting upstream
 
-The FIDO2 work waits on `webauthn-rs` 0.6 stable. We ride the `0.6.0-dev` pin today and will bump in lockstep when the release lands.
+The `argon2` entry waits on `webauthn-rs`, read against its 0.6.2 source.
 
-- **Per-ceremony UV / attestation policy.** Configure `UserVerificationPolicy::{Required,Preferred,Discouraged}` and `AttestationConveyancePreference::{None,Indirect,Direct,Enterprise}` per FIDO2 operation (registration vs. authentication vs. step-up). `webauthn-rs` 0.6.0-dev applies these at `WebauthnBuilder` time and has no per-ceremony override surface; the `Fido2Provider` trait is already shaped to accept the per-ceremony arguments, which pass through once upstream allows it.
-
-- **Pin `webauthn-rs` to stable.** Single-file bump in `axess-core/Cargo.toml` once `0.6` lands on crates.io.
-
-- **One `argon2` line in the tree.** `webauthn-rs` reaches `argon2` 0.5 through `crypto-glue`, so a build with `fido2` carries `argon2`, `password-hash` and `blake2` in two majors beside the 0.6 line axess uses; without `fido2` the tree has one. Resolves when `webauthn-rs` moves to `argon2` 0.6.
-
-- **FIDO2 example app.** Standalone example with browser-side JS demonstrating registration (Direct attestation), authentication (Preferred UV), and discoverable credentials (Required UV for step-up). Depends on the per-ceremony policy.
-
-- **Cross-Device Authentication (CDA).** `begin_cross_device_authn` / `complete_cross_device_authn` on `Fido2Service` per the FIDO Alliance hybrid-transport spec (QR + BLE proximity); reference example in `examples/fido2/`. Depends on the per-ceremony policy.
+- **One `argon2` line in the tree.** `webauthn-rs` 0.6.2 reaches `argon2` 0.5 through `crypto-glue` 0.2 (0.2.2, the newest, requires `argon2` ^0.5.2), so a build with `fido2` carries `argon2`, `password-hash` and `blake2` in two majors beside the 0.6 line axess uses; without `fido2` the tree has one. Resolves when a `crypto-glue` release that `webauthn-rs-core` accepts moves to `argon2` 0.6; the weekly `webauthn-argon2-watch` workflow opens an issue when one does.
 
 ---
 

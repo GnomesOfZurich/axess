@@ -239,11 +239,9 @@ where
             guard.pop(k);
         }
         drop(guard);
-        if count > 0 {
-            self.stats
-                .invalidations
-                .fetch_add(count as u64, Ordering::Relaxed);
-        }
+        self.stats
+            .invalidations
+            .fetch_add(count as u64, Ordering::Relaxed);
         tracing::Span::current().record("removed", count);
         count
     }
@@ -270,11 +268,9 @@ where
             guard.pop(k);
         }
         drop(guard);
-        if count > 0 {
-            self.stats
-                .invalidations
-                .fetch_add(count as u64, Ordering::Relaxed);
-        }
+        self.stats
+            .invalidations
+            .fetch_add(count as u64, Ordering::Relaxed);
         count
     }
 
@@ -295,11 +291,9 @@ where
         let count = guard.len();
         guard.clear();
         drop(guard);
-        if count > 0 {
-            self.stats
-                .invalidations
-                .fetch_add(count as u64, Ordering::Relaxed);
-        }
+        self.stats
+            .invalidations
+            .fetch_add(count as u64, Ordering::Relaxed);
         tracing::Span::current().record("removed", count);
     }
 
@@ -332,11 +326,9 @@ where
             guard.pop(k);
         }
         drop(guard);
-        if count > 0 {
-            self.stats
-                .invalidations
-                .fetch_add(count as u64, Ordering::Relaxed);
-        }
+        self.stats
+            .invalidations
+            .fetch_add(count as u64, Ordering::Relaxed);
         tracing::Span::current().record("removed", count);
         count
     }

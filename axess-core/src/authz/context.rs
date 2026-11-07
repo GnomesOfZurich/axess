@@ -93,16 +93,14 @@ pub trait BuildRequestContext: Send + Sync {
 ///
 /// # Without a provider
 ///
-/// When no provider is installed the gate evaluates with an empty context.
-/// That is safe for a policy set that never mentions `context`. For one that
-/// does it fails closed in two ways: a context attribute the action's schema
-/// declares required makes the request invalid, which `PolicyStore` denies,
-/// and `PolicyStore` also denies any request in which a policy errors during
-/// evaluation. The schema validator refuses a policy that reads an optional
-/// attribute without a `context has ..` guard, so the one case an empty
-/// context can permit is a policy that guards its access and treats absence
-/// as allowed. Declare the attributes policies rely on as required, and
-/// install a provider wherever policies reason about the context.
+/// When no provider is installed and the policy store mentions `context`
+/// ([`PolicyStore::mentions_context`](super::store::PolicyStore::mentions_context)),
+/// the gate refuses with a 500 and an error log naming the missing extension:
+/// an empty context would let a `forbid` that guards an optional attribute
+/// with `context has ..` stop applying while the `permit` beside it allows.
+/// When no policy mentions `context` the gate evaluates with an empty context.
+/// Declare the attributes policies rely on as required, and install the
+/// provider as `Arc<dyn RequestContextProvider>`.
 ///
 /// # Errors
 ///
@@ -142,6 +140,7 @@ impl BuildRequestContext for NoContext {
 /// | `mfa_verified`     | Boolean | yes            |
 /// | `ip_address`       | String  | only if `Some` |
 /// | `timestamp`        | String (ISO 8601) | only if built via [`StandardRequestContext::at`] |
+/// | `assurance`        | `AxessAssurance` | only if built with [`StandardRequestContext::with_assurance`] |
 ///
 /// Cedar policy example: require recent MFA for financial operations:
 ///
@@ -170,6 +169,11 @@ pub struct StandardRequestContext {
     /// [`new`]: Self::new
     /// [`at`]: Self::at
     pub timestamp: Option<DateTime<Utc>>,
+
+    /// The session's assurance record, emitted as `assurance` when `Some`
+    /// (see [`with_assurance`](Self::with_assurance)); the action's schema
+    /// must then declare `assurance` (`AxessAssurance`).
+    pub assurance: Option<super::assurance::AssuranceContext>,
 }
 
 impl StandardRequestContext {
@@ -183,6 +187,7 @@ impl StandardRequestContext {
             mfa_verified,
             ip_address,
             timestamp: None,
+            assurance: None,
         }
     }
 
@@ -200,7 +205,18 @@ impl StandardRequestContext {
             mfa_verified,
             ip_address,
             timestamp: Some(timestamp),
+            assurance: None,
         }
+    }
+
+    /// Emit `assurance` as well: the session's record, built with
+    /// [`AssuranceContext::from_session`](super::assurance::AssuranceContext::from_session)
+    /// from [`AuthSession::assurance`](crate::session::extractor::AuthSession::assurance)
+    /// and the clock reading of this request.
+    #[must_use]
+    pub fn with_assurance(mut self, assurance: super::assurance::AssuranceContext) -> Self {
+        self.assurance = Some(assurance);
+        self
     }
 }
 
@@ -222,6 +238,13 @@ impl BuildRequestContext for StandardRequestContext {
             pairs.push((
                 "timestamp".to_string(),
                 RestrictedExpression::new_string(ts.to_rfc3339()),
+            ));
+        }
+
+        if let Some(assurance) = &self.assurance {
+            pairs.push((
+                super::assurance::ASSURANCE_ATTRIBUTE.to_string(),
+                assurance.to_expression()?,
             ));
         }
 

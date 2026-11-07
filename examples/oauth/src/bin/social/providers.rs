@@ -75,6 +75,7 @@ fn github_mapper(raw: &serde_json::Value) -> Result<SocialClaims, SocialError> {
         // The profile address carries no verified flag, so it is not passed
         // on as one the provider vouches for. It stays in `raw`.
         email: None,
+        email_verified: false,
         display_name: raw.get("name").and_then(|v| v.as_str()).map(String::from),
         raw: raw.clone(),
     })
@@ -118,6 +119,8 @@ fn discord_mapper(raw: &serde_json::Value) -> Result<SocialClaims, SocialError> 
         .get("verified")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    // `email` is set only when Discord says it is verified, and the claims
+    // say so in the same breath.
     let email = if verified {
         raw.get("email").and_then(|v| v.as_str()).map(String::from)
     } else {
@@ -126,6 +129,7 @@ fn discord_mapper(raw: &serde_json::Value) -> Result<SocialClaims, SocialError> 
     Ok(SocialClaims {
         subject: id.to_string(),
         email,
+        email_verified: verified,
         // `global_name` is JSON null for a user who has not set one, so the
         // fallback is on the value, not on the key being absent.
         display_name: ["global_name", "username"]
@@ -182,6 +186,7 @@ fn twitter_x_mapper(raw: &serde_json::Value) -> Result<SocialClaims, SocialError
     Ok(SocialClaims {
         subject: id.to_string(),
         email: None, // Not available through OAuth 2.0 user-context.
+        email_verified: false,
         display_name: data.get("name").and_then(|v| v.as_str()).map(String::from),
         raw: raw.clone(),
     })
@@ -225,6 +230,7 @@ fn spotify_mapper(raw: &serde_json::Value) -> Result<SocialClaims, SocialError> 
         // Spotify does not verify the address it returns, so it is not
         // passed on as one the provider vouches for. It stays in `raw`.
         email: None,
+        email_verified: false,
         display_name: raw
             .get("display_name")
             .and_then(|v| v.as_str())
@@ -272,6 +278,7 @@ fn reddit_mapper(raw: &serde_json::Value) -> Result<SocialClaims, SocialError> {
     Ok(SocialClaims {
         subject: id.to_string(),
         email: None, // Reddit does not expose email via OAuth 2.0.
+        email_verified: false,
         display_name: raw.get("name").and_then(|v| v.as_str()).map(String::from),
         raw: raw.clone(),
     })

@@ -29,16 +29,12 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event.repository.visibility == 'public'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
+      # Pinned in the script, which the CI "Book" job also runs, so the book
+      # a pull request was checked with is the book published here.
       - name: Install mdBook + mdbook-mermaid
-        run: |
-          mkdir -p "$HOME/.cargo/bin"
-          curl -sSL https://github.com/rust-lang/mdBook/releases/download/v0.5.3/mdbook-v0.5.3-x86_64-unknown-linux-gnu.tar.gz \
-            | tar -xz -C "$HOME/.cargo/bin"
-          curl -sSL https://github.com/badboy/mdbook-mermaid/releases/download/v0.17.0/mdbook-mermaid-v0.17.0-x86_64-unknown-linux-gnu.tar.gz \
-            | tar -xz -C "$HOME/.cargo/bin"
-          chmod +x "$HOME/.cargo/bin/mdbook" "$HOME/.cargo/bin/mdbook-mermaid"
+        run: ./scripts/install-mdbook.sh
 
       - name: Install mermaid assets
         run: mdbook-mermaid install docs
@@ -57,12 +53,12 @@ jobs:
         run: mdbook test docs -L target/debug/deps
 
       - name: Configure Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
         with:
           enablement: true
 
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: docs/book
 
@@ -77,4 +73,4 @@ jobs:
     steps:
       - name: Deploy
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

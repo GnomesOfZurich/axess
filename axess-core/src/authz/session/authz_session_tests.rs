@@ -253,3 +253,109 @@ fn try_new_refuses_a_provider_that_fails_schema_validation() {
     );
     assert!(accepted.is_ok());
 }
+
+/// The schema of a `View` whose policies read `mfa_verified` and
+/// `assurance`, the attributes a `StandardRequestContext` with assurance
+/// emits.
+fn assurance_schema() -> String {
+    let mut schema = serde_json::json!({
+        "TestApp": {
+            "entityTypes": {
+                "User": { "memberOfTypes": [] },
+                "Resource": { "memberOfTypes": [] }
+            },
+            "actions": {
+                "View": {
+                    "appliesTo": {
+                        "principalTypes": ["User"],
+                        "resourceTypes": ["Resource"],
+                        "context": {
+                            "type": "Record",
+                            "attributes": {
+                                "mfa_verified": { "type": "Boolean" },
+                                "assurance": { "type": "AxessAssurance" }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+    crate::authz::assurance::merge_assurance_schema(&mut schema, "TestApp").unwrap();
+    schema.to_string()
+}
+
+/// `require_with_step_up` tells a shortfall from a denial: the step-up the
+/// rule's annotation names when the session's passkey is short, `Ok` when
+/// it is fresh, and the plain denial for a resource the rule never covers.
+#[tokio::test]
+async fn require_with_step_up_names_the_step_up_a_shortfall_needs() {
+    use crate::authn::assurance::{FactorAssurance, StepUp};
+    use crate::authn::factor::{FactorKind, Fido2Ceremony};
+    use crate::authz::assurance::{AssuranceContext, AuthzRefusal};
+    use crate::authz::context::StandardRequestContext;
+
+    const RULE: &str = r#"
+@step_up("passkey")
+permit (
+    principal == TestApp::User::"alice",
+    action == TestApp::Action::"View",
+    resource == TestApp::Resource::"doc1"
+) when {
+    context.assurance has fido2 &&
+    context.assurance.fido2.user_verified &&
+    context.assurance.fido2.credential == "device_bound" &&
+    context.assurance.fido2.age_seconds <= 300
+};
+"#;
+    let evaluator: Arc<dyn PolicyEvaluator> =
+        Arc::new(PolicyStore::from_text(RULE, &assurance_schema()).unwrap());
+    let store = Arc::new(
+        AuthzStore::try_new(
+            evaluator,
+            Arc::new(TenantRecordingProvider {
+                seen: Mutex::new(Vec::new()),
+            }),
+            "TestApp",
+        )
+        .unwrap(),
+    );
+    let now = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+    let ago = |seconds: i64| now - chrono::Duration::seconds(seconds);
+    let with = |record: &[FactorAssurance]| {
+        StandardRequestContext::new(false, None)
+            .with_assurance(AssuranceContext::from_session(record, now))
+    };
+
+    let password_only = [FactorAssurance::for_kind(FactorKind::Password, ago(10))];
+    let authz = store
+        .for_user_id_with_context("alice", with(&password_only))
+        .unwrap();
+    assert_eq!(
+        authz
+            .require_with_step_up("View", &"doc1".to_string())
+            .await,
+        Err(AuthzRefusal::StepUpRequired(StepUp::Fido2(
+            Fido2Ceremony::Passkey
+        )))
+    );
+    assert_eq!(
+        authz
+            .require_with_step_up("View", &"doc2".to_string())
+            .await,
+        Err(AuthzRefusal::Denied),
+        "no step-up reaches a resource the rule does not cover"
+    );
+    assert!(authz.require("View", &"doc1".to_string()).await.is_err());
+
+    let fresh_passkey = [FactorAssurance::fido2(true, false, false, None, ago(10))];
+    let authz = store
+        .for_user_id_with_context("alice", with(&fresh_passkey))
+        .unwrap();
+    assert_eq!(
+        authz
+            .require_with_step_up("View", &"doc1".to_string())
+            .await,
+        Ok(())
+    );
+}

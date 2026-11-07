@@ -18,7 +18,7 @@ use axess_core::{
     device::types::{Device, FingerprintHash},
     testing::{
         mock_authn::{MockFactorStore, MockIdentityStore},
-        test_session, test_session_on_device,
+        test_session, test_session_on_device, test_session_on_unproven_device,
     },
 };
 use chrono::Utc;
@@ -164,6 +164,25 @@ async fn a_known_device_still_logs_in_while_the_account_is_locked() {
             "a login resets the count"
         );
     }
+}
+
+/// The account's own `Seen` device, bound to the session by a resolver that
+/// found it by fingerprint alone, is no way past the lock: only a device the
+/// client proved holds the exemption.
+#[tokio::test]
+async fn a_device_found_by_fingerprint_alone_does_not_lift_the_lock() {
+    let world = locked_world(true).await;
+    let id = device_id("seen");
+    put(&world.devices, id, Some("u1"), DeviceTrustLevel::Seen, 1).await;
+
+    let session = test_session_on_unproven_device(id);
+    let (begun, verified) = login_from(&world, &session).await;
+
+    assert!(
+        !matches!(verified, Some(FactorOutcome::Authenticated)),
+        "{begun:?} {verified:?}"
+    );
+    assert!(!session.is_authenticated().await);
 }
 
 /// Every other origin stays out: no device, an unknown one, one that is not

@@ -280,7 +280,7 @@ pub fn validate_bearer_token(
     let Some((issuer_cfg, claims)) = verified else {
         return Err(match first_error {
             Some(e) => BearerError::Jwt(JwtVerificationError::from(e)),
-            None => BearerError::UntrustedIssuer(iss.to_string()),
+            None => BearerError::UntrustedIssuer(echo_issuer(iss)),
         });
     };
 
@@ -357,6 +357,32 @@ impl From<JwtError> for JwtVerificationError {
     }
 }
 
+/// The most of an unverified `iss` an error carries, in bytes.
+pub const MAX_ISSUER_ECHO_BYTES: usize = 128;
+
+/// An unverified `iss` as an error may carry it: cut to
+/// [`MAX_ISSUER_ECHO_BYTES`] bytes at a character boundary (with an ellipsis
+/// when anything was dropped) and with control characters escaped, so a
+/// forged issuer neither floods a log line nor forges another one.
+fn echo_issuer(iss: &str) -> String {
+    let mut end = iss.len().min(MAX_ISSUER_ECHO_BYTES);
+    while !iss.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = String::with_capacity(end + 3);
+    for c in iss[..end].chars() {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    if end < iss.len() {
+        out.push_str("...");
+    }
+    out
+}
+
 /// Errors from bearer token validation.
 #[derive(Debug, thiserror::Error)]
 pub enum BearerError {
@@ -368,7 +394,9 @@ pub enum BearerError {
     #[error("bearer token missing `iss` claim")]
     MissingIssuer,
 
-    /// The token's `iss` doesn't match any configured issuer.
+    /// The token's `iss` doesn't match any configured issuer. The text is the
+    /// token's own, unverified, so it is cut to [`MAX_ISSUER_ECHO_BYTES`]
+    /// bytes and its control characters are escaped before it is carried.
     #[error("untrusted issuer: {0}")]
     UntrustedIssuer(String),
 

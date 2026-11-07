@@ -81,7 +81,7 @@ fn svid_claims(sub: &str) -> serde_json::Value {
 async fn valid_jwt_svid_resolves_to_workload_principal() {
     let (der, jwks, kid) = rsa_keypair();
     let token = sign(
-        &svid_claims("spiffe://gnomes.local/compute-worker/ekekrantz"),
+        &svid_claims("spiffe://gnomes.local/compute-worker/gnomes"),
         &kid,
         &der,
     );
@@ -89,19 +89,20 @@ async fn valid_jwt_svid_resolves_to_workload_principal() {
         build_verifier(jwks),
         TrustDomain::new("gnomes.local").unwrap(),
         token,
-    );
+    )
+    .without_tenant_cross_check();
 
     let principal = resolver.resolve().await.expect("must resolve");
     match principal {
         Principal::Workload(w) => {
             assert_eq!(
                 w.workload_id.as_str(),
-                "spiffe://gnomes.local/compute-worker/ekekrantz"
+                "spiffe://gnomes.local/compute-worker/gnomes"
             );
             assert_eq!(w.trust_domain.as_str(), "gnomes.local");
             assert_eq!(w.issuer, Issuer::JwtSvid);
             assert_eq!(w.service_name, "compute-worker");
-            assert_eq!(w.tenant_slug, "ekekrantz");
+            assert_eq!(w.tenant_slug, "gnomes");
             assert_eq!(w.tenant_id.to_string(), sample_tenant_uuid());
         }
         Principal::Human(_) => panic!("expected Workload, got Human"),
@@ -114,7 +115,7 @@ async fn wrong_trust_domain_rejected() {
     // Token carries a SPIFFE ID under `attacker.example`; the
     // resolver pins `gnomes.local`.
     let token = sign(
-        &svid_claims("spiffe://attacker.example/compute-worker/ekekrantz"),
+        &svid_claims("spiffe://attacker.example/compute-worker/gnomes"),
         &kid,
         &der,
     );
@@ -122,7 +123,8 @@ async fn wrong_trust_domain_rejected() {
         build_verifier(jwks),
         TrustDomain::new("gnomes.local").unwrap(),
         token,
-    );
+    )
+    .without_tenant_cross_check();
 
     let err = resolver
         .resolve()
@@ -143,7 +145,8 @@ async fn malformed_spiffe_sub_rejected() {
         build_verifier(jwks),
         TrustDomain::new("gnomes.local").unwrap(),
         token,
-    );
+    )
+    .without_tenant_cross_check();
 
     let err = resolver
         .resolve()
@@ -165,7 +168,7 @@ async fn missing_tid_claim_rejected() {
     let token = sign(
         &serde_json::json!({
             "iss": "https://idp.gnomes.local",
-            "sub": "spiffe://gnomes.local/compute-worker/ekekrantz",
+            "sub": "spiffe://gnomes.local/compute-worker/gnomes",
             "aud": "axess-platform",
             "exp": now + 3600,
             "iat": now,
@@ -177,7 +180,8 @@ async fn missing_tid_claim_rejected() {
         build_verifier(jwks),
         TrustDomain::new("gnomes.local").unwrap(),
         token,
-    );
+    )
+    .without_tenant_cross_check();
 
     let err = resolver
         .resolve()
@@ -195,7 +199,7 @@ async fn extra_spiffe_path_segments_rejected() {
     // SPIFFE path is valid per the spec but doesn't match the
     // platform's 2-segment shape: rejected.
     let token = sign(
-        &svid_claims("spiffe://gnomes.local/region/compute-worker/ekekrantz"),
+        &svid_claims("spiffe://gnomes.local/region/compute-worker/gnomes"),
         &kid,
         &der,
     );
@@ -203,7 +207,8 @@ async fn extra_spiffe_path_segments_rejected() {
         build_verifier(jwks),
         TrustDomain::new("gnomes.local").unwrap(),
         token,
-    );
+    )
+    .without_tenant_cross_check();
 
     let err = resolver
         .resolve()
@@ -223,7 +228,7 @@ async fn expired_token_rejected() {
     let token = sign(
         &serde_json::json!({
             "iss": "https://idp.gnomes.local",
-            "sub": "spiffe://gnomes.local/compute-worker/ekekrantz",
+            "sub": "spiffe://gnomes.local/compute-worker/gnomes",
             "aud": "axess-platform",
             "exp": now - 3600,
             "iat": now - 7200,
@@ -236,7 +241,8 @@ async fn expired_token_rejected() {
         build_verifier(jwks),
         TrustDomain::new("gnomes.local").unwrap(),
         token,
-    );
+    )
+    .without_tenant_cross_check();
 
     let err = resolver
         .resolve()
@@ -258,7 +264,8 @@ async fn non_jwt_string_rejects_cleanly() {
         build_verifier(jwks),
         TrustDomain::new("gnomes.local").unwrap(),
         "not-a-jwt-at-all".to_string(),
-    );
+    )
+    .without_tenant_cross_check();
     let err = resolver
         .resolve()
         .await
@@ -277,7 +284,7 @@ async fn non_jwt_string_rejects_cleanly() {
 async fn tid_claim_must_match_the_tenant_registered_for_the_spiffe_slug() {
     let (der, jwks, kid) = rsa_keypair();
     let token = sign(
-        &svid_claims("spiffe://gnomes.local/compute-worker/ekekrantz"),
+        &svid_claims("spiffe://gnomes.local/compute-worker/gnomes"),
         &kid,
         &der,
     );
@@ -288,7 +295,7 @@ async fn tid_claim_must_match_the_tenant_registered_for_the_spiffe_slug() {
 
     // Slug maps to the tenant the token claims: resolves.
     let ok = JwtSvidResolver::new(verifier.clone(), td.clone(), token.clone())
-        .with_tenant_lookup(move |slug| (slug == "ekekrantz").then_some(claimed));
+        .with_tenant_lookup(move |slug| (slug == "gnomes").then_some(claimed));
     assert!(ok.resolve().await.is_ok());
 
     // Slug maps to a different tenant than `tid`: refused.
@@ -314,7 +321,7 @@ async fn tid_claim_must_match_the_tenant_registered_for_the_spiffe_slug() {
 async fn a_verifier_without_an_audience_or_issuer_pin_is_refused() {
     let (der, jwks, kid) = rsa_keypair();
     let token = sign(
-        &svid_claims("spiffe://gnomes.local/compute-worker/ekekrantz"),
+        &svid_claims("spiffe://gnomes.local/compute-worker/gnomes"),
         &kid,
         &der,
     );
@@ -333,7 +340,8 @@ async fn a_verifier_without_an_audience_or_issuer_pin_is_refused() {
             verifier,
             TrustDomain::new("gnomes.local").unwrap(),
             token.clone(),
-        );
+        )
+        .without_tenant_cross_check();
         assert!(
             matches!(
                 resolver.resolve().await,
@@ -342,4 +350,55 @@ async fn a_verifier_without_an_audience_or_issuer_pin_is_refused() {
             "an unpinned verifier must be refused"
         );
     }
+}
+
+/// Without a tenant lookup the slug in `sub` and the `tid` claim cannot be
+/// cross-checked, so the resolver refuses the token instead of resolving a
+/// principal whose slug and id may name two tenants.
+#[tokio::test]
+async fn a_resolver_without_a_tenant_lookup_refuses_by_default() {
+    let (der, jwks, kid) = rsa_keypair();
+    let token = sign(
+        &svid_claims("spiffe://gnomes.local/compute-worker/gnomes"),
+        &kid,
+        &der,
+    );
+    let resolver = JwtSvidResolver::new(
+        build_verifier(jwks),
+        TrustDomain::new("gnomes.local").unwrap(),
+        token,
+    );
+    assert!(
+        matches!(
+            resolver.resolve().await,
+            Err(IdentityError::NotAuthenticated)
+        ),
+        "no lookup and no waiver must refuse"
+    );
+}
+
+/// The named waiver resolves a token whose slug and `tid` nothing ties
+/// together, and a lookup set beside it still applies.
+#[tokio::test]
+async fn the_named_waiver_resolves_without_a_lookup_and_a_lookup_still_applies() {
+    let (der, jwks, kid) = rsa_keypair();
+    let token = sign(
+        &svid_claims("spiffe://gnomes.local/compute-worker/gnomes"),
+        &kid,
+        &der,
+    );
+    let td = TrustDomain::new("gnomes.local").unwrap();
+    let verifier = build_verifier(jwks);
+
+    let waived = JwtSvidResolver::new(verifier.clone(), td.clone(), token.clone())
+        .without_tenant_cross_check();
+    assert!(waived.resolve().await.is_ok());
+
+    let still_checked = JwtSvidResolver::new(verifier, td, token)
+        .without_tenant_cross_check()
+        .with_tenant_lookup(|_| Some(TenantId::from_bytes([9u8; 16])));
+    assert!(matches!(
+        still_checked.resolve().await,
+        Err(IdentityError::NotAuthenticated)
+    ));
 }

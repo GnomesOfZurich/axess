@@ -281,7 +281,7 @@ fn from_static_is_never_inline_but_never_allocates() {
     // exist: `Static` is allocation-free without carrying its bytes.
     const SHORT: ShortString = ShortString::from_static("ab");
     const LONG: ShortString =
-        ShortString::from_static("spiffe://gnomes.local/feed-worker/ekekrantz");
+        ShortString::from_static("spiffe://gnomes.local/compute-worker/gnomes");
 
     for s in [SHORT, LONG] {
         assert!(
@@ -299,7 +299,7 @@ fn clone_of_an_allocated_value_shares_rather_than_copies() {
     // makes the clone a refcount bump. `CompactString` fails this by
     // design, and a change here that quietly reverted to copying would
     // remove the only reason not to depend on it.
-    let original = ShortString::new("spiffe://gnomes.local/feed-worker/ekekrantz");
+    let original = ShortString::new("spiffe://gnomes.local/compute-worker/gnomes");
     assert!(
         original.is_allocated(),
         "precondition: the case must be over the cap"
@@ -334,8 +334,8 @@ fn reverse_equality_holds_from_the_std_side() {
 fn into_string_carries_content_for_every_repr() {
     // One case per form, since each reaches `as_str` differently.
     let inline = ShortString::new("case-42");
-    let stat = ShortString::from_static("spiffe://gnomes.local/feed-worker/ekekrantz");
-    let shared = ShortString::new("spiffe://gnomes.local/feed-worker/ekekrantz");
+    let stat = ShortString::from_static("spiffe://gnomes.local/compute-worker/gnomes");
+    let shared = ShortString::new("spiffe://gnomes.local/compute-worker/gnomes");
 
     assert!(inline.is_inline());
     assert!(!stat.is_allocated() && !stat.is_inline());
@@ -344,10 +344,10 @@ fn into_string_carries_content_for_every_repr() {
     assert_eq!(String::from(inline), "case-42");
     assert_eq!(
         String::from(stat),
-        "spiffe://gnomes.local/feed-worker/ekekrantz"
+        "spiffe://gnomes.local/compute-worker/gnomes"
     );
     assert_eq!(
         String::from(shared),
-        "spiffe://gnomes.local/feed-worker/ekekrantz"
+        "spiffe://gnomes.local/compute-worker/gnomes"
     );
 }

@@ -220,13 +220,13 @@ pub use axess_factors::oauth::{FapiConfig, ParResponse, SenderConstraint};
 #[cfg(feature = "device")]
 #[cfg_attr(docsrs, doc(cfg(feature = "device")))]
 pub use device::{
-    AttestationClass, BindingsUpdate, CachedDeviceStore, DefaultFingerprintExtractor, Device,
-    DeviceBinding, DeviceCookieConfig, DeviceCookieSlot, DeviceEventSink,
+    AttestationClass, BindingsUpdate, BoundDevice, CachedDeviceStore, DefaultFingerprintExtractor,
+    Device, DeviceBinding, DeviceCookieConfig, DeviceCookieSlot, DeviceEventSink,
     DeviceFingerprintExtractor, DeviceLifecycleService, DevicePiiCategory, DevicePiiMapping,
     DevicePiiResolver, DevicePiiStore, DeviceRequest, DeviceResolver, DeviceStore, DeviceToken,
     DeviceTrustLevel, FingerprintHash, LifecycleDeviceResolver, MemoryDevicePiiStore,
     MemoryDevicePiiStoreError, MemoryDeviceStore, MemoryDeviceStoreError, NoopDeviceEventSink,
-    NoopDeviceResolver, OwnerClaim, PiiToken, PresentedDevice, REDACTED_PLACEHOLDER,
+    NoopDeviceResolver, OwnerClaim, PiiToken, PresentedDevice, ProvenDevice, REDACTED_PLACEHOLDER,
     RedactedResolver, ResolvedDevice, SessionDevice, SessionTenant, SessionUser, SweepConfig,
     SweepConfigBuilder, SweepConfigError, SweepCounts, TenantPepperResolver, TrustTransition,
     cascade_revoke_by_refresh_family, cascade_revoke_devices,

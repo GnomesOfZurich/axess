@@ -61,6 +61,7 @@
 //! See `examples/authz/` for a complete working example with RBAC, ReBAC
 //! (ownership), and ABAC (MFA requirement) patterns.
 
+pub mod assurance;
 pub mod audit;
 pub mod cache;
 pub mod context;
@@ -75,6 +76,10 @@ pub mod store;
 // the only correct walk behind the `authz` feature: the rate limiter could
 // not reach it without compiling Cedar, so it read the headers itself and
 // was spoofable for three releases.
+pub use assurance::{
+    ASSURANCE_ATTRIBUTE, ASSURANCE_SCHEMA_FRAGMENT, AssuranceContext, AssuranceContextProvider,
+    AuthzRefusal, FactorEvidence, STEP_UP_ANNOTATION, merge_assurance_schema,
+};
 pub use context::{BuildRequestContext, NoContext, RequestContextProvider, StandardRequestContext};
 pub use error::{AuthzDenied, AuthzError};
 pub use provider::{

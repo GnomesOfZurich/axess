@@ -65,6 +65,29 @@ const GUARDED_SCHEMA: &str = r#"{
     }
 }"#;
 
+const OPTIONAL_SCHEMA: &str = r#"{
+    "App": {
+        "entityTypes": {
+            "User": { "shape": { "type": "Record", "attributes": {} } },
+            "Doc":  { "shape": { "type": "Record", "attributes": {} } }
+        },
+        "actions": {
+            "View": {
+                "appliesTo": {
+                    "principalTypes": ["User"],
+                    "resourceTypes": ["Doc"],
+                    "context": {
+                        "type": "Record",
+                        "attributes": {
+                            "mfa_verified": { "type": "Boolean", "required": false }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}"#;
+
 fn session_layer() -> SessionLayer<MemorySessionStore> {
     SessionLayer::without_registry_insecure(MemorySessionStore::new(), axess::testing::test_key(42))
         .with_ttl(std::time::Duration::from_secs(3600))
@@ -285,9 +308,9 @@ async fn example_delete_is_allowed_when_the_provider_reports_mfa() {
 }
 
 #[tokio::test]
-async fn example_delete_without_a_provider_is_denied() {
+async fn example_delete_without_a_provider_is_refused_as_misconfigured() {
     let status = get_status(example(None), "/delete/d1").await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 }
 
 #[tokio::test]
@@ -301,9 +324,11 @@ async fn example_delete_is_denied_when_the_provider_errors() {
 }
 
 #[tokio::test]
-async fn example_view_needs_no_context_and_still_works_without_a_provider() {
+async fn example_view_is_refused_without_a_provider_while_the_store_reads_context() {
+    // The store mentions `context` (the delete rule), and the gate cannot
+    // tell which action's policies do, so every gate on it refuses.
     let status = get_status(example(None), "/view/d1").await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 }
 
 #[tokio::test]
@@ -320,10 +345,56 @@ async fn guarded_forbid_follows_the_provider_context() {
 
 #[tokio::test]
 async fn guarded_forbid_does_not_become_an_allow_without_a_provider() {
-    // The attribute is required, so the empty context is an invalid request
-    // and the permit beside the forbid must not decide.
+    // The policies read `context` and nothing supplies it: the gate refuses
+    // by name instead of deciding on an empty context.
     assert_eq!(
         get_status(guarded(None), "/app/d1").await,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+}
+
+/// The same forbid with the attribute optional in the schema: on an empty
+/// context `context has mfa_verified` is false, the forbid stops applying and
+/// the permit allows.
+const OPTIONAL_POLICY: &str = r#"
+    permit (principal, action, resource);
+    forbid (principal, action, resource)
+        when { context has mfa_verified && !context.mfa_verified };
+"#;
+
+fn optional(context: Option<MfaProvider>) -> Router {
+    app(
+        Setup {
+            policy: OPTIONAL_POLICY,
+            schema: OPTIONAL_SCHEMA,
+            entities: Entities4Test {
+                role: None,
+                namespace: "App",
+            },
+            context,
+        },
+        "App",
+    )
+}
+
+#[tokio::test]
+async fn an_optional_context_guard_is_refused_without_a_provider_not_allowed() {
+    let store = PolicyStore::from_text(OPTIONAL_POLICY, OPTIONAL_SCHEMA).unwrap();
+    assert!(store.mentions_context());
+    assert_eq!(
+        get_status(optional(None), "/app/d1").await,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+}
+
+#[tokio::test]
+async fn an_optional_context_guard_follows_the_provider_when_there_is_one() {
+    assert_eq!(
+        get_status(optional(Some(MfaProvider(Ok(false)))), "/app/d1").await,
         StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        get_status(optional(Some(MfaProvider(Ok(true)))), "/app/d1").await,
+        StatusCode::OK
     );
 }

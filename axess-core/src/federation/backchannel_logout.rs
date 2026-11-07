@@ -12,6 +12,18 @@
 //! (e.g. 10 requests per minute per IP) or place it behind a reverse proxy with
 //! rate limiting enabled.
 //!
+//! Every request is answered before it is authenticated: it reads the issuer
+//! out of the unverified token, and with tenant providers each request that
+//! names a configured issuer costs a read of the tenant source and may rebuild
+//! or revalidate the providers it returns (discovery included) before any
+//! signature is checked. The handler remembers an issuer the source has no
+//! provider for for 30 seconds
+//! ([`with_unknown_issuer_memory`](BackChannelLogoutHandler::with_unknown_issuer_memory)),
+//! which bounds the cost of a loop of made-up issuers; it cannot bound a loop
+//! that names a real one. Key the rate limit on the client address, as for the
+//! front-channel route, and keep the limit low: an IdP sends a few tokens a
+//! minute.
+//!
 //! [`RateLimitLayer`]: crate::middleware::ratelimit::RateLimitLayer
 //!
 //! # Setup
@@ -100,15 +112,15 @@ pub use audit::{IdpSessionEnded, LogoutAudit};
 
 use super::log_field::loggable;
 use super::oauth_tenant::TenantOAuthProviders;
+use super::replay_log::{LogoutReplayLog, Recorded};
+use super::sid_store::SidStore;
 use crate::authn::ids::{TenantId, UserId};
+use crate::metrics::SessionMetrics;
 use crate::session::id::SessionId;
 use crate::session::store::SessionRevoker;
 use axess_clock::Clock;
 use axess_factors::oauth::OAuthProvider;
-use axess_factors::oidc::logout_token::{
-    IatCheck, JTI_RETENTION_SECS, aud_contains, azp_satisfied, check_iat, decode_jwt_payload,
-    events_contains_logout,
-};
+use axess_factors::oidc::logout_token::{aud_contains, azp_satisfied};
 use axum::extract::{Form, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -136,7 +148,7 @@ pub struct BackChannelLogoutHandler {
     registry: Arc<dyn SessionRevoker>,
     /// OIDC `(issuer, sid)` → local session mapping for `sid`-based logout,
     /// and the `(issuer, user)` index behind `sub`-based logout.
-    sid_map: SidMap,
+    sid_map: Arc<dyn SidStore>,
     /// Replay cache for `(issuer, jti)` pairs of recently-seen logout tokens.
     /// Within the `iat` acceptance window an attacker who captures one valid
     /// logout token must not be able to re-fire it; without this cache the
@@ -144,7 +156,15 @@ pub struct BackChannelLogoutHandler {
     /// Bounded to `JTI_CACHE_MAX` live entries per issuer, with TTL-based
     /// eviction, so one IdP's traffic cannot get another IdP's logouts
     /// refused.
-    seen_jtis: Arc<jti_log::JtiLog>,
+    /// The log the handler records `jti`s in: an in-process one unless replaced
+    /// by [`with_replay_log`](Self::with_replay_log) with one the instances
+    /// share.
+    replay: Arc<dyn LogoutReplayLog>,
+    /// Told when a verified token ends no session.
+    metrics: Option<Arc<dyn SessionMetrics>>,
+    /// Issuers the tenant source recently had no provider for, so a loop of
+    /// requests naming one costs one source read per interval.
+    unknown_issuers: Arc<unknown_issuers::UnknownIssuers>,
     /// Injected clock for the IAT-window check and the JTI replay window.
     /// Production wires `SystemClock`; tests inject `MockClock` so the
     /// 5-minute acceptance window can be exercised deterministically.
@@ -155,59 +175,49 @@ pub struct BackChannelLogoutHandler {
     tenants: Option<Arc<dyn TenantOAuthProviders>>,
 }
 
-/// Why no single provider could be chosen for a logout token.
-#[derive(Debug, thiserror::Error)]
-pub enum LogoutProviderError {
-    /// More than one provider has the token's issuer and client id, so the
-    /// token cannot be attributed to one of them. The token is refused.
-    #[error(
-        "back-channel logout: {} providers share the issuer and client id of the token \
-         (global registration: {global}, tenants: {tenants:?})",
-        tenants.len() + usize::from(*global)
-    )]
-    Ambiguous {
-        /// Whether the global registration is one of the matches.
-        global: bool,
-        /// The tenants whose providers match.
-        tenants: Vec<TenantId>,
-    },
-    /// The tenant source failed while looking for providers of the issuer.
-    #[error("back-channel logout: the tenant provider source failed: {0}")]
-    Source(#[from] axess_factors::oauth::OAuthError),
-    /// The one provider with the token's issuer and client id is a tenant's
-    /// that could not be built (its configuration does not open, or its
-    /// discovery failed). The token is refused as retryable: the IdP resends
-    /// it, and it verifies once the configuration is fixed. Other tenants of
-    /// the issuer are not affected.
-    #[error(
-        "back-channel logout: the provider {name} of tenant {tenant} has the token's issuer and \
-         client id but could not be built: {error}"
-    )]
-    Unavailable {
-        /// The tenant whose provider it is.
-        tenant: TenantId,
-        /// The provider's name within the tenant.
-        name: Arc<str>,
-        /// Why it could not be built.
-        error: axess_factors::oauth::OAuthError,
-    },
-}
-
-/// The pair of a token being acted on. Dropped before `done`, it forgets the
-/// pair; dropped after, it settles it as spent.
-struct ActingOn<'a> {
-    log: &'a jti_log::JtiLog,
-    issuer: &'a str,
-    jti: &'a str,
+/// The pair of a token being acted on. [`finish`](Self::finish) settles it as
+/// spent, or forgets it when the action failed. Dropped without finishing (the
+/// request was cancelled), it forgets the pair on a task of its own, so the
+/// resend is acted on.
+struct ActingOn {
+    log: Arc<dyn LogoutReplayLog>,
+    issuer: String,
+    jti: String,
     done: bool,
 }
 
-impl Drop for ActingOn<'_> {
+impl ActingOn {
+    async fn finish(mut self, acted: bool) {
+        self.done = true;
+        let result = if acted {
+            self.log.settle(&self.issuer, &self.jti).await
+        } else {
+            self.log.forget(&self.issuer, &self.jti).await
+        };
+        if let Err(e) = result {
+            tracing::warn!(
+                iss = %loggable(&self.issuer),
+                error = %e,
+                "back-channel logout: the replay log did not take the outcome of a token"
+            );
+        }
+    }
+}
+
+impl Drop for ActingOn {
     fn drop(&mut self) {
         if self.done {
-            self.log.settle(self.issuer, self.jti);
-        } else {
-            self.log.forget(self.issuer, self.jti);
+            return;
+        }
+        let (log, issuer, jti) = (
+            Arc::clone(&self.log),
+            std::mem::take(&mut self.issuer),
+            std::mem::take(&mut self.jti),
+        );
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = log.forget(&issuer, &jti).await;
+            });
         }
     }
 }
@@ -218,6 +228,13 @@ impl Drop for ActingOn<'_> {
 /// for in `azp`, so the lookup must not stop at the first client in `aud`.
 fn addressed_to(unverified: &serde_json::Value, client_id: &str) -> bool {
     aud_contains(unverified, client_id) && azp_satisfied(unverified, client_id)
+}
+
+/// The negative cache a handler starts with.
+fn default_unknown_issuers() -> Arc<unknown_issuers::UnknownIssuers> {
+    Arc::new(unknown_issuers::UnknownIssuers::new(
+        chrono::Duration::seconds(unknown_issuers::DEFAULT_TTL_SECS),
+    ))
 }
 
 /// Maximum live entries the `jti` replay cache keeps per issuer. Sized so
@@ -263,6 +280,9 @@ pub struct LogoutTokenClaims {
     /// Token `jti` claim (always present on a validated token). Used by the handler to detect
     /// replay of the same logout token within the IAT window.
     pub jti: Option<String>,
+    /// The tenant whose provider verified the token; `None` for a global
+    /// provider. The sessions the token ends belong to this tenant.
+    pub tenant: Option<TenantId>,
 }
 
 impl BackChannelLogoutHandler {
@@ -311,8 +331,10 @@ impl BackChannelLogoutHandler {
         Some(Self {
             providers_by_issuer: Arc::new(by_issuer),
             registry,
-            sid_map,
-            seen_jtis: Arc::new(jti_log::JtiLog::new(JTI_CACHE_MAX)),
+            sid_map: Arc::new(sid_map),
+            replay: Arc::new(jti_log::JtiLog::new(JTI_CACHE_MAX)),
+            metrics: None,
+            unknown_issuers: default_unknown_issuers(),
             clock,
             audit: None,
             tenants: None,
@@ -335,8 +357,10 @@ impl BackChannelLogoutHandler {
         Self {
             providers_by_issuer: Arc::new(HashMap::new()),
             registry,
-            sid_map,
-            seen_jtis: Arc::new(jti_log::JtiLog::new(JTI_CACHE_MAX)),
+            sid_map: Arc::new(sid_map),
+            replay: Arc::new(jti_log::JtiLog::new(JTI_CACHE_MAX)),
+            metrics: None,
+            unknown_issuers: default_unknown_issuers(),
             clock,
             audit: None,
             tenants: Some(source),
@@ -354,84 +378,54 @@ impl BackChannelLogoutHandler {
         self
     }
 
-    /// The provider that verifies a token of issuer `iss` addressed to the
-    /// client ids in `unverified` (its unverified payload), or `None` when no
-    /// provider of the issuer has a client id the token names.
-    ///
-    /// Errors: [`LogoutProviderError::Ambiguous`] when more than one provider
-    /// (global or a tenant's) matches; [`LogoutProviderError::Unavailable`]
-    /// when the one match is a tenant's provider that could not be built;
-    /// [`LogoutProviderError::Source`] when the tenant source fails.
-    async fn entry_for(
-        &self,
-        iss: &str,
-        unverified: &serde_json::Value,
-    ) -> Result<Option<ProviderEntry>, LogoutProviderError> {
-        // Providers can share an issuer; the one whose client id the token
-        // is addressed to verifies it. The first global match stands for the
-        // global registration, as before tenants existed.
-        let global = self
-            .providers_by_issuer
-            .get(iss)
-            .and_then(|entries| {
-                entries
-                    .iter()
-                    .find(|e| addressed_to(unverified, &e.client_id))
-            })
-            .cloned();
-        let Some(source) = &self.tenants else {
-            return Ok(global);
-        };
-        let found = source.providers_for_issuer(iss).await?;
-        let mut tenant_matches: Vec<ProviderEntry> = Vec::new();
-        for built in found.providers {
-            let Some(client_id) = built.provider.client_id().map(str::to_string) else {
-                continue;
-            };
-            if addressed_to(unverified, &client_id) {
-                tenant_matches.push(ProviderEntry {
-                    client_id,
-                    name: built.name,
-                    provider: built.provider,
-                    tenant: Some(built.tenant),
-                });
-            }
-        }
-        // A provider that could not be built still counts where the token is
-        // addressed to it: it may be the one the IdP meant, so it neither
-        // drops out of an ambiguity nor lets a token through to another.
-        // Providers of the issuer the token is not addressed to do not matter.
-        let broken: Vec<_> = found
-            .broken
-            .into_iter()
-            .filter(|b| addressed_to(unverified, &b.client_id))
-            .collect();
-        for b in &broken {
-            tracing::warn!(
-                tenant = %b.tenant,
-                provider = %b.name,
-                error = %b.error,
-                "back-channel logout: a tenant provider the token is addressed to could not be built"
-            );
-        }
-        if usize::from(global.is_some()) + tenant_matches.len() + broken.len() > 1 {
-            return Err(LogoutProviderError::Ambiguous {
-                global: global.is_some(),
-                tenants: tenant_matches
-                    .iter()
-                    .filter_map(|e| e.tenant)
-                    .chain(broken.iter().map(|b| b.tenant))
-                    .collect(),
-            });
-        }
-        if let Some(b) = broken.into_iter().next() {
-            return Err(LogoutProviderError::Unavailable {
-                tenant: b.tenant,
-                name: b.name,
-                error: b.error,
-            });
-        }
-        Ok(global.or_else(|| tenant_matches.pop()))
+    /// Remember an issuer the tenant source has no provider for, for `ttl`
+    /// (default 30 seconds), so an anonymous loop of tokens naming made-up
+    /// issuers costs one source read per interval and not one per request.
+    /// `Duration::ZERO` remembers nothing. A provider added through
+    /// `LiveTenantOAuthProviders` or `StoredTenantOAuthProviders` is found at
+    /// once (they change the source's
+    /// [`generation`](TenantOAuthProviders::generation), which voids a remembered
+    /// miss); a source that does not implement it, or a store another process
+    /// writes, is found once the interval has passed.
+    #[must_use]
+    pub fn with_unknown_issuer_memory(mut self, ttl: std::time::Duration) -> Self {
+        self.unknown_issuers = Arc::new(unknown_issuers::UnknownIssuers::new(
+            chrono::Duration::from_std(ttl).unwrap_or(chrono::Duration::zero()),
+        ));
+        self
+    }
+
+    /// Read the `sid` mappings and subject records from `store` instead of
+    /// the [`SidMap`] the constructor took, so a token that reaches this
+    /// instance finds the session another instance established. Pass
+    /// [`AuthnService::sid_store`](crate::authn::service::AuthnService::sid_store),
+    /// the store the login path writes to.
+    #[must_use]
+    pub fn with_sid_store(mut self, store: Arc<dyn SidStore>) -> Self {
+        self.sid_map = store;
+        self
+    }
+
+    /// Record the `jti`s of the logout tokens in `log` instead of in this
+    /// process, so a token cannot be replayed to another instance inside the
+    /// `iat` window and the record survives a restart. `ValkeyReplayLog`
+    /// (feature `valkey`) is the shared one. If the log fails, the token is
+    /// answered with a retryable `503` and acted on when the IdP resends it.
+    #[must_use]
+    pub fn with_replay_log(mut self, log: Arc<dyn LogoutReplayLog>) -> Self {
+        self.replay = log;
+        self
+    }
+
+    /// Count, through `metrics`, the logout tokens that verified but ended no
+    /// session ([`SessionMetrics::back_channel_logout_unmatched`]). The IdP
+    /// is answered `200` either way, as OpenID Connect Back-Channel Logout
+    /// 1.0 has it; the count is how an operator sees the rate. A rate that
+    /// does not fall is instances that do not share a `sid` store.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<dyn SessionMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Report every session this handler ends to `audit`.
@@ -502,18 +496,25 @@ impl BackChannelLogoutHandler {
         let Some(ref jti) = claims.jti else {
             return Err(StatusCode::BAD_REQUEST);
         };
-        handler.admit_jti(&claims.iss, jti)?;
+        handler.admit_jti(&claims.iss, jti).await?;
         // Until the token has been acted on, its pair is in flight (recording
         // it set that): a resend meanwhile is told to come again, and a
         // delivery that ends any other way than done (a failure, a dropped
         // request) leaves the pair forgotten so the resend is acted on.
-        let mut acting = ActingOn {
-            log: &handler.seen_jtis,
-            issuer: &claims.iss,
-            jti,
+        let acting = ActingOn {
+            log: Arc::clone(&handler.replay),
+            issuer: claims.iss.clone(),
+            jti: jti.clone(),
             done: false,
         };
+        let outcome = handler.act_on(&claims).await;
+        acting.finish(outcome.is_ok()).await;
+        outcome
+    }
 
+    /// End the sessions a verified, admitted token names.
+    async fn act_on(&self, claims: &LogoutTokenClaims) -> Result<StatusCode, StatusCode> {
+        let handler = self;
         tracing::info!(
             iss = %loggable(&claims.iss),
             has_sub = claims.sub.is_some(),
@@ -535,7 +536,7 @@ impl BackChannelLogoutHandler {
         // live, so its mappings stay for the retry, the `jti` is forgotten
         // (the resend is not a replay) and the answer is retryable: OIDC
         // Back-Channel Logout 1.0 section 2.8 has the OP retry on a non-200.
-        let sid_outcome = handler.end_by_sid(&claims).await;
+        let sid_outcome = handler.end_by_sid(claims).await;
 
         // End the sessions of the IdP subject that THIS issuer established
         // when the token has no `sid`, or its `sid` maps to nothing (the
@@ -551,10 +552,13 @@ impl BackChannelLogoutHandler {
         // must not be able to log out users it never authenticated, nor end
         // sessions that came from another issuer or from a password or
         // passkey login.
-        let failed = match sid_outcome {
-            SidOutcome::Ended => false,
-            SidOutcome::Failed => true,
-            SidOutcome::Unmapped => handler.end_by_sub(&claims).await,
+        let (failed, matched) = match sid_outcome {
+            SidOutcome::Ended => (false, true),
+            SidOutcome::Failed => (true, true),
+            SidOutcome::Unmapped => {
+                let by_sub = handler.end_by_sub(claims).await;
+                (by_sub.failed, by_sub.found > 0)
+            }
         };
 
         if failed {
@@ -564,170 +568,46 @@ impl BackChannelLogoutHandler {
             return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
 
-        acting.done = true;
+        if !matched {
+            // The token verified and named nothing this instance can find.
+            // The answer stays `200`, as the OIDC specification has it for a
+            // session the endpoint does not know; the count is how an
+            // operator sees instances that do not share a `sid` store.
+            tracing::warn!(
+                iss = %loggable(&claims.iss),
+                "back-channel logout: the token verified but no session was found"
+            );
+            if let Some(metrics) = &handler.metrics {
+                metrics.back_channel_logout_unmatched();
+            }
+        }
+
         Ok(StatusCode::OK)
     }
 
-    /// Validate a back-channel logout token JWT.
+    /// Refuse a token whose `(issuer, jti)` was seen before (a replay), or
+    /// that the replay log has no room to record or could not be asked
+    /// (retryable); record it otherwise.
     ///
-    /// Verifies the JWT signature (via the provider's JWKS), then checks
-    /// issuer, audience, iat recency, events claim, and presence of sub/sid.
-    async fn validate_logout_token(&self, token: &str) -> Result<LogoutTokenClaims, StatusCode> {
-        // 0. Peek at the unverified payload to identify the issuer, so we
-        //    know which provider's JWKS to verify against.
-        let unverified = decode_jwt_payload(token).map_err(|e| {
-            tracing::warn!(error = %e, "back-channel logout: failed to decode JWT");
-            StatusCode::BAD_REQUEST
-        })?;
-
-        let iss = unverified
-            .get("iss")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                tracing::warn!("back-channel logout: missing iss claim");
-                StatusCode::BAD_REQUEST
-            })?;
-
-        // Read from the unverified payload only to choose whose keys to
-        // verify with: the verified payload is checked for `aud` again below.
-        let entry = match self.entry_for(iss, &unverified).await {
-            Ok(Some(entry)) => entry,
-            Ok(None) => {
-                // The issuer is the sender's own claim on an endpoint anyone
-                // can reach; it is not a reason to write a stranger's string
-                // to the warn log.
-                tracing::debug!(
+    /// The log forgets entries older than `JTI_RETENTION_SECS` (the full
+    /// span over which one token's `iat` is accepted). The in-process log
+    /// holds [`JTI_CACHE_MAX`] live entries per issuer and refuses its new
+    /// pair at that bound; it never forgets a live one to make room, and
+    /// holds the other issuers' entries apart.
+    async fn admit_jti(&self, iss: &str, jti: &str) -> Result<(), StatusCode> {
+        let recorded = match self.replay.record(iss, jti, self.clock.now()).await {
+            Ok(recorded) => recorded,
+            Err(e) => {
+                tracing::warn!(
                     iss = %loggable(iss),
-                    "back-channel logout: no provider of this issuer has a client id the \
-                     token's aud names"
+                    error = %e,
+                    "back-channel logout: the replay log could not be asked; \
+                     refusing the token (retryable)"
                 );
-                return Err(StatusCode::BAD_REQUEST);
-            }
-            Err(e @ LogoutProviderError::Ambiguous { .. }) => {
-                tracing::warn!(iss = %loggable(iss), error = %e, "back-channel logout refused");
-                return Err(StatusCode::BAD_REQUEST);
-            }
-            Err(e @ (LogoutProviderError::Source(_) | LogoutProviderError::Unavailable { .. })) => {
-                // Retryable: the IdP sends the token again.
-                tracing::warn!(iss = %loggable(iss), error = %e, "back-channel logout refused");
                 return Err(StatusCode::SERVICE_UNAVAILABLE);
             }
         };
-
-        // 1. Verify JWT signature using the provider's JWKS.
-        //    On unknown `kid`, refresh the JWKS and retry once (key rotation).
-        //    pattern-match on the typed `OAuthError::UnknownKid`
-        //    variant rather than substring-matching the error message.
-        let payload = match entry.provider.verify_logout_jwt(token) {
-            Ok(p) => p,
-            Err(
-                e @ (axess_factors::oauth::OAuthError::UnknownKid(_)
-                | axess_factors::oauth::OAuthError::JwksExpired),
-            ) => {
-                tracing::info!(iss = %loggable(iss), reason = %e, "back-channel logout: JWKS unusable; refreshing");
-                if let Err(refresh_err) = entry.provider.refresh_jwks().await {
-                    tracing::warn!(iss = %loggable(iss), error = %refresh_err, "JWKS refresh failed");
-                }
-                entry.provider.verify_logout_jwt(token).map_err(|e| {
-                    tracing::warn!(iss = %loggable(iss), error = %e, "back-channel logout: JWT verification failed after JWKS refresh");
-                    StatusCode::BAD_REQUEST
-                })?
-            }
-            Err(e) => {
-                tracing::warn!(iss = %loggable(iss), error = %e, "back-channel logout: JWT verification failed");
-                return Err(StatusCode::BAD_REQUEST);
-            }
-        };
-
-        let provider = entry;
-
-        // 2. Check `aud` contains the client ID.
-        if !aud_contains(&payload, &provider.client_id) {
-            tracing::warn!(iss = %loggable(iss), "back-channel logout: aud does not contain client_id");
-            return Err(StatusCode::BAD_REQUEST);
-        }
-
-        // when aud is multi-valued, OIDC §2 requires
-        // `azp == client_id`. Without this, a logout token addressed to
-        // [our_client_id, other_client_id] with `azp: other_client_id`
-        // would be wrongly accepted.
-        if !azp_satisfied(&payload, &provider.client_id) {
-            tracing::warn!(
-                iss = %loggable(iss),
-                "back-channel logout: aud is multi-valued and azp does not match client_id"
-            );
-            return Err(StatusCode::BAD_REQUEST);
-        }
-
-        // 3. Check `iat` is recent.
-        match check_iat(&payload, self.clock.now().timestamp()) {
-            IatCheck::Ok => {}
-            IatCheck::Missing => {
-                tracing::warn!("back-channel logout: missing or invalid iat claim");
-                return Err(StatusCode::BAD_REQUEST);
-            }
-            IatCheck::OutOfRange { iat, now } => {
-                tracing::warn!(
-                    iat = iat,
-                    now = now,
-                    "back-channel logout: iat too old or in the future"
-                );
-                return Err(StatusCode::BAD_REQUEST);
-            }
-        }
-
-        // 4. Check `events` contains the back-channel logout event.
-        if !events_contains_logout(&payload) {
-            tracing::warn!("back-channel logout: events claim missing back-channel logout URI");
-            return Err(StatusCode::BAD_REQUEST);
-        }
-
-        // 5. Extract `sub` and/or `sid`.
-        let sub = payload
-            .get("sub")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let sid = payload
-            .get("sid")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        if sub.is_none() && sid.is_none() {
-            tracing::warn!("back-channel logout: neither sub nor sid present");
-            return Err(StatusCode::BAD_REQUEST);
-        }
-
-        // 6. Must NOT contain a `nonce` claim (per spec).
-        if payload.get("nonce").is_some() {
-            tracing::warn!("back-channel logout: logout token must not contain nonce");
-            return Err(StatusCode::BAD_REQUEST);
-        }
-
-        // OIDC Back-Channel Logout 1.0 §2.4 makes `jti` REQUIRED. Without it
-        // the token cannot be replay-protected, so refuse it.
-        let jti = payload
-            .get("jti")
-            .and_then(|v| v.as_str())
-            .filter(|j| !j.is_empty())
-            .map(|s| s.to_string());
-        if jti.is_none() {
-            tracing::warn!("back-channel logout: missing jti claim");
-            return Err(StatusCode::BAD_REQUEST);
-        }
-
-        Ok(LogoutTokenClaims {
-            sub,
-            sid,
-            iss: iss.to_string(),
-            jti,
-        })
-    }
-
-    /// Refuse a token whose `(issuer, jti)` was seen before (a replay), or
-    /// that the replay log has no room to record (retryable); record it
-    /// otherwise.
-    fn admit_jti(&self, iss: &str, jti: &str) -> Result<(), StatusCode> {
-        match self.record_jti(iss, jti, self.clock.now()) {
+        match recorded {
             Recorded::New => {}
             Recorded::InFlight => {
                 tracing::info!(
@@ -760,29 +640,15 @@ impl BackChannelLogoutHandler {
         }
         Ok(())
     }
-
-    /// Record this `(issuer, jti)` as seen: [`Recorded::New`] the first time,
-    /// [`Recorded::Replay`] when the log still holds the pair, and
-    /// [`Recorded::Full`] when the pair is new but the issuer's partition of
-    /// the log has no room. Tokens without a `jti` never reach this point:
-    /// `validate_logout_token` refuses them.
-    ///
-    /// Entries older than [`JTI_RETENTION_SECS`] (the full span over which
-    /// one token's `iat` is accepted) are dropped on each call, off the front
-    /// of an arrival-ordered queue, so the work is the number of entries
-    /// removed. An issuer at [`JTI_CACHE_MAX`] live entries after that
-    /// refuses its new pair; the log never forgets a live one to make room,
-    /// and holds the other issuers' entries apart.
-    fn record_jti(&self, issuer: &str, jti: &str, now: chrono::DateTime<chrono::Utc>) -> Recorded {
-        let cutoff = now - chrono::Duration::seconds(JTI_RETENTION_SECS);
-        self.seen_jtis.record(issuer, jti, now, cutoff)
-    }
 }
 
 mod ending;
 mod jti_log;
+mod provider_lookup;
+mod unknown_issuers;
+mod verify;
 use ending::SidOutcome;
-use jti_log::Recorded;
+pub use provider_lookup::LogoutProviderError;
 
 #[cfg(test)]
 mod audit_tests;
@@ -793,6 +659,10 @@ mod in_flight_tests;
 #[cfg(test)]
 mod scoping_tests;
 #[cfg(test)]
+mod shared_tests;
+#[cfg(test)]
 mod tenant_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, feature = "valkey"))]
+mod valkey_tests;

@@ -38,14 +38,15 @@
 
 use super::SubjectSession;
 use super::concurrent;
-use crate::federation::sid_map::{DisplacedSid, SidKey, SidMap};
+use crate::federation::sid_map::{DisplacedSid, SidKey};
+use crate::federation::sid_store::SidStore;
 use crate::session::store::{SessionRegistryHandle, note_revocation};
 use std::sync::Arc;
 
 /// Sessions owed an end by one login. See the [module docs](self).
 pub(super) struct PendingEnds {
     registry: Option<Arc<dyn SessionRegistryHandle>>,
-    sid_map: SidMap,
+    sid_map: Arc<dyn SidStore>,
     /// Aged out of the `sid` map by the TTL prune: ended whether or not the
     /// login stands.
     aged: Vec<SubjectSession>,
@@ -58,7 +59,10 @@ pub(super) struct PendingEnds {
 impl PendingEnds {
     /// A holder with nothing owed yet. Without a registry nothing can be
     /// ended and nothing is ever owed.
-    pub(super) fn new(registry: Option<Arc<dyn SessionRegistryHandle>>, sid_map: SidMap) -> Self {
+    pub(super) fn new(
+        registry: Option<Arc<dyn SessionRegistryHandle>>,
+        sid_map: Arc<dyn SidStore>,
+    ) -> Self {
         Self {
             registry,
             sid_map,
@@ -94,7 +98,12 @@ impl PendingEnds {
         self.settled = true;
         if let Some((key, displaced)) = self.displaced.take() {
             let session = displaced.session;
-            if self.sid_map.restore_if_vacant(key.clone(), displaced) {
+            if self
+                .sid_map
+                .restore_if_vacant(key.clone(), displaced)
+                .await
+                .unwrap_or(false)
+            {
                 tracing::debug!(
                     iss = %key.0,
                     "sid_map: put back the mapping a refused login had displaced"
@@ -167,7 +176,7 @@ impl Drop for PendingEnds {
 /// end used to put the session out of reach of every logout for good.
 async fn end_sessions(
     registry: Arc<dyn SessionRegistryHandle>,
-    sid_map: SidMap,
+    sid_map: Arc<dyn SidStore>,
     sessions: Vec<SubjectSession>,
 ) {
     let outcomes = concurrent::bounded(sessions, |(_, user, session)| {
@@ -182,7 +191,12 @@ async fn end_sessions(
     .await;
     for ((issuer, user, session), ended) in outcomes {
         if ended {
-            sid_map.forget_subject_session(&issuer, &user, &session);
+            if let Err(e) = sid_map
+                .forget_subject_session(&issuer, &user, &session)
+                .await
+            {
+                tracing::warn!(error = %e, "sid store: an ended session was not forgotten");
+            }
         } else {
             tracing::warn!(
                 iss = %issuer,

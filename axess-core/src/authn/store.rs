@@ -277,6 +277,24 @@ pub trait IdentityAdmin: IdentityAuthnLog {
         &self,
         user_id: &UserId,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Delete up to `limit` users that are still
+    /// [`Candidate`](EntityState::Candidate) and were created before
+    /// `before`, with the same erasure as [`delete_user`](Self::delete_user),
+    /// and return the users deleted so the caller can audit each one. A user
+    /// in any other state is never touched. An empty result means there was
+    /// nothing to delete.
+    ///
+    /// The sweep behind
+    /// [`purge_expired_candidates`](crate::authn::service::RequestAuthnService::purge_expired_candidates):
+    /// an unverified signup holds its identifier only for a bounded time, and
+    /// this reaps the ones nobody asks for again. No default body: a store
+    /// that cannot list by age and state does not compile.
+    fn delete_candidates_created_before(
+        &self,
+        before: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+    ) -> impl std::future::Future<Output = Result<Vec<User>, Self::Error>> + Send;
 }
 
 // ── IdentityStore (umbrella) ─────────────────────────────────────────────────
@@ -304,10 +322,18 @@ impl<T: IdentityAdmin> IdentityStore for T {}
 /// is a compile error naming the two methods rather than a runtime
 /// panic on an unauthenticated route.
 pub trait IdentityPasswordReset: IdentityLookup {
-    /// Persist `(user_id, token_hash, expires_at)`, replacing any token
-    /// already outstanding for that user. Implementations MUST write
-    /// atomically (a single-row upsert), so two concurrent requests
-    /// cannot leave two live tokens for one account.
+    /// Add `(user_id, token_hash, expires_at)` to the user's live reset
+    /// tokens, unless the user already holds `max_live` of them. Returns
+    /// `Ok(true)` when the token was stored and `Ok(false)` when it was not,
+    /// because the user's live tokens are full.
+    ///
+    /// A new token never invalidates an earlier live one: a third party who
+    /// asks for a reset must not be able to kill the link in the owner's
+    /// inbox. A token is live while `expires_at > now`; expired tokens of the
+    /// user are removed here. Counting the live tokens, removing the expired
+    /// ones and inserting are one atomic step (a transaction, a script), so
+    /// two concurrent requests cannot both take the last slot. Storing a
+    /// hash that is already held is `Ok(true)` and changes nothing.
     ///
     /// Store the **hash**, never the token: a database reader must not be
     /// able to complete a reset.
@@ -316,12 +342,16 @@ pub trait IdentityPasswordReset: IdentityLookup {
         user_id: &UserId,
         token_hash: &str,
         expires_at: chrono::DateTime<chrono::Utc>,
-    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send;
+        now: chrono::DateTime<chrono::Utc>,
+        max_live: usize,
+    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send;
 
-    /// Compare the stored hash for `user_id` with `token_hash` in **constant time**, deleting the
-    /// row on a match (single-use). Expired means `expires_at <= now`, the caller's clock reading.
+    /// Compare the stored hashes for `user_id` with `token_hash` in **constant time**, deleting
+    /// **every** token of the user on a match (using any one consumes them all, so a link
+    /// that was mailed earlier cannot be used after the reset). Expired means `expires_at <= now`, the caller's clock reading.
     ///
-    /// Return `Ok(false)` for absent, expired and mismatched alike; the
+    /// Return `Ok(false)` for absent, expired and mismatched alike (no token of the user is
+    /// deleted then); the
     /// caller does not distinguish them and neither should the response.
     fn verify_reset_token(
         &self,

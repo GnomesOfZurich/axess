@@ -24,11 +24,8 @@ fn trust_domain_rejects_invalid_forms() {
 #[test]
 fn workload_id_build_round_trips_through_parse() {
     let trust = TrustDomain::new("gnomes.local").unwrap();
-    let wid = WorkloadId::build(&trust, "compute-worker", "ekekrantz").unwrap();
-    assert_eq!(
-        wid.as_str(),
-        "spiffe://gnomes.local/compute-worker/ekekrantz"
-    );
+    let wid = WorkloadId::build(&trust, "compute-worker", "gnomes").unwrap();
+    assert_eq!(wid.as_str(), "spiffe://gnomes.local/compute-worker/gnomes");
     let reparsed = WorkloadId::parse(wid.as_str()).unwrap();
     assert_eq!(wid, reparsed);
 }
@@ -36,7 +33,7 @@ fn workload_id_build_round_trips_through_parse() {
 #[test]
 fn workload_id_build_rejects_empty_service() {
     let trust = TrustDomain::new("gnomes.local").unwrap();
-    assert!(WorkloadId::build(&trust, "", "ekekrantz").is_err());
+    assert!(WorkloadId::build(&trust, "", "gnomes").is_err());
 }
 
 #[test]
@@ -48,14 +45,14 @@ fn workload_id_build_rejects_empty_tenant_slug() {
 #[test]
 fn workload_id_build_rejects_invalid_chars_in_segment() {
     let trust = TrustDomain::new("gnomes.local").unwrap();
-    assert!(WorkloadId::build(&trust, "compute worker", "ekekrantz").is_err());
+    assert!(WorkloadId::build(&trust, "compute worker", "gnomes").is_err());
     assert!(WorkloadId::build(&trust, "compute-worker", "eke/krantz").is_err());
     assert!(WorkloadId::build(&trust, "compute-worker", "eke?krantz").is_err());
 }
 
 #[test]
 fn workload_id_parse_accepts_canonical_spiffe_uri() {
-    let raw = "spiffe://gnomes.local/compute-worker/ekekrantz";
+    let raw = "spiffe://gnomes.local/compute-worker/gnomes";
     let parsed = WorkloadId::parse(raw).unwrap();
     assert_eq!(parsed.as_str(), raw);
 }
@@ -111,7 +108,7 @@ fn workload_id_parse_rejects_uppercase_trust_domain() {
 #[test]
 fn workload_id_display_matches_as_str() {
     let trust = TrustDomain::new("gnomes.local").unwrap();
-    let wid = WorkloadId::build(&trust, "feed-worker", "ekekrantz").unwrap();
+    let wid = WorkloadId::build(&trust, "feed-worker", "gnomes").unwrap();
     assert_eq!(format!("{wid}"), wid.as_str());
 }
 
@@ -119,9 +116,9 @@ fn workload_id_display_matches_as_str() {
 #[test]
 fn workload_id_serializes_as_transparent_string() {
     let trust = TrustDomain::new("gnomes.local").unwrap();
-    let wid = WorkloadId::build(&trust, "compute-worker", "ekekrantz").unwrap();
+    let wid = WorkloadId::build(&trust, "compute-worker", "gnomes").unwrap();
     let json = serde_json::to_string(&wid).unwrap();
-    assert_eq!(json, "\"spiffe://gnomes.local/compute-worker/ekekrantz\"");
+    assert_eq!(json, "\"spiffe://gnomes.local/compute-worker/gnomes\"");
     let back: WorkloadId = serde_json::from_str(&json).unwrap();
     assert_eq!(wid, back);
 }

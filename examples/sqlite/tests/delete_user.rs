@@ -64,7 +64,13 @@ async fn delete_user_erases_every_row_naming_the_user() {
         .await
         .expect("history");
     backend
-        .store_reset_token(&alice, "h", chrono::Utc::now() + chrono::Duration::hours(1))
+        .store_reset_token(
+            &alice,
+            "h",
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            chrono::Utc::now(),
+            3,
+        )
         .await
         .expect("reset token");
     sqlx::query(

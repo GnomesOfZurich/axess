@@ -122,7 +122,46 @@ pub trait DeviceResolver: Send + Sync + 'static {
     fn resolve(
         &self,
         parts: &Parts,
-    ) -> impl Future<Output = Result<Option<DeviceId>, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<Option<BoundDevice>, Self::Error>> + Send;
+}
+
+/// The device a [`DeviceResolver`] bound a request to, and whether the client
+/// proved it.
+///
+/// [`Proven`](Self::Proven) is only constructible from a
+/// [`ProvenDevice`](crate::device::proof::ProvenDevice), which only a resolution by
+/// [`resolve_proven`](crate::device::DeviceLifecycleService::resolve_proven)
+/// yields, so a resolver cannot claim a proof it does not hold. A bare
+/// [`DeviceId`] converts to [`Unproven`](Self::Unproven): the session keeps it
+/// as a label for the device, and no lockout exemption reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundDevice {
+    /// A device the client proved it holds.
+    Proven(super::proof::ProvenDevice),
+    /// A device found by other means (a fingerprint, a lookup).
+    Unproven(DeviceId),
+}
+
+impl BoundDevice {
+    /// The device's id, proven or not.
+    pub fn id(&self) -> DeviceId {
+        match self {
+            Self::Proven(p) => p.id(),
+            Self::Unproven(id) => *id,
+        }
+    }
+}
+
+impl From<DeviceId> for BoundDevice {
+    fn from(id: DeviceId) -> Self {
+        Self::Unproven(id)
+    }
+}
+
+impl From<super::proof::ProvenDevice> for BoundDevice {
+    fn from(proven: super::proof::ProvenDevice) -> Self {
+        Self::Proven(proven)
+    }
 }
 
 /// No-op resolver used as the default plug when the `device` feature is on
@@ -139,7 +178,7 @@ pub struct NoopDeviceResolver;
 impl DeviceResolver for NoopDeviceResolver {
     type Error = std::convert::Infallible;
 
-    async fn resolve(&self, parts: &Parts) -> Result<Option<DeviceId>, Self::Error> {
+    async fn resolve(&self, parts: &Parts) -> Result<Option<BoundDevice>, Self::Error> {
         tracing::trace!(
             target: "axess::device",
             method = %parts.method,
@@ -175,7 +214,7 @@ pub(crate) trait ErasedDeviceResolver: Send + Sync + 'static {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DeviceResolution {
     /// The resolver answered: the request's device, or none.
-    Resolved(Option<DeviceId>),
+    Resolved(Option<BoundDevice>),
     /// The resolver failed, so nothing is known about the request's device.
     /// The layer keeps the session's device as it was: a fault in the device
     /// store must not read as "no device" and strip the session's binding.
@@ -234,7 +273,7 @@ mod tests {
 
         impl DeviceResolver for BoomResolver {
             type Error = BoomError;
-            async fn resolve(&self, _: &Parts) -> Result<Option<DeviceId>, Self::Error> {
+            async fn resolve(&self, _: &Parts) -> Result<Option<BoundDevice>, Self::Error> {
                 Err(BoomError)
             }
         }
@@ -251,8 +290,8 @@ mod tests {
 
         impl DeviceResolver for StaticResolver {
             type Error = std::convert::Infallible;
-            async fn resolve(&self, _: &Parts) -> Result<Option<DeviceId>, Self::Error> {
-                Ok(Some(self.0))
+            async fn resolve(&self, _: &Parts) -> Result<Option<BoundDevice>, Self::Error> {
+                Ok(Some(self.0.into()))
             }
         }
 
@@ -260,6 +299,6 @@ mod tests {
         let resolver = StaticResolver(id);
         let parts = empty_parts();
         let outcome = resolver.resolve_erased(&parts).await;
-        assert_eq!(outcome, DeviceResolution::Resolved(Some(id)));
+        assert_eq!(outcome, DeviceResolution::Resolved(Some(id.into())));
     }
 }

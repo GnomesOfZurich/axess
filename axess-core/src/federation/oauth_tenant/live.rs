@@ -25,6 +25,9 @@ type Entries = HashMap<TenantId, HashMap<Arc<str>, Arc<dyn OAuthProvider>>>;
 #[derive(Default)]
 pub struct LiveTenantOAuthProviders {
     current: arc_swap::ArcSwap<Entries>,
+    /// Bumped by every `set` and `remove`; see
+    /// [`TenantOAuthProviders::generation`].
+    generation: std::sync::atomic::AtomicU64,
 }
 
 impl LiveTenantOAuthProviders {
@@ -78,6 +81,8 @@ impl LiveTenantOAuthProviders {
             replaced.store(was.is_some(), std::sync::atomic::Ordering::Relaxed);
             next
         });
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         replaced.load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -95,13 +100,27 @@ impl LiveTenantOAuthProviders {
             removed.store(was, std::sync::atomic::Ordering::Relaxed);
             next
         });
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         removed.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
 impl TenantOAuthProviders for LiveTenantOAuthProviders {
+    fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     fn provider<'a>(&'a self, tenant: &'a TenantId, name: &'a str) -> ProviderFuture<'a> {
         Box::pin(async move { Ok(self.get(tenant, name)) })
+    }
+
+    fn built_providers(&self) -> Vec<Arc<dyn OAuthProvider>> {
+        self.current
+            .load()
+            .values()
+            .flat_map(|byname| byname.values().cloned())
+            .collect()
     }
 
     fn providers_for_issuer<'a>(&'a self, issuer: &'a str) -> IssuerFuture<'a> {

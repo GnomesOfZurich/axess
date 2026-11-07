@@ -1,4 +1,4 @@
-//! Passkey registration: beginning and finishing the ceremony.
+//! FIDO2 registration: beginning and finishing the typed ceremony.
 
 use super::{CredentialChange, RequestAuthnService, fido2_keys};
 use crate::authn::{
@@ -28,11 +28,35 @@ where
     /// minted for them: the caller persists it on the user row before the
     /// next ceremony, since WebAuthn needs the same handle for every
     /// credential of the user. `None` means the user already had one.
+    ///
+    /// The ceremony is [`Fido2Options::registration_ceremony`](crate::authn::factor::Fido2Options::registration_ceremony);
+    /// [`begin_fido2_registration_with`](Self::begin_fido2_registration_with)
+    /// names one for this call.
     #[tracing::instrument(skip(self, user, session))]
     pub async fn begin_fido2_registration(
         &self,
         user: &crate::authn::types::User,
         session: &AuthSession,
+    ) -> Result<(serde_json::Value, Option<uuid::Uuid>), AuthnError<I::Error>> {
+        let ceremony = self.inner.fido2_options.registration_ceremony.clone();
+        self.begin_fido2_registration_with(user, session, &ceremony)
+            .await
+    }
+
+    /// [`begin_fido2_registration`](Self::begin_fido2_registration) running
+    /// `ceremony`: a security key for an administrator who enrols hardware
+    /// tokens, an attested passkey for a role that must hold one. The
+    /// credential is stored typed by the ceremony, and later logins use it
+    /// only through a ceremony that accepts that type
+    /// ([`Fido2Ceremony::accepts`](crate::authn::factor::Fido2Ceremony::accepts)).
+    /// A ceremony the provider cannot run (an attested passkey against a
+    /// trust anchor it does not hold) is [`AuthnError::NoFlow`].
+    #[tracing::instrument(skip(self, user, session))]
+    pub async fn begin_fido2_registration_with(
+        &self,
+        user: &crate::authn::types::User,
+        session: &AuthSession,
+        ceremony: &crate::authn::factor::Fido2Ceremony,
     ) -> Result<(serde_json::Value, Option<uuid::Uuid>), AuthnError<I::Error>> {
         let fido2 = self.inner.fido2.load_full();
         let webauthn = match &fido2 {
@@ -85,13 +109,14 @@ where
 
         let (challenge, reg_state) = webauthn
             .start_registration(
+                ceremony,
                 user_unique_id,
                 &user.identifier,
                 &user.display_name,
                 Some(exclude_ids),
             )
             .map_err(|e| {
-                tracing::warn!("FIDO2 start_passkey_registration failed: {e:?}");
+                tracing::warn!(%ceremony, "FIDO2 registration could not start: {e:?}");
                 AuthnError::NoFlow
             })?;
 
@@ -165,7 +190,9 @@ where
             _ => return Err(AuthnError::NoFlow),
         };
 
-        let reg_state: webauthn_rs::prelude::PasskeyRegistration =
+        // The state names the ceremony that began it; state from before the
+        // ceremonies were typed does not read and the ceremony begins again.
+        let reg_state: axess_factors::fido2::Fido2Registration =
             serde_json::from_value(state_json).map_err(|_| AuthnError::NoFlow)?;
 
         // The account may have been suspended or locked since the
@@ -178,10 +205,10 @@ where
                 .await);
         }
 
-        let passkey = match webauthn.finish_registration(response, &reg_state) {
-            Ok(passkey) => passkey,
+        let key = match webauthn.finish_registration(response, &reg_state) {
+            Ok(key) => key,
             Err(e) => {
-                tracing::warn!("FIDO2 finish_passkey_registration failed: {e:?}");
+                tracing::warn!(ceremony = %reg_state.ceremony(), "FIDO2 registration refused: {e:?}");
                 // A rejected attestation is a security-relevant event, and
                 // the success and inactive-account paths both leave a row.
                 self.emit_audit(
@@ -196,11 +223,11 @@ where
             }
         };
 
-        // Capture the credential id before `passkey` moves into the
-        // factor config below; needed for the post-save device-binding
-        // hook so the `Fido2Provider` impl can durably bind this
-        // credential to the resolved `DeviceId`.
-        let cred_id = passkey.cred_id().clone();
+        // Capture the credential id before `key` moves into the factor
+        // config below; needed for the post-save device-binding hook so the
+        // `Fido2Provider` impl can durably bind this credential to the
+        // resolved `DeviceId`.
+        let cred_id = key.cred_id().clone();
 
         // A credential id another user of the tenant holds is refused: one
         // authenticator credential belongs to one account. A failed lookup
@@ -208,7 +235,7 @@ where
         let holder = self
             .inner
             .factors
-            .fido2_credential_holder(&user.tenant_id, cred_id.as_ref())
+            .fido2_credential_holder(&user.tenant_id, cred_id.as_slice())
             .await
             .map_err(AuthnError::Store)?;
         if holder.is_some_and(|holder| holder != user.id) {
@@ -237,7 +264,7 @@ where
                     return None;
                 }
                 credentials.push(crate::authn::factor::Fido2Credential::new(
-                    passkey.clone(),
+                    key.clone(),
                     credential_name,
                     registered_at,
                 ));

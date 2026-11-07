@@ -11,7 +11,7 @@ use axess_identity::{TenantId, UserId};
 
 use crate::delegated::error::DelegatedError;
 
-use super::credential::{DelegatedCredentialStore, StoredDelegation, store_err};
+use super::credential::{CredentialSwap, DelegatedCredentialStore, StoredDelegation, store_err};
 use super::grant::refresh_token_grant;
 use super::provider::DelegatedProvider;
 
@@ -45,6 +45,27 @@ fn default_http_client() -> Result<reqwest::Client, DelegatedError> {
     }
     let built = crate::outbound_http::hardened_client()?;
     Ok(CLIENT.get_or_init(|| built).clone())
+}
+
+/// Say, once per store type, that a refresh fell back to an unconditional
+/// save because the store has no compare-and-swap. Without one, a revoke from
+/// another process while a refresh is in flight is written back.
+fn warn_unsupported_once<S>() {
+    static WARNED: OnceLock<Mutex<std::collections::HashSet<&'static str>>> = OnceLock::new();
+    let name = std::any::type_name::<S>();
+    let first = WARNED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(name);
+    if first {
+        tracing::warn!(
+            store = name,
+            "the delegated credential store does not implement save_if_unchanged; a refresh \
+             writes its result unconditionally, so a revoke from another process while it \
+             is in flight is overwritten. Implement it atomically (a conditional UPDATE)."
+        );
+    }
 }
 
 /// The access token as a bearer string, for a `Bearer` credential only. A
@@ -223,7 +244,18 @@ where
     /// inform the IdP. Adopters wanting server-side revocation should
     /// POST to the provider's revocation endpoint separately (out of
     /// scope for this module; semantics vary per provider).
+    ///
+    /// Takes the same single-flight lock as a refresh, so a refresh in flight
+    /// finishes first and the removal comes after it: once this returns, no
+    /// later [`get_access_token`](Self::get_access_token) in this process
+    /// succeeds. Across processes the refresh writes its result with
+    /// [`save_if_unchanged`](DelegatedCredentialStore::save_if_unchanged), so
+    /// a row removed meanwhile is not written back; a store without that
+    /// compare-and-swap leaves a revoke from another process racing a
+    /// refresh.
     pub async fn revoke(&self) -> Result<(), DelegatedError> {
+        let lock = refresh_lock((self.tenant, self.user, self.provider.name.clone()));
+        let _guard = lock.lock().await;
         self.store
             .revoke(&self.tenant, &self.user, &self.provider.name)
             .await
@@ -311,10 +343,33 @@ where
         // the refresh token and spent the old one, so refusing the answer
         // must not lose the new one.
         let access = bearer(&final_credential);
-        self.store
-            .save(&self.tenant, &self.user, final_credential)
+        // Written only over the row the refresh started from: a row removed
+        // (the user disconnected) or replaced (they reconnected) while the
+        // IdP was asked is not overwritten.
+        let swap = self
+            .store
+            .save_if_unchanged(&self.tenant, &self.user, cred, final_credential.clone())
             .await
             .map_err(store_err)?;
-        access
+        match swap {
+            CredentialSwap::Saved => access,
+            CredentialSwap::Unsupported => {
+                // A store without compare-and-swap: the lock in `revoke`
+                // still orders a revoke in this process after the refresh,
+                // but a revoke from another process can be overwritten.
+                warn_unsupported_once::<S>();
+                self.store
+                    .save(&self.tenant, &self.user, final_credential)
+                    .await
+                    .map_err(store_err)?;
+                access
+            }
+            CredentialSwap::Changed => {
+                // Whatever is stored now is the user's latest word: nothing
+                // when they disconnected, a newer credential when they
+                // reconnected.
+                bearer(&self.load_credential().await?)
+            }
+        }
     }
 }

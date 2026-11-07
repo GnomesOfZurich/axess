@@ -480,14 +480,28 @@ where
             return Err(AuthnError::NoFlow);
         }
 
-        // Extract raw passkeys for the ceremony.
-        let passkeys: Vec<_> = cfg.credentials.iter().map(|c| c.passkey.clone()).collect();
+        // The ceremony a step-up named, or the login ceremony; it offers
+        // only the credentials it can authenticate.
+        let ceremony = self.fido2_ceremony_for_step(session).await;
+        let keys: Vec<_> = cfg
+            .credentials
+            .iter()
+            .filter(|c| ceremony.accepts(&c.key))
+            .map(|c| c.key.clone())
+            .collect();
+        if keys.is_empty() {
+            tracing::warn!(%ceremony, "FIDO2 step refused: no credential of the user fits the ceremony");
+            return Err(AuthnError::NoFlow);
+        }
 
         // Start the authentication ceremony.
-        let (challenge, auth_state) = webauthn.start_authentication(&passkeys).map_err(|e| {
-            tracing::warn!("FIDO2 start_passkey_authentication failed: {e:?}");
-            AuthnError::NoFlow
-        })?;
+        let (challenge, auth_state) =
+            webauthn
+                .start_authentication(&ceremony, &keys)
+                .map_err(|e| {
+                    tracing::warn!(%ceremony, "FIDO2 authentication could not start: {e:?}");
+                    AuthnError::NoFlow
+                })?;
 
         // Store the ceremony state and timestamp in the session.
         let state_json = serde_json::to_value(&auth_state).map_err(|_| AuthnError::NoFlow)?;
@@ -503,6 +517,21 @@ where
         Ok(PrepareOutcome::Fido2Challenge {
             challenge: challenge_json,
         })
+    }
+
+    /// The FIDO2 ceremony the current step runs: the one
+    /// [`begin_step_up_for`](Self::begin_step_up_for) kept with the step-up,
+    /// or [`Fido2Options::login_ceremony`](crate::authn::factor::Fido2Options::login_ceremony).
+    #[cfg(feature = "fido2")]
+    async fn fido2_ceremony_for_step(
+        &self,
+        session: &AuthSession,
+    ) -> crate::authn::factor::Fido2Ceremony {
+        session
+            .get_custom(crate::session::data::STEP_UP_CEREMONY_KEY)
+            .await
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_else(|| self.inner.fido2_options.login_ceremony.clone())
     }
 
     /// Verify a factor credential during an in-progress authentication flow.

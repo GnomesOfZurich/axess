@@ -105,6 +105,9 @@ impl SessionMetrics for RecordingMetrics {
     fn sid_map_evicted(&self, count: u64) {
         self.record("sid_map_evicted", count);
     }
+    fn back_channel_logout_unmatched(&self) {
+        self.record("back_channel_logout_unmatched", 1);
+    }
 }
 
 impl RotationMetrics for RecordingMetrics {

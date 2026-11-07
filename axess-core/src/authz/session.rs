@@ -141,9 +141,8 @@ impl<P: AuthzEntityProvider> AuthzStore<P> {
     /// the new schema before it swaps, so a provider that does not fit a
     /// reloaded schema refuses the reload.
     pub fn validate(&self) -> Result<(), AuthzError> {
-        let evaluator = self.evaluator.load();
-        if let Some(schema) = evaluator.schema() {
-            self.provider.validate_schema(schema)?;
+        if let Some(schema) = self.evaluator.load().schema() {
+            self.provider.validate_schema(&schema)?;
         }
         Ok(())
     }
@@ -308,6 +307,46 @@ impl<P: AuthzEntityProvider, Ctx> AuthzSession<P, Ctx> {
         }
     }
 
+    /// Check access, and on a denial say whether a step-up would cure it.
+    ///
+    /// `Err(AuthzRefusal::StepUpRequired(step_up))` when the policies would
+    /// permit after the step-up their `@step_up` annotations name (see
+    /// [`PolicyEvaluator::step_up_for`]),
+    /// `Err(AuthzRefusal::Denied)` for every other denial. Both convert to a
+    /// 403; the step-up's body names it and nothing of the policy. Needs a
+    /// context that carries `assurance`
+    /// ([`StandardRequestContext::with_assurance`](super::context::StandardRequestContext::with_assurance)).
+    #[tracing::instrument(skip(self, resource))]
+    pub async fn require_with_step_up(
+        &self,
+        action: &str,
+        resource: &P::ResourceId,
+    ) -> Result<(), super::assurance::AuthzRefusal> {
+        match self.evaluate(action, resource).await {
+            Evaluated::Decided {
+                decision: AuthzDecision::Allow,
+                ..
+            } => Ok(()),
+            Evaluated::Decided {
+                decision: AuthzDecision::Deny,
+                question,
+            } => {
+                let evaluator = self.store.evaluator.load();
+                match evaluator.step_up_for(
+                    &question.entities,
+                    self.principal.clone(),
+                    question.action,
+                    question.resource,
+                    self.context.clone(),
+                ) {
+                    Some(step_up) => Err(super::assurance::AuthzRefusal::StepUpRequired(step_up)),
+                    None => Err(super::assurance::AuthzRefusal::Denied),
+                }
+            }
+            Evaluated::Refused => Err(super::assurance::AuthzRefusal::Denied),
+        }
+    }
+
     /// Check access and return a boolean.
     ///
     /// Returns `true` if Cedar permits, `false` on denial or any error.
@@ -347,6 +386,13 @@ impl<P: AuthzEntityProvider, Ctx> AuthzSession<P, Ctx> {
     // ── Internal evaluation ───────────────────────────────────────────────────
 
     async fn check(&self, action: &str, resource: &P::ResourceId) -> AuthzDecision {
+        match self.evaluate(action, resource).await {
+            Evaluated::Decided { decision, .. } => decision,
+            Evaluated::Refused => AuthzDecision::Deny,
+        }
+    }
+
+    async fn evaluate(&self, action: &str, resource: &P::ResourceId) -> Evaluated {
         // 1. Build action UID.
         let action_uid = match self.store.action_uid(action) {
             Ok(uid) => uid,
@@ -358,7 +404,7 @@ impl<P: AuthzEntityProvider, Ctx> AuthzSession<P, Ctx> {
                     "",
                     "invalid_action",
                 );
-                return AuthzDecision::Deny;
+                return Evaluated::Refused;
             }
         };
 
@@ -373,7 +419,7 @@ impl<P: AuthzEntityProvider, Ctx> AuthzSession<P, Ctx> {
                     "",
                     "invalid_resource",
                 );
-                return AuthzDecision::Deny;
+                return Evaluated::Refused;
             }
         };
 
@@ -417,7 +463,7 @@ impl<P: AuthzEntityProvider, Ctx> AuthzSession<P, Ctx> {
                             &resource_uid.to_string(),
                             "entity_provider_error",
                         );
-                        return AuthzDecision::Deny;
+                        return Evaluated::Refused;
                     }
                 }
             }
@@ -426,14 +472,39 @@ impl<P: AuthzEntityProvider, Ctx> AuthzSession<P, Ctx> {
         // 5. Evaluate Cedar policy against one snapshot of the swap slot: a
         // wait-free read, dropped with the decision, so a reload that lands
         // now applies to the next request and never splits this one.
-        self.store.evaluator.load().is_authorized(
+        let decision = self.store.evaluator.load().is_authorized(
             &entities,
             self.principal.clone(),
-            action_uid,
-            resource_uid,
+            action_uid.clone(),
+            resource_uid.clone(),
             self.context.clone(),
-        )
+        );
+        Evaluated::Decided {
+            decision,
+            question: Box::new(Question {
+                entities,
+                action: action_uid,
+                resource: resource_uid,
+            }),
+        }
     }
+}
+
+/// One check's outcome: decided by the policies (with what they were asked,
+/// for a step-up question), or refused before they ran.
+enum Evaluated {
+    Decided {
+        decision: AuthzDecision,
+        question: Box<Question>,
+    },
+    Refused,
+}
+
+/// What the policies were asked.
+struct Question {
+    entities: Arc<Entities>,
+    action: EntityUid,
+    resource: EntityUid,
 }
 
 #[cfg(test)]

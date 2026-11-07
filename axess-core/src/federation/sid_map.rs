@@ -47,6 +47,20 @@
 //! mapping that capacity evicted finds nothing under its key, and falls
 //! through to the `sub` path when the logout token carries both.
 //!
+//! # Tenant scope
+//!
+//! A mapping and a subject record carry the tenant the login was in, when it
+//! was recorded with one (`insert`, `register_subject_session`; every
+//! insert names its tenant or `None`, and the login path passes the tenant of
+//! a tenant provider and `None` for a global one). A logout token verified by a tenant's
+//! provider reads the map with that tenant as its scope (`get_in`,
+//! `subject_sessions_in`) and sees only that tenant's records, so one
+//! tenant's IdP cannot end another tenant's sessions of the same subject
+//! through a shared issuer. A token verified by a global provider has no
+//! scope and sees every record, as before. A record made for a global
+//! provider (`None`) is invisible to a tenant scope, as that provider's
+//! tokens are not a tenant's.
+//!
 //! The ordered set holds exactly one item per entry: an entry that is removed
 //! or replaced takes its item with it, so the set is never larger than the
 //! map.
@@ -54,7 +68,7 @@
 //! No registry call happens under the lock. Eviction returns what it removed
 //! and the caller decides what to do with the sessions.
 
-use crate::authn::ids::UserId;
+use crate::authn::ids::{TenantId, UserId};
 use crate::session::id::SessionId;
 use chrono::{DateTime, Utc};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -79,6 +93,8 @@ pub type SidEntry = (UserId, SessionId, DateTime<Utc>);
 pub struct DisplacedSid {
     /// The IdP subject the displaced mapping belonged to.
     pub subject: String,
+    /// The tenant the displaced mapping was recorded for, if any.
+    pub tenant: Option<TenantId>,
     /// The local user of the displaced session.
     pub user: UserId,
     /// The displaced session.
@@ -99,6 +115,7 @@ pub struct SidMap {
 /// A `sid` mapping together with the IdP subject it belongs to.
 struct Stored {
     subject: String,
+    tenant: Option<TenantId>,
     user: UserId,
     session: SessionId,
     at: DateTime<Utc>,
@@ -114,6 +131,7 @@ impl Stored {
 struct SubjectOf {
     issuer: String,
     subject: String,
+    tenant: Option<TenantId>,
     user: UserId,
 }
 
@@ -168,9 +186,20 @@ impl SidState {
         displaced
     }
 
-    fn register_subject(&mut self, issuer: &str, subject: &str, user: UserId, session: SessionId) {
+    fn register_subject(
+        &mut self,
+        issuer: &str,
+        subject: &str,
+        tenant: Option<TenantId>,
+        user: UserId,
+        session: SessionId,
+    ) {
         if let Some(held) = self.subject_of.get(&session) {
-            if held.issuer == issuer && held.subject == subject && held.user == user {
+            if held.issuer == issuer
+                && held.subject == subject
+                && held.tenant == tenant
+                && held.user == user
+            {
                 return;
             }
             // The session was recorded under another subject; a session
@@ -187,6 +216,7 @@ impl SidState {
             SubjectOf {
                 issuer: issuer.to_string(),
                 subject: subject.to_string(),
+                tenant,
                 user,
             },
         );
@@ -277,6 +307,16 @@ impl SidState {
     }
 }
 
+/// Whether a record made for `recorded` is visible to a logout verified for
+/// `scope`: everything is to a global provider (`None`), and only the same
+/// tenant's records are to a tenant's.
+fn in_scope(recorded: Option<&TenantId>, scope: Option<&TenantId>) -> bool {
+    match scope {
+        None => true,
+        Some(tenant) => recorded == Some(tenant),
+    }
+}
+
 impl SidMap {
     /// An empty map.
     pub fn new() -> Self {
@@ -292,15 +332,21 @@ impl SidMap {
     /// Map `key` to the session of `user`, who logged in as the IdP subject
     /// `subject`. Returns the entry it displaced, if the key was already
     /// mapped; the caller owns ending that session.
+    ///
+    /// `tenant` is the tenant of the provider the user logged in through, or
+    /// `None` for a global provider's login. A logout verified by a tenant's
+    /// provider ends only the mappings recorded for that tenant; one verified
+    /// by a global provider sees every mapping.
     pub fn insert(
         &self,
         key: SidKey,
         subject: &str,
+        tenant: Option<TenantId>,
         user: UserId,
         session: SessionId,
         inserted_at: DateTime<Utc>,
     ) -> Option<SidEntry> {
-        self.insert_displacing(key, subject, user, session, inserted_at)
+        self.insert_displacing(key, subject, tenant, user, session, inserted_at)
             .map(|old| (old.user, old.session, old.inserted_at))
     }
 
@@ -311,6 +357,7 @@ impl SidMap {
         &self,
         key: SidKey,
         subject: &str,
+        tenant: Option<TenantId>,
         user: UserId,
         session: SessionId,
         inserted_at: DateTime<Utc>,
@@ -320,6 +367,7 @@ impl SidMap {
                 key,
                 Stored {
                     subject: subject.to_string(),
+                    tenant,
                     user,
                     session,
                     at: inserted_at,
@@ -327,6 +375,7 @@ impl SidMap {
             )
             .map(|old| DisplacedSid {
                 subject: old.subject,
+                tenant: old.tenant,
                 user: old.user,
                 session: old.session,
                 inserted_at: old.at,
@@ -348,6 +397,7 @@ impl SidMap {
             key,
             Stored {
                 subject: displaced.subject,
+                tenant: displaced.tenant,
                 user: displaced.user,
                 session: displaced.session,
                 at: displaced.inserted_at,
@@ -358,7 +408,17 @@ impl SidMap {
 
     /// The entry for `key`, if any.
     pub fn get(&self, key: &SidKey) -> Option<SidEntry> {
-        self.lock().entries.get(key).map(Stored::entry)
+        self.get_in(key, None)
+    }
+
+    /// The entry for `key`, if any and if it was recorded for `scope`: with
+    /// `Some(tenant)` only a mapping recorded for that tenant is returned.
+    pub fn get_in(&self, key: &SidKey, scope: Option<&TenantId>) -> Option<SidEntry> {
+        self.lock()
+            .entries
+            .get(key)
+            .filter(|s| in_scope(s.tenant.as_ref(), scope))
+            .map(Stored::entry)
     }
 
     /// Whether `key` is mapped.
@@ -389,15 +449,18 @@ impl SidMap {
     /// Record that `session` was established for the local `user`, who logged
     /// in under `issuer` as the IdP subject `subject`, whether or not the
     /// login has a `sid` mapping. A `sub`-only logout reaches the session
-    /// through [`subject_sessions`](Self::subject_sessions).
+    /// through [`subject_sessions`](Self::subject_sessions). `tenant` is as
+    /// for [`insert`](Self::insert).
     pub fn register_subject_session(
         &self,
         issuer: &str,
         subject: &str,
+        tenant: Option<TenantId>,
         user: UserId,
         session: SessionId,
     ) {
-        self.lock().register_subject(issuer, subject, user, session);
+        self.lock()
+            .register_subject(issuer, subject, tenant, user, session);
     }
 
     /// Drop one session from the subject registry; returns whether it was
@@ -414,16 +477,43 @@ impl SidMap {
     /// calls [`remove_session`](Self::remove_session) for it, so a session
     /// the registry could not end stays reachable for a retry.
     pub fn subject_sessions(&self, issuer: &str, subject: &str) -> Vec<(UserId, SessionId)> {
+        self.subject_sessions_in(issuer, subject, None)
+    }
+
+    /// [`subject_sessions`](Self::subject_sessions), only those recorded for
+    /// `scope`: with `Some(tenant)` the sessions of other tenants, and those
+    /// recorded without one, are left out.
+    pub fn subject_sessions_in(
+        &self,
+        issuer: &str,
+        subject: &str,
+        scope: Option<&TenantId>,
+    ) -> Vec<(UserId, SessionId)> {
         let state = self.lock();
         let slot = (issuer.to_string(), subject.to_string());
         let mut out: Vec<(UserId, SessionId)> = state
             .subjects
             .get(&slot)
-            .map(|set| set.iter().copied().collect())
+            .map(|set| {
+                set.iter()
+                    .filter(|(_, session)| {
+                        let tenant = state
+                            .subject_of
+                            .get(session)
+                            .and_then(|s| s.tenant.as_ref());
+                        in_scope(tenant, scope)
+                    })
+                    .copied()
+                    .collect()
+            })
             .unwrap_or_default();
         if let Some(sids) = state.by_subject.get(&slot) {
             for sid in sids {
-                if let Some(stored) = state.entries.get(&(issuer.to_string(), sid.clone())) {
+                if let Some(stored) = state
+                    .entries
+                    .get(&(issuer.to_string(), sid.clone()))
+                    .filter(|s| in_scope(s.tenant.as_ref(), scope))
+                {
                     let pair = (stored.user, stored.session);
                     if !out.contains(&pair) {
                         out.push(pair);

@@ -79,7 +79,10 @@ struct SvidCustomClaims {
 ///     verifier.clone(),
 ///     trust_domain.clone(),
 ///     token,
-/// );
+/// )
+/// // The slug in `sub` and the `tid` claim are cross-checked against your
+/// // tenant registry; `without_tenant_cross_check()` is the named waiver.
+/// .with_tenant_lookup(|slug| tenants.id_of(slug));
 /// let principal = resolver.resolve().await?;
 /// ```
 pub struct JwtSvidResolver<R: JtiReplayStore = NoReplay> {
@@ -87,6 +90,7 @@ pub struct JwtSvidResolver<R: JtiReplayStore = NoReplay> {
     expected_trust_domain: TrustDomain,
     token: String,
     tenant_lookup: Option<TenantLookup>,
+    cross_check_waived: bool,
 }
 
 /// Maps a SPIFFE tenant slug to the typed tenant the deployment registered
@@ -99,6 +103,14 @@ impl<R: JtiReplayStore> JwtSvidResolver<R> {
     /// JWT-level validation (signature, `iss`, `aud`, `exp`, `nbf`,
     /// allowed algorithms) is delegated to the wrapped
     /// [`JwtVerifier`].
+    ///
+    /// The slug in `sub` and the `tid` claim are checked against each other,
+    /// and the check needs a registry: set it with
+    /// [`with_tenant_lookup`](Self::with_tenant_lookup), or waive the check by
+    /// name with
+    /// [`without_tenant_cross_check`](Self::without_tenant_cross_check). A
+    /// resolver with neither refuses every token, as the verifier refuses
+    /// one it cannot pin.
     pub fn new(
         verifier: Arc<JwtVerifier<R>>,
         expected_trust_domain: TrustDomain,
@@ -109,6 +121,7 @@ impl<R: JtiReplayStore> JwtSvidResolver<R> {
             expected_trust_domain,
             token: token.into(),
             tenant_lookup: None,
+            cross_check_waived: false,
         }
     }
 
@@ -118,12 +131,28 @@ impl<R: JtiReplayStore> JwtSvidResolver<R> {
     /// together, so an IdP bug or a loosely templated claim could put one
     /// tenant's UUID under another's slug. With a lookup, the token is
     /// refused when the slug is unknown or maps to a different tenant than
-    /// `tid`. Deployments that have a tenant registry should set this.
+    /// `tid`. A resolver needs this, or
+    /// [`without_tenant_cross_check`](Self::without_tenant_cross_check).
     pub fn with_tenant_lookup(
         mut self,
         lookup: impl Fn(&str) -> Option<TenantId> + Send + Sync + 'static,
     ) -> Self {
         self.tenant_lookup = Some(Arc::new(lookup));
+        self
+    }
+
+    /// Resolve without cross-checking the SPIFFE tenant slug against the
+    /// `tid` claim. A waiver by name, in line with the verifier's
+    /// `allow_any_*` waivers: the resolved principal then carries a slug and
+    /// an id that two claims of one token asserted, with nothing tying them to
+    /// the same tenant, so a policy that reads one and data scoping that reads
+    /// the other can split. Use it only where the issuer is the sole writer of
+    /// both claims and you trust its templating. A
+    /// [`with_tenant_lookup`](Self::with_tenant_lookup) set as well still
+    /// applies.
+    #[must_use]
+    pub fn without_tenant_cross_check(mut self) -> Self {
+        self.cross_check_waived = true;
         self
     }
 }
@@ -189,7 +218,16 @@ impl<R: JtiReplayStore + 'static> PrincipalResolver for JwtSvidResolver<R> {
             )));
         }
 
-        // 5. The slug and the `tid` claim must name the same tenant.
+        // 5. The slug and the `tid` claim must name the same tenant. With no
+        //    registry to ask, only a named waiver lets the token through.
+        if self.tenant_lookup.is_none() && !self.cross_check_waived {
+            tracing::warn!(
+                slug = %tenant_slug,
+                "JwtSvidResolver: no tenant lookup to cross-check the tid claim against the \
+                 SPIFFE tenant slug, and no without_tenant_cross_check() waiver; refusing",
+            );
+            return Err(IdentityError::NotAuthenticated);
+        }
         if let Some(lookup) = &self.tenant_lookup {
             match lookup(&tenant_slug) {
                 Some(registered) if registered == claims.custom.tid => {}

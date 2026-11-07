@@ -21,13 +21,13 @@ architectural decisions that the review process holds new code
 against. A PR that violates one of them is harder to land; a PR
 written with them in mind sails through.
 
-**Find or create an AX-NNN tracking entry.** The
-ROADMAP is the source of truth for "what is being worked on" and
-"what is committed." A PR that lands a feature should reference
-an AX-NNN. A PR that lands a bug fix can do without (though one
-is often associated even with fixes). The number lives in the
-PR description and in the commit messages; the format is
-`AX-NNN` (no `#`, no space).
+**Find the ROADMAP entry or the issue.** The ROADMAP lists what
+is planned and what waits on upstream, by name; a PR that lands
+one of its entries names that entry in its description and
+removes it from the ROADMAP in the same PR, since the ROADMAP
+lists only what is not built. A bug fix links its GitHub issue
+when there is one. Commit messages and code carry no tracking
+keys: they say what now holds.
 
 **Discuss substantial changes before writing them.**
 The review cycle is faster when the maintainers have agreed to
@@ -142,9 +142,10 @@ code has to update. The section is what feeds the *Migration
 guide* chapter; the maintainers add the entry there as part of
 the merge, but the PR author drafts the wording.
 
-A reference to the AX-NNN tracking number. If the work is
-substantial, the AX entry has the larger context; the PR
-description summarises the slice this PR delivers.
+The ROADMAP entry or issue the work belongs to, by name or
+link. If the work is substantial, that entry has the larger
+context; the PR description summarises the slice this PR
+delivers.
 
 ## Naming and visibility
 

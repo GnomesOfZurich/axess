@@ -2,8 +2,8 @@
 #
 # Drives the mutation-testing sweep. Used by both local
 # developer runs and the CI job in `.github/workflows/mutants.yml`
-# (which adds `--in-diff origin/main` so PRs only mutate the files
-# they touch).
+# (which shards the weekly sweep through `scripts/mutants-sweep.sh`
+# and adds `--in-diff` so a PR only mutates the lines it touches).
 #
 # # Local-run isolation
 #
@@ -52,20 +52,14 @@
 # Pattern syntax mirrors `.gitignore`. Globs match relative to the
 # workspace root.
 
-# Files we want mutation testing to examine.
-examine_globs = [
-    "axess/src/**/*.rs",
-    "axess-core/src/**/*.rs",
-    "axess-cache/src/**/*.rs",
-    "axess-clock/src/**/*.rs",
-    "axess-rng/src/**/*.rs",
-    "axess-factors/src/**/*.rs",
-    "axess-events/src/**/*.rs",
-    "axess-identity/src/**/*.rs",
-    "axess-strings/src/**/*.rs",
-]
+# No `examine_globs`. cargo-mutants adds a command-line `--file` to the
+# config's examine list instead of narrowing it, so with a list here
+# `cargo mutants -f axess-cache/src/cache.rs` still selected all 7725
+# mutants in the workspace. The workspace's library crates are what
+# cargo-mutants examines by default; the excludes below take out the
+# rest (examples, tests, macros), and the selected set is identical.
 
-# Hard excludes: never mutate these even if they match `examine_globs`.
+# Hard excludes: never mutate these.
 exclude_globs = [
     # Test-only modules and integration tests are themselves the
     # oracles; mutating them would just produce noise.

@@ -46,6 +46,11 @@ fn merge(
         auth_state: pick(&base.auth_state, &local.auth_state, &fresh.auth_state),
         fingerprint: pick(&base.fingerprint, &local.fingerprint, &fresh.fingerprint),
         device_id: pick(&base.device_id, &local.device_id, &fresh.device_id),
+        device_proven: pick(
+            &base.device_proven,
+            &local.device_proven,
+            &fresh.device_proven,
+        ),
         custom: merge_custom(&base.custom, &local.custom, &fresh.custom, keep_additions),
         revision: fresh.revision,
         touched_at: fresh.touched_at,

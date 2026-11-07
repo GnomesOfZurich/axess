@@ -92,20 +92,35 @@ async fn happy_path_creates_then_a_cookie_finds() {
     let ip = Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)));
 
     let parts1 = req_with(Some("Mozilla/5.0"), Some(tenant), ip);
-    let id1 = resolver.resolve(&parts1).await.unwrap().expect("created");
+    let id1 = resolver
+        .resolve(&parts1)
+        .await
+        .unwrap()
+        .expect("created")
+        .id();
     let cookie = issued_cookie(&parts1).expect("a cookie was issued");
 
     let mut parts2 = req_with(Some("Mozilla/5.0"), Some(tenant), ip);
     parts2
         .headers
         .insert(axum::http::header::COOKIE, cookie_header(&cookie));
-    let id2 = resolver.resolve(&parts2).await.unwrap().expect("found");
+    let id2 = resolver
+        .resolve(&parts2)
+        .await
+        .unwrap()
+        .expect("found")
+        .id();
     assert_eq!(id1, id2, "the cookie names the device");
     assert!(issued_cookie(&parts2).is_none(), "nothing new is issued");
 
     // Same headers, no cookie: not the same device.
     let parts3 = req_with(Some("Mozilla/5.0"), Some(tenant), ip);
-    let id3 = resolver.resolve(&parts3).await.unwrap().expect("created");
+    let id3 = resolver
+        .resolve(&parts3)
+        .await
+        .unwrap()
+        .expect("created")
+        .id();
     assert_ne!(id1, id3, "matching headers alone must not find a device");
 
     // Confirm trust level is Unknown.
@@ -142,7 +157,12 @@ async fn new_id_fn_override_is_honoured() {
         make_resolver().with_new_id_fn(|| crate::authn::ids::testing::device("dev-fixed"));
     let tenant = crate::authn::ids::testing::tenant("t1");
     let parts = req_with(Some("Mozilla/5.0"), Some(tenant), None);
-    let id = resolver.resolve(&parts).await.unwrap().expect("created");
+    let id = resolver
+        .resolve(&parts)
+        .await
+        .unwrap()
+        .expect("created")
+        .id();
     assert_eq!(id, crate::authn::ids::testing::device("dev-fixed"));
 }
 
@@ -172,7 +192,8 @@ async fn tenant_fn_override_is_honoured() {
         .resolve(&parts)
         .await
         .unwrap()
-        .expect("created from header tenant");
+        .expect("created from header tenant")
+        .id();
     let device = resolver
         .lifecycle
         .store()
@@ -197,7 +218,12 @@ async fn user_fn_override_populates_device_user_id() {
     });
     let tenant = crate::authn::ids::testing::tenant("t1");
     let parts = req_with(Some("Mozilla/5.0"), Some(tenant), None);
-    let id = resolver.resolve(&parts).await.unwrap().expect("created");
+    let id = resolver
+        .resolve(&parts)
+        .await
+        .unwrap()
+        .expect("created")
+        .id();
     let device = resolver
         .lifecycle
         .store()
@@ -241,8 +267,8 @@ async fn custom_client_ip_fn_distinguishes_subnets() {
                 .fingerprint_hash
         }
     };
-    let id_a = resolver.resolve(&p1).await.unwrap().expect("a");
-    let id_b = resolver.resolve(&p2).await.unwrap().expect("b");
+    let id_a = resolver.resolve(&p1).await.unwrap().expect("a").id();
+    let id_b = resolver.resolve(&p2).await.unwrap().expect("b").id();
     assert_ne!(
         fingerprint_of(id_a).await,
         fingerprint_of(id_b).await,
@@ -267,8 +293,8 @@ async fn default_client_ip_fn_returns_none_so_ip_does_not_change_fingerprint() {
         Some(tenant),
         Some(IpAddr::V4(Ipv4Addr::new(10, 0, 99, 1))),
     );
-    let id_a = resolver.resolve(&p1).await.unwrap().expect("a");
-    let id_b = resolver.resolve(&p2).await.unwrap().expect("b");
+    let id_a = resolver.resolve(&p1).await.unwrap().expect("a").id();
+    let id_b = resolver.resolve(&p2).await.unwrap().expect("b").id();
     let store = resolver.lifecycle.store();
     let fp_a = store
         .load(&tenant, &id_a)
@@ -302,7 +328,12 @@ async fn create_uses_injected_clock_for_timestamps() {
 
     let tenant = crate::authn::ids::testing::tenant("t1");
     let parts = req_with(Some("Mozilla/5.0"), Some(tenant), None);
-    let id = resolver.resolve(&parts).await.unwrap().expect("created");
+    let id = resolver
+        .resolve(&parts)
+        .await
+        .unwrap()
+        .expect("created")
+        .id();
     let device = resolver
         .lifecycle
         .store()
@@ -327,12 +358,14 @@ async fn default_device_ids_are_the_injected_rngs_draws() {
         .resolve(&req_with(Some("Browser/1"), Some(tenant), None))
         .await
         .unwrap()
-        .expect("created");
+        .expect("created")
+        .id();
     let second = resolver
         .resolve(&req_with(Some("Browser/2"), Some(tenant), None))
         .await
         .unwrap()
-        .expect("created");
+        .expect("created")
+        .id();
 
     let rng = MockRng::new(41);
     let expect = |rng: &MockRng| {

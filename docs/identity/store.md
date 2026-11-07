@@ -145,6 +145,9 @@ pub trait IdentityAdmin: IdentityAuthnLog {
     // Plus the suspension verbs. `delete_user` is the one method here
     // that still defaults to `unimplemented!()`; nothing in axess calls
     // it, so the panic fires only if you call it yourself. See below.
+    // `delete_candidates_created_before(before, limit)` is required: it
+    // deletes Candidates older than `before` and returns them, for the
+    // `purge_expired_candidates` sweep.
 }
 
 // The umbrella for production: all three tiers.
@@ -155,12 +158,17 @@ impl<T: IdentityAdmin> IdentityStore for T {}
 // flow asks for it, and only a store that implements it can call that
 // flow.
 pub trait IdentityPasswordReset: IdentityLookup {
+    // Adds a token unless the user already holds `max_live` live ones
+    // (`Ok(false)`); never replaces a live one. A successful
+    // `verify_reset_token` deletes all of the user's tokens.
     fn store_reset_token(
         &self,
         user_id: &UserId,
         token_hash: &str,
         expires_at: DateTime<Utc>,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+        now: DateTime<Utc>,
+        max_live: usize,
+    ) -> impl Future<Output = Result<bool, Self::Error>> + Send;
 
     fn verify_reset_token(
         &self,

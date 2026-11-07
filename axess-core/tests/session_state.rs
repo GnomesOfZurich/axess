@@ -36,6 +36,7 @@ fn auth_state_authenticated_has_user_and_tenant() {
         factors_completed: vec![],
         impersonator: None,
         ldap_groups: None,
+        assurance: Vec::new(),
     };
     assert!(state.is_authenticated());
     assert_eq!(state.authenticated_user_id(), Some(&uid("u1")));
@@ -53,6 +54,7 @@ fn auth_state_authenticating_is_not_authenticated() {
         attempt_count: 0,
         last_attempt: None,
         ldap_groups: None,
+        assurance: Vec::new(),
         impersonator: None,
     };
     assert!(state.is_authenticating());
@@ -178,9 +180,11 @@ fn session_data_json_roundtrip() {
             factors_completed: vec![],
             impersonator: None,
             ldap_groups: None,
+            assurance: Vec::new(),
         },
         fingerprint: Some("abc123".to_string()),
         device_id: None,
+        device_proven: false,
         custom: serde_json::json!({"key": "value"}),
         revision: 0,
         touched_at: None,

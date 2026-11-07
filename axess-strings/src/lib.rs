@@ -258,12 +258,12 @@ impl ShortString {
     ///
     /// // A 42-byte SPIFFE-derived subject id does allocate; a clone of
     /// // it is then a refcount bump rather than a copy.
-    /// let id = ShortString::new("spiffe://gnomes.local/feed-worker/ekekrantz");
+    /// let id = ShortString::new("spiffe://gnomes.local/compute-worker/gnomes");
     /// assert!(id.is_allocated());
     ///
     /// // A compile-time-known one of the same length does not.
     /// const ID: ShortString =
-    ///     ShortString::from_static("spiffe://gnomes.local/feed-worker/ekekrantz");
+    ///     ShortString::from_static("spiffe://gnomes.local/compute-worker/gnomes");
     /// assert!(!ID.is_allocated());
     /// assert!(!ID.is_inline());
     /// ```

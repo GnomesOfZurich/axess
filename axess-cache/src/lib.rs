@@ -70,6 +70,8 @@ mod lru;
 pub mod stats;
 
 #[cfg(test)]
+mod invalidate_tests;
+#[cfg(test)]
 mod tests;
 
 pub use cache::ClockTtlCache;

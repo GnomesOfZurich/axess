@@ -38,7 +38,7 @@ const LONG: &str = "inst-aapl-20260923-001";
 /// The dominant real workload: `platform/domain/messaging/core` builds a
 /// subject id from a principal's SPIFFE URI. At 42 bytes it exceeds both
 /// inline buffers, so this is the case the design turns on.
-const SPIFFE: &str = "spiffe://gnomes.local/feed-worker/ekekrantz";
+const SPIFFE: &str = "spiffe://gnomes.local/compute-worker/gnomes";
 
 const CASES: [(&str, &str); 3] = [
     ("short_7b", SHORT),

@@ -109,11 +109,48 @@ where
     /// [`authenticated_within`](AuthSession::authenticated_within) or
     /// [`has_completed_factor`](AuthSession::has_completed_factor) and call
     /// this when it says no.
+    ///
+    /// A FIDO2 factor runs [`Fido2Options::login_ceremony`](crate::authn::factor::Fido2Options::login_ceremony);
+    /// [`begin_step_up_for`](Self::begin_step_up_for) names the ceremony.
     #[tracing::instrument(skip(self, session))]
     pub async fn begin_step_up(
         &self,
         session: &AuthSession,
         factors: Vec<FactorKind>,
+    ) -> Result<FactorKind, AuthnError<I::Error>> {
+        self.begin_step_up_with(session, factors, None).await
+    }
+
+    /// Begin the step-up a refusal named: the factor of `step_up` and, for a
+    /// FIDO2 step-up, the ceremony it names, which the step's
+    /// [`prepare_factor`](Self::prepare_factor) challenge runs instead of
+    /// the login ceremony.
+    ///
+    /// `step_up` is what `require_authz!` or
+    /// [`AuthzSession::require_with_step_up`](crate::authz::AuthzSession::require_with_step_up)
+    /// answered (`StepUp::from_str` of the `step_up` field). A client that
+    /// sends back a weaker one gains nothing: the action is decided again on
+    /// what the step-up recorded. Otherwise as [`begin_step_up`](Self::begin_step_up)
+    /// with one factor.
+    #[tracing::instrument(skip(self, session))]
+    pub async fn begin_step_up_for(
+        &self,
+        session: &AuthSession,
+        step_up: &crate::authn::assurance::StepUp,
+    ) -> Result<FactorKind, AuthnError<I::Error>> {
+        self.begin_step_up_with(
+            session,
+            vec![step_up.factor_kind()],
+            step_up.fido2_ceremony(),
+        )
+        .await
+    }
+
+    async fn begin_step_up_with(
+        &self,
+        session: &AuthSession,
+        factors: Vec<FactorKind>,
+        ceremony: Option<&crate::authn::factor::Fido2Ceremony>,
     ) -> Result<FactorKind, AuthnError<I::Error>> {
         if factors.is_empty() {
             return Err(AuthnError::NoFlow);
@@ -162,7 +199,27 @@ where
             let mut guard = session.0.0.write().await;
             let same_user = guard.data.auth_state.pending_user_id() == Some(&user_id)
                 && guard.data.auth_state.tenant_id() == Some(&tenant_id);
-            if !same_user || !guard.data.auth_state.begin_step_up(steps) {
+            if !same_user || !guard.data.auth_state.is_authenticated() {
+                return Err(AuthnError::NoFlow);
+            }
+            // The step-up's own ceremony, or none so the login ceremony
+            // applies, written before the state moves: a ceremony that does
+            // not fit the session refuses the step-up and leaves the session
+            // as it was.
+            let key = crate::session::data::STEP_UP_CEREMONY_KEY;
+            match ceremony {
+                Some(ceremony) => {
+                    if !guard.set_custom_value(key.to_owned(), serde_json::json!(ceremony)) {
+                        return Err(AuthnError::NoFlow);
+                    }
+                }
+                None => {
+                    if let Some(custom) = guard.data.custom.as_object_mut() {
+                        custom.remove(key);
+                    }
+                }
+            }
+            if !guard.data.auth_state.begin_step_up(steps) {
                 return Err(AuthnError::NoFlow);
             }
             guard.set_custom_value(super::flow::FLOW_KEY.to_owned(), stamp);

@@ -276,8 +276,11 @@ where
         // Holds what the steps below owe an end to from the moment they
         // take it out of the map, so that dropping this future at any
         // await loses none of it.
+        let store = self.inner.sid_store();
+        // A tenant provider's login is the tenant's; a global provider's is `None`.
+        let tenant = tenant_provider.then_some(user.tenant_id);
         let mut pending =
-            pending_ends::PendingEnds::new(self.inner.registry.clone(), self.inner.sid_map.clone());
+            pending_ends::PendingEnds::new(self.inner.registry.clone(), store.clone());
 
         // Without a session registry no session is registered anywhere a
         // logout could end it, so a mapping or a subject entry would only
@@ -301,7 +304,6 @@ where
         // logout precision on the evicted mappings.
         let max_sid_map_entries = self.inner.sid_map_capacity;
         const SID_MAP_TTL: chrono::TimeDelta = chrono::TimeDelta::hours(24);
-        const EVICT_BATCH: usize = 128;
         const PRUNE_BATCH: usize = 128;
 
         // A tenant's provider is not in the global registry; the verified ID
@@ -328,9 +330,15 @@ where
 
         // Every login enters the subject registry, with or without a `sid`,
         // so a logout by `sub` alone can always find the session.
-        self.inner
-            .sid_map
-            .register_subject_session(&issuer, &claims.subject, user.id, *sid);
+        if let Err(e) = store
+            .register_subject_session(&issuer, &claims.subject, tenant, user.id, *sid)
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                "sid store: the login's subject record was not written; a logout by `sub` will not find it"
+            );
+        }
         self.sweep_subject_registry().await;
 
         let Some(oidc_sid) = claims.oidc_sid.as_ref().filter(|s| {
@@ -353,11 +361,14 @@ where
 
         // Phase 1: TTL prune, bounded per call.
         let cutoff = now - SID_MAP_TTL;
-        for (evict_key, (evict_user, evict_sid, _)) in self
-            .inner
-            .sid_map
+        let aged = store
             .evict_inserted_before(cutoff, PRUNE_BATCH)
-        {
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "sid store: the TTL prune failed");
+                Vec::new()
+            });
+        for (evict_key, (evict_user, evict_sid, _)) in aged {
             tracing::debug!(
                 evicted_iss = %evict_key.0,
                 evicted_oidc_sid = %evict_key.1,
@@ -366,13 +377,48 @@ where
             pending.age_out((evict_key.0, evict_user, evict_sid));
         }
 
-        // Phase 2: capacity-based batch eviction. Drops the mapping only;
-        // the user's session is still valid. The subject registry keeps a
-        // live session reachable by `sub`; only a session the registry
-        // reports gone is forgotten there, never one whose liveness it could
-        // not answer. The liveness checks of the batch run concurrently.
-        if self.inner.sid_map.len() >= max_sid_map_entries {
-            let evicted = self.inner.sid_map.evict_oldest(EVICT_BATCH);
+        self.evict_for_capacity(&store, max_sid_map_entries).await;
+
+        // Atomic swap with displaced-mapping invalidation.
+        let displaced = store
+            .insert_displacing(key.clone(), &claims.subject, tenant, user.id, *sid, now)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    error = %e,
+                    "sid store: the login's `sid` mapping was not written; a logout by `sid` \
+                     will not find it (`sub` still does)"
+                );
+                None
+            });
+        if let Some(displaced) = displaced {
+            tracing::warn!(
+                iss = %issuer,
+                oidc_sid = %oidc_sid,
+                old_user = %displaced.user,
+                "SidMap atomic swap displaced existing mapping; invalidating old session"
+            );
+            pending.displace(key, displaced);
+        }
+        pending
+    }
+
+    /// Capacity-based batch eviction, when the store is at `max_entries`.
+    /// Drops the mapping only; the user's session is still valid. The subject
+    /// registry keeps a live session reachable by `sub`; only a session the
+    /// registry reports gone is forgotten there, never one whose liveness it
+    /// could not answer. The liveness checks of the batch run concurrently.
+    async fn evict_for_capacity(
+        &self,
+        store: &std::sync::Arc<dyn crate::federation::sid_store::SidStore>,
+        max_entries: usize,
+    ) {
+        const EVICT_BATCH: usize = 128;
+        if store.mapping_count().await.unwrap_or(0) >= max_entries {
+            let evicted = store.evict_oldest(EVICT_BATCH).await.unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "sid store: the capacity eviction failed");
+                Vec::new()
+            });
             self.inner
                 .metrics
                 .session
@@ -392,22 +438,6 @@ where
                 .collect();
             self.forget_gone_subject_sessions(candidates).await;
         }
-
-        // Atomic swap with displaced-mapping invalidation.
-        let displaced =
-            self.inner
-                .sid_map
-                .insert_displacing(key.clone(), &claims.subject, user.id, *sid, now);
-        if let Some(displaced) = displaced {
-            tracing::warn!(
-                iss = %issuer,
-                oidc_sid = %oidc_sid,
-                old_user = %displaced.user,
-                "SidMap atomic swap displaced existing mapping; invalidating old session"
-            );
-            pending.displace(key, displaced);
-        }
-        pending
     }
 
     /// Ask the registry about each `(issuer, user, session)`, concurrently,
@@ -423,10 +453,14 @@ where
         })
         .await;
         for ((issuer, user, session), liveness) in answers {
-            if liveness == SessionLiveness::Gone {
-                self.inner
-                    .sid_map
-                    .forget_subject_session(&issuer, &user, &session);
+            if liveness == SessionLiveness::Gone
+                && let Err(e) = self
+                    .inner
+                    .sid_store()
+                    .forget_subject_session(&issuer, &user, &session)
+                    .await
+            {
+                tracing::warn!(error = %e, "sid store: a gone session was not forgotten");
             }
         }
     }
@@ -441,7 +475,12 @@ where
         if self.inner.registry.is_none() {
             return;
         }
-        let candidates = self.inner.sid_map.sweep_subject_candidates(SWEEP_BATCH);
+        let candidates = self
+            .inner
+            .sid_store()
+            .sweep_subject_candidates(SWEEP_BATCH)
+            .await
+            .unwrap_or_default();
         self.forget_gone_subject_sessions(candidates).await;
     }
 }
@@ -511,6 +550,14 @@ where
                 user.id,
                 user.tenant_id,
                 now,
+                Some(crate::authn::assurance::FactorAssurance::for_kind(
+                    crate::authn::factor::FactorKind::Federated(
+                        crate::authn::factor::FederatedProvider::Custom(
+                            claims.provider.to_string(),
+                        ),
+                    ),
+                    now,
+                )),
                 &self.inner.preserved_custom_keys,
             )
             .await;
@@ -577,7 +624,9 @@ where
             // The login is refused, so nothing of it may stay reachable:
             // not the registry entry, not the session state, and not the
             // back-channel `sid` mapping installed above.
-            self.inner.sid_map.remove_session(&sid);
+            if let Err(e) = self.inner.sid_store().remove_session(&sid).await {
+                tracing::warn!(error = %e, "sid store: the refused login's mappings were not removed");
+            }
             // The mapping this login displaced goes back (its user must stay
             // reachable by a logout for that `sid`), and only the sessions
             // that aged out are ended.

@@ -100,6 +100,7 @@ async fn a_resend_while_the_first_delivery_runs_is_retryable_and_a_later_one_is_
     sid_map.insert(
         (ISS.to_string(), "sid-slow".to_string()),
         "idp-subject-slow",
+        None,
         user,
         session,
         chrono::Utc::now(),

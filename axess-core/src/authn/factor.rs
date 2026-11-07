@@ -39,8 +39,10 @@ pub use template::{FactorTemplate, default_catalog};
 
 #[cfg(feature = "fido2")]
 pub use axess_factors::{
-    AuthenticationResult, AuthenticatorAttachment, CredentialID, Fido2Credential, Fido2Options,
+    AttestationCaList, AuthenticationResult, AuthenticatorAttachment, CredentialID,
+    Fido2Credential, Fido2Key, Fido2Options,
 };
+pub use axess_factors::{DEFAULT_FIDO2_CEREMONY, Fido2Ceremony, SecurityKeyVerification};
 
 use serde::{Deserialize, Serialize};
 use std::{fmt, sync::Arc};

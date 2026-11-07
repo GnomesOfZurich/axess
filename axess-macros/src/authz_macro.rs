@@ -99,7 +99,11 @@
 ///
 /// - **401 Unauthorized**: caller is not authenticated.
 /// - **403 Forbidden**: Cedar policy denied the request
-///   (returns `axess_core::authz::AuthzDenied`).
+///   (returns `axess_core::authz::AuthzDenied`), or, when a step-up named by
+///   a policy's `@step_up` annotation would permit it, answers
+///   `{"error": "step_up_required", "step_up": "<name>"}`
+///   (`axess_core::authz::AuthzRefusal::StepUpRequired`), naming the
+///   step-up and nothing of the policy.
 /// - **400 Bad Request**: a path parameter is not valid UTF-8 after
 ///   percent-decoding, for an authenticated caller (an anonymous one is
 ///   401 first).
@@ -288,9 +292,9 @@ macro_rules! require_authz {
 
                 // 6. The request context. A provider in the extensions builds
                 //    it from the session and the request head; an error is a
-                //    denial. Without a provider the context is empty, which
-                //    the policy store fails closed on for any policy that
-                //    reads it, and the first such request logs a warning.
+                //    denial. Without a provider the gate refuses with a 500
+                //    when the policies read `context`, and decides on an
+                //    empty context when they never do.
                 let (req_parts, req_body) = req.into_parts();
                 let context = match req_parts
                     .extensions
@@ -319,29 +323,40 @@ macro_rules! require_authz {
                         }
                     }
                     ::std::option::Option::None => {
-                        static WARNED: ::std::sync::atomic::AtomicBool =
-                            ::std::sync::atomic::AtomicBool::new(false);
-                        $crate::__macro_support::warn_once_without_context_provider(
-                            &store, &WARNED, $action,
-                        );
+                        if $crate::__macro_support::refuse_without_context_provider(
+                            &store, $action,
+                        ) {
+                            return $crate::axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                                .into_response();
+                        }
                         $crate::__cedar::Context::empty()
                     }
                 };
                 let req = $crate::axum::extract::Request::from_parts(req_parts, req_body);
 
-                // 7. Cedar evaluation. AuthzDenied is the standard 403 response.
+                // 7. Cedar evaluation. AuthzDenied is the standard 403
+                //    response; a denial a step-up the policies name would
+                //    cure answers `step_up_required` with that step-up.
                 let decision = $crate::__authz::PolicyEvaluator::is_authorized(
                     &*store,
                     &entities,
-                    principal,
-                    action_uid_parsed,
-                    resource,
-                    context,
+                    principal.clone(),
+                    action_uid_parsed.clone(),
+                    resource.clone(),
+                    context.clone(),
                 );
                 match decision {
                     $crate::__authz::AuthzDecision::Allow => next.run(req).await,
                     $crate::__authz::AuthzDecision::Deny => {
-                        $crate::__authz::AuthzDenied.into_response()
+                        $crate::__macro_support::refusal(
+                            &*store,
+                            &entities,
+                            principal,
+                            action_uid_parsed,
+                            resource,
+                            context,
+                        )
+                        .into_response()
                     }
                 }
               }

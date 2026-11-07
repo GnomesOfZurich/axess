@@ -263,7 +263,7 @@ async fn whoami(
             );
         }
     };
-    let device = match devices.load(&tenant, &device_id).await {
+    let device = match devices.load(&tenant, &device_id.id()).await {
         Ok(d) => d,
         Err(e) => {
             tracing::error!(error = %e, "device load failed");
@@ -348,7 +348,7 @@ async fn step_up_check(
             );
         }
     };
-    let device = match devices.load(&tenant, &device_id).await {
+    let device = match devices.load(&tenant, &device_id.id()).await {
         Ok(Some(d)) => d,
         Ok(None) => return unknown_device_outcome("resolved id did not load"),
         Err(e) => {

@@ -124,6 +124,7 @@ mod custom_bag_tests {
                 axess_identity::testing::user("alice"),
                 axess_identity::testing::tenant("acme"),
                 chrono::Utc::now(),
+                None,
                 &["locale".to_owned()],
             )
             .await;
@@ -150,7 +151,13 @@ mod custom_bag_tests {
             )
             .await;
         session
-            .advance_factor(&FactorKind::Password, chrono::Utc::now(), &[])
+            .advance_factor(
+                crate::authn::assurance::FactorAssurance::for_kind(
+                    FactorKind::Password,
+                    chrono::Utc::now(),
+                ),
+                &[],
+            )
             .await;
 
         assert!(session.is_authenticated().await);

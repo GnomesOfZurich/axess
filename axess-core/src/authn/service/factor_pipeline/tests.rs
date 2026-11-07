@@ -993,7 +993,10 @@ async fn authenticating_state_returns_none_for_authenticated_session() {
     let session = authenticating_session(vec![FactorKind::Password]).await;
     // Advance through the only remaining factor to flip to Authenticated.
     session
-        .advance_factor(&FactorKind::Password, Utc::now(), &[])
+        .advance_factor(
+            crate::authn::assurance::FactorAssurance::for_kind(FactorKind::Password, Utc::now()),
+            &[],
+        )
         .await;
     assert!(session.is_authenticated().await);
     assert!(

@@ -9,6 +9,7 @@ use crate::authn::factor_secret::FactorSecretCipher;
 use crate::authn::ids::TenantId;
 use axess_clock::Clock;
 use axess_factors::client_assertion::ClientAssertionSigner;
+use axess_factors::egress::EgressPolicy;
 use axess_factors::oauth::{OAuthError, OAuthProvider, OAuthProviderConfig};
 use axess_rng::SecureRng;
 use std::collections::HashMap;
@@ -44,6 +45,17 @@ struct Built {
 /// deleted and written anew) and the record is built and held; otherwise the
 /// reader had lost a race with an update and takes the newer record.
 ///
+/// The issuer URL of a record is the tenant's to write, so every request the
+/// directory's providers make is screened by an [`EgressPolicy`]: HTTPS only,
+/// no connection to a loopback, private, link-local, unique-local or
+/// metadata address, at discovery and at every endpoint the discovery
+/// document names. [`upsert`](Self::upsert) refuses a record whose issuer URL
+/// the policy refuses. A deployment that federates with an identity provider
+/// on its own network names the opt-out with
+/// [`with_egress_policy`](Self::with_egress_policy), and tests against a mock
+/// on the loopback interface use
+/// [`EgressPolicy::screened_allowing_loopback_http`].
+///
 /// [`invalidate`](Self::invalidate) drops a held provider early, for a
 /// reason the record does not show (the IdP rotated its keys and you want
 /// discovery redone).
@@ -52,7 +64,11 @@ pub struct StoredTenantOAuthProviders<S> {
     cipher: Option<Arc<FactorSecretCipher>>,
     clock: Arc<dyn Clock>,
     rng: Arc<dyn SecureRng>,
+    egress: EgressPolicy,
     built: Mutex<HashMap<(TenantId, String), Built>>,
+    /// Bumped by `upsert`, `remove` and the invalidations; see
+    /// [`TenantOAuthProviders::generation`].
+    generation: std::sync::atomic::AtomicU64,
 }
 
 impl<S: TenantOAuthProviderStore> StoredTenantOAuthProviders<S> {
@@ -81,7 +97,9 @@ impl<S: TenantOAuthProviderStore> StoredTenantOAuthProviders<S> {
             cipher,
             clock: Arc::new(axess_clock::SystemClock),
             rng: Arc::new(axess_rng::SystemRng),
+            egress: EgressPolicy::screened(),
             built: Mutex::new(HashMap::new()),
+            generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -98,6 +116,17 @@ impl<S: TenantOAuthProviderStore> StoredTenantOAuthProviders<S> {
         self
     }
 
+    /// The screen applied to the issuer URL and every URL its discovery
+    /// document names. The default is [`EgressPolicy::screened`]; pass
+    /// [`EgressPolicy::unscreened`] to federate with an identity provider on
+    /// the deployment's own network, or
+    /// [`EgressPolicy::screened_allowing_loopback_http`] in tests against a
+    /// mock on the loopback interface.
+    pub fn with_egress_policy(mut self, policy: EgressPolicy) -> Self {
+        self.egress = policy;
+        self
+    }
+
     /// The underlying store, for listing and reading records.
     pub fn store(&self) -> &S {
         &self.store
@@ -109,8 +138,8 @@ impl<S: TenantOAuthProviderStore> StoredTenantOAuthProviders<S> {
     ///
     /// # Errors
     ///
-    /// [`OAuthError::Config`] when the record is incomplete,
-    /// [`OAuthError::Store`] when the credential cannot be sealed or the
+    /// [`OAuthError::Config`] when the record is incomplete or its issuer URL
+    /// is one the egress policy refuses, [`OAuthError::Store`] when the credential cannot be sealed or the
     /// store fails.
     pub async fn upsert(
         &self,
@@ -121,12 +150,17 @@ impl<S: TenantOAuthProviderStore> StoredTenantOAuthProviders<S> {
                 "a tenant provider needs a name, an issuer and a client id".to_string(),
             ));
         }
+        self.egress
+            .check_url(&record.issuer, "issuer URL")
+            .map_err(|e| OAuthError::Config(e.to_string()))?;
         if let Some(cipher) = &self.cipher {
             record
                 .seal(cipher)
                 .map_err(|e| OAuthError::Store(Box::new(e)))?;
         }
-        self.store.put(record).await.map_err(store_error)
+        let stored = self.store.put(record).await.map_err(store_error);
+        self.bump();
+        stored
     }
 
     /// Remove a record and the provider held for it; `true` when there was a
@@ -145,11 +179,18 @@ impl<S: TenantOAuthProviderStore> StoredTenantOAuthProviders<S> {
     /// builds it afresh.
     pub fn invalidate(&self, tenant: &TenantId, name: &str) {
         self.lock().remove(&(*tenant, name.to_string()));
+        self.bump();
     }
 
     /// Drop every provider held for `tenant`.
     pub fn invalidate_tenant(&self, tenant: &TenantId) {
         self.lock().retain(|(t, _), _| t != tenant);
+        self.bump();
+    }
+
+    fn bump(&self) {
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<(TenantId, String), Built>> {
@@ -280,23 +321,25 @@ impl<S: TenantOAuthProviderStore> StoredTenantOAuthProviders<S> {
         }
         let config = match &record.credential {
             TenantClientCredential::Secret(_) => {
-                OAuthProviderConfig::discover(
+                OAuthProviderConfig::discover_screened(
                     &record.name,
                     &record.issuer,
                     &record.client_id,
                     &opened,
                     &record.redirect_url,
+                    self.egress,
                 )
                 .await?
             }
             TenantClientCredential::PrivateKeyJwt { signer, .. } => {
                 let signer =
                     ClientAssertionSigner::from_spec(record.client_id.clone(), &opened, signer)?;
-                OAuthProviderConfig::discover_with_private_key_jwt(
+                OAuthProviderConfig::discover_screened_with_private_key_jwt(
                     &record.name,
                     &record.issuer,
                     signer,
                     &record.redirect_url,
+                    self.egress,
                 )
                 .await?
             }
@@ -338,8 +381,19 @@ fn store_error(e: TenantOAuthProviderStoreError) -> OAuthError {
 }
 
 impl<S: TenantOAuthProviderStore> TenantOAuthProviders for StoredTenantOAuthProviders<S> {
+    fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     fn provider<'a>(&'a self, tenant: &'a TenantId, name: &'a str) -> ProviderFuture<'a> {
         Box::pin(self.resolve(tenant, name))
+    }
+
+    fn built_providers(&self) -> Vec<Arc<dyn OAuthProvider>> {
+        self.lock()
+            .values()
+            .filter_map(|built| built.provider.get().cloned())
+            .collect()
     }
 
     fn providers_for_issuer<'a>(&'a self, issuer: &'a str) -> IssuerFuture<'a> {

@@ -281,7 +281,7 @@ impl FactorStore for MockFactorStore {
             if cfg
                 .credentials
                 .iter()
-                .any(|c| c.cred_id().as_ref() == credential_id)
+                .any(|c| c.cred_id().as_slice() == credential_id)
             {
                 return Ok(UserId::try_new(user).ok());
             }

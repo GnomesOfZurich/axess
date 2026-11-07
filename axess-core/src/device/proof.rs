@@ -104,6 +104,38 @@ impl DeviceToken {
     }
 }
 
+/// A device the client proved it holds: it presented the secret token on the
+/// device's cookie (see [`DeviceToken`]), which a fingerprint cannot stand in
+/// for.
+///
+/// The only way to get one is a resolution by
+/// [`DeviceLifecycleService::resolve_proven`](crate::device::DeviceLifecycleService::resolve_proven)
+/// (through [`ResolvedDevice::proven`](crate::device::ResolvedDevice::proven)),
+/// so an API that takes a `ProvenDevice` cannot be handed a device found by
+/// fingerprint. The per-account lockout's exemption for a device the account
+/// has used is one: [`AuthSession::proven_device`](crate::session::extractor::AuthSession::proven_device)
+/// answers only for a session the layer bound to a proven device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProvenDevice(DeviceId);
+
+impl ProvenDevice {
+    /// The device's id.
+    pub fn id(&self) -> DeviceId {
+        self.0
+    }
+
+    pub(crate) fn new(id: DeviceId) -> Self {
+        Self(id)
+    }
+
+    /// A proof for a test that has no cookie to present. Not available in a
+    /// production build.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn for_tests(id: DeviceId) -> Self {
+        Self(id)
+    }
+}
+
 /// The device a request claims to be, as read from its cookie: an id and a
 /// token to prove it with. Nothing here is verified yet.
 #[derive(Debug, Clone, PartialEq, Eq)]

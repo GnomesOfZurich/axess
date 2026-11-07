@@ -19,6 +19,7 @@ mod follower;
 
 use std::error::Error as StdError;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tracing::{error, info, warn};
 
@@ -29,7 +30,7 @@ pub use crate::reload::{
     CoordinationError, InProcessCoordinator, ReloadCoordinator, ReloadFuture, ReloadNotice,
     ReloadReceiver,
 };
-pub use follower::{PolicyBundle, PolicySource, ReloadFollower, ReloadOrigin};
+pub use follower::{PolicyBundle, PolicySource, ReloadFollower, ReloadOrigin, VersionedBundle};
 
 use super::{
     cache::CacheInvalidator,
@@ -79,11 +80,54 @@ impl<C: CacheInvalidator> ReloadHook for InvalidateAll<C> {
     }
 }
 
+/// How long a reload waits on each step that leaves the process.
+///
+/// The reload lock is held across these steps, so a stalled cache or
+/// coordinator would otherwise hold back every later reload on the instance,
+/// an emergency `forbid` included. A step that runs out of time is logged at
+/// error level and reported (`cache_invalidated` or `announced` is `false`,
+/// or the refused counter counts a source read); the swap itself is never
+/// undone. Set with [`AuthzStore::with_reload_timeouts`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReloadTimeouts {
+    /// One [`PolicySource`] read by a follower. Default
+    /// [`ReloadTimeouts::DEFAULT_SOURCE_READ`].
+    pub source_read: Duration,
+    /// One [`ReloadHook`] or cache invalidation. Default
+    /// [`ReloadTimeouts::DEFAULT_HOOK`].
+    pub hook: Duration,
+    /// The announcement to the other instances. Default
+    /// [`ReloadTimeouts::DEFAULT_ANNOUNCE`].
+    pub announce: Duration,
+}
+
+impl ReloadTimeouts {
+    /// Default for [`source_read`](Self::source_read): 30 seconds.
+    pub const DEFAULT_SOURCE_READ: Duration = Duration::from_secs(30);
+    /// Default for [`hook`](Self::hook): 30 seconds.
+    pub const DEFAULT_HOOK: Duration = Duration::from_secs(30);
+    /// Default for [`announce`](Self::announce): 10 seconds.
+    pub const DEFAULT_ANNOUNCE: Duration = Duration::from_secs(10);
+}
+
+impl Default for ReloadTimeouts {
+    fn default() -> Self {
+        Self {
+            source_read: Self::DEFAULT_SOURCE_READ,
+            hook: Self::DEFAULT_HOOK,
+            announce: Self::DEFAULT_ANNOUNCE,
+        }
+    }
+}
+
 /// The reload machinery an [`AuthzStore`] carries.
 #[derive(Default)]
 pub(super) struct ReloadState {
     /// Serialises reloads; the request path never takes it.
     lock: tokio::sync::Mutex<()>,
+    pub(super) timeouts: ReloadTimeouts,
+    /// The highest source generation a follower has applied.
+    pub(super) generation: std::sync::Mutex<Option<u64>>,
     hooks: Vec<Arc<dyn ReloadHook>>,
     coordinator: Option<Arc<dyn ReloadCoordinator>>,
     metrics: Option<MetricSinks>,
@@ -124,6 +168,21 @@ impl<P: AuthzEntityProvider> AuthzStore<P> {
     pub fn with_metrics(mut self, metrics: MetricSinks) -> Self {
         self.reload.metrics = Some(metrics);
         self
+    }
+
+    /// Bound the steps of a reload that leave the process, see
+    /// [`ReloadTimeouts`].
+    #[must_use]
+    pub fn with_reload_timeouts(mut self, timeouts: ReloadTimeouts) -> Self {
+        self.reload.timeouts = timeouts;
+        self
+    }
+
+    /// Count one refused reload or unreadable source on the metrics sink.
+    pub(super) fn count_refused(&self) {
+        if let Some(metrics) = &self.reload.metrics {
+            metrics.authz_cache().authz_policy_reload_refused();
+        }
     }
 
     /// The digest of the policy set in force, or `None` when the evaluator
@@ -191,21 +250,39 @@ impl<P: AuthzEntityProvider> AuthzStore<P> {
         // Validate before swap: nothing below the next three lines runs for
         // a set that failed to parse, validate or fit the provider.
         let store = PolicyStore::from_text(policy_text, schema_json)?;
-        self.provider.validate_schema(store.schema())?;
+        self.provider.validate_schema(&store.schema())?;
         let digest = store.digest().to_string();
 
-        let next: Arc<dyn PolicyEvaluator> = Arc::new(store);
-        let previous = self.evaluator.swap(Arc::new(next));
+        let previous_digest = self.evaluator.load().digest();
+        // The evaluator the store was built with takes the new set in place
+        // when it can, so a `require_authz!` gate holding that same object
+        // sees the reload. One that cannot (a mock, a custom evaluator) is
+        // replaced in the swap slot.
+        if let Err(store) = self.evaluator.load().adopt(Arc::new(store)) {
+            let next: Arc<dyn PolicyEvaluator> = store;
+            self.evaluator.store(Arc::new(next));
+        }
 
         let mut cache_invalidated = true;
         for hook in &self.reload.hooks {
-            if let Err(e) = hook.policies_reloaded().await {
-                cache_invalidated = false;
-                error!(
-                    target: "axess::authz::reload",
-                    error = %e,
-                    "a cache did not drop its entries after the policy swap; they age out by TTL",
-                );
+            match tokio::time::timeout(self.reload.timeouts.hook, hook.policies_reloaded()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    cache_invalidated = false;
+                    error!(
+                        target: "axess::authz::reload",
+                        error = %e,
+                        "a cache did not drop its entries after the policy swap; they age out by TTL",
+                    );
+                }
+                Err(_) => {
+                    cache_invalidated = false;
+                    error!(
+                        target: "axess::authz::reload",
+                        limit_ms = self.reload.timeouts.hook.as_millis() as u64,
+                        "a cache did not answer after the policy swap in time; its entries age out by TTL",
+                    );
+                }
             }
         }
 
@@ -213,12 +290,19 @@ impl<P: AuthzEntityProvider> AuthzStore<P> {
         if origin == ReloadOrigin::Local
             && let Some(coordinator) = &self.reload.coordinator
         {
-            match coordinator.announce(&digest).await {
-                Ok(()) => announced = true,
-                Err(e) => error!(
+            match tokio::time::timeout(self.reload.timeouts.announce, coordinator.announce(&digest))
+                .await
+            {
+                Ok(Ok(())) => announced = true,
+                Ok(Err(e)) => error!(
                     target: "axess::authz::reload",
                     error = %e,
                     "the reload was not announced; other instances catch up by their poll",
+                ),
+                Err(_) => error!(
+                    target: "axess::authz::reload",
+                    limit_ms = self.reload.timeouts.announce.as_millis() as u64,
+                    "announcing the reload timed out; other instances catch up by their poll",
                 ),
             }
         }
@@ -227,7 +311,7 @@ impl<P: AuthzEntityProvider> AuthzStore<P> {
             target: "axess::authz::reload",
             origin = origin.as_str(),
             digest = %digest,
-            previous_digest = previous.digest().as_deref().unwrap_or(""),
+            previous_digest = previous_digest.as_deref().unwrap_or(""),
             cache_invalidated,
             announced,
             "policy set reloaded",

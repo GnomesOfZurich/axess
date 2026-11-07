@@ -61,6 +61,14 @@ use crate::device::types::{Device, DeviceTrustLevel, FingerprintHash};
 /// [`DeviceLifecycleService::with_sighting_granularity`] says otherwise.
 const DEFAULT_SIGHTING_GRANULARITY_SECS: i64 = 300;
 
+/// How many `Unknown` devices one user may hold at once, unless
+/// [`DeviceLifecycleService::with_max_unknown_devices_per_user`] says
+/// otherwise. A client that arrives without its device cookie gets a new
+/// `Unknown` device per login; past this many, the least recently seen
+/// `Unknown` devices of that user are deleted to make room. `Seen` and
+/// `Trusted` devices are never evicted.
+pub const DEFAULT_MAX_UNKNOWN_DEVICES_PER_USER: usize = 32;
+
 /// How often a bindings edit re-reads the row and tries again after losing a
 /// compare-and-swap to a concurrent edit.
 #[cfg(feature = "fido2")]
@@ -99,6 +107,8 @@ where
     /// A known device whose `last_seen_at` is newer than this is not
     /// written again by `ensure_device`.
     sighting_granularity: chrono::Duration,
+    /// See [`DEFAULT_MAX_UNKNOWN_DEVICES_PER_USER`].
+    max_unknown_per_user: usize,
 }
 
 impl<S> DeviceLifecycleService<S>
@@ -113,7 +123,22 @@ where
             store,
             event_sink: Arc::new(NoopDeviceEventSink),
             sighting_granularity: chrono::Duration::seconds(DEFAULT_SIGHTING_GRANULARITY_SECS),
+            max_unknown_per_user: DEFAULT_MAX_UNKNOWN_DEVICES_PER_USER,
         }
+    }
+
+    /// How many `Unknown` devices one user may hold (default
+    /// [`DEFAULT_MAX_UNKNOWN_DEVICES_PER_USER`]; at least one).
+    ///
+    /// A request that carries a user and no valid device cookie creates a
+    /// device. Without a bound a client that drops its cookie, or a script,
+    /// adds a row per login for ever. When a user already holds this many
+    /// `Unknown` devices, the least recently seen are deleted before the new
+    /// one is written. Only `Unknown` rows are evicted: a device the user has
+    /// been recognised on (`Seen`, `Trusted`) stays.
+    pub fn with_max_unknown_devices_per_user(mut self, max: usize) -> Self {
+        self.max_unknown_per_user = max.max(1);
+        self
     }
 
     /// Set how stale a device's `last_seen_at` must be before
@@ -159,6 +184,17 @@ where
     /// owner cannot be compared, so the fingerprint's device is returned
     /// as is; compare the owner with the authenticating user before
     /// trusting it (see [`decide_step_up_for_user`](crate::authn::service::decide_step_up_for_user)).
+    ///
+    /// **A fingerprint is not proof of a device.** It is shared by everyone
+    /// behind one address with the same headers, and an attacker can match a
+    /// victim's. A device found this way must never be taken as one the user
+    /// has used: not for a lockout exemption
+    /// ([`with_device_store`](crate::authn::service::AuthnServiceBuilder::with_device_store)),
+    /// not for skipping a step-up. Bind the session's device with
+    /// [`resolve_proven`](Self::resolve_proven), which finds a device only by
+    /// the secret token on its cookie and is what
+    /// [`LifecycleDeviceResolver`](crate::device::LifecycleDeviceResolver)
+    /// uses.
     ///
     /// A `Revoked` device is never reused or touched: a request whose
     /// fingerprint matches one gets a new `Unknown` device, so a sighting

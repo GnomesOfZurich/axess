@@ -424,7 +424,24 @@ async fn authenticated_session_verdict(
     let Some(registry) = policy.registry else {
         return SessionVerdict::Keep;
     };
-    match registry.liveness(user_id, id).await {
+    let own = registry_verdict(registry.liveness(user_id, id).await, policy);
+    let (SessionVerdict::Keep, Some(imp)) = (&own, impersonator) else {
+        return own;
+    };
+    // An impersonation also stands on the administrator: the entry
+    // `begin_impersonation` registered under them goes when their sessions
+    // do (a suspension, a deletion, a forced logout).
+    let anchor = imp.registry_anchor(user_id);
+    let held = registry_verdict(registry.liveness(&imp.admin, &anchor).await, policy);
+    if matches!(held, SessionVerdict::End) {
+        tracing::info!("the administrator of an impersonation no longer holds it; ending it");
+    }
+    held
+}
+
+/// What the registry's answer about one entry means for the session.
+fn registry_verdict(liveness: SessionLiveness, policy: &LoadPolicy<'_>) -> SessionVerdict {
+    match liveness {
         SessionLiveness::Valid => SessionVerdict::Keep,
         SessionLiveness::Gone => {
             tracing::info!("session is no longer held by the registry; ending it");

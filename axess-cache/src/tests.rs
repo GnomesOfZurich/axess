@@ -768,8 +768,14 @@ async fn joiner_succeeds_and_is_cached_after_leader_fetch_fails() {
                 .await
         })
     };
-    // Let the joiner reach the cell before the leader fails.
+    // Let the joiner reach the cell before the leader fails. Bounded, so a
+    // counter that never moves fails the test instead of hanging it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while c.stats().single_flight_joins == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the joiner never reached the in-flight cell"
+        );
         tokio::task::yield_now().await;
     }
     release.notify_one();

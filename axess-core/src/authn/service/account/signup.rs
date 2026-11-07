@@ -50,6 +50,12 @@ where
     /// began a signup may submit it again and gets `Started` once more, with
     /// a success row carrying reason `resumed`.
     ///
+    /// An account that is still `Candidate` holds its identifier only for
+    /// [`DEFAULT_CANDIDATE_TTL`](crate::authn::service::DEFAULT_CANDIDATE_TTL)
+    /// (`with_candidate_ttl` changes it): past that, a `begin_signup` for the
+    /// same identifier from another session deletes it, audits the deletion
+    /// and goes on as for a free identifier.
+    ///
     /// Because `Started` covers both, the handler tells them apart with
     /// [`AuthSession::pending_user_id`](crate::session::AuthSession::pending_user_id)
     /// after the call: `Some` means an account is in flight, `None` means the
@@ -125,9 +131,18 @@ where
         // password, in a flow that saves one). The only resumption left is
         // the idempotent one: this session is already pending signup for
         // that very user, so a repeated submit answers `Started` again.
-        // A stale `Candidate` that nobody is resuming is the application's
-        // to purge (`delete_user`), after whatever proof of control its
-        // verification step gives.
+        // A `Candidate` holds its identifier only for `candidate_ttl`: nobody
+        // has proved control of it, so a stranger who started a signup and
+        // walked away must not keep the identifier from the person it
+        // belongs to. Once it is older than that and not this session's own
+        // it is deleted here and the signup goes on as for a free identifier.
+        let existing = match existing {
+            Some(candidate) if self.candidate_expired(&candidate, session).await => {
+                self.purge_expired_candidate(&candidate).await?;
+                None
+            }
+            other => other,
+        };
         if let Some(existing_user) = existing {
             let resuming_own = matches!(
                 session.auth_state().await,
@@ -165,6 +180,9 @@ where
         // pending workflow (and the existence check above) named another.
         let mut user = user;
         user.tenant_id = tenant.id;
+        // The age of a candidate is the service's clock at creation, not
+        // whatever time the record the caller built carries.
+        user.created_at = self.inner.clock.now();
         let user_id = user.id;
         let tenant_id = tenant.id;
 
@@ -194,6 +212,108 @@ where
         .await?;
 
         Ok(SignupOutcome::Started(Some(verification)))
+    }
+
+    /// Delete the unverified signups that have outlived their lifetime and
+    /// that nobody asked for again, up to `limit` per call, and return how
+    /// many were deleted.
+    ///
+    /// An expired `Candidate` stops reserving its identifier on its own (the
+    /// next [`begin_signup`](Self::begin_signup) for it takes the row over),
+    /// but a row nobody asks for again would stay for ever, holding the
+    /// address. Call this on a schedule (a timer task, a cron job) with a
+    /// `limit` that bounds one pass, for example 1000, and call it again while
+    /// it returns `limit`. The lifetime is the one `begin_signup` applies:
+    /// [`with_candidate_ttl`](crate::authn::service::AuthnServiceBuilder::with_candidate_ttl),
+    /// never shorter than the verification secret's.
+    ///
+    /// Each deletion writes an `AccountDeleted` audit row naming the user, as
+    /// the take-over does. Only accounts still `Candidate` are touched.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthnError::Store`] when the store fails, or the audit error when a
+    /// row cannot be written; the users deleted before it stay deleted.
+    pub async fn purge_expired_candidates(
+        &self,
+        limit: usize,
+    ) -> Result<usize, AuthnError<I::Error>> {
+        let ttl = self
+            .inner
+            .candidate_ttl
+            .max(self.inner.signup_verification_ttl);
+        let ttl = chrono::Duration::from_std(ttl).unwrap_or(chrono::Duration::MAX / 4);
+        let before = self
+            .inner
+            .clock
+            .now()
+            .checked_sub_signed(ttl)
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
+        let deleted = self
+            .inner
+            .identity
+            .delete_candidates_created_before(before, limit)
+            .await
+            .map_err(AuthnError::Store)?;
+        for user in &deleted {
+            if let Some(reg) = &self.inner.registry {
+                // A candidate holds no session, but a stray entry is cheap
+                // to end and costs nothing to be sure of.
+                crate::session::store::note_revocation(
+                    reg.invalidate_user(&user.id).await,
+                    "purging an expired candidate",
+                );
+            }
+            self.emit_audit(
+                AuthEventBuilder::success(AuthEventType::AccountDeleted)
+                    .attributed_to(&user.id, &user.tenant_id),
+            )
+            .await?;
+        }
+        Ok(deleted.len())
+    }
+
+    /// Whether `user` is a `Candidate` past `candidate_ttl` that `session` is
+    /// not the one resuming.
+    async fn candidate_expired(
+        &self,
+        user: &crate::authn::types::User,
+        session: &AuthSession,
+    ) -> bool {
+        if !matches!(user.status, crate::authn::types::EntityState::Candidate) {
+            return false;
+        }
+        let resuming_own = matches!(
+            session.auth_state().await,
+            crate::session::data::AuthState::PendingWorkflow { user_id, workflow, .. }
+                if user_id == user.id && workflow.kind == WorkflowKind::Signup
+        );
+        // Never shorter than the verification secret's life.
+        let ttl = self
+            .inner
+            .candidate_ttl
+            .max(self.inner.signup_verification_ttl);
+        let ttl = chrono::Duration::from_std(ttl).unwrap_or(chrono::Duration::MAX / 4);
+        !resuming_own && self.inner.clock.now() - user.created_at > ttl
+    }
+
+    /// Delete an expired candidate so its identifier is free, and leave the
+    /// row that says so.
+    async fn purge_expired_candidate(
+        &self,
+        user: &crate::authn::types::User,
+    ) -> Result<(), AuthnError<I::Error>> {
+        self.inner
+            .identity
+            .delete_user(&user.id)
+            .await
+            .map_err(AuthnError::Store)?;
+        tracing::info!(tenant = %user.tenant_id, "an expired unverified signup released its identifier");
+        self.emit_audit(
+            AuthEventBuilder::success(AuthEventType::AccountDeleted)
+                .attributed_to(&user.id, &user.tenant_id),
+        )
+        .await
     }
 
     /// The session submits its own pending signup again: a row for the

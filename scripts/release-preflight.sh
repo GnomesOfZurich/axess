@@ -77,6 +77,13 @@ step "Format check" cargo fmt --manifest-path "$AXESS_DIR/Cargo.toml" --all -- -
 # from crates.io or the GitHub tree view will pin whatever it says.
 step "Documented versions" "$AXESS_DIR/scripts/check-doc-versions.sh"
 
+# Sub-second as well. The preflight runs when a release is being prepared, so
+# the strict mode applies: the version in Cargo.toml, the internal pins and a
+# dated CHANGELOG.md section for it, with nothing left under [Unreleased].
+# CI's "Release Version" job runs the same check on the release pull request
+# and the release workflow runs it on the tag.
+step "Release version and dated changelog" "$AXESS_DIR/scripts/check-release-version.sh"
+
 # Also sub-second, and the only gate that reads the book. 108 of its 112
 # Rust blocks are ```rust,ignore, so a chapter can name a type that does
 # not exist and every other check stays green; one sweep found 59 such
@@ -128,7 +135,7 @@ step "Ban #[non_exhaustive]" bash -c '
       -e "#\[ *non_exhaustive *\]" \
       axess axess-core axess-factors axess-macros examples; then
     echo "ERROR: #[non_exhaustive] is forbidden in first-party crates." >&2
-    echo "See ROADMAP.md / feedback_no_non_exhaustive memory." >&2
+    echo "See CONTRIBUTING.md, \"No #[non_exhaustive] on first-party enums\"." >&2
     exit 1
   fi
   echo "OK: no #[non_exhaustive] occurrences."
@@ -151,10 +158,10 @@ step "Book builds" bash -c '
     echo "SKIP: mdbook not installed (cargo install mdbook)."
     exit 0
   fi
-  pinned=$(grep -oE "mdBook/releases/download/v[0-9.]+" .github/workflows/docs.yml | head -1 | sed "s@.*/v@@")
+  pinned=$(sed -n "s/^MDBOOK_VERSION=//p" scripts/install-mdbook.sh)
   local_v=$(mdbook --version | sed "s/^mdbook v\{0,1\}//")
   if [ "$pinned" != "$local_v" ]; then
-    echo "WARNING: local mdbook $local_v, docs.yml pins $pinned."
+    echo "WARNING: local mdbook $local_v, scripts/install-mdbook.sh pins $pinned."
     echo "         A newer local mdbook accepts book.toml keys the pinned one"
     echo "         rejects, so a green build here does not prove a green CI."
   fi
@@ -228,19 +235,10 @@ step "Advisory ignore lists agree (deny.toml vs .cargo/audit.toml)" \
 step "Supply-chain policy (cargo deny)" cargo deny --manifest-path "$AXESS_DIR/Cargo.toml" check licenses sources bans
 step "Security advisories (cargo audit)" cargo audit --file "$AXESS_DIR/Cargo.lock" --deny warnings
 
-# A pass here is a floor, not a ceiling. cargo-semver-checks has no lint for a
-# public struct field changing type (255 lints as of 0.50.0; the nearest are
-# `struct_pub_field_missing` and the struct-to-enum conversions), so a change
-# like `pub client_secret: String` -> `ZeroizedString` is breaking and still
-# reports "no semver update required" against a real baseline. Read a green
-# step as "none of the covered classes regressed", and keep documenting
-# breaking changes in CHANGELOG.md by hand.
-#
-# The tool also reads rustdoc JSON and supports only a narrow range of format
-# versions: an "unsupported rustdoc format vNN" failure here means
-# cargo-semver-checks is older than the pinned toolchain, not that the code
-# broke. Fix with `cargo install cargo-semver-checks --locked`.
-step "Semver checks" cargo semver-checks check-release --manifest-path "$AXESS_DIR/Cargo.toml" --workspace
+# Against the last release tag below HEAD, the baseline CI's "SemVer Checks"
+# job uses; the script says why a pass is a floor and what an "unsupported
+# rustdoc format" failure means.
+step "Semver checks (against the last release tag)" "$AXESS_DIR/scripts/check-semver.sh"
 
 step "Leaf crate publish dry-runs" bash -c '
   set -euo pipefail

@@ -1,17 +1,24 @@
 name: Mutants
 
-# AX-028: mutation-testing sweep. Runs on every PR (touch-only via
-# `--in-diff`) and on a weekly schedule for a fuller pass over the
-# whole workspace. Per-file kill rate is summarised on the workflow
-# job summary so a regression on a previously-clean file shows up at
-# review time.
+# Mutation testing. On a pull request it mutates only the lines the PR
+# touches (`--in-diff`) and fails on a survivor; on the weekly schedule it
+# mutates the whole workspace, sharded so every shard finishes inside the
+# job limit, and reports the kill rate per file.
+#
+# The sweep refuses to be blind. Until this layout every scheduled run
+# since the workflow existed was cancelled at the 6 h job limit with no
+# outcomes, and passed with a warning. Now the summary job fails the run
+# when any shard is missing, cancelled, unfinished or short, or when the
+# shards together tested a different number of mutants than the plan
+# listed. `scripts/mutants-sweep.sh` holds the per-shard flags and the
+# sizing arithmetic; `scripts/mutants-summary.py` holds the refusals and
+# proves them with `--self-test` in the plan job.
 
 on:
   pull_request:
     branches: [main, develop]
   schedule:
-    # Sunday 03:00 UTC: full sweep so mainline kill rates have a
-    # weekly reference point even when no PR has been opened.
+    # Sunday 03:00 UTC.
     - cron: '0 3 * * 0'
   workflow_dispatch:
     inputs:
@@ -24,148 +31,197 @@ on:
 env:
   RUST_BACKTRACE: 1
   CARGO_TERM_COLOR: always
+  # Bump in lockstep with the local dev environment.
+  CARGO_MUTANTS_VERSION: 27.0.0
 
 jobs:
-  mutants:
-    name: cargo-mutants
+  plan:
+    name: Plan the sweep
     runs-on: ubuntu-latest
-
-    # No `services:` block: mutants invokes `cargo test --lib` per the
-    # workspace `mutants.toml`, which excludes infra-dependent
-    # integration tests. Bringing up Valkey / Postgres here would just
-    # slow the sweep down. If a future mutants run depends on
-    # integration tests, mirror the services block from `ci.yml`.
-
+    timeout-minutes: 30
+    outputs:
+      mode: ${{ steps.scope.outputs.mode }}
+      total: ${{ steps.plan.outputs.total }}
+      shards: ${{ steps.plan.outputs.shards }}
+      matrix: ${{ steps.plan.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
-          # cargo-mutants `--in-diff` needs the merge-base to compare
-          # against. fetch-depth=0 grabs the full history; for PRs on
-          # large repos a shallower fetch with `git fetch origin main`
-          # would also work.
+          # `--in-diff` needs the merge base to diff against.
           fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          # Mutants rebuilds the workspace per probe; a warm target
-          # cache is the difference between minutes and hours.
-          shared-key: mutants
+      - name: Prove the summary's refusals
+        run: python3 scripts/mutants-summary.py --self-test
 
       - name: Install cargo-mutants
-        # Pin a known-good version. Bump in lockstep with the local
-        # dev environment to avoid silent behaviour drift between CI
-        # and local runs.
-        run: cargo install cargo-mutants --version 27.0.0 --locked
+        run: cargo install cargo-mutants --version "$CARGO_MUTANTS_VERSION" --locked
 
       - name: Determine sweep scope
         id: scope
         run: |
           set -eu
+          mkdir -p plan
           if [ "${{ github.event_name }}" = "schedule" ] || \
              [ "${{ inputs.full_sweep }}" = "true" ]; then
             echo "mode=full" >> "$GITHUB_OUTPUT"
-            echo "args=" >> "$GITHUB_OUTPUT"
+            : > plan/args
           else
             echo "mode=in-diff" >> "$GITHUB_OUTPUT"
-            # `--in-diff` consumes a unified diff on stdin or a file path.
-            # We materialise the PR diff once so the run is self-contained.
             git fetch origin "${{ github.base_ref }}"
-            git diff "origin/${{ github.base_ref }}"...HEAD > pr.diff
-            wc -l pr.diff
-            echo "args=--in-diff pr.diff" >> "$GITHUB_OUTPUT"
+            git diff "origin/${{ github.base_ref }}"...HEAD > plan/pr.diff
+            wc -l plan/pr.diff
+            echo "--in-diff plan/pr.diff" > plan/args
           fi
+          cp "$(command -v cargo-mutants)" plan/cargo-mutants
 
-      - name: Run cargo-mutants
-        id: mutants
-        # `--no-shuffle` keeps the per-file ordering stable across
-        # runs so the summary diff is meaningful.
-        # `--json` emits machine-readable output to a directory we
-        # can post-process for the per-file kill rate.
-        run: |
-          set +e
-          cargo mutants \
-            ${{ steps.scope.outputs.args }} \
-            --no-shuffle \
-            --output mutants.out \
-            --json
-          status=$?
-          echo "exit_status=$status" >> "$GITHUB_OUTPUT"
-          # Don't fail the step yet: we want the summary to render
-          # before exiting. Final fail/pass decision is in the next
-          # step.
-          exit 0
-
-      - name: Summarise per-file kill rate
-        if: always()
+      - name: Size the matrix
+        id: plan
         run: |
           set -eu
-          if [ ! -f mutants.out/outcomes.json ]; then
-            echo "::warning::cargo-mutants produced no outcomes.json: sweep may have aborted before producing output."
+          # shellcheck disable=SC2046
+          scripts/mutants-sweep.sh plan $(cat plan/args) > plan/sizing
+          cat plan/sizing
+          total=$(sed -n 's/^total=//p' plan/sizing)
+          shards=$(sed -n 's/^shards=//p' plan/sizing)
+          if [ "${{ steps.scope.outputs.mode }}" = "full" ] && [ "$total" -eq 0 ]; then
+            echo "::error::the full sweep listed no mutants: the cargo-mutants config selects nothing."
+            exit 1
+          fi
+          echo "total=$total" >> "$GITHUB_OUTPUT"
+          echo "shards=$shards" >> "$GITHUB_OUTPUT"
+          echo "matrix=$(python3 -c "import json; print(json.dumps(list(range($shards))))")" >> "$GITHUB_OUTPUT"
+
+      - name: Hand the plan to the shards
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutants-plan
+          path: plan/
+          retention-days: 7
+          if-no-files-found: error
+
+  baseline:
+    # The full sweep runs the unmutated suite once, here, in place of a
+    # baseline in each of its shards (`--baseline skip` there). Its cache is
+    # the one the shards restore. A pull request's single shard runs its own
+    # baseline over just the packages its diff touches.
+    name: Unmutated baseline
+    needs: plan
+    if: needs.plan.outputs.mode == 'full'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: mutants
+      - name: Test the default members with every feature, as each mutant is tested
+        run: cargo test --all-features
+
+  shard:
+    name: cargo-mutants shard ${{ matrix.shard }}
+    needs: [plan, baseline]
+    if: >-
+      always() && needs.plan.result == 'success' && needs.plan.outputs.total != '0' &&
+      (needs.baseline.result == 'success' ||
+       (needs.baseline.result == 'skipped' && needs.plan.outputs.mode == 'in-diff'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      # A free organisation has 20 concurrent jobs; the sweep takes ten so
+      # pull-request CI is not queued behind it for days.
+      max-parallel: 10
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      # cargo-mutants builds in a copy of the tree; pointing it at the
+      # restored target keeps the dependencies warm there too.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      MUTANTS_BASELINE: ${{ needs.plan.outputs.mode == 'full' && 'skip' || 'run' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: mutants
+          save-if: false
+      - name: Fetch the plan
+        uses: actions/download-artifact@v8
+        with:
+          name: mutants-plan
+          path: plan
+      - name: Run shard ${{ matrix.shard }} of ${{ needs.plan.outputs.shards }}
+        timeout-minutes: 300
+        run: |
+          set -eu
+          install -m 0755 plan/cargo-mutants "$HOME/.cargo/bin/cargo-mutants"
+          # shellcheck disable=SC2046
+          scripts/mutants-sweep.sh shard "${{ matrix.shard }}" "${{ needs.plan.outputs.shards }}" out $(cat plan/args)
+      - name: Upload shard ${{ matrix.shard }}
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutants-shard-${{ matrix.shard }}
+          path: out/
+          retention-days: 30
+          if-no-files-found: error
+
+  summary:
+    name: Mutation summary
+    needs: [plan, baseline, shard]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Refuse a sweep whose jobs did not all succeed
+        run: |
+          set -eu
+          if [ "${{ needs.plan.result }}" != "success" ]; then
+            echo "::error::the plan job ended '${{ needs.plan.result }}': nothing was measured."
+            exit 1
+          fi
+          if [ "${{ needs.plan.outputs.total }}" = "0" ]; then
+            echo "No mutants in the diff; nothing to measure."
             exit 0
           fi
-          python3 - <<'PY'
-          import collections
-          import json
-          import os
-          import pathlib
-
-          # cargo-mutants 27.x JSON shape:
-          #   {"outcomes": [{"scenario": "Baseline" | {"Mutant": {"file": "..."}}, "summary": "Success"|"Caught"|"Missed"|...}]}
-          # The Baseline entry has `scenario == "Baseline"` (string); skip it.
-          outcomes_path = pathlib.Path("mutants.out/outcomes.json")
-          data = json.loads(outcomes_path.read_text())
-          per_file = collections.defaultdict(lambda: {"total": 0, "caught": 0, "missed": 0, "timeout": 0, "unviable": 0})
-          for entry in data.get("outcomes", []):
-              scenario = entry.get("scenario")
-              if not isinstance(scenario, dict) or "Mutant" not in scenario:
-                  continue
-              src = scenario["Mutant"].get("file") or "unknown"
-              status = (entry.get("summary") or "").lower()
-              bucket = per_file[src]
-              bucket["total"] += 1
-              if status in bucket:
-                  bucket[status] += 1
-          rows = []
-          for src, b in sorted(per_file.items()):
-              # Kill rate excludes unviable mutants from the denominator
-              # (an unviable mutant is one that doesn't compile, it's
-              # not a "missed" coverage gap, it's an artifact of the
-              # mutation operator). Keeps the rate honest.
-              denom = b["total"] - b["unviable"]
-              kill_rate = (b["caught"] / denom) * 100.0 if denom else 100.0
-              rows.append((kill_rate, src, b))
-
-          summary = pathlib.Path(os.environ["GITHUB_STEP_SUMMARY"])
-          with summary.open("a") as f:
-              f.write("## cargo-mutants per-file kill rate\n\n")
-              f.write("| Kill rate | File | caught/missed/timeout/unviable / total |\n")
-              f.write("|----------:|------|---------------------------------------:|\n")
-              for kr, src, b in sorted(rows):
-                  marker = "✅" if kr >= 80.0 else ("⚠️" if kr >= 50.0 else "❌")
-                  f.write(
-                      f"| {marker} {kr:5.1f}% | `{src}` | "
-                      f"{b['caught']}/{b['missed']}/{b['timeout']}/{b['unviable']} / {b['total']} |\n"
-                  )
-
-          # Also print a brief stdout so the raw log is useful.
-          print("Per-file kill rate (lowest first):")
-          for kr, src, b in sorted(rows):
-              print(f"  {kr:5.1f}%  {src}  ({b['caught']}/{b['total']} caught)")
-          PY
-
-      - name: Upload mutants output
-        if: always()
-        uses: actions/upload-artifact@v4
+          baseline="${{ needs.baseline.result }}"
+          if [ "${{ needs.plan.outputs.mode }}" = "in-diff" ] && [ "$baseline" = "skipped" ]; then
+            baseline=success
+          fi
+          for job in "baseline:$baseline" "shard:${{ needs.shard.result }}"; do
+            if [ "${job#*:}" != "success" ]; then
+              echo "::error::the ${job%%:*} job(s) ended '${job#*:}': the sweep is incomplete, so its kill rate is not a measurement."
+              exit 1
+            fi
+          done
+      - name: Fetch every shard
+        if: needs.plan.outputs.total != '0'
+        uses: actions/download-artifact@v8
         with:
-          name: mutants-${{ steps.scope.outputs.mode }}
-          path: mutants.out/
-          retention-days: 30
-
-      - name: Enforce no surviving mutants on PRs
-        if: github.event_name == 'pull_request' && steps.mutants.outputs.exit_status != '0'
+          pattern: mutants-shard-*
+          path: shards
+          merge-multiple: true
+      - name: Merge the shards and refuse a blind sweep
+        if: needs.plan.outputs.total != '0'
         run: |
-          echo "::error::cargo-mutants reported survived mutants on this PR."
-          echo "Inspect the per-file kill-rate summary above and the uploaded artifact."
-          exit 1
+          set -eu
+          gate=""
+          if [ "${{ needs.plan.outputs.mode }}" = "in-diff" ]; then
+            gate="--fail-on-missed"
+          fi
+          python3 scripts/mutants-summary.py shards \
+            --shards "${{ needs.plan.outputs.shards }}" \
+            --expected-total "${{ needs.plan.outputs.total }}" \
+            $gate
+      - name: Upload the merged outcomes
+        if: always() && needs.plan.outputs.total != '0'
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutants-${{ needs.plan.outputs.mode }}
+          path: shards/outcomes-merged.json
+          retention-days: 30
+          if-no-files-found: warn

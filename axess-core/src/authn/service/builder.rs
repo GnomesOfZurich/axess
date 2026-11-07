@@ -10,9 +10,17 @@ use axess_clock::{Clock, SystemClock};
 use axess_rng::{SecureRng, SystemRng};
 use std::sync::Arc;
 
+pub use account_limits::{DEFAULT_CANDIDATE_TTL, DEFAULT_MAX_LIVE_RESET_TOKENS};
+
+mod account_limits;
 mod breached_password;
+mod removers;
+use removers::{RefreshStoreRevoker, RowRemover};
+pub(crate) use removers::{SessionRowRemover, UserTokenRevoker};
 #[cfg(feature = "oauth")]
 mod duplicate_providers;
+#[cfg(feature = "oauth")]
+mod federation;
 
 /// Configures an [`AuthnService`], and is what the built handle shares.
 ///
@@ -57,6 +65,11 @@ where
     /// How long the secret `begin_signup` mints completes the signup; see
     /// [`with_signup_verification_ttl`](Self::with_signup_verification_ttl).
     pub(crate) signup_verification_ttl: std::time::Duration,
+    /// How long an unverified `Candidate` account holds its identifier; see
+    /// [`with_candidate_ttl`](Self::with_candidate_ttl).
+    pub(crate) candidate_ttl: std::time::Duration,
+    /// See [`with_max_live_reset_tokens`](Self::with_max_live_reset_tokens).
+    pub(crate) max_live_reset_tokens: usize,
     /// Whether an impersonated session may issue refresh tokens and enrol
     /// or delete factors; see
     /// [`with_impersonated_credential_changes_allowed`](Self::with_impersonated_credential_changes_allowed).
@@ -116,6 +129,10 @@ where
     /// The timestamp enables TTL-based eviction of stale entries.
     #[cfg(feature = "oauth")]
     pub(crate) sid_map: crate::federation::sid_map::SidMap,
+    /// A store that replaces [`sid_map`](Self::sid_map) for the login path,
+    /// set by [`with_sid_store`](AuthnServiceBuilder::with_sid_store).
+    #[cfg(feature = "oauth")]
+    pub(crate) sid_store: Option<Arc<dyn crate::federation::sid_store::SidStore>>,
     /// Capacity cap for [`sid_map`](Self::sid_map). When at/over this
     /// count, `maintain_oidc_sid_map` evicts a batch of oldest entries.
     /// High-throughput OAuth deployments raise this via
@@ -151,56 +168,6 @@ pub const DEFAULT_SIGNUP_VERIFICATION_TTL: std::time::Duration =
 /// ten minutes. Change it with [`AuthnServiceBuilder::with_flow_ttl`].
 pub const DEFAULT_FLOW_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
-/// Deletes one stored session row, behind a trait object so the service does
-/// not take the session store's type as a parameter.
-pub(crate) trait SessionRowRemover: Send + Sync {
-    /// Delete the row of `id`. The error is its text.
-    fn delete_row<'a>(
-        &'a self,
-        id: &'a crate::session::id::SessionId,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
-}
-
-struct RowRemover<S>(S);
-
-impl<S: crate::session::store::SessionStore> SessionRowRemover for RowRemover<S> {
-    fn delete_row<'a>(
-        &'a self,
-        id: &'a crate::session::id::SessionId,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
-        Box::pin(async move { self.0.delete(id).await.map_err(|e| e.to_string()) })
-    }
-}
-
-/// The one refresh-token operation the credential-change paths need, behind a
-/// trait object so the service does not take the store's type as a parameter.
-pub(crate) trait UserTokenRevoker: Send + Sync {
-    /// Revoke every refresh token of `user_id`. The error is its text.
-    fn revoke_user_tokens<'a>(
-        &'a self,
-        user_id: &'a crate::authn::ids::UserId,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
-}
-
-struct RefreshStoreRevoker<R>(R);
-
-impl<R> UserTokenRevoker for RefreshStoreRevoker<R>
-where
-    R: crate::session::refresh::RefreshTokenStore + 'static,
-{
-    fn revoke_user_tokens<'a>(
-        &'a self,
-        user_id: &'a crate::authn::ids::UserId,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
-        Box::pin(async move {
-            self.0
-                .revoke_user_tokens(user_id)
-                .await
-                .map_err(|e| e.to_string())
-        })
-    }
-}
-
 /// Default interval of the JWKS refresh loop the builder starts: one hour.
 /// Well inside the 24 hour maximum age of a cached key set, so a few failed
 /// refreshes in a row do not stop verification.
@@ -218,6 +185,16 @@ where
     I: IdentityStore,
     F: FactorStore<Error = I::Error>,
 {
+    /// The store the login path writes the `sid` mapping and subject record
+    /// to: the one set with `with_sid_store`, else the in-process map.
+    #[cfg(feature = "oauth")]
+    pub(crate) fn sid_store(&self) -> Arc<dyn crate::federation::sid_store::SidStore> {
+        match &self.sid_store {
+            Some(store) => Arc::clone(store),
+            None => Arc::new(self.sid_map.clone()),
+        }
+    }
+
     /// Start configuring a service. Finish with [`build`](Self::build).
     pub fn new(identity: I, factors: F) -> Self {
         Self {
@@ -237,6 +214,8 @@ where
             reset_requests: None,
             reveal_signup_conflicts: false,
             signup_verification_ttl: DEFAULT_SIGNUP_VERIFICATION_TTL,
+            candidate_ttl: DEFAULT_CANDIDATE_TTL,
+            max_live_reset_tokens: DEFAULT_MAX_LIVE_RESET_TOKENS,
             impersonated_credential_changes: false,
             reveal_lockout_on_begin: false,
             #[cfg(feature = "device")]
@@ -263,6 +242,8 @@ where
             tenant_oauth_providers: None,
             #[cfg(feature = "oauth")]
             sid_map: Default::default(),
+            #[cfg(feature = "oauth")]
+            sid_store: None,
             #[cfg(feature = "oauth")]
             sid_map_capacity: DEFAULT_SID_MAP_CAPACITY,
             #[cfg(feature = "oauth")]
@@ -374,136 +355,6 @@ where
         self
     }
 
-    /// Register an OAuth/OIDC identity provider.
-    ///
-    /// Call once per provider at startup. Multiple providers can be registered
-    /// (e.g. Google + GitHub + corporate IdP), each under a distinct name.
-    ///
-    /// **Duplicate name safety.** Registering two providers under the same
-    /// `provider.name()` is a real security-relevant misconfiguration
-    /// (token exchanges for that IdP would then run against whichever
-    /// credentials won the race). The registry emits `tracing::warn!` on
-    /// overwrite and `debug_assert!`s in debug builds; production builds
-    /// keep the new registration and continue, so operators still notice
-    /// via logs.
-    ///
-    /// # Tenancy
-    ///
-    /// **Providers are registered globally on `AuthnService`, not per-tenant.**
-    /// The library does not maintain a per-tenant OAuth registry; that is
-    /// out of scope by design. Two supported patterns:
-    ///
-    /// 1. **Same IdP, multiple tenants (single shared client).** Tenant A
-    ///    and tenant B both federate to the same IdP (e.g. one Azure AD
-    ///    app serving two SaaS tenants). The callback alone cannot tell
-    ///    them apart; the application MUST use
-    ///    [`begin_oauth_login_in_tenant`](AuthnService::begin_oauth_login_in_tenant)
-    ///    to bind the ceremony to a tenant up-front, and the
-    ///    claims→user resolver MUST scope its lookup to the bound tenant.
-    /// 2. **Distinct IdPs, one per set of tenants.** Register one provider
-    ///    per IdP under a stable name (`"acme-corp-azure"`, `"beta-corp-okta"`,
-    ///    etc.); the application maps a tenant → provider-name in its own
-    ///    tenant record and calls [`begin_oauth_login`](AuthnService::begin_oauth_login)
-    ///    with the resolved name. Provider names are stable identifiers,
-    ///    NOT dynamic per-tenant strings: do not derive them from
-    ///    `tenant_id` at registration time (would require re-registration
-    ///    on every tenant create/delete, would collide with reserved
-    ///    identifier characters, and would defeat the introspection story
-    ///    on [`oauth_providers`](AuthnService::oauth_providers)).
-    ///
-    /// If you need genuinely dynamic per-tenant IdP configuration
-    /// (each tenant admin uploads their own client_secret through a UI,
-    /// changing at runtime), use
-    /// [`with_tenant_oauth_providers`](Self::with_tenant_oauth_providers):
-    /// the provider is resolved by `(tenant, name)` from a store at request
-    /// time and an update is used by the next login.
-    #[cfg(feature = "oauth")]
-    pub fn with_oauth_provider(
-        mut self,
-        provider: impl axess_factors::oauth::OAuthProvider,
-    ) -> Self {
-        if self.oauth_providers.add(provider) {
-            self.duplicate_providers += 1;
-        }
-        self
-    }
-
-    /// Resolve per-tenant OAuth providers (bring your own IdP) from
-    /// `providers` at request time.
-    ///
-    /// A login started with
-    /// [`begin_oauth_login_with_tenant_provider`](AuthnService::begin_oauth_login_with_tenant_provider)
-    /// asks `providers` for the provider named `(tenant, name)`; the
-    /// callback asks again for the same tenant, taken from the session. The
-    /// global registrations of
-    /// [`with_oauth_provider`](Self::with_oauth_provider) are unaffected and
-    /// remain the single-tenant form: a name registered there is reached by
-    /// [`begin_oauth_login`](AuthnService::begin_oauth_login), a tenant's by
-    /// the tenant method, and the two never shadow each other.
-    ///
-    /// [`StoredTenantOAuthProviders`](crate::federation::oauth_tenant::StoredTenantOAuthProviders)
-    /// is the implementation over a store.
-    #[cfg(feature = "oauth")]
-    pub fn with_tenant_oauth_providers(
-        mut self,
-        providers: impl crate::federation::oauth_tenant::TenantOAuthProviders,
-    ) -> Self {
-        self.tenant_oauth_providers = Some(Arc::new(providers));
-        self
-    }
-
-    /// Override the capacity cap for the OIDC `sid` → local-session map that
-    /// powers back-channel logout by `sid`.
-    ///
-    /// The map is populated per successful OAuth login that returns an
-    /// `oidc_sid` claim; when at/over this cap, the maintenance path
-    /// evicts a batch of oldest entries. Default:
-    /// [`DEFAULT_SID_MAP_CAPACITY`] (10 000). Raise for high-throughput
-    /// deployments where legitimate concurrent OIDC sessions exceed the
-    /// default and back-channel logout precision degrades on eviction.
-    #[cfg(feature = "oauth")]
-    pub fn with_sid_map_capacity(mut self, capacity: usize) -> Self {
-        self.sid_map_capacity = capacity;
-        self
-    }
-
-    /// Have [`build`](Self::build) start a background loop that refreshes the
-    /// JWKS of every registered OAuth provider every `interval`.
-    ///
-    /// Cached key sets have a maximum age (24 hours by default,
-    /// `JwksCache::with_max_age`), after which verification with them fails
-    /// closed until a refresh succeeds. Without this loop (or an equivalent
-    /// started with `AuthnService::spawn_jwks_refresh` or a scheduler calling
-    /// `AuthnService::refresh_all_jwks`) the keys expire by that maximum age
-    /// and logout-token verification then relies on the refresh a kid miss
-    /// triggers. The loop stops when the last clone of the built service is
-    /// dropped. It needs a tokio runtime at `build` time: without one it is
-    /// not started and a warning is logged.
-    #[cfg(feature = "oauth")]
-    pub fn with_jwks_refresh(mut self, interval: std::time::Duration) -> Self {
-        self.jwks_refresh_interval = Some(interval);
-        self
-    }
-
-    /// [`with_jwks_refresh`](Self::with_jwks_refresh) at the default
-    /// interval, [`DEFAULT_JWKS_REFRESH_INTERVAL`] (one hour).
-    #[cfg(feature = "oauth")]
-    pub fn with_default_jwks_refresh(self) -> Self {
-        self.with_jwks_refresh(DEFAULT_JWKS_REFRESH_INTERVAL)
-    }
-
-    /// Start the refresh loop `with_jwks_refresh` asked for, if any.
-    #[cfg(feature = "oauth")]
-    fn with_jwks_refresh_started(mut self) -> Self {
-        if let Some(interval) = self.jwks_refresh_interval {
-            self.jwks_refresh_task = super::oauth_service::JwksRefreshTask::start(
-                super::oauth_service::live_providers(self.oauth_providers.handle()),
-                interval,
-            );
-        }
-        self
-    }
-
     /// Attach a session registry for forced-logout support.
     pub fn with_registry(mut self, registry: impl SessionRegistry + 'static) -> Self {
         self.registry = Some(Arc::new(SessionRegistryAdapter(registry)));
@@ -599,12 +450,13 @@ where
     ///
     /// The record lives in this process, on the injected clock, and holds at
     /// most [`RESET_COOLDOWN_CAPACITY`] identifiers, each for the cooldown
-    /// and no longer. A cooldown that has not run out is never pushed out by
-    /// other identifiers, so a flood of them cannot clear one person's;
-    /// instead, when that many cooldowns are live, a new identifier is
-    /// answered `Ok(None)` until one runs out. A caller who mints
-    /// identifiers can therefore hold the reset route shut for a cooldown at
-    /// a time; the rate limit on the route is what bounds that. A deployment of several instances applies the
+    /// and no longer. When that many are live, the oldest is dropped to
+    /// make room, so a caller who mints identifiers cannot refuse a real
+    /// user's reset: a refusal falls only on an identifier that is itself
+    /// cooling down. What bounds the mail an account is sent is the limit on
+    /// its live reset tokens
+    /// ([`with_max_live_reset_tokens`](Self::with_max_live_reset_tokens)). A
+    /// deployment of several instances applies the
     /// cooldown per instance; put the route behind a shared rate limit for a
     /// bound across them. The default is
     /// [`DEFAULT_PASSWORD_RESET_COOLDOWN`], a minute.
@@ -646,6 +498,15 @@ where
     /// holds for everyone. See
     /// [`LockoutPolicy`](crate::authn::types::LockoutPolicy). An
     /// administrator's suspension is not affected.
+    ///
+    /// **The session's device must be one the client proved.** Wire the
+    /// session layer with
+    /// [`LifecycleDeviceResolver`](crate::device::LifecycleDeviceResolver),
+    /// which binds a device only on its secret cookie token. A resolver that
+    /// binds by fingerprint alone (for example through
+    /// [`DeviceLifecycleService::ensure_device`](crate::device::DeviceLifecycleService::ensure_device)
+    /// with no user) lets anyone sharing the victim's address and headers
+    /// ride the victim's `Seen` device past the lockout.
     #[cfg(feature = "device")]
     #[must_use]
     pub fn with_device_store<D: crate::device::DeviceStore>(mut self, devices: D) -> Self {

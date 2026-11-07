@@ -81,7 +81,7 @@ async fn run(fail: bool) -> (Vec<IdpSessionEnded>, bool, StatusCode) {
     let user = axess_identity::testing::user("user-1");
     for s in [&x, &y] {
         registry.register(&user, s).await.unwrap();
-        sid_map.register_subject_session(ISS, "idp-sub", user, *s);
+        sid_map.register_subject_session(ISS, "idp-sub", None, user, *s);
     }
 
     // No `sid`: both sessions of the subject end, and both are reported.

@@ -57,6 +57,7 @@ impl OAuthProviderConfig {
             client_id,
             Some(ClientSecret::new(client_secret.to_string())),
             redirect_url,
+            crate::egress::EgressPolicy::unscreened(),
         )
         .await
     }
@@ -78,8 +79,69 @@ impl OAuthProviderConfig {
         redirect_url: &str,
     ) -> Result<OAuthProviderBuilder, OAuthError> {
         let client_id = signer.client_id().to_string();
+        Ok(Self::discover_with(
+            name,
+            issuer_url,
+            &client_id,
+            None,
+            redirect_url,
+            crate::egress::EgressPolicy::unscreened(),
+        )
+        .await?
+        .with_private_key_jwt(signer))
+    }
+
+    /// As [`discover`](Self::discover) for an issuer URL a tenant supplied:
+    /// `policy` screens the issuer URL, every endpoint the discovery document
+    /// names, and the addresses each request connects to, so the server is
+    /// not made a request proxy into the loopback interface or the private
+    /// network. See [`EgressPolicy`](crate::egress::EgressPolicy) for the
+    /// policies and the named opt-out.
+    ///
+    /// [`discover`](Self::discover) itself takes a URL the operator wrote and
+    /// applies only the transport rule (HTTPS, or loopback HTTP).
+    ///
+    /// # Errors
+    ///
+    /// As [`discover`](Self::discover); [`OAuthError::Config`] names the URL
+    /// the policy refused and why.
+    pub async fn discover_screened(
+        name: &str,
+        issuer_url: &str,
+        client_id: &str,
+        client_secret: &str,
+        redirect_url: &str,
+        policy: crate::egress::EgressPolicy,
+    ) -> Result<OAuthProviderBuilder, OAuthError> {
+        Self::discover_with(
+            name,
+            issuer_url,
+            client_id,
+            Some(ClientSecret::new(client_secret.to_string())),
+            redirect_url,
+            policy,
+        )
+        .await
+    }
+
+    /// As [`discover_screened`](Self::discover_screened), authenticating to
+    /// the token endpoint by `private_key_jwt` as
+    /// [`discover_with_private_key_jwt`](Self::discover_with_private_key_jwt)
+    /// does.
+    ///
+    /// # Errors
+    ///
+    /// As [`discover_screened`](Self::discover_screened).
+    pub async fn discover_screened_with_private_key_jwt(
+        name: &str,
+        issuer_url: &str,
+        signer: crate::client_assertion::ClientAssertionSigner,
+        redirect_url: &str,
+        policy: crate::egress::EgressPolicy,
+    ) -> Result<OAuthProviderBuilder, OAuthError> {
+        let client_id = signer.client_id().to_string();
         Ok(
-            Self::discover_with(name, issuer_url, &client_id, None, redirect_url)
+            Self::discover_with(name, issuer_url, &client_id, None, redirect_url, policy)
                 .await?
                 .with_private_key_jwt(signer),
         )
@@ -91,6 +153,7 @@ impl OAuthProviderConfig {
         client_id: &str,
         client_secret: Option<ClientSecret>,
         redirect_url: &str,
+        policy: crate::egress::EgressPolicy,
     ) -> Result<OAuthProviderBuilder, OAuthError> {
         // Reject non-HTTPS issuer URLs to prevent MITM during OIDC discovery.
         // Allow http://localhost / 127.0.0.1 / [::1] for local development.
@@ -100,6 +163,9 @@ impl OAuthProviderConfig {
                     .to_string(),
             ));
         }
+        policy
+            .check_url(issuer_url, "issuer URL")
+            .map_err(|e| OAuthError::Config(e.to_string()))?;
 
         let issuer = IssuerUrl::new(issuer_url.to_string())
             .map_err(|e| OAuthError::Config(format!("invalid issuer URL: {e}")))?;
@@ -108,8 +174,8 @@ impl OAuthProviderConfig {
         // 30-second timeout for individual HTTP operations (discovery, token
         // exchange, JWKS fetch). This is distinct from `ceremony_timeout` which
         // bounds the entire OAuth redirect flow (default 10 min).
-        let http_client = openidconnect::reqwest::ClientBuilder::new()
-            .redirect(openidconnect::reqwest::redirect::Policy::none())
+        let http_client = policy
+            .client_builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| OAuthError::Config(format!("HTTP client build failed: {e}")))?;
@@ -119,9 +185,18 @@ impl OAuthProviderConfig {
         // the key set's transport; the typed metadata is parsed from the
         // same bytes, so the endpoints the provider calls and the optional
         // endpoints read below cannot come from two answers that differ.
-        let extras = crate::oidc::discovery::DiscoveryDocument::fetch(issuer_url, &http_client)
-            .await
-            .map_err(|e| OAuthError::Discovery(format!("{e}")))?;
+        let extras = crate::oidc::discovery::DiscoveryDocument::fetch_screened(
+            issuer_url,
+            &http_client,
+            policy,
+        )
+        .await
+        .map_err(|e| match e {
+            crate::oidc::OidcError::EgressRefused { setting, range } => {
+                OAuthError::Config(format!("{setting} refused: {range}"))
+            }
+            other => OAuthError::Discovery(format!("{other}")),
+        })?;
         let metadata: CoreProviderMetadata = serde_json::from_value(extras.raw.clone())
             .map_err(|e| OAuthError::Discovery(format!("discovery document: {e}")))?;
         if metadata.issuer().as_str() != issuer.as_str() {

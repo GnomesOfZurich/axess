@@ -493,3 +493,15 @@ async fn an_oversized_payload_is_refused_and_the_old_row_kept() {
         "admin"
     );
 }
+
+#[tokio::test]
+#[ignore = "requires a running Postgres (POSTGRES_URL)"]
+async fn a_session_carrying_assurance_round_trips() {
+    let store = store().await;
+    let id = new_id();
+    let data = crate::session::data::assured_fixture::assured_session();
+    store.save(&id, &data, TTL).await.unwrap();
+    let back = store.load(&id).await.unwrap().expect("stored");
+    assert_eq!(back.auth_state, data.auth_state);
+    assert_eq!(back.auth_state.assurance(), data.auth_state.assurance());
+}

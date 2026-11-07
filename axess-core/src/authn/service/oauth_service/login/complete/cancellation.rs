@@ -81,12 +81,13 @@ async fn fixture(delay: Duration) -> Fixture {
     );
     for s in [&aged, &displaced, &newcomer] {
         registry.inner.register(&user, s).await.unwrap();
-        sid_map.register_subject_session(ISS, &user.to_string(), user, *s);
+        sid_map.register_subject_session(ISS, &user.to_string(), None, user, *s);
     }
     let now = chrono::Utc::now();
     sid_map.insert(
         (ISS.into(), "sid-1".into()),
         &user.to_string(),
+        None,
         user,
         displaced,
         now,
@@ -104,7 +105,7 @@ async fn fixture(delay: Duration) -> Fixture {
 fn pending_for(f: &Fixture, newcomer_user: UserId) -> PendingEnds {
     let handle: Arc<dyn SessionRegistryHandle> =
         Arc::new(SessionRegistryAdapter(f.registry.clone()));
-    let mut pending = PendingEnds::new(Some(handle), f.sid_map.clone());
+    let mut pending = PendingEnds::new(Some(handle), std::sync::Arc::new(f.sid_map.clone()));
     pending.age_out((ISS.to_string(), f.user, f.aged));
     let key = (ISS.to_string(), "sid-1".to_string());
     let rng = MockRng::new(99);
@@ -113,6 +114,7 @@ fn pending_for(f: &Fixture, newcomer_user: UserId) -> PendingEnds {
         .insert_displacing(
             key.clone(),
             &newcomer_user.to_string(),
+            None,
             newcomer_user,
             SessionId::new(&rng),
             chrono::Utc::now(),

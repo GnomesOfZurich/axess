@@ -1,6 +1,7 @@
 //! Session payload: the typed data stored in the session store per session.
 
 use crate::authn::{
+    assurance::{FactorAssurance, record_proof},
     factor::{FactorKind, FactorStep},
     ids::{DeviceId, TenantId, UserId},
 };
@@ -67,6 +68,18 @@ pub struct SessionData {
     /// [`docs/identity/device.md`](../../../docs/identity/device.md).
     #[serde(default)]
     pub device_id: Option<DeviceId>,
+    /// Whether `device_id` is a device the client proved it holds (the
+    /// secret token on its cookie, through
+    /// [`DeviceLifecycleService::resolve_proven`](crate::device::DeviceLifecycleService::resolve_proven)),
+    /// and not one a resolver found by fingerprint alone. Only the session
+    /// layer sets it, from what the device resolver reports; a lockout
+    /// exemption reads the device through
+    /// [`AuthSession::proven_device`](super::extractor::AuthSession::proven_device),
+    /// which answers only when this is `true`. A session stored before this
+    /// field existed reads `false` until its next request resolves the device
+    /// again.
+    #[serde(default)]
+    pub device_proven: bool,
     /// Escape hatch for application-specific data stored alongside the session.
     pub custom: serde_json::Value,
     /// Write counter: the session layer raises it on every write to the
@@ -89,6 +102,13 @@ pub struct SessionData {
 /// transition to `Authenticated` keeps it: the registration step that follows
 /// reads it to check the credentials did not change meanwhile.
 pub(crate) const LOGIN_FLOW_KEY: &str = "axess.login.flow";
+
+/// Custom key under which a step-up begun for a named FIDO2 ceremony keeps
+/// it, for the challenge the step's `prepare_factor` issues. A new login
+/// removes it and the transition to `Authenticated` drops it (it is not one
+/// of the keys [`retain_across_login`] keeps), so it never outlives its
+/// step-up.
+pub(crate) const STEP_UP_CEREMONY_KEY: &str = "axess.step_up.ceremony";
 
 /// Drop the pre-login contents of the custom bag when a session becomes
 /// authenticated, keeping the key the login service owns (the flow in
@@ -157,6 +177,7 @@ impl Default for SessionData {
             auth_state: AuthState::default(),
             fingerprint: None,
             device_id: None,
+            device_proven: false,
             custom: serde_json::Value::default(),
             revision: 0,
             touched_at: None,
@@ -281,6 +302,12 @@ pub enum AuthState {
         /// user's own session.
         #[serde(skip_serializing_if = "Option::is_none")]
         impersonator: Option<Impersonation>,
+        /// What each factor verified so far proved, the most recent proof
+        /// of each kind; carried into
+        /// [`AuthState::Authenticated::assurance`]. A step-up begins with
+        /// the record of the state it began from.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        assurance: Vec<FactorAssurance>,
     },
 
     /// All factors verified: user is fully authenticated.
@@ -323,6 +350,16 @@ pub enum AuthState {
         /// `AuthSession::ldap_groups`.
         #[serde(skip_serializing_if = "Option::is_none")]
         ldap_groups: Option<Vec<String>>,
+        /// What each verified factor proved, and when: the most recent
+        /// proof of each factor kind (see
+        /// [`FactorAssurance`]). Part of the authenticated state for the
+        /// same reasons as `impersonator`. Empty for a session that reached
+        /// this state without verifying a factor (impersonation, signup)
+        /// and for a session written before the field existed, and an empty
+        /// record satisfies no policy that asks for assurance. Read with
+        /// [`AuthState::assurance`].
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        assurance: Vec<FactorAssurance>,
     },
 
     /// Authenticated but blocked on a post-auth workflow (e.g. signup, KYC, password reset).
@@ -334,17 +371,6 @@ pub enum AuthState {
         /// Workflow currently blocking full authentication (e.g. signup, KYC).
         workflow: WorkflowState,
     },
-}
-
-/// An administrator acting in a user's name: who, and since when. Carried by
-/// [`AuthState::Authenticated::impersonator`] and returned by
-/// [`AuthSession::impersonation`](super::extractor::AuthSession::impersonation).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Impersonation {
-    /// The administrator.
-    pub admin: UserId,
-    /// When `begin_impersonation` made the session.
-    pub since: DateTime<Utc>,
 }
 
 impl AuthState {
@@ -425,6 +451,16 @@ impl AuthState {
         }
     }
 
+    /// What each factor of an authenticated session proved, the most recent
+    /// proof of each kind; empty for every other session and for a session
+    /// that recorded none.
+    pub fn assurance(&self) -> &[FactorAssurance] {
+        match self {
+            AuthState::Authenticated { assurance, .. } => assurance,
+            _ => &[],
+        }
+    }
+
     /// Return `true` if this is an unauthenticated guest session.
     pub fn is_guest(&self) -> bool {
         matches!(self, AuthState::Guest)
@@ -475,6 +511,7 @@ impl AuthState {
             last_attempt: None,
             ldap_groups: None,
             impersonator: None,
+            assurance: Vec::new(),
         };
     }
 
@@ -491,6 +528,7 @@ impl AuthState {
             factors_completed,
             ldap_groups,
             impersonator,
+            assurance,
             ..
         } = self
         else {
@@ -508,6 +546,7 @@ impl AuthState {
             // in the step-up replaces them.
             ldap_groups: ldap_groups.take(),
             impersonator: impersonator.take(),
+            assurance: std::mem::take(assurance),
         };
         true
     }
@@ -519,11 +558,29 @@ impl AuthState {
     /// where the IdP already enforced MFA). For MFA flows that complete
     /// through `advance_factor`, the `factors_completed` list is built
     /// from the prior `Authenticating` state's `completed` field.
+    ///
+    /// Records no assurance, which satisfies no assurance policy; the
+    /// shorthand the tests use for
+    /// [`set_authenticated_with`](Self::set_authenticated_with) without a
+    /// proof.
+    #[cfg(test)]
     pub(crate) fn set_authenticated(
         &mut self,
         user_id: UserId,
         tenant_id: TenantId,
         authn_time: DateTime<Utc>,
+    ) {
+        self.set_authenticated_with(user_id, tenant_id, authn_time, None);
+    }
+
+    /// [`set_authenticated`](Self::set_authenticated) recording `proof`,
+    /// what the transition itself verified (a federated login).
+    pub(crate) fn set_authenticated_with(
+        &mut self,
+        user_id: UserId,
+        tenant_id: TenantId,
+        authn_time: DateTime<Utc>,
+        proof: Option<FactorAssurance>,
     ) {
         *self = AuthState::Authenticated {
             user_id,
@@ -532,6 +589,7 @@ impl AuthState {
             factors_completed: Vec::new(),
             impersonator: None,
             ldap_groups: None,
+            assurance: proof.into_iter().collect(),
         };
     }
 
@@ -573,8 +631,9 @@ impl AuthState {
 
     /// Advance through a multi-factor flow.
     ///
-    /// Removes the first step `kind` satisfies from `remaining` (if any) and pushes `kind` to
-    /// `completed`. When `remaining` becomes empty, transitions to
+    /// Removes the first step `proof.kind` satisfies from `remaining` (if
+    /// any), pushes the kind to `completed` and records `proof` in
+    /// `assurance`, both at `proof.at`. When `remaining` becomes empty, transitions to
     /// `Authenticated` carrying the `completed` list as
     /// `factors_completed`. Returns the [`AdvanceOutcome`] describing
     /// what happened so the caller (`AuthSession::advance_factor`) can
@@ -585,11 +644,7 @@ impl AuthState {
     /// machine is defensive: calling `advance_factor` on `Guest` is a
     /// no-op rather than an error so partial-attribution audit emits
     /// can fire before reaching here without a panic risk.
-    pub(crate) fn advance_factor(
-        &mut self,
-        kind: &FactorKind,
-        authn_time: DateTime<Utc>,
-    ) -> AdvanceOutcome {
+    pub(crate) fn advance_factor(&mut self, proof: FactorAssurance) -> AdvanceOutcome {
         match self {
             AuthState::Authenticating {
                 user_id,
@@ -598,13 +653,17 @@ impl AuthState {
                 completed,
                 ldap_groups,
                 impersonator,
+                assurance,
                 ..
             } => {
+                let authn_time = proof.at;
                 // The step this factor satisfies is done; the factor itself
-                // (not the step's other choices) is what was completed.
-                if let Some(pos) = remaining.iter().position(|step| step.accepts(kind)) {
+                // (not the step's other choices) is what was completed, and
+                // what it proved is recorded beside it.
+                if let Some(pos) = remaining.iter().position(|step| step.accepts(&proof.kind)) {
                     remaining.remove(pos);
-                    completed.push((kind.clone(), authn_time));
+                    completed.push((proof.kind.clone(), authn_time));
+                    record_proof(assurance, proof);
                 }
                 if remaining.is_empty() {
                     let uid = *user_id;
@@ -612,6 +671,7 @@ impl AuthState {
                     let factors = std::mem::take(completed);
                     let ldap_groups = ldap_groups.take();
                     let impersonator = impersonator.take();
+                    let assurance = std::mem::take(assurance);
                     *self = AuthState::Authenticated {
                         user_id: uid,
                         tenant_id: tid,
@@ -619,6 +679,7 @@ impl AuthState {
                         factors_completed: factors,
                         impersonator,
                         ldap_groups,
+                        assurance,
                     };
                     AdvanceOutcome::Completed
                 } else {
@@ -668,68 +729,18 @@ pub(crate) enum AdvanceOutcome {
     Completed,
 }
 
-/// Post-authentication workflow tracking.
-///
-/// Used when the user is fully authenticated but must complete an additional
-/// workflow step before being granted full access (e.g. KYC, password reset).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct WorkflowState {
-    /// The kind of workflow that must be completed.
-    pub kind: WorkflowKind,
-    /// Zero-based index of the current step.
-    pub current_step: u32,
-    /// Total number of steps in this workflow.
-    pub total_steps: u32,
-    /// When this workflow was initiated.
-    pub initiated_at: DateTime<Utc>,
-    /// Lowercase hex SHA-256 of the secret that completes the workflow, when
-    /// it has one (signup). Only the digest is kept in the session.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verification_digest: Option<String>,
-    /// When the secret stops being accepted.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verification_expires_at: Option<DateTime<Utc>>,
-}
-
-impl WorkflowState {
-    /// Create a new workflow. Pass `clock.now()` as `now` for DST compatibility.
-    pub fn new(kind: WorkflowKind, total_steps: u32, now: DateTime<Utc>) -> Self {
-        Self {
-            kind,
-            current_step: 0,
-            total_steps,
-            initiated_at: now,
-            verification_digest: None,
-            verification_expires_at: None,
-        }
-    }
-
-    /// Require a secret to complete this workflow: its hex SHA-256 `digest`,
-    /// accepted until `expires_at`.
-    pub fn with_verification(mut self, digest: String, expires_at: DateTime<Utc>) -> Self {
-        self.verification_digest = Some(digest);
-        self.verification_expires_at = Some(expires_at);
-        self
-    }
-}
-
-/// The classification of a post-authentication workflow.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum WorkflowKind {
-    /// New-user registration workflow.
-    Signup,
-    /// Password reset flow initiated by the user or an admin.
-    PasswordReset,
-    /// Email verification after account creation or address change.
-    EmailVerification,
-    /// Application-defined workflow with a custom name.
-    Custom(Arc<str>),
-}
-
+mod impersonation;
+pub use impersonation::Impersonation;
+mod workflow;
+pub use workflow::{WorkflowKind, WorkflowState};
 mod wire;
 use wire::AuthStateWire;
 mod merge;
 pub(crate) use merge::{merge_concurrent, merge_rotating};
 
+#[cfg(test)]
+mod assurance_tests;
+#[cfg(test)]
+pub(crate) mod assured_fixture;
 #[cfg(test)]
 mod tests;

@@ -12,6 +12,17 @@ pub enum OidcError {
     #[error("invalid issuer URL: {0}")]
     InvalidIssuer(String),
 
+    /// An [`EgressPolicy`](crate::egress::EgressPolicy) refused the issuer URL
+    /// or an endpoint its discovery document names. Neither the URL nor an
+    /// address is carried: only the setting and the reason.
+    #[error("egress refused for {setting}: {range}")]
+    EgressRefused {
+        /// The setting that carried the URL (`issuer URL`, `jwks_uri`, ...).
+        setting: String,
+        /// The reserved range's name, or `HTTPS required` and the like.
+        range: String,
+    },
+
     /// The issuer URL uses an insecure scheme and is not on the loopback
     /// allowlist (`localhost`, `127.0.0.1`, `[::1]`). Plain HTTP elsewhere
     /// would let an on-path attacker rewrite the discovery document and,

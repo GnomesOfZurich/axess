@@ -206,6 +206,15 @@ impl DelegatedCredentialStore for NoSwap {
     async fn save(&self, t: &TenantId, u: &UserId, c: StoredDelegation) -> Result<(), String> {
         self.0.save(t, u, c).await
     }
+    async fn save_if_unchanged(
+        &self,
+        _: &TenantId,
+        _: &UserId,
+        _: &StoredDelegation,
+        _: StoredDelegation,
+    ) -> Result<CredentialSwap, String> {
+        Ok(CredentialSwap::Unsupported)
+    }
     async fn revoke(&self, t: &TenantId, u: &UserId, p: &str) -> Result<(), String> {
         self.0.revoke(t, u, p).await
     }

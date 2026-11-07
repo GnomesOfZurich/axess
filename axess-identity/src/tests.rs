@@ -26,13 +26,13 @@ fn human_principal_tenant_id_accessor() {
 fn workload_principal_tenant_id_accessor() {
     let tenant = sample_tenant();
     let trust = TrustDomain::new("gnomes.local").unwrap();
-    let wid = WorkloadId::build(&trust, "compute-worker", "ekekrantz").unwrap();
+    let wid = WorkloadId::build(&trust, "compute-worker", "gnomes").unwrap();
     let workload = WorkloadPrincipal {
         workload_id: wid,
         trust_domain: trust,
         issuer: Issuer::Cli,
         tenant_id: tenant,
-        tenant_slug: "ekekrantz".to_string(),
+        tenant_slug: "gnomes".to_string(),
         service_name: "compute-worker".to_string(),
         attributes: BTreeMap::new(),
     };
@@ -43,13 +43,13 @@ fn workload_principal_tenant_id_accessor() {
 #[test]
 fn attributes_accessor_returns_empty_by_default() {
     let trust = TrustDomain::new("gnomes.local").unwrap();
-    let wid = WorkloadId::build(&trust, "feed-worker", "ekekrantz").unwrap();
+    let wid = WorkloadId::build(&trust, "feed-worker", "gnomes").unwrap();
     let workload = WorkloadPrincipal {
         workload_id: wid,
         trust_domain: trust,
         issuer: Issuer::Cli,
         tenant_id: sample_tenant(),
-        tenant_slug: "ekekrantz".to_string(),
+        tenant_slug: "gnomes".to_string(),
         service_name: "feed-worker".to_string(),
         attributes: BTreeMap::new(),
     };
@@ -80,7 +80,7 @@ fn attributes_accessor_returns_populated_human_map() {
 #[test]
 fn attributes_accessor_returns_populated_workload_map() {
     let trust = TrustDomain::new("gnomes.local").unwrap();
-    let wid = WorkloadId::build(&trust, "feed-worker", "ekekrantz").unwrap();
+    let wid = WorkloadId::build(&trust, "feed-worker", "gnomes").unwrap();
     let mut attrs = BTreeMap::new();
     attrs.insert("region".to_string(), serde_json::json!("eu-west-1"));
     let workload = WorkloadPrincipal {
@@ -88,7 +88,7 @@ fn attributes_accessor_returns_populated_workload_map() {
         trust_domain: trust,
         issuer: Issuer::Cli,
         tenant_id: sample_tenant(),
-        tenant_slug: "ekekrantz".to_string(),
+        tenant_slug: "gnomes".to_string(),
         service_name: "feed-worker".to_string(),
         attributes: attrs,
     };

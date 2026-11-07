@@ -518,8 +518,11 @@ impl ProviderSource for TestSource {
                 .get(key)
                 .cloned()
                 .ok_or_else(|| ProviderSourceError("unknown key".into()))?;
-            let ProviderKey::OAuth { name, .. } = key else {
-                return Err(ProviderSourceError("not an OAuth key".into()));
+            let name = match key {
+                ProviderKey::OAuth { name, .. } => name,
+                // The other keys exist only with their features on.
+                #[cfg(any(feature = "fido2", feature = "ldap"))]
+                _ => return Err(ProviderSourceError("not an OAuth key".into())),
             };
             let provider = candidate(name, &uri, "followed")
                 .await

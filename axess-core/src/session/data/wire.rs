@@ -82,6 +82,8 @@ pub(super) enum AuthStateWire {
         ldap_groups: Option<Vec<String>>,
         #[serde(default)]
         impersonator: Option<Impersonation>,
+        #[serde(default)]
+        assurance: Vec<FactorAssurance>,
     },
     Authenticated {
         user_id: UserId,
@@ -93,6 +95,8 @@ pub(super) enum AuthStateWire {
         impersonator: Option<Impersonation>,
         #[serde(default)]
         ldap_groups: Option<Vec<String>>,
+        #[serde(default)]
+        assurance: Vec<FactorAssurance>,
     },
     PendingWorkflow {
         user_id: UserId,
@@ -118,6 +122,7 @@ impl From<AuthStateWire> for AuthState {
                 last_attempt,
                 ldap_groups,
                 impersonator,
+                assurance,
             } => {
                 stamp_legacy(&mut completed, DateTime::<Utc>::UNIX_EPOCH);
                 AuthState::Authenticating {
@@ -130,6 +135,7 @@ impl From<AuthStateWire> for AuthState {
                     last_attempt,
                     ldap_groups,
                     impersonator,
+                    assurance,
                 }
             }
             AuthStateWire::Authenticated {
@@ -139,7 +145,10 @@ impl From<AuthStateWire> for AuthState {
                 mut factors_completed,
                 impersonator,
                 ldap_groups,
+                assurance,
             } => {
+                // A session written before the record existed has none: it
+                // satisfies no assurance policy until it steps up.
                 stamp_legacy(&mut factors_completed, authn_time);
                 AuthState::Authenticated {
                     user_id,
@@ -148,6 +157,7 @@ impl From<AuthStateWire> for AuthState {
                     factors_completed,
                     impersonator,
                     ldap_groups,
+                    assurance,
                 }
             }
             AuthStateWire::PendingWorkflow {
