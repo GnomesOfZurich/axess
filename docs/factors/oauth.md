@@ -329,12 +329,58 @@ let handler = BackChannelLogoutHandler::for_tenants(
 The handler asks the source for every tenant provider of the token's issuer;
 the one whose client id the token's `aud` names verifies it, and the session
 the `(issuer, sid)` maps to is the one that ends. Two tenants may share an
-issuer when their client ids differ. When two providers (two tenants, or a
+issuer when their client ids differ. The sessions a token ends are the
+verifying tenant's: the login path records the tenant beside each `sid`
+mapping and subject record, and a token verified by tenant A's provider
+neither finds nor ends tenant B's session, though both are for the same `sub`
+under the shared issuer. A token verified by a global provider ends the
+subject's sessions in every tenant, as the provider is shared. When two providers (two tenants, or a
 tenant and a global provider) share both the issuer and the client id, the
 token cannot be attributed, and the handler refuses it with
 `LogoutProviderError::Ambiguous` and ends nothing; give each tenant its own
 client registration. A tenant source that fails answers 503, so the IdP
 retries.
+
+## Back-channel logout across instances
+
+The `sid` map and the subject registry that back-channel logout reads are in
+the process that handled the login. Behind a load balancer without
+stickiness the IdP's logout token can reach another instance, which finds no
+mapping, answers `200` (the OpenID Connect answer for a session the endpoint
+does not know) and leaves the session valid. Two things close that:
+
+```rust,ignore
+let client = fred::prelude::Client::new(config, None, None, None);
+client.init().await?;
+let store: Arc<dyn SidStore> = Arc::new(ValkeySidStore::new(client.clone()));
+
+// The login path writes to the shared store...
+let authn = AuthnService::builder(identity, factors)
+    .with_sid_store(store)
+    // ...
+    .build();
+
+// ...and every instance's handler reads it, and shares the replay log.
+let handler = BackChannelLogoutHandler::for_tenants(source, registry, authn.sid_map(), clock)
+    .with_sid_store(authn.sid_store())
+    .with_replay_log(Arc::new(ValkeyReplayLog::new(client)))
+    .with_metrics(session_metrics);
+```
+
+`SidStore` and `LogoutReplayLog` are traits, so a store of your own (SQL, say)
+plugs in the same way. `ValkeySidStore` ages its keys out by time instead of
+by the in-process map's capacity and prune (`with_sid_ttl`, `with_subject_ttl`),
+so `with_sid_map_capacity` does not apply to it, and it gives every key one
+prefix; in a cluster put a hash tag in it (`with_prefix("{axess}:logout")`)
+because its scripts address the records of a session together. A login whose
+mapping the store could not write is still a login (the mapping is best
+effort, as at capacity); a logout whose store cannot be read is answered
+`503`, so the IdP sends the token again.
+
+`with_metrics` counts the tokens that verified but ended no session
+(`back_channel_logout_unmatched`); the answer stays `200`. A rate that does not
+fall is instances that do not share a store, or logouts for sessions that
+already ended.
 
 ## Changing a provider on a running service
 

@@ -5,7 +5,7 @@
 //! else.
 
 use super::*;
-use crate::device::proof::{DeviceToken, PresentedDevice};
+use crate::device::proof::{DeviceToken, PresentedDevice, ProvenDevice};
 use axess_rng::SecureRng;
 
 /// What a request is, and what it offers to be recognised by.
@@ -35,12 +35,52 @@ pub struct ResolvedDevice {
     /// A token minted for it by this request. `Some` exactly when the device
     /// was just created: the cookie that carries it must reach the browser.
     pub issued: Option<DeviceToken>,
+    /// The proof, kept out of reach of a struct literal.
+    pub(crate) proof: ProvenDevice,
+}
+
+impl ResolvedDevice {
+    /// The device as one the client proved. Hand it to the session layer from
+    /// a [`DeviceResolver`](crate::device::DeviceResolver) as
+    /// [`BoundDevice::Proven`](crate::device::BoundDevice::Proven); an API
+    /// that exempts a device from a lockout accepts nothing else.
+    pub fn proven(&self) -> ProvenDevice {
+        self.proof
+    }
 }
 
 impl<S> DeviceLifecycleService<S>
 where
     S: DeviceStore,
 {
+    /// Delete the least recently seen `Unknown` devices of `user` so that,
+    /// with one more written, they hold at most `max`. Looks at the user's
+    /// most recently seen devices only (a window of four times `max` and a
+    /// hundred more), which holds every `Unknown` device of a user who is
+    /// not hoarding `Seen` ones; the sweep reaps what lies beyond it.
+    async fn make_room_for_unknown(
+        &self,
+        tenant: &TenantId,
+        user: &UserId,
+        max: usize,
+    ) -> Result<(), S::Error> {
+        let window = max.saturating_mul(4).saturating_add(100);
+        let rows = self.store.find_for_user(tenant, user, window).await?;
+        let unknown: Vec<&Device> = rows
+            .iter()
+            .filter(|d| d.trust_level == DeviceTrustLevel::Unknown)
+            .collect();
+        let surplus = (unknown.len() + 1).saturating_sub(max);
+        if surplus == 0 {
+            return Ok(());
+        }
+        // Newest-sighted first: the oldest are at the end.
+        for device in unknown.iter().rev().take(surplus) {
+            self.store.delete(tenant, &device.id).await?;
+        }
+        Ok(())
+    }
+
     /// Resolve a request to its device by the token it presents.
     ///
     /// - A request whose cookie names a device of `tenant` and presents the
@@ -51,7 +91,10 @@ where
     /// - Otherwise a request with no `user` has no device.
     /// - Otherwise the device the session was last bound to is kept when it
     ///   exists, is not revoked and belongs to `user`.
-    /// - Otherwise a new `Unknown` device owned by `user` is created, with a
+    /// - Otherwise a new `Unknown` device owned by `user` is created, after the
+    ///   user's least recently seen `Unknown` devices beyond
+    ///   [`DEFAULT_MAX_UNKNOWN_DEVICES_PER_USER`]
+    ///   (or the service's own bound) are deleted, with a
     ///   fresh token whose digest is on the row and whose value is returned in
     ///   [`ResolvedDevice::issued`] for the cookie.
     ///
@@ -72,6 +115,7 @@ where
         let fingerprint = request.fingerprint;
         let presented = request.presented.cloned();
         let session_device = request.session_device.copied();
+        let max_unknown = self.max_unknown_per_user;
         async move {
             if let Some(presented) = presented.as_ref()
                 && let Some(device) = self.store.load(&tenant, &presented.id).await?
@@ -83,6 +127,7 @@ where
                     return Ok(Some(ResolvedDevice {
                         id: device.id,
                         issued: None,
+                        proof: ProvenDevice::new(device.id),
                     }));
                 };
                 if device.user_id.is_none()
@@ -100,6 +145,7 @@ where
                     return Ok(Some(ResolvedDevice {
                         id: device.id,
                         issued: None,
+                        proof: ProvenDevice::new(device.id),
                     }));
                 }
             }
@@ -116,9 +162,12 @@ where
                 return Ok(Some(ResolvedDevice {
                     id: device.id,
                     issued: None,
+                    proof: ProvenDevice::new(device.id),
                 }));
             }
 
+            self.make_room_for_unknown(&tenant, &user, max_unknown)
+                .await?;
             let token = DeviceToken::mint(rng);
             let id = new_id_fn();
             let device = Device {
@@ -142,6 +191,7 @@ where
             Ok(Some(ResolvedDevice {
                 id,
                 issued: Some(token),
+                proof: ProvenDevice::new(id),
             }))
         }
     }

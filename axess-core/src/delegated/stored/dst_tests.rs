@@ -210,6 +210,15 @@ impl DelegatedCredentialStore for ScriptedStore {
     async fn save(&self, _: &TenantId, _: &UserId, _: StoredDelegation) -> Result<(), String> {
         Ok(())
     }
+    async fn save_if_unchanged(
+        &self,
+        _: &TenantId,
+        _: &UserId,
+        _: &StoredDelegation,
+        _: StoredDelegation,
+    ) -> Result<CredentialSwap, String> {
+        Ok(CredentialSwap::Unsupported)
+    }
     async fn revoke(&self, _: &TenantId, _: &UserId, _: &str) -> Result<(), String> {
         Ok(())
     }

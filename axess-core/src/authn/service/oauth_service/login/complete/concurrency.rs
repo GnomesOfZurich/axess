@@ -153,7 +153,7 @@ async fn the_subject_sweep_checks_liveness_concurrently_within_the_bound() {
         let session = SessionId::new(&axess_rng::testing::MockRng::new(rand_seed()));
         h.svc
             .sid_map()
-            .register_subject_session("test", "stale-sub", h.user.id, session);
+            .register_subject_session("test", "stale-sub", None, h.user.id, session);
     }
     h.peak();
 

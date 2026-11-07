@@ -1,0 +1,79 @@
+name: Tag release
+
+# A squash merge into main is a release. This workflow runs on every push to
+# main: when CHANGELOG.md has a dated section for the workspace version and
+# no tag `v$VERSION` exists, it creates that tag at the pushed commit and
+# starts release.yml from it. A push whose version is already tagged (there
+# should be none, main changes only by release pull requests) ends with
+# "already tagged" and nothing done.
+#
+# The tag is created with the workflow's own token, and a tag so created
+# fires no `on: push: tags` run by itself, hence the explicit dispatch of
+# release.yml from the tag; release.yml's verify job then reads it as a tag
+# run and the `crates-io` environment admits it (deployments from `v*` tags
+# only). The tag ruleset "release tags: created by admins" lists GitHub
+# Actions as a bypass actor for the creation; the immutability ruleset lets
+# nobody move or delete a tag, this workflow included.
+#
+# If this workflow fails, the maintainer tags by hand (publishing.md, the
+# release workflow), which is what it replaces.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tag-main
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    name: Tag the release on main
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create the tag
+      actions: write    # start release.yml from it
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: The pushed commit is a release with a dated changelog section
+        id: version
+        run: |
+          set -eu
+          ./scripts/check-release-version.sh
+          version=$(sed -n '/^\[workspace.package\]/,/^\[/p' Cargo.toml \
+            | sed -n 's/^version *= *"\([^"]*\)".*/\1/p' | head -1)
+          [ -n "$version" ] || { echo "::error::no [workspace.package].version in Cargo.toml"; exit 1; }
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Create the tag at the pushed commit, unless it exists
+        id: create
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -eu
+          if at=$(git ls-remote --exit-code --tags origin "refs/tags/${TAG}" | cut -f1); then
+            echo "already tagged: ${TAG} is at ${at}; nothing to do."
+            echo "created=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f ref="refs/tags/${TAG}" -f sha="${GITHUB_SHA}" >/dev/null
+          echo "created=true" >> "$GITHUB_OUTPUT"
+          echo "OK: ${TAG} created at ${GITHUB_SHA}."
+
+      - name: Start the release workflow from the tag
+        if: steps.create.outputs.created == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -eu
+          gh workflow run release.yml --repo "${GITHUB_REPOSITORY}" --ref "${TAG}"
+          echo "OK: release.yml started from ${TAG}; the maintainer approves the crates-io deployment when it asks."

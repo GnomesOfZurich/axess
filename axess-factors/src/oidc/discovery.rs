@@ -21,6 +21,18 @@ pub const MAX_DISCOVERY_BYTES: usize = 1024 * 1024;
 /// (OIDC Core 1.0 §4.1).
 const WELL_KNOWN_SUFFIX: &str = "/.well-known/openid-configuration";
 
+/// The endpoint fields of a discovery document a screened policy checks, apart
+/// from `jwks_uri`.
+const ENDPOINT_FIELDS: [&str; 7] = [
+    "authorization_endpoint",
+    "token_endpoint",
+    "userinfo_endpoint",
+    "end_session_endpoint",
+    "revocation_endpoint",
+    "pushed_authorization_request_endpoint",
+    "device_authorization_endpoint",
+];
+
 /// Parsed OIDC discovery document.
 ///
 /// Only OIDC-standard fields are typed; everything else (provider
@@ -62,7 +74,36 @@ impl DiscoveryDocument {
         issuer_url: &str,
         http_client: &openidconnect::reqwest::Client,
     ) -> Result<Self, OidcError> {
+        Self::fetch_screened(
+            issuer_url,
+            http_client,
+            crate::egress::EgressPolicy::unscreened(),
+        )
+        .await
+    }
+
+    /// As [`fetch`](Self::fetch), with `policy` applied to the issuer URL and
+    /// to every endpoint the document names: a URL the policy refuses ends
+    /// the fetch with [`OidcError::EgressRefused`]. Build `http_client` with
+    /// [`EgressPolicy::client_builder`](crate::egress::EgressPolicy::client_builder)
+    /// so the addresses a host name resolves to are screened too.
+    ///
+    /// # Errors
+    ///
+    /// As [`fetch`](Self::fetch), and [`OidcError::EgressRefused`] for a URL the
+    /// policy refuses.
+    pub async fn fetch_screened(
+        issuer_url: &str,
+        http_client: &openidconnect::reqwest::Client,
+        policy: crate::egress::EgressPolicy,
+    ) -> Result<Self, OidcError> {
         require_https_or_loopback(issuer_url)?;
+        policy
+            .check_url(issuer_url, "issuer URL")
+            .map_err(|e| OidcError::EgressRefused {
+                setting: e.setting,
+                range: e.range,
+            })?;
 
         let url = format!("{}{WELL_KNOWN_SUFFIX}", issuer_url.trim_end_matches('/'));
         let mut response = http_client
@@ -110,6 +151,27 @@ impl DiscoveryDocument {
         let pick = |key: &str| -> Option<String> {
             raw.get(key).and_then(|v| v.as_str()).map(String::from)
         };
+        if policy.is_screened() {
+            let aliases = raw
+                .get("mtls_endpoint_aliases")
+                .and_then(|v| v.as_object())
+                .into_iter()
+                .flatten()
+                .filter_map(|(k, v)| v.as_str().map(|u| (k.as_str(), u.to_owned())));
+            let named = [("jwks_uri", jwks_uri.clone())].into_iter().chain(
+                ENDPOINT_FIELDS
+                    .iter()
+                    .filter_map(|k| pick(k).map(|u| (*k, u))),
+            );
+            for (what, url) in named.chain(aliases) {
+                policy
+                    .check_url(&url, what)
+                    .map_err(|e| OidcError::EgressRefused {
+                        setting: e.setting,
+                        range: e.range,
+                    })?;
+            }
+        }
 
         Ok(Self {
             issuer,

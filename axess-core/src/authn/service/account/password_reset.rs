@@ -15,6 +15,7 @@
 //!   expensive Argon2id-flavoured rest of the flow.
 
 use crate::authn::service::RequestAuthnService;
+use crate::authn::service::reset_cooldown::Asked;
 use crate::authn::{
     error::AuthnError,
     event::{AuthEventBuilder, AuthEventType, AuthFailureReason},
@@ -48,6 +49,13 @@ where
     ///
     /// The token expires after `ttl`. Returns the plaintext token that the
     /// application should embed in a reset link.
+    ///
+    /// A new request never invalidates a link already sent: an account holds up
+    /// to [`DEFAULT_MAX_LIVE_RESET_TOKENS`](crate::authn::service::DEFAULT_MAX_LIVE_RESET_TOKENS)
+    /// live tokens (`with_max_live_reset_tokens`), and a request beyond that is
+    /// refused as throttled: `Ok(None)`, as for an unknown identifier, with the
+    /// audit row reason `live_tokens_full`. Using any one token consumes all of
+    /// the account's tokens.
     ///
     /// A `ttl` of zero, or one longer than seven days, is refused with
     /// [`AuthnError::Internal`] before anything is looked up, so a bad value
@@ -100,12 +108,12 @@ where
         // unregistered one alike, so being inside it says nothing about
         // whether an account exists. It runs after the input limits, which
         // map an over-long identifier to the empty string.
-        if self
+        let asked = self
             .inner
             .reset_requests
             .as_ref()
-            .is_some_and(|r| r.already_asked(tenant_identifier, identifier))
-        {
+            .map_or(Asked::Fresh, |r| r.ask(tenant_identifier, identifier));
+        if asked != Asked::Fresh {
             self.emit_audit(
                 AuthEventBuilder::failure(AuthEventType::PasswordResetRequested)
                     .with_error(AuthFailureReason::from("cooldown")),
@@ -131,7 +139,13 @@ where
             let _ = self
                 .inner
                 .identity
-                .store_reset_token(&DUMMY_TOKEN_USER, &hash, now)
+                .store_reset_token(
+                    &DUMMY_TOKEN_USER,
+                    &hash,
+                    now,
+                    now,
+                    self.inner.max_live_reset_tokens,
+                )
                 .await;
             // The row of a refused account names it; an unknown identifier
             // has nobody to name.
@@ -150,24 +164,46 @@ where
         // its write fails, so a store fault is not a way to tell a
         // registered identifier from an unregistered one. The fault is
         // logged for the operator, and the audit row records the failure.
-        if let Err(e) = self
+        let stored = self
             .inner
             .identity
-            .store_reset_token(&user.id, &hash, expires_at)
-            .await
-        {
-            tracing::error!(
-                user_id = %user.id,
-                error = %e,
-                "could not store a password reset token; answering as for an unknown identifier"
-            );
-            self.emit_audit(
-                AuthEventBuilder::failure(AuthEventType::PasswordResetRequested)
-                    .attributed_to(&user.id, &user.tenant_id)
-                    .with_error(AuthFailureReason::from("token_store_error")),
+            .store_reset_token(
+                &user.id,
+                &hash,
+                expires_at,
+                now,
+                self.inner.max_live_reset_tokens,
             )
-            .await?;
-            return Ok(None);
+            .await;
+        match stored {
+            Ok(true) => {}
+            Ok(false) => {
+                // The account already holds its most live tokens. Nothing is
+                // stored and nothing earlier is touched; the caller gets
+                // `None`, as for an unknown identifier, so the refusal says
+                // nothing about the account.
+                self.emit_audit(
+                    AuthEventBuilder::failure(AuthEventType::PasswordResetRequested)
+                        .attributed_to(&user.id, &user.tenant_id)
+                        .with_error(AuthFailureReason::from("live_tokens_full")),
+                )
+                .await?;
+                return Ok(None);
+            }
+            Err(e) => {
+                tracing::error!(
+                    user_id = %user.id,
+                    error = %e,
+                    "could not store a password reset token; answering as for an unknown identifier"
+                );
+                self.emit_audit(
+                    AuthEventBuilder::failure(AuthEventType::PasswordResetRequested)
+                        .attributed_to(&user.id, &user.tenant_id)
+                        .with_error(AuthFailureReason::from("token_store_error")),
+                )
+                .await?;
+                return Ok(None);
+            }
         }
 
         self.emit_audit(

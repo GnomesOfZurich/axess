@@ -158,8 +158,8 @@ where
         session: &AuthSession,
     ) -> Result<FactorOutcome, AuthnError<I::Error>> {
         self.inner.metrics.factors.factor_success();
+        // The throttle is cleared when the whole login completes.
         self.release_guess(reserved, user_id).await;
-        self.clear_throttle_for(user_id, tenant_id).await;
 
         // The audit row first: a failed write must leave the session
         // where it was, where the other order had already advanced it
@@ -181,8 +181,10 @@ where
 
         session
             .advance_factor(
-                &FactorKind::LdapBind,
-                self.inner.clock.now(),
+                crate::authn::assurance::FactorAssurance::for_kind(
+                    FactorKind::LdapBind,
+                    self.inner.clock.now(),
+                ),
                 &self.inner.preserved_custom_keys,
             )
             .await;

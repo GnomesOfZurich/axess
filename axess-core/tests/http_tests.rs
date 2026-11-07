@@ -636,18 +636,17 @@ async fn binding_turned_on_later_binds_an_existing_authenticated_session() {
     );
 }
 
-// Note: login_required!() and require_partial_authn!() macros live in
-// axess-macros and are re-exported via the `axess` facade crate. They cannot
-// be tested from axess-core. See the macro test TODO in the ROADMAP;
-// these tests should go in an `axess/tests/` integration test file that
-// depends on the `axess` crate directly.
+// The require_authn!() and require_partial_authn!() macros live in
+// axess-macros and are re-exported through the `axess` facade crate, so they
+// cannot be tested from axess-core. Their tests are in
+// axess/tests/macro_tests.rs.
 
 // ── SessionLayer + DeviceResolver wiring ─────────────────────────────
 
 #[cfg(feature = "device")]
 mod device_resolver_wiring {
     use super::*;
-    use axess_core::device::{DeviceId, DeviceResolver};
+    use axess_core::device::{BoundDevice, DeviceId, DeviceResolver};
     use axum::http::request::Parts;
 
     /// Test resolver that hands out a fixed [`DeviceId`] regardless of input.
@@ -658,9 +657,9 @@ mod device_resolver_wiring {
 
     impl DeviceResolver for StaticResolver {
         type Error = std::convert::Infallible;
-        async fn resolve(&self, parts: &Parts) -> Result<Option<DeviceId>, Self::Error> {
+        async fn resolve(&self, parts: &Parts) -> Result<Option<BoundDevice>, Self::Error> {
             tracing::trace!(uri = %parts.uri, "StaticResolver: returning fixed device id");
-            Ok(Some(self.0))
+            Ok(Some(self.0.into()))
         }
     }
 
@@ -671,7 +670,7 @@ mod device_resolver_wiring {
 
     impl DeviceResolver for NoneResolver {
         type Error = std::convert::Infallible;
-        async fn resolve(&self, parts: &Parts) -> Result<Option<DeviceId>, Self::Error> {
+        async fn resolve(&self, parts: &Parts) -> Result<Option<BoundDevice>, Self::Error> {
             tracing::trace!(uri = %parts.uri, "NoneResolver: returning None");
             Ok(None)
         }
@@ -770,10 +769,10 @@ mod device_resolver_wiring {
 
     impl DeviceResolver for FailingLaterResolver {
         type Error = StoreDown;
-        async fn resolve(&self, _: &Parts) -> Result<Option<DeviceId>, Self::Error> {
+        async fn resolve(&self, _: &Parts) -> Result<Option<BoundDevice>, Self::Error> {
             let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if call == 0 {
-                Ok(Some(self.id))
+                Ok(Some(self.id.into()))
             } else {
                 Err(StoreDown)
             }

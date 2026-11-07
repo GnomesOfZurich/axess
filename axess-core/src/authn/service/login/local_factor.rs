@@ -125,15 +125,19 @@ where
         // is a failure, answered above.
         self.inner.metrics.factors.factor_success();
 
+        // The throttle is cleared when the whole login completes, not here:
+        // a factor that passes must not wipe the delay that wrong guesses
+        // at a later factor have earned.
         self.release_guess(reserved, user_id).await;
-        self.clear_throttle_for(user_id, tenant_id).await;
         self.rehash_outdated_password(credential, &config, &resolved_from, user_id, tenant_id)
             .await;
 
         session
             .advance_factor(
-                &current_kind,
-                self.inner.clock.now(),
+                crate::authn::assurance::FactorAssurance::for_kind(
+                    current_kind.clone(),
+                    self.inner.clock.now(),
+                ),
                 &self.inner.preserved_custom_keys,
             )
             .await;

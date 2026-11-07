@@ -151,13 +151,14 @@ CREATE INDEX IF NOT EXISTS idx_password_history_user_created
     ON password_history(user_id, created_at DESC);
 
 -- password_reset_tokens — out-of-band password-recovery state.
--- One token per user at a time (an issuing call upserts so prior tokens
--- are invalidated). `verify_reset_token` deletes the row on a successful
--- match, enforcing single-use semantics.
+-- A user holds several live tokens (a new request never invalidates an
+-- earlier link); `verify_reset_token` deletes all of the user's rows on a
+-- successful match, enforcing single-use semantics.
 CREATE TABLE IF NOT EXISTS password_reset_tokens (
-    user_id    TEXT PRIMARY KEY,
+    user_id    TEXT NOT NULL,
     token_hash TEXT NOT NULL,
     expires_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, token_hash),
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 

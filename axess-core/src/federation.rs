@@ -33,4 +33,10 @@ pub mod oauth;
 #[cfg(feature = "oauth")]
 pub mod oauth_tenant;
 #[cfg(feature = "oauth")]
+pub mod replay_log;
+#[cfg(feature = "oauth")]
 pub mod sid_map;
+#[cfg(feature = "oauth")]
+pub mod sid_store;
+#[cfg(all(feature = "oauth", feature = "valkey"))]
+pub mod valkey_logout;

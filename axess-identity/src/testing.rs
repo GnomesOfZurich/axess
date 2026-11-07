@@ -155,13 +155,13 @@ mod tests {
 
     fn sample_workload() -> Principal {
         let trust = TrustDomain::new("gnomes.local").unwrap();
-        let wid = WorkloadId::build(&trust, "compute-worker", "ekekrantz").unwrap();
+        let wid = WorkloadId::build(&trust, "compute-worker", "gnomes").unwrap();
         Principal::Workload(WorkloadPrincipal {
             workload_id: wid,
             trust_domain: trust,
             issuer: Issuer::Cli,
             tenant_id: TenantId::from_bytes([3u8; 16]),
-            tenant_slug: "ekekrantz".to_string(),
+            tenant_slug: "gnomes".to_string(),
             service_name: "compute-worker".to_string(),
             attributes: BTreeMap::new(),
         })

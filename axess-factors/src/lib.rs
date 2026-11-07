@@ -50,6 +50,10 @@ pub use fido2_stub as fido2;
 /// axum request extensions (`bearer` feature).
 #[cfg(feature = "bearer")]
 pub mod bearer;
+/// Where the server may connect to for a URL it was handed: the screen for
+/// tenant-supplied identity-provider URLs (`oidc` feature).
+#[cfg(feature = "oidc")]
+pub mod egress;
 /// The endpoint rule shared by the clients that send credentials or send a
 /// user to a remote endpoint.
 #[cfg(any(feature = "oidc", feature = "social"))]
@@ -181,14 +185,15 @@ pub use recovery_code::{
     normalize_recovery_code, verify_recovery_code, verify_recovery_code_rotating,
 };
 
-pub use fido2::Fido2Config;
 #[cfg(all(feature = "fido2", any(test, feature = "testing")))]
 pub use fido2::MockFido2Provider;
 #[cfg(feature = "fido2")]
 pub use fido2::{
-    AuthenticationResult, AuthenticatorAttachment, CredentialID, DefaultFido2Provider,
-    Fido2Credential, Fido2Options, Fido2Provider,
+    AttestationCaList, AuthenticationResult, AuthenticatorAttachment, CredentialID,
+    DefaultFido2Provider, Fido2Authentication, Fido2Credential, Fido2Key, Fido2Options,
+    Fido2Provider, Fido2Registration,
 };
+pub use fido2::{DEFAULT_FIDO2_CEREMONY, Fido2Ceremony, Fido2Config, SecurityKeyVerification};
 
 #[cfg(all(feature = "ldap", any(test, feature = "testing")))]
 pub use ldap::MockLdapProvider;

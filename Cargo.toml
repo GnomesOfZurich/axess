@@ -35,7 +35,7 @@ resolver = "3"
 # Per-crate fields (`name`, `description`, `keywords`, `categories`, `exclude`)
 # stay local because they genuinely differ.
 [workspace.package]
-version = "0.17.0"
+version = "0.18.0"
 edition = "2024"
 rust-version = "1.95.0"
 authors = ["Gnomes"]
@@ -52,11 +52,14 @@ homepage = "https://github.com/GnomesOfZurich/axess"
 # `workspace = true` so the version stays consistent across the
 # workspace (axess-core's session fingerprint HMAC matches axess-factors'
 # HOTP HMAC, etc.). Transitive duplicate-majors pulled in by upstreams,
-# such as `openidconnect` on `sha2 v0.10` + `hmac v0.12`,
-# `webauthn-rs v0.6.0-dev` on `x509-parser v0.16`, are out of our
-# control and accepted until the respective upstreams bump; see
-# `docs/architecture.md` (crypto-backend posture) for the full
-# rationale. `x509-parser` is pre-pinned for the mTLS resolver
+# such as `openidconnect` 4.1 and `oauth2` 5 on `sha2 v0.10`, `hmac v0.12`,
+# `rand v0.8`, `base64 v0.22` and `thiserror v1`,
+# `webauthn-rs v0.6.2` on `argon2 v0.5`, `base64 v0.21`, `thiserror v1`
+# and the `p256 v0.14` / `rsa v0.10.0-rc` cohort, are out of our
+# control and accepted until the respective upstreams bump; the
+# `skip-tree` list in `deny.toml` gives each root's reason (the
+# backends themselves are in docs/production/security-posture.md).
+# `x509-parser` is pre-pinned for the mTLS resolver
 # work: no current direct consumer.
 [workspace.dependencies]
 # Internal axess crates. Members write `axess-foo = { workspace = true }`
@@ -72,15 +75,15 @@ homepage = "https://github.com/GnomesOfZurich/axess"
 # override unless the workspace entry has it too. Members that want the
 # defaults restate them via `features = [...]`. The other entries leave
 # defaults enabled so the common case stays terse.
-axess-cache    = { path = "axess-cache",    version = "=0.17.0" }
-axess-clock    = { path = "axess-clock",    version = "=0.17.0" }
-axess-core     = { path = "axess-core",     version = "=0.17.0", default-features = false }
-axess-events   = { path = "axess-events",   version = "=0.17.0" }
-axess-factors  = { path = "axess-factors",  version = "=0.17.0" }
-axess-identity = { path = "axess-identity", version = "=0.17.0", default-features = false }
-axess-macros   = { path = "axess-macros",   version = "=0.17.0" }
-axess-rng      = { path = "axess-rng",      version = "=0.17.0" }
-axess-strings  = { path = "axess-strings",  version = "=0.17.0", default-features = false }
+axess-cache    = { path = "axess-cache",    version = "=0.18.0" }
+axess-clock    = { path = "axess-clock",    version = "=0.18.0" }
+axess-core     = { path = "axess-core",     version = "=0.18.0", default-features = false }
+axess-events   = { path = "axess-events",   version = "=0.18.0" }
+axess-factors  = { path = "axess-factors",  version = "=0.18.0" }
+axess-identity = { path = "axess-identity", version = "=0.18.0", default-features = false }
+axess-macros   = { path = "axess-macros",   version = "=0.18.0" }
+axess-rng      = { path = "axess-rng",      version = "=0.18.0" }
+axess-strings  = { path = "axess-strings",  version = "=0.18.0", default-features = false }
 
 # RustCrypto family + x509-parser; see preamble above.
 aes-gcm = "0.11.1"
@@ -99,7 +102,12 @@ quick-xml = { version = "0.42.0", features = ["serialize"] }
 # bump anything; the goal is to stop new drift from accumulating.
 axum = { version = "0.8.9", default-features = false }
 base32 = "0.5.1"
-base64 = "0.22.1"
+# `simd-unsafe`, on by default since 0.23.0, is the crate's only `unsafe`
+# code; axess is `forbid(unsafe_code)` and takes the scalar engines. Cargo
+# unifies features, so a build that also links a crate taking base64's
+# defaults still compiles the SIMD engines in: hyper-util (through reqwest,
+# so `oauth` and the other HTTP features) and crypto-glue (`fido2`) do.
+base64 = { version = "0.23.1", default-features = false, features = ["std"] }
 chrono = "0.4.45"
 # Benchmark-only in this workspace (axess-strings compares ShortString
 # against it). Pinned to the version nomos uses so the comparison is

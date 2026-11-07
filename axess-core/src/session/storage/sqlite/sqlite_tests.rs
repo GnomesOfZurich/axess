@@ -440,3 +440,22 @@ async fn listing_sessions_by_user_is_reported_unsupported() {
         Err(SqlStoreError::Unsupported("find_sessions_for_user"))
     ));
 }
+
+/// An encrypted SQLite store returns a session's assurance record as it
+/// was saved.
+#[tokio::test]
+async fn a_session_carrying_assurance_round_trips() {
+    let store = SqliteSessionStore::new(
+        memory_pool().await,
+        crate::session::crypto::SessionCrypto::new(crate::testing::test_key(9)),
+    );
+    store.init_schema().await.expect("init_schema");
+    let id = sample_id();
+    let data = crate::session::data::assured_fixture::assured_session();
+    store
+        .save(&id, &data, std::time::Duration::from_secs(60))
+        .await
+        .unwrap();
+    let back = store.load(&id).await.unwrap().expect("stored");
+    assert_eq!(back.auth_state, data.auth_state);
+}

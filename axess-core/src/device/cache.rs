@@ -81,8 +81,8 @@ const DEFAULT_CAPACITY: usize = 10_000;
 /// Any pending trust-level change races a 60s upper bound until the
 /// next load forces a re-fetch. Within a single pod, mutations
 /// invalidate explicitly so this only matters for cross-pod
-/// propagation (no invalidation bus exists today; see the
-/// `valkey-bridge` work tracked separately for that).
+/// propagation, for which there is no invalidation bus: another pod
+/// sees the change when its entry expires.
 const DEFAULT_TTL_SECS: u64 = 60;
 
 /// Cache key: `(tenant_id, device_id)`. Tenant scoping is mandatory

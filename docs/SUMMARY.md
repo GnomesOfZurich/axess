@@ -14,6 +14,7 @@
 - [Scope hierarchy](authentication/scope.md)
 - [Refresh tokens and session continuity](authentication/refresh-tokens.md)
 - [Live provider reload](authentication/live-provider-reload.md)
+- [Impersonation standing, tenant egress and candidate expiry](authentication/account-and-egress-hardening.md)
 
 # Part III: Authn protocols and verifiers
 
@@ -30,6 +31,7 @@
 - [Entity providers and request context](authorization/cedar-providers.md)
 - [RBAC, ReBAC, and ABAC patterns](authorization/cedar-patterns.md)
 - [Live policy reload](authorization/live-policy-reload.md)
+- [Authentication assurance and ceremonies](authorization/assurance.md)
 
 # Part V: Sessions and storage
 
@@ -70,6 +72,7 @@
 - [Behind an mTLS terminator](production/mtls.md)
 - [Operations runbook](production/operations.md)
 - [Migration guide](production/migrating.md)
+  - [0.17.0 to 0.18.0](production/migrating/0.17.0-to-0.18.0.md)
   - [0.16.0 to 0.17.0](production/migrating/0.16.0-to-0.17.0.md)
   - [0.15.0 to 0.16.0](production/migrating/0.15.0-to-0.16.0.md)
   - [0.14.0 to 0.15.0](production/migrating/0.14.0-to-0.15.0.md)
@@ -90,4 +93,5 @@
 # Part IX: Project
 
 - [Contributing](project/contributing.md)
+- [Mutation testing](project/mutation-testing.md)
 - [Publishing runbook](project/publishing.md)

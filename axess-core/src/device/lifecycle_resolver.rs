@@ -55,7 +55,7 @@ use crate::authn::ids::{DeviceId, TenantId, UserId};
 use crate::device::fingerprint::DeviceFingerprintExtractor;
 use crate::device::lifecycle::{DeviceLifecycleService, DeviceRequest};
 use crate::device::proof::{DeviceCookieConfig, DeviceCookieSlot, DeviceToken};
-use crate::device::resolver::DeviceResolver;
+use crate::device::resolver::{BoundDevice, DeviceResolver};
 use crate::device::store::DeviceStore;
 
 /// Function shape: pull a [`TenantId`] from request [`Parts`]. Default
@@ -227,7 +227,7 @@ where
 {
     type Error = S::Error;
 
-    async fn resolve(&self, parts: &Parts) -> Result<Option<DeviceId>, Self::Error> {
+    async fn resolve(&self, parts: &Parts) -> Result<Option<BoundDevice>, Self::Error> {
         // No tenant → no scoped device. Silent no-op.
         let Some(tenant) = (self.tenant_fn)(parts) else {
             return Ok(None);
@@ -264,10 +264,11 @@ where
         let Some(resolved) = resolved else {
             return Ok(None);
         };
+        let proven = resolved.proven();
         if let Some(token) = resolved.issued {
             self.hand_over_cookie(parts, &resolved.id, &token);
         }
-        Ok(Some(resolved.id))
+        Ok(Some(BoundDevice::Proven(proven)))
     }
 }
 

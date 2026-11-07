@@ -517,9 +517,12 @@ async fn resolve_device(
     // keeps the one it was bound to, and is not rewritten for it.
     let changed = match resolution {
         DeviceResolution::Resolved(resolved) => {
-            let changed = resolved != load.data.device_id;
+            let id = resolved.map(|b| b.id());
+            let proven = matches!(resolved, Some(crate::device::BoundDevice::Proven(_)));
+            let changed = id != load.data.device_id || proven != load.data.device_proven;
             if changed {
-                load.data.device_id = resolved;
+                load.data.device_id = id;
+                load.data.device_proven = proven;
             }
             changed
         }

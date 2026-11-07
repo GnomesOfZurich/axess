@@ -54,6 +54,7 @@ ALLOW = {
     "Router", "Json", "Form", "State", "Extension",       # axum
     "DateTime", "Utc", "NaiveDateTime", "TimeDelta",      # chrono
     "Pool", "PgPool", "SqlitePool", "MySqlPool",          # sqlx
+    "WebauthnError",                                   # webauthn-rs
 }
 
 tracked = subprocess.run(

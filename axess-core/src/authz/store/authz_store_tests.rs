@@ -73,7 +73,7 @@ fn alice_with(n: i64, store: &PolicyStore) -> Entities {
     let json = format!(
         r#"[{{"uid": {{"type": "TestApp::User", "id": "alice"}}, "attrs": {{"n": {n}}}, "parents": []}}]"#
     );
-    Entities::from_json_str(&json, Some(store.schema())).unwrap()
+    Entities::from_json_str(&json, Some(&store.schema())).unwrap()
 }
 
 fn view_doc1(store: &PolicyStore, entities: &Entities) -> AuthzDecision {
@@ -182,7 +182,7 @@ fn delete_doc(store: &PolicyStore, entities: &Entities, mfa: bool) -> AuthzDecis
     let context = Context::from_json_value(
         serde_json::json!({ "mfa_verified": mfa }),
         Some((
-            store.schema(),
+            &store.schema(),
             &r#"TestApp::Action::"DeleteDocument""#.parse().unwrap(),
         )),
     )
@@ -224,7 +224,7 @@ fn a_forbid_over_an_action_group_denies_without_schema_built_entities() {
                 r#"TestApp::User::"alice""#.parse().unwrap(),
                 Default::default(),
             )],
-            Some(store.schema()),
+            Some(&store.schema()),
         )
         .unwrap();
     assert_eq!(delete_doc(&store, &with_schema, false), AuthzDecision::Deny);
@@ -300,7 +300,7 @@ fn schema_shaped_action_entities_round_tripped_without_schema_are_accepted() {
                 r#"TestApp::User::"alice""#.parse().unwrap(),
                 Default::default(),
             )],
-            Some(store.schema()),
+            Some(&store.schema()),
         )
         .unwrap();
     let json = with_schema.to_json_value().unwrap();
@@ -336,8 +336,8 @@ fn policy_store_schema_accessor_is_borrow_of_inner() {
     // body replacement. Two consecutive calls must return refs
     // to the same Schema instance (verified via pointer equality).
     let store = build_store();
-    let s1 = store.schema() as *const _;
-    let s2 = store.schema() as *const _;
+    let s1 = store.original_schema() as *const _;
+    let s2 = store.original_schema() as *const _;
     assert_eq!(
         s1, s2,
         "schema() must borrow the stored Schema, not produce a new one"

@@ -490,6 +490,7 @@ async fn authenticated_state_roundtrip_byte_perfect() {
             factors_completed: Vec::new(),
             impersonator: None,
             ldap_groups: None,
+            assurance: Vec::new(),
         },
         fingerprint: Some("test-fingerprint".to_string()),
         custom: serde_json::json!({ "session.scope": "read+write" }),

@@ -2,7 +2,7 @@
 //!
 //! The envelope itself does not enforce encryption. Producers that
 //! want broker-opaque payloads wrap their value in an [`EncryptedBlob`]
-//! and place it in [`EventBody::Encrypted`](crate::EventBody::Encrypted);
+//! and place it in [`EventBody::Encrypted`];
 //! subscribers without the key still see envelope metadata (id,
 //! kind, time, tenant, subject, actor, status) for routing and
 //! auditing without ever decrypting the payload contents.
@@ -15,8 +15,11 @@
 use axess_strings::ShortString;
 
 use crate::id::{EventId, TenantId};
-use crate::kind::KindTag;
+use crate::kind::{EventPayload, KindTag};
+use crate::status::EventStatus;
 use crate::subject::{EventSubject, EventSubjectRef};
+use crate::trace::TraceContext;
+use crate::{Event, EventBody};
 
 /// Reference to a key in a KMS / key registry. The envelope crate
 /// stores only the id; key material lives wherever your KMS does.
@@ -67,7 +70,7 @@ pub enum AeadAlgorithm {
 }
 
 /// Encrypted payload bytes. Replaces a clear payload in the
-/// [`EventBody`](crate::EventBody) for events that should remain
+/// [`EventBody`] for events that should remain
 /// opaque to brokers and unauthorised subscribers.
 ///
 /// Decryption produces the plaintext bytes; the recipient knows what
@@ -106,10 +109,24 @@ pub struct EncryptedBlob {
 /// version lead, so a future change to the field set cannot collide with
 /// this one.
 ///
+/// This is the first AAD tag and authenticates only the four fields above.
+/// The event's `status`, `actor`, `time_micros`, `envelope_version` and
+/// `trace_context`, and the blob's `algorithm` and `key_id`, are not bound:
+/// someone who can write the store but holds no key can change them and the
+/// payload still decrypts. It is deprecated for sealing: seal new events
+/// under [`envelope_aad_for`] (or [`envelope_aad_v2`]), and open any event
+/// with [`open_aads_for`], which tries the second tag first and this one
+/// second. This crate does no sealing itself; the AAD an adopter's seal path
+/// passes is the AAD it asks one of these functions for.
+///
 /// # Panics
 ///
 /// If a field is longer than `u32::MAX` bytes: a length that saturated
 /// would let two different oversized fields share one encoding.
+#[deprecated(
+    since = "0.18.0",
+    note = "binds only id, kind, tenant and subject; seal under `envelope_aad_for` and open with `open_aads_for`"
+)]
 #[must_use]
 pub fn envelope_aad(
     id: &EventId,
@@ -117,47 +134,185 @@ pub fn envelope_aad(
     tenant: Option<&TenantId>,
     subject: Option<&EventSubject>,
 ) -> Vec<u8> {
-    fn put(buf: &mut Vec<u8>, bytes: &[u8]) {
-        let len = field_len(bytes.len()).expect("an AAD field is longer than u32::MAX bytes");
-        buf.extend_from_slice(&len.to_be_bytes());
-        buf.extend_from_slice(bytes);
-    }
     let mut buf = Vec::with_capacity(96);
     put(&mut buf, b"axess-events/envelope-aad/v1");
     put(&mut buf, id.as_bytes());
     put(&mut buf, kind.as_str().as_bytes());
+    put_tenant(&mut buf, tenant);
+    put_subject(&mut buf, subject);
+    buf
+}
+
+/// Every envelope field a reader acts on, for [`envelope_aad_v2`].
+///
+/// A producer that is about to seal a payload has these in hand (the key and
+/// algorithm it chose, the event it is building); a reader that holds a
+/// stored [`Event`] with an [`EventBody::Encrypted`] body gets the same value
+/// from [`envelope_aad_for`].
+#[derive(Clone, Copy, Debug)]
+pub struct EnvelopeFields<'a> {
+    /// The event id.
+    pub id: &'a EventId,
+    /// The envelope schema version, as in [`Event::envelope_version`].
+    pub envelope_version: u8,
+    /// Microseconds since the Unix epoch, as in [`Event::time_micros`].
+    pub time_micros: i64,
+    /// The tenant scope.
+    pub tenant: Option<&'a TenantId>,
+    /// The kind tag.
+    pub kind: &'a KindTag,
+    /// Who the event is about.
+    pub subject: Option<&'a EventSubject>,
+    /// Who initiated the event.
+    pub actor: Option<&'a EventSubject>,
+    /// The W3C trace context.
+    pub trace_context: Option<&'a TraceContext>,
+    /// The outcome bucket.
+    pub status: EventStatus,
+    /// The key the payload is sealed under.
+    pub key_id: &'a KeyId,
+    /// The AEAD algorithm the payload is sealed with.
+    pub algorithm: AeadAlgorithm,
+}
+
+/// Associated data under the second AAD tag: [`envelope_aad`]'s fields and
+/// every other envelope field a reader acts on (status, actor, time,
+/// envelope version, trace context, and the blob's algorithm and key id).
+///
+/// With [`envelope_aad`] alone, someone who can write the event store but
+/// holds no key can rewrite `status`, `actor` or `time_micros` and the
+/// payload still decrypts: the audit record reads differently from what was
+/// written. Sealed under this value, a changed field fails authentication.
+///
+/// The encoding is injective in the same way as [`envelope_aad`]'s and leads
+/// with its own label (`axess-events/envelope-aad/v2`), so a v1 and a v2
+/// value never collide. Events sealed under the first tag stay readable: a
+/// reader tries [`envelope_aad_for`] first and [`envelope_aad`] second, and
+/// accepts a v1 success knowing that only the v1 fields were authenticated.
+///
+/// # Panics
+///
+/// If a field is longer than `u32::MAX` bytes, as for [`envelope_aad`].
+#[must_use]
+pub fn envelope_aad_v2(fields: &EnvelopeFields<'_>) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(160);
+    put(&mut buf, b"axess-events/envelope-aad/v2");
+    put(&mut buf, fields.id.as_bytes());
+    buf.push(fields.envelope_version);
+    buf.extend_from_slice(&fields.time_micros.to_be_bytes());
+    put(&mut buf, fields.kind.as_str().as_bytes());
+    put_tenant(&mut buf, fields.tenant);
+    put_subject(&mut buf, fields.subject);
+    put_subject(&mut buf, fields.actor);
+    match fields.trace_context {
+        None => buf.push(0),
+        Some(t) => {
+            buf.push(1);
+            buf.extend_from_slice(&t.trace_id);
+            buf.extend_from_slice(&t.span_id);
+            buf.push(t.flags);
+        }
+    }
+    buf.push(match fields.status {
+        EventStatus::Success => 1,
+        EventStatus::Failure => 2,
+        EventStatus::Info => 3,
+    });
+    put(&mut buf, fields.key_id.as_str().as_bytes());
+    buf.push(match fields.algorithm {
+        AeadAlgorithm::Aes256Gcm => 1,
+        AeadAlgorithm::ChaCha20Poly1305 => 2,
+    });
+    buf
+}
+
+/// The second-tag associated data of a stored event, read from the event's
+/// own fields and its blob. `None` when the body is
+/// [`EventBody::Clear`]: there is no ciphertext to open.
+///
+/// To read an event of either generation, open the blob under this value
+/// and, if that fails, under [`envelope_aad`] built from the same event.
+#[must_use]
+pub fn envelope_aad_for<P: EventPayload>(event: &Event<P>) -> Option<Vec<u8>> {
+    let EventBody::Encrypted(blob) = &event.body else {
+        return None;
+    };
+    Some(envelope_aad_v2(&EnvelopeFields {
+        id: &event.id,
+        envelope_version: event.envelope_version,
+        time_micros: event.time_micros,
+        tenant: event.tenant_id.as_ref(),
+        kind: &event.kind,
+        subject: event.subject.as_ref(),
+        actor: event.actor.as_ref(),
+        trace_context: event.trace_context.as_ref(),
+        status: event.status,
+        key_id: &blob.key_id,
+        algorithm: blob.algorithm,
+    }))
+}
+
+/// The associated data to try, in order, when opening an encrypted event:
+/// the second tag, then the first for events sealed before the second
+/// existed. `None` when the body is [`EventBody::Clear`].
+///
+/// A success under the first entry means every field a reader acts on was
+/// authenticated. A success under the second authenticated only id, kind,
+/// tenant and subject, as it did when the event was sealed.
+#[must_use]
+pub fn open_aads_for<P: EventPayload>(event: &Event<P>) -> Option<[Vec<u8>; 2]> {
+    let v2 = envelope_aad_for(event)?;
+    #[allow(deprecated)]
+    let v1 = envelope_aad(
+        &event.id,
+        &event.kind,
+        event.tenant_id.as_ref(),
+        event.subject.as_ref(),
+    );
+    Some([v2, v1])
+}
+
+fn put(buf: &mut Vec<u8>, bytes: &[u8]) {
+    let len = field_len(bytes.len()).expect("an AAD field is longer than u32::MAX bytes");
+    buf.extend_from_slice(&len.to_be_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+fn put_tenant(buf: &mut Vec<u8>, tenant: Option<&TenantId>) {
     match tenant {
         Some(t) => {
             buf.push(1);
-            put(&mut buf, t.as_bytes());
+            put(buf, t.as_bytes());
         }
         None => buf.push(0),
     }
+}
+
+fn put_subject(buf: &mut Vec<u8>, subject: Option<&EventSubject>) {
     match subject.map(EventSubject::as_ref) {
         None => buf.push(0),
         Some(EventSubjectRef::User(u)) => {
             buf.push(1);
-            put(&mut buf, u.as_bytes());
+            put(buf, u.as_bytes());
         }
         Some(EventSubjectRef::Tenant(t)) => {
             buf.push(2);
-            put(&mut buf, t.as_bytes());
+            put(buf, t.as_bytes());
         }
         Some(EventSubjectRef::Device(d)) => {
             buf.push(3);
-            put(&mut buf, d.as_bytes());
+            put(buf, d.as_bytes());
         }
         Some(EventSubjectRef::Session(s)) => {
             buf.push(4);
-            put(&mut buf, s.as_bytes());
+            put(buf, s.as_bytes());
         }
         Some(EventSubjectRef::Other { kind, id }) => {
             buf.push(5);
-            put(&mut buf, kind.as_bytes());
-            put(&mut buf, id.as_bytes());
+            put(buf, kind.as_bytes());
+            put(buf, id.as_bytes());
         }
     }
-    buf
 }
 
 /// The length prefix of an AAD field, or `None` when it does not fit.
@@ -166,6 +321,7 @@ fn field_len(len: usize) -> Option<u32> {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::id::UserId;

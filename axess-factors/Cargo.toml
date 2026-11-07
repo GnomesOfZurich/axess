@@ -39,17 +39,18 @@ hmac = { workspace = true, optional = true }
 jsonwebtoken = { version = "11.1.0", default-features = false, optional = true }
 ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-ring"], optional = true }
 # `timing-resistant-secret-traits` makes secret types refuse `PartialEq` / `Hash`.
-openidconnect = { version = "4.0.1", default-features = false, features = ["reqwest", "rustls-tls", "timing-resistant-secret-traits"], optional = true }
-# 0.13 to match webauthn-rs's transitive pin (-> crypto-glue); avoids a
-# duplicate-major. 0.14 additionally needs elliptic-curve 0.14 and drops
-# the `jwk` feature selected here.
+openidconnect = { version = "4.1.0", default-features = false, features = ["reqwest", "rustls-tls", "timing-resistant-secret-traits"], optional = true }
+# 0.13 to match jsonwebtoken's transitive pin. openidconnect 4.1 and
+# webauthn-rs (through crypto-glue) are on 0.14, so a build with `oauth` or
+# `fido2` carries both. 0.14 additionally needs elliptic-curve 0.14 and drops the `jwk`
+# feature selected here.
 p256 = { version = "0.13.2", features = ["ecdsa", "jwk"], optional = true }
 # Hashing and verification both go through `argon2` directly, with the explicit
 # `Params` in `password.rs` for new hashes and the parameters read from the
 # stored PHC string for verification, so a release cannot move the work factors.
 argon2 = { version = "0.6.0", default-features = false, features = ["alloc", "password-hash"], optional = true }
 # 0.12 to match axess-core's pin; avoids a duplicate-major in the resolved tree
-# (openidconnect 4.0.1 -> oauth2 5.0.0 transitively pins reqwest = "0.12").
+# (openidconnect 4.1.0 -> oauth2 5.0.0 transitively pins reqwest = "0.12").
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "json"], optional = true }
 rustls-pki-types = { version = "1.15.1", optional = true }
 # `rc` is required by `EmailOtpConfig::email: Arc<str>` (Deserialize for
@@ -61,18 +62,16 @@ sha1 = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 subtle = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }
-tokio = { workspace = true, features = ["rt", "time", "macros"], optional = true }
+tokio = { workspace = true, features = ["rt", "time", "macros", "net"], optional = true }
 tower = { version = "0.5.3", features = ["util"], optional = true }
 tracing = { workspace = true }
 url = { workspace = true, optional = true }
 uuid = { workspace = true, features = ["v4"], optional = true }
-# Pinned exactly: 0.6.0-dev is a pre-release, and a pre-release's API and
-# behaviour may change between builds, so a range would let a resolver
-# move it. `danger-allow-state-serialisation` is required to store a
+# `danger-allow-state-serialisation` is required to store a
 # ceremony's registration/authentication state between the two requests;
 # keep that state SERVER-SIDE only (never in a cookie or any field the
 # client can read or return), because it is the ceremony's trust anchor.
-webauthn-rs = { version = "=0.6.0-dev", features = ["danger-allow-state-serialisation", "conditional-ui"], optional = true }
+webauthn-rs = { version = "0.6.2", features = ["danger-allow-state-serialisation", "conditional-ui"], optional = true }
 x509-parser = { workspace = true, optional = true }
 zeroize = { workspace = true }
 
@@ -86,6 +85,10 @@ axess-rng = { workspace = true, features = ["testing"] }
 # rcgen mints SPIFFE-shape X509-SVID certs for mTLS resolver tests.
 rcgen = "0.14.10"
 rsa = { version = "0.9.10", features = ["pkcs5"] }
+# The tests build a `Webauthn` for UV-discouraged security keys, which
+# `webauthn-rs` offers only behind this feature; adopters who want that
+# ceremony enable it in their own build. The library does not use it.
+webauthn-rs = { version = "0.6.2", features = ["danger-allow-state-serialisation", "conditional-ui", "danger-user-presence-only-security-keys"] }
 # The breached-password screening is async; its unit tests need a runtime.
 tokio = { workspace = true, features = ["rt", "macros"] }
 wiremock = "0.6.5"

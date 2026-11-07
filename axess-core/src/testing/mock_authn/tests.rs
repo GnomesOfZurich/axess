@@ -43,6 +43,8 @@ async fn a_reset_token_verifies_once_under_concurrent_attempts() {
                 &user,
                 &hash,
                 chrono::Utc::now() + chrono::Duration::hours(1),
+                chrono::Utc::now(),
+                3,
             )
             .await
             .unwrap();
@@ -78,6 +80,8 @@ async fn a_wrong_hash_does_not_consume_the_reset_token() {
             &user,
             "right",
             chrono::Utc::now() + chrono::Duration::hours(1),
+            chrono::Utc::now(),
+            3,
         )
         .await
         .unwrap();
@@ -111,7 +115,7 @@ async fn a_reset_token_expires_on_the_instant_passed_in() {
     let ttl = chrono::Duration::minutes(30);
     let store = MockIdentityStore::new();
     let user = axess_identity::testing::user("u1");
-    let issue = |hash: &'static str| store.store_reset_token(&user, hash, origin + ttl);
+    let issue = |hash: &'static str| store.store_reset_token(&user, hash, origin + ttl, origin, 3);
 
     issue("h1").await.unwrap();
     let before = origin + ttl - chrono::Duration::minutes(1);

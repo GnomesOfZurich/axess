@@ -398,8 +398,8 @@ kick, log out everywhere) removes it from the **session registry**. On its
 own that does not touch the stored session row or the cookie. What notices
 depends on what guards the route:
 
-- `require_authn!` and `login_required!` check only the session's own
-  state. A revoked session still passes them.
+- `require_authn!` checks only the session's own state. A revoked
+  session still passes it.
 - `require_valid_session` consults the registry and answers 401. It also
   clears the stored session and rotates its id, so the row stops saying
   `Authenticated`.

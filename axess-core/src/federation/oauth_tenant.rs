@@ -138,6 +138,33 @@ pub trait TenantOAuthProviders: Send + Sync + 'static {
     /// Whatever stops the issuer's providers from being listed at all: an
     /// unreachable store.
     fn providers_for_issuer<'a>(&'a self, issuer: &'a str) -> IssuerFuture<'a>;
+
+    /// A number that changes whenever this source's answers can have changed:
+    /// a provider added, replaced or removed through it. The back-channel
+    /// logout route remembers, for a short time, that an issuer had no
+    /// provider; it trusts a remembered miss only while this number is the
+    /// one it saw when it asked, so a provider added through a live reload is
+    /// found at once.
+    ///
+    /// The default is a constant, which leaves the remembered miss bounded by
+    /// its time alone: a source that changes underneath the process (a store
+    /// another process writes) or that does not implement this keeps that
+    /// bound.
+    fn generation(&self) -> u64 {
+        0
+    }
+
+    /// The providers this registry holds built right now, over all tenants,
+    /// without building any: what the JWKS refresh loop and
+    /// [`AuthnService::refresh_all_jwks`](crate::authn::service::AuthnService::refresh_all_jwks)
+    /// refresh beside the service's own providers, so a signing key a
+    /// tenant's IdP withdrew does not stay trusted until the cache ages out.
+    ///
+    /// There is no default: a registry that refreshes nothing would keep a
+    /// withdrawn key trusted without saying so. A registry that builds its
+    /// providers on demand returns the ones it holds; one that holds none
+    /// returns `Vec::new()` and means it.
+    fn built_providers(&self) -> Vec<Arc<dyn OAuthProvider>>;
 }
 
 /// A [`TenantOAuthProviderStore`] failed. The backend's error is kept as the
@@ -226,5 +253,13 @@ impl<T: TenantOAuthProviders> TenantOAuthProviders for Arc<T> {
 
     fn providers_for_issuer<'a>(&'a self, issuer: &'a str) -> IssuerFuture<'a> {
         (**self).providers_for_issuer(issuer)
+    }
+
+    fn generation(&self) -> u64 {
+        (**self).generation()
+    }
+
+    fn built_providers(&self) -> Vec<Arc<dyn OAuthProvider>> {
+        (**self).built_providers()
     }
 }

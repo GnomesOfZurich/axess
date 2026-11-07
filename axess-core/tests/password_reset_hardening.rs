@@ -489,7 +489,13 @@ async fn an_unknown_identifier_does_not_overwrite_the_system_users_token() {
     let system = axess_core::authn::ids::UserId::SYSTEM;
     let now = chrono::Utc::now();
     identity
-        .store_reset_token(&system, "real-token-hash", now + chrono::Duration::hours(1))
+        .store_reset_token(
+            &system,
+            "real-token-hash",
+            now + chrono::Duration::hours(1),
+            now,
+            3,
+        )
         .await
         .unwrap();
 

@@ -15,18 +15,42 @@ use std::sync::Arc;
 use super::error::OAuthError;
 use super::provider::OAuthProvider;
 
-/// Refresh the JWKS of every provider once, in order, and return the
-/// providers whose refresh failed with their errors.
+/// How many providers a pass refreshes at once.
+pub const JWKS_REFRESH_CONCURRENCY: usize = 8;
+
+/// Refresh the JWKS of every provider once, up to
+/// [`JWKS_REFRESH_CONCURRENCY`] at a time, and return the providers whose
+/// refresh failed with their errors.
 ///
-/// A failure never stops the pass: each provider is attempted. An empty
-/// result means every refresh succeeded (or was coalesced by the provider's
-/// own debounce). Failures are logged at `warn`.
+/// A failure never stops the pass: each provider is attempted, and one that
+/// hangs until its client timeout holds back its own slot only, not the
+/// providers behind it. An empty result means every refresh succeeded (or
+/// was coalesced by the provider's own debounce). Failures are logged at
+/// `warn`; the order of the returned failures is the order they finished in.
 pub async fn refresh_providers_jwks(
     providers: &[Arc<dyn OAuthProvider>],
 ) -> Vec<(Arc<str>, OAuthError)> {
     let mut failures = Vec::new();
-    for provider in providers {
-        match provider.refresh_jwks().await {
+    let mut running = tokio::task::JoinSet::new();
+    let mut pending = providers.iter().cloned();
+    loop {
+        while running.len() < JWKS_REFRESH_CONCURRENCY
+            && let Some(provider) = pending.next()
+        {
+            running.spawn(async move {
+                let outcome = provider.refresh_jwks().await;
+                (provider, outcome)
+            });
+        }
+        let Some(done) = running.join_next().await else {
+            break;
+        };
+        // A refresh that panicked is its provider's failure alone.
+        let Ok((provider, outcome)) = done else {
+            tracing::warn!("a JWKS refresh task ended abnormally");
+            continue;
+        };
+        match outcome {
             Ok(()) => tracing::debug!(provider = %provider.name(), "JWKS refresh ok"),
             Err(e) => {
                 tracing::warn!(

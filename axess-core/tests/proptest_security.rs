@@ -65,6 +65,7 @@ fn arb_session_data() -> impl Strategy<Value = SessionData> {
         auth_state: AuthState::Guest,
         fingerprint,
         device_id: None,
+        device_proven: false,
         custom,
         revision: 0,
         touched_at: None,

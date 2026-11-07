@@ -374,6 +374,27 @@ impl crate::authn::store::IdentityAdmin for InMemoryBackend {
         }
         Ok(())
     }
+
+    async fn delete_candidates_created_before(
+        &self,
+        before: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+    ) -> Result<Vec<User>, Self::Error> {
+        let deleted = self
+            .identity
+            .delete_candidates_created_before(before, limit)
+            .await?;
+        if let Some(registry) = &self.sessions {
+            use crate::session::store::SessionRegistry as _;
+            for user in &deleted {
+                match registry.invalidate_user(&user.id).await {
+                    Ok(()) => {}
+                    Err(never) => match never {},
+                }
+            }
+        }
+        Ok(deleted)
+    }
 }
 
 impl crate::authn::store::IdentityPasswordHistory for InMemoryBackend {
@@ -473,9 +494,11 @@ impl crate::authn::store::IdentityPasswordReset for InMemoryBackend {
         user_id: &UserId,
         token_hash: &str,
         expires_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), Self::Error> {
+        now: chrono::DateTime<chrono::Utc>,
+        max_live: usize,
+    ) -> Result<bool, Self::Error> {
         self.identity
-            .store_reset_token(user_id, token_hash, expires_at)
+            .store_reset_token(user_id, token_hash, expires_at, now, max_live)
             .await
     }
 

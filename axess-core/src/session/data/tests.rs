@@ -146,6 +146,7 @@ fn only_an_authenticated_state_has_an_authenticated_user_id() {
             factors_completed: vec![],
             impersonator: None,
             ldap_groups: None,
+            assurance: Vec::new(),
         }
         .authenticated_user_id(),
         Some(&user)
@@ -176,6 +177,7 @@ fn pending_user_id_returns_none_only_for_guest() {
             factors_completed: vec![],
             impersonator: None,
             ldap_groups: None,
+            assurance: Vec::new(),
         }
         .pending_user_id(),
         Some(&user)
@@ -197,6 +199,7 @@ fn tenant_id_returns_none_only_for_guest() {
             factors_completed: vec![],
             impersonator: None,
             ldap_groups: None,
+            assurance: Vec::new(),
         }
         .tenant_id(),
         Some(&tenant)
@@ -218,6 +221,7 @@ fn is_authenticated_only_for_authenticated_variant() {
             factors_completed: vec![],
             impersonator: None,
             ldap_groups: None,
+            assurance: Vec::new(),
         }
         .is_authenticated()
     );
@@ -238,6 +242,7 @@ fn is_guest_only_for_guest_variant() {
             factors_completed: vec![],
             impersonator: None,
             ldap_groups: None,
+            assurance: Vec::new(),
         }
         .is_guest()
     );
@@ -269,9 +274,11 @@ fn session_data_json_round_trip() {
             ],
             impersonator: None,
             ldap_groups: None,
+            assurance: Vec::new(),
         },
         fingerprint: Some("fp-abc".to_string()),
         device_id: Some(axess_identity::testing::device("dev-1")),
+        device_proven: false,
         custom: serde_json::json!({"key": "value"}),
         revision: 7,
         touched_at: Some(chrono::Utc::now()),
@@ -310,6 +317,7 @@ fn is_authenticating_only_true_for_authenticating_variant() {
             attempt_count: 0,
             last_attempt: None,
             ldap_groups: None,
+            assurance: Vec::new(),
             impersonator: None,
         }
         .is_authenticating()
@@ -322,6 +330,7 @@ fn is_authenticating_only_true_for_authenticating_variant() {
             factors_completed: vec![],
             impersonator: None,
             ldap_groups: None,
+            assurance: Vec::new(),
         }
         .is_authenticating()
     );
@@ -382,7 +391,9 @@ fn begin_authenticating_constructs_authenticating_with_factors_in_order() {
             last_attempt,
             ldap_groups,
             impersonator,
+            assurance,
         } => {
+            assert!(assurance.is_empty(), "a login begins with no proof");
             assert_eq!(user_id, user);
             assert_eq!(tenant_id, tenant);
             assert_eq!(&*method_name, "password+totp");
@@ -415,7 +426,9 @@ fn set_authenticated_constructs_authenticated_with_empty_factors() {
             factors_completed,
             impersonator,
             ldap_groups,
+            assurance,
         } => {
+            assert!(assurance.is_empty(), "a direct transition proves nothing");
             assert_eq!(user_id, user);
             assert_eq!(tenant_id, tenant);
             assert_eq!(authn_time, t);
@@ -443,9 +456,13 @@ fn advance_factor_still_authenticating_when_factors_remain() {
         attempt_count: 0,
         last_attempt: None,
         ldap_groups: None,
+        assurance: Vec::new(),
         impersonator: None,
     };
-    let outcome = state.advance_factor(&FactorKind::Password, now());
+    let outcome = state.advance_factor(crate::authn::assurance::FactorAssurance::for_kind(
+        FactorKind::Password,
+        now(),
+    ));
     assert_eq!(outcome, AdvanceOutcome::StillAuthenticating);
     match state {
         AuthState::Authenticating {
@@ -474,9 +491,13 @@ fn advance_factor_completes_when_last_factor_verified() {
         attempt_count: 0,
         last_attempt: None,
         ldap_groups: None,
+        assurance: Vec::new(),
         impersonator: None,
     };
-    let outcome = state.advance_factor(&FactorKind::Password, t);
+    let outcome = state.advance_factor(crate::authn::assurance::FactorAssurance::for_kind(
+        FactorKind::Password,
+        t,
+    ));
     assert_eq!(outcome, AdvanceOutcome::Completed);
     match state {
         AuthState::Authenticated {
@@ -486,7 +507,16 @@ fn advance_factor_completes_when_last_factor_verified() {
             factors_completed,
             impersonator,
             ldap_groups,
+            assurance,
         } => {
+            assert_eq!(
+                assurance,
+                vec![crate::authn::assurance::FactorAssurance::for_kind(
+                    FactorKind::Password,
+                    t
+                )],
+                "the factor's proof is carried into the authenticated state"
+            );
             assert_eq!(user_id, user);
             assert_eq!(tenant_id, tenant);
             assert_eq!(authn_time, t);
@@ -516,14 +546,21 @@ fn advance_factor_carries_completed_factors_into_authenticated() {
         attempt_count: 0,
         last_attempt: None,
         ldap_groups: None,
+        assurance: Vec::new(),
         impersonator: None,
     };
     assert_eq!(
-        state.advance_factor(&FactorKind::Password, t),
+        state.advance_factor(crate::authn::assurance::FactorAssurance::for_kind(
+            FactorKind::Password,
+            t
+        )),
         AdvanceOutcome::StillAuthenticating
     );
     assert_eq!(
-        state.advance_factor(&FactorKind::Totp, t),
+        state.advance_factor(crate::authn::assurance::FactorAssurance::for_kind(
+            FactorKind::Totp,
+            t
+        )),
         AdvanceOutcome::Completed
     );
     match state {
@@ -556,9 +593,13 @@ fn advance_factor_no_op_when_kind_not_in_remaining() {
         attempt_count: 0,
         last_attempt: None,
         ldap_groups: None,
+        assurance: Vec::new(),
         impersonator: None,
     };
-    let outcome = state.advance_factor(&FactorKind::Totp, now());
+    let outcome = state.advance_factor(crate::authn::assurance::FactorAssurance::for_kind(
+        FactorKind::Totp,
+        now(),
+    ));
     assert_eq!(outcome, AdvanceOutcome::StillAuthenticating);
     match state {
         AuthState::Authenticating {
@@ -581,7 +622,10 @@ fn advance_factor_no_op_when_kind_not_in_remaining() {
 fn advance_factor_not_applicable_outside_authenticating() {
     let mut state = AuthState::Guest;
     assert_eq!(
-        state.advance_factor(&FactorKind::Password, now()),
+        state.advance_factor(crate::authn::assurance::FactorAssurance::for_kind(
+            FactorKind::Password,
+            now()
+        )),
         AdvanceOutcome::NotApplicable
     );
     assert_eq!(state, AuthState::Guest);
@@ -601,6 +645,7 @@ fn record_attempt_at_increments_counter_and_captures_timestamp() {
         attempt_count: 0,
         last_attempt: None,
         ldap_groups: None,
+        assurance: Vec::new(),
         impersonator: None,
     };
     state.record_attempt_at(t);
@@ -676,11 +721,17 @@ fn a_choice_step_is_completed_by_whichever_factor_it_offers() {
     );
     let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
     assert_eq!(
-        state.advance_factor(&FactorKind::Password, now),
+        state.advance_factor(crate::authn::assurance::FactorAssurance::for_kind(
+            FactorKind::Password,
+            now
+        )),
         AdvanceOutcome::StillAuthenticating
     );
     assert_eq!(
-        state.advance_factor(&FactorKind::RecoveryCode, now),
+        state.advance_factor(crate::authn::assurance::FactorAssurance::for_kind(
+            FactorKind::RecoveryCode,
+            now
+        )),
         AdvanceOutcome::Completed
     );
     match state {
@@ -762,14 +813,21 @@ fn ldap_groups_ride_the_login_into_the_authenticated_state() {
         last_attempt: None,
         ldap_groups: Some(staff.clone()),
         impersonator: None,
+        assurance: Vec::new(),
     };
     assert_eq!(state.ldap_groups(), None, "not before the login completes");
 
-    state.advance_factor(&FactorKind::LdapBind, now());
+    state.advance_factor(crate::authn::assurance::FactorAssurance::for_kind(
+        FactorKind::LdapBind,
+        now(),
+    ));
     assert_eq!(state.ldap_groups(), Some(staff.as_slice()));
 
     assert!(state.begin_step_up(required(vec![FactorKind::Totp])));
-    state.advance_factor(&FactorKind::Totp, now());
+    state.advance_factor(crate::authn::assurance::FactorAssurance::for_kind(
+        FactorKind::Totp,
+        now(),
+    ));
     assert_eq!(
         state.ldap_groups(),
         Some(staff.as_slice()),
@@ -800,7 +858,10 @@ fn a_step_up_keeps_the_impersonation() {
 
     assert!(state.begin_step_up(required(vec![FactorKind::Totp])));
     assert_eq!(
-        state.advance_factor(&FactorKind::Totp, now()),
+        state.advance_factor(crate::authn::assurance::FactorAssurance::for_kind(
+            FactorKind::Totp,
+            now()
+        )),
         AdvanceOutcome::Completed
     );
     assert_eq!(
@@ -837,15 +898,22 @@ fn a_step_up_keeps_the_time_of_the_factors_before_it() {
         attempt_count: 0,
         last_attempt: None,
         ldap_groups: None,
+        assurance: Vec::new(),
         impersonator: None,
     };
     assert_eq!(
-        state.advance_factor(&FactorKind::Password, login),
+        state.advance_factor(crate::authn::assurance::FactorAssurance::for_kind(
+            FactorKind::Password,
+            login
+        )),
         AdvanceOutcome::Completed
     );
     assert!(state.begin_step_up(required(vec![FactorKind::Totp])));
     assert_eq!(
-        state.advance_factor(&FactorKind::Totp, step_up),
+        state.advance_factor(crate::authn::assurance::FactorAssurance::for_kind(
+            FactorKind::Totp,
+            step_up
+        )),
         AdvanceOutcome::Completed
     );
 
@@ -874,6 +942,7 @@ fn a_plain_list_of_factor_kinds_reads_as_verified_at_authn_time() {
         factors_completed: vec![(FactorKind::Password, at), (FactorKind::Totp, at)],
         impersonator: None,
         ldap_groups: None,
+        assurance: Vec::new(),
     };
     let mut row = serde_json::to_value(&current).unwrap();
     row["factors_completed"] = serde_json::json!(["Password", "Totp"]);
@@ -900,6 +969,7 @@ fn a_plain_list_in_an_authenticating_row_reads_as_the_epoch() {
         attempt_count: 0,
         last_attempt: None,
         ldap_groups: None,
+        assurance: Vec::new(),
         impersonator: None,
     };
     let mut row = serde_json::to_value(&current).unwrap();

@@ -117,6 +117,7 @@ The new signals are these methods:
 | `fingerprint_key_fallback` | `RotationMetrics` | same, for the fingerprint signing key |
 | `session_fingerprint_backfilled` | `SessionMetrics` | a rate that does not fall after binding was turned on |
 | `sid_map_evicted(count)` | `SessionMetrics` | any steady count: the `sid` map capacity is too small |
+| `back_channel_logout_unmatched` | `SessionMetrics` | a steady rate: logout tokens reach an instance that cannot find the session (instances that do not share a `sid` store), or arrive for sessions that already ended |
 | `provider_reloaded(category)` | `ProviderRegistryMetrics` | a reload nobody ordered; compare the count across instances after one |
 | `provider_removed(category)` | `ProviderRegistryMetrics` | a removal nobody ordered: a tenant lost its IdP |
 | `provider_reload_refused(category)` | `ProviderRegistryMetrics` | any count: a provider that does not work was published and the previous one stays in force |

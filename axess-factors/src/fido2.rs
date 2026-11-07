@@ -1,12 +1,14 @@
 //! FIDO2/WebAuthn factor data types: config, credential metadata,
-//! options, and re-exports of the `webauthn-rs` primitives the
-//! orchestrator persists alongside them.
+//! options, the ceremony vocabulary, and re-exports of the `webauthn-rs`
+//! primitives the orchestrator persists alongside them.
 //!
-//! Gated on the `fido2` feature. The *verifier* (ceremony logic, the
-//! `Fido2Provider` trait, `Fido2Service`) still lives in axess-core
-//! until lands; the types here are just the
-//! storage shapes the orchestrator's `FactorConfig::Fido2(...)`
-//! variant embeds.
+//! [`Fido2Config`], [`Fido2Ceremony`] and [`SecurityKeyVerification`] are
+//! plain data and compile without the `fido2` feature, so admin tooling and
+//! policy code can name them without `webauthn-rs`. Everything else is
+//! gated on `fido2`: the stored credential ([`Fido2Credential`] holding a
+//! typed [`Fido2Key`]), the ceremony state ([`Fido2Registration`],
+//! [`Fido2Authentication`]), the [`Fido2Provider`] trait and its
+//! [`DefaultFido2Provider`].
 
 #[cfg(feature = "fido2")]
 use chrono::{DateTime, Utc};
@@ -30,17 +32,155 @@ pub struct Fido2Config {
     pub credentials: Vec<serde_json::Value>,
 }
 
+// ── Fido2Ceremony ────────────────────────────────────────────────────────────
+
+/// Which typed WebAuthn ceremony runs for an operation.
+///
+/// WebAuthn fixes the user verification and attestation it asks for in the
+/// challenge, before the ceremony; `webauthn-rs` makes that choice a typed
+/// ceremony, and this names the three axess runs. A credential keeps the type
+/// of the ceremony that registered it, and a login ceremony offers only the
+/// credentials it can authenticate ([`accepts`](Self::accepts), `fido2`
+/// feature).
+///
+/// Written and parsed as a string (its [`Display`](std::fmt::Display) form):
+/// `passkey`, `security_key:preferred`, `security_key:discouraged`,
+/// `attested_passkey:<trust anchor>`. The order is from the ceremony that
+/// asks the least to the one that asks the most.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(into = "String", try_from = "String")]
+pub enum Fido2Ceremony {
+    /// The security-key ceremony (`start_securitykey_*`): a non-discoverable
+    /// credential, with user verification preferred or discouraged.
+    SecurityKey(SecurityKeyVerification),
+    /// The passkey ceremony (`start_passkey_*`): user verification required,
+    /// no attestation. What axess ran for every operation before the
+    /// ceremony was chosen per operation, and [`DEFAULT_FIDO2_CEREMONY`].
+    Passkey,
+    /// The attested-passkey ceremony (`start_attested_passkey_*`): user
+    /// verification required, the authenticator's attestation verified
+    /// against the trust anchor (`AttestationCaList`) the provider holds
+    /// under `trust_anchor`, and synced authenticators refused.
+    AttestedPasskey {
+        /// The name the provider holds the trust anchor under.
+        trust_anchor: String,
+    },
+}
+
+/// The ceremony every FIDO2 operation runs unless the adopter chooses
+/// another: [`Fido2Ceremony::Passkey`].
+pub const DEFAULT_FIDO2_CEREMONY: Fido2Ceremony = Fido2Ceremony::Passkey;
+
+/// The user verification a security-key ceremony asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecurityKeyVerification {
+    /// Ask the authenticator not to verify the user: presence only. Needs a
+    /// `Webauthn` built for presence-only security keys, see
+    /// `DefaultFido2Provider::with_presence_only_security_keys`.
+    Discouraged,
+    /// Ask the authenticator to verify the user when it can.
+    Preferred,
+}
+
+/// A string that names no [`Fido2Ceremony`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fido2CeremonyParseError {
+    /// The string that was refused.
+    pub value: String,
+}
+
+impl std::fmt::Display for Fido2CeremonyParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "unknown FIDO2 ceremony {:?}: expected passkey, security_key:preferred, \
+             security_key:discouraged or attested_passkey:<trust anchor>",
+            self.value
+        )
+    }
+}
+
+impl std::error::Error for Fido2CeremonyParseError {}
+
+impl std::fmt::Display for Fido2Ceremony {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Passkey => f.write_str("passkey"),
+            Self::SecurityKey(SecurityKeyVerification::Preferred) => {
+                f.write_str("security_key:preferred")
+            }
+            Self::SecurityKey(SecurityKeyVerification::Discouraged) => {
+                f.write_str("security_key:discouraged")
+            }
+            Self::AttestedPasskey { trust_anchor } => write!(f, "attested_passkey:{trust_anchor}"),
+        }
+    }
+}
+
+impl std::str::FromStr for Fido2Ceremony {
+    type Err = Fido2CeremonyParseError;
+
+    /// Parse the [`Display`](std::fmt::Display) form. A trust anchor name is
+    /// one or more visible ASCII characters (no space, no control
+    /// character), because it travels in policy annotations and responses.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let refused = || Fido2CeremonyParseError {
+            value: value.to_string(),
+        };
+        match value {
+            "passkey" => Ok(Self::Passkey),
+            "security_key:preferred" => Ok(Self::SecurityKey(SecurityKeyVerification::Preferred)),
+            "security_key:discouraged" => {
+                Ok(Self::SecurityKey(SecurityKeyVerification::Discouraged))
+            }
+            other => {
+                let anchor = other
+                    .strip_prefix("attested_passkey:")
+                    .ok_or_else(refused)?;
+                if anchor.is_empty() || !anchor.bytes().all(|b| b.is_ascii_graphic()) {
+                    return Err(refused());
+                }
+                Ok(Self::AttestedPasskey {
+                    trust_anchor: anchor.to_string(),
+                })
+            }
+        }
+    }
+}
+
+impl From<Fido2Ceremony> for String {
+    fn from(ceremony: Fido2Ceremony) -> Self {
+        ceremony.to_string()
+    }
+}
+
+impl TryFrom<String> for Fido2Ceremony {
+    type Error = Fido2CeremonyParseError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
 // ── Fido2Credential ──────────────────────────────────────────────────────────
 
 /// A FIDO2 credential with application-level metadata.
 ///
-/// Wraps webauthn-rs `Passkey` with a friendly name, registration timestamp,
-/// and last-used timestamp for credential management UIs.
+/// Wraps the typed [`Fido2Key`] the registering ceremony produced with a
+/// friendly name, registration timestamp, and last-used timestamp for
+/// credential management UIs.
+///
+/// A passkey is stored in the shape earlier releases wrote (its key under
+/// `passkey`), so they still read it; a security key or an attested passkey
+/// is stored under `key`. Both shapes read back.
 #[cfg(feature = "fido2")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "credential_wire::Fido2CredentialWire")]
+#[serde(into = "credential_wire::Fido2CredentialWire")]
 pub struct Fido2Credential {
-    /// Underlying webauthn-rs `Passkey` (public key + counter + transports).
-    pub passkey: webauthn_rs::prelude::Passkey,
+    /// The credential as the ceremony that registered it typed it.
+    pub key: Fido2Key,
     /// User-supplied label shown in credential management UIs.
     pub name: String,
     /// Timestamp at which the credential was registered.
@@ -51,14 +191,15 @@ pub struct Fido2Credential {
 
 #[cfg(feature = "fido2")]
 impl Fido2Credential {
-    /// Construct a fresh credential record with `last_used_at` cleared.
+    /// Construct a fresh credential record with `last_used_at` cleared. A
+    /// `Passkey` converts into a [`Fido2Key`], so a passkey is passed as is.
     pub fn new(
-        passkey: webauthn_rs::prelude::Passkey,
+        key: impl Into<Fido2Key>,
         name: impl Into<String>,
         registered_at: DateTime<Utc>,
     ) -> Self {
         Self {
-            passkey,
+            key: key.into(),
             name: name.into(),
             registered_at,
             last_used_at: None,
@@ -67,7 +208,7 @@ impl Fido2Credential {
 
     /// Return the WebAuthn credential ID assigned by the authenticator.
     pub fn cred_id(&self) -> &webauthn_rs::prelude::CredentialID {
-        self.passkey.cred_id()
+        self.key.cred_id()
     }
 
     /// Update the stored counter from a successful authentication and record
@@ -79,26 +220,30 @@ impl Fido2Credential {
     ) {
         // `update_credential` answers `None` for a result that belongs to
         // another credential; only the matching one counts as used.
-        if self.passkey.update_credential(result).is_some() {
+        if self.key.update_credential(result).is_some() {
             self.last_used_at = Some(now);
         }
     }
 }
+
+#[cfg(feature = "fido2")]
+mod credential_wire;
 
 // ── Re-exports ───────────────────────────────────────────────────────────────
 
 #[cfg(feature = "fido2")]
 pub use webauthn_rs::prelude::AuthenticatorAttachment;
 #[cfg(feature = "fido2")]
-pub use webauthn_rs::prelude::{AuthenticationResult, CredentialID};
+pub use webauthn_rs::prelude::{AttestationCaList, AuthenticationResult, CredentialID};
 
 // ── Fido2Options ─────────────────────────────────────────────────────────────
 
 /// Configuration for FIDO2/WebAuthn ceremony management.
 ///
-/// Controls the ceremony state timeout at the service level.
-/// UV policy, authenticator attachment, and attestation are configured at
-/// `WebauthnBuilder` level.
+/// Controls the ceremony state timeout, the age a session needs for a
+/// credential change, and which ceremony registration and login run. A
+/// step-up for a named action takes its ceremony from the `@step_up`
+/// annotation of the Cedar rule that requires it instead.
 #[cfg(feature = "fido2")]
 #[derive(Debug, Clone)]
 pub struct Fido2Options {
@@ -112,6 +257,14 @@ pub struct Fido2Options {
     /// cannot enrol an attacker's passkey hours later. `None`, the
     /// default, applies no age limit; a few minutes is the usual choice.
     pub max_authn_age: Option<std::time::Duration>,
+    /// The ceremony a registration runs unless the call names one
+    /// (`begin_fido2_registration_with`). Default
+    /// [`DEFAULT_FIDO2_CEREMONY`], the passkey ceremony.
+    pub registration_ceremony: Fido2Ceremony,
+    /// The ceremony the FIDO2 step of a login method runs, and a step-up
+    /// begun without a ceremony of its own. Default
+    /// [`DEFAULT_FIDO2_CEREMONY`], the passkey ceremony.
+    pub login_ceremony: Fido2Ceremony,
 }
 
 #[cfg(feature = "fido2")]
@@ -120,460 +273,34 @@ impl Default for Fido2Options {
         Self {
             ceremony_timeout: std::time::Duration::from_secs(300),
             max_authn_age: None,
+            registration_ceremony: DEFAULT_FIDO2_CEREMONY,
+            login_ceremony: DEFAULT_FIDO2_CEREMONY,
         }
     }
 }
 
-// ── Fido2Provider trait (verifier abstraction) ───────────────────────────────
-//
-// Pairs with the orchestrator's FIDO2 service in axess-core
-// (`AuthnService` methods are orchestrator-level). The trait + the two
-// impl shapes live here next to the credential type.
+// ── Typed keys, ceremony state, provider ────────────────────────────────────
 
 #[cfg(feature = "fido2")]
-use axess_identity::DeviceId;
+mod key;
 #[cfg(feature = "fido2")]
-use webauthn_rs::prelude::*;
-
-/// Abstraction over WebAuthn ceremony operations.
-///
-/// Production: [`DefaultFido2Provider`] (wraps `webauthn_rs::Webauthn`).
-/// Tests: `MockFido2Provider` (`testing` feature; configurable outcomes without crypto).
-///
-/// # Timeouts
-///
-/// FIDO2 ceremonies are browser-side; the authenticator interaction happens
-/// on the client. The server enforces a ceremony timeout: stale ceremony
-/// state is rejected if the timestamp exceeds the configured limit (default
-/// 5 minutes). No server-side network calls are involved, so no HTTP timeout
-/// is needed.
-///
-/// # Declared determinism exception
-///
-/// [`DefaultFido2Provider`] delegates to `webauthn-rs`, which draws challenge
-/// bytes from the thread RNG and checks attestation validity against the
-/// system clock; neither can be injected through its API. Everything axess
-/// itself decides around a ceremony (its timeout, timestamps, the credential
-/// list) uses the service's injected `Clock`. A test
-/// that needs a reproducible ceremony substitutes the provider:
-/// `MockFido2Provider` returns configured outcomes with no randomness and
-/// no clock.
-///
-/// # Limitations (webauthn-rs 0.6)
-///
-/// The `Webauthn` struct hardcodes `UserVerificationPolicy::Required` in
-/// `start_passkey_authentication`. UV policy, authenticator attachment, and
-/// attestation preferences are configured at `WebauthnBuilder` construction
-/// time, not per-ceremony. When webauthn-rs exposes per-ceremony configuration,
-/// the `Fido2Provider` trait is already designed to support it.
-#[cfg(feature = "fido2")]
-pub trait Fido2Provider: Send + Sync + 'static {
-    /// The relying-party id this provider's ceremonies are bound to.
-    ///
-    /// A passkey is bound to the relying-party id it was registered under, so
-    /// changing it orphans every registered credential. A live reload
-    /// (`AuthnService::reload_fido2`) compares the id of the provider it
-    /// replaces with the candidate's and refuses a change unless the caller
-    /// acknowledged it. An implementation that cannot tell returns an empty
-    /// string, which equals no real id, so a reload to or from it is refused
-    /// until acknowledged.
-    fn relying_party_id(&self) -> &str;
-
-    /// Start a passkey authentication ceremony.
-    fn start_authentication(
-        &self,
-        credentials: &[Passkey],
-    ) -> WebauthnResult<(RequestChallengeResponse, PasskeyAuthentication)>;
-
-    /// Finish a passkey authentication ceremony.
-    fn finish_authentication(
-        &self,
-        assertion: &PublicKeyCredential,
-        state: &PasskeyAuthentication,
-    ) -> WebauthnResult<AuthenticationResult>;
-
-    /// Start a passkey registration ceremony.
-    fn start_registration(
-        &self,
-        user_id: uuid::Uuid,
-        user_name: &str,
-        display_name: &str,
-        exclude: Option<Vec<CredentialID>>,
-    ) -> WebauthnResult<(CreationChallengeResponse, PasskeyRegistration)>;
-
-    /// Finish a passkey registration ceremony.
-    fn finish_registration(
-        &self,
-        response: &RegisterPublicKeyCredential,
-        state: &PasskeyRegistration,
-    ) -> WebauthnResult<Passkey>;
-
-    /// Start a discoverable (passwordless) authentication ceremony.
-    fn start_discoverable_authentication(
-        &self,
-    ) -> WebauthnResult<(RequestChallengeResponse, DiscoverableAuthentication)>;
-
-    /// Finish a discoverable authentication ceremony.
-    fn finish_discoverable_authentication(
-        &self,
-        assertion: &PublicKeyCredential,
-        state: DiscoverableAuthentication,
-        keys: &[DiscoverableKey],
-    ) -> WebauthnResult<AuthenticationResult>;
-
-    /// Credential-used notification hook.
-    ///
-    /// Fired by the orchestrator's service layer after a successful
-    /// WebAuthn ceremony (registration or assertion) for which the
-    /// request resolved to a known device. Adopters that wire the
-    /// orchestrator's device subsystem override this method to persist
-    /// a `DeviceBinding::WebAuthn` row (or update `last_used_at` on an
-    /// existing binding) so the device → credential relation is
-    /// auditable and step-up policy can reason about "this device has
-    /// presented this credential before."
-    ///
-    /// # Sync surface, async-friendly
-    ///
-    /// The default impl is a no-op so the trait stays sync; adopters
-    /// that need to write to an async device store spawn a task inside
-    /// the override (`tokio::spawn(async move { … })`) or push the
-    /// event onto a channel for a background worker. The hook is
-    /// informational; failures inside the override must not fail the
-    /// surrounding ceremony; the ceremony already succeeded at the
-    /// WebAuthn layer when this fires.
-    fn on_credential_used(&self, credential_id: &CredentialID, device_id: &DeviceId) {
-        tracing::trace!(
-            target: "axess::factors::fido2",
-            ?credential_id,
-            %device_id,
-            "Fido2Provider::on_credential_used default impl: no observer wired",
-        );
-    }
-}
-
-// ── DefaultFido2Provider ─────────────────────────────────────────────────────
-
-/// Production FIDO2 provider wrapping `webauthn_rs::Webauthn`.
-///
-/// Construct with `WebauthnBuilder` to set relying party ID and origin:
-///
-/// ```rust,ignore
-/// use webauthn_rs::prelude::*;
-/// use axess_factors::fido2::DefaultFido2Provider;
-///
-/// let webauthn = WebauthnBuilder::new("example.com", &Url::parse("https://example.com")?)
-///     .unwrap()
-///     .build()
-///     .unwrap();
-/// let provider = DefaultFido2Provider::new(webauthn);
-/// ```
-#[cfg(feature = "fido2")]
-pub struct DefaultFido2Provider {
-    inner: Webauthn,
-    rp_id: String,
-}
+pub use key::{Fido2Authentication, Fido2Key, Fido2Registration};
 
 #[cfg(feature = "fido2")]
-impl DefaultFido2Provider {
-    /// Wrap an existing `Webauthn` instance.
-    ///
-    /// The relying-party id is read from the instance itself (the challenge
-    /// a discoverable authentication would send names it), so it cannot
-    /// disagree with the ceremonies. If that read fails, which the library
-    /// does not do for a built instance, the id is empty and a reload is
-    /// refused until acknowledged.
-    pub fn new(webauthn: Webauthn) -> Self {
-        let rp_id = webauthn
-            .start_discoverable_authentication()
-            .map(|(challenge, _)| challenge.public_key.rp_id)
-            .unwrap_or_default();
-        Self {
-            inner: webauthn,
-            rp_id,
-        }
-    }
-}
-
+mod provider;
 #[cfg(feature = "fido2")]
-impl Fido2Provider for DefaultFido2Provider {
-    fn relying_party_id(&self) -> &str {
-        &self.rp_id
-    }
-
-    fn start_authentication(
-        &self,
-        credentials: &[Passkey],
-    ) -> WebauthnResult<(RequestChallengeResponse, PasskeyAuthentication)> {
-        self.inner.start_passkey_authentication(credentials)
-    }
-
-    fn finish_authentication(
-        &self,
-        assertion: &PublicKeyCredential,
-        state: &PasskeyAuthentication,
-    ) -> WebauthnResult<AuthenticationResult> {
-        self.inner.finish_passkey_authentication(assertion, state)
-    }
-
-    fn start_registration(
-        &self,
-        user_id: uuid::Uuid,
-        user_name: &str,
-        display_name: &str,
-        exclude: Option<Vec<CredentialID>>,
-    ) -> WebauthnResult<(CreationChallengeResponse, PasskeyRegistration)> {
-        self.inner
-            .start_passkey_registration(user_id, user_name, display_name, exclude)
-    }
-
-    fn finish_registration(
-        &self,
-        response: &RegisterPublicKeyCredential,
-        state: &PasskeyRegistration,
-    ) -> WebauthnResult<Passkey> {
-        self.inner.finish_passkey_registration(response, state)
-    }
-
-    fn start_discoverable_authentication(
-        &self,
-    ) -> WebauthnResult<(RequestChallengeResponse, DiscoverableAuthentication)> {
-        self.inner.start_discoverable_authentication()
-    }
-
-    fn finish_discoverable_authentication(
-        &self,
-        assertion: &PublicKeyCredential,
-        state: DiscoverableAuthentication,
-        keys: &[DiscoverableKey],
-    ) -> WebauthnResult<AuthenticationResult> {
-        self.inner
-            .finish_discoverable_authentication(assertion, state, keys)
-    }
-}
-
-// ── MockFido2Provider ────────────────────────────────────────────────────────
-
-/// Test double for [`Fido2Provider`]. Fails every ceremony call so the
-/// caller can exercise error paths without real WebAuthn crypto; for
-/// end-to-end FIDO2 tests, use [`DefaultFido2Provider`] against a
-/// `WebauthnBuilder` configured for a test origin.
-#[cfg(all(feature = "fido2", any(test, feature = "testing")))]
-pub struct MockFido2Provider {
-    rp_id: String,
-}
+pub use provider::{DefaultFido2Provider, Fido2Provider};
 
 #[cfg(all(feature = "fido2", any(test, feature = "testing")))]
-impl MockFido2Provider {
-    /// Construct a new mock provider that always fails ceremony calls. Its
-    /// relying-party id is `localhost`; change it with
-    /// [`with_relying_party_id`](Self::with_relying_party_id).
-    pub fn new() -> Self {
-        Self {
-            rp_id: "localhost".to_string(),
-        }
-    }
-
-    /// The relying-party id [`Fido2Provider::relying_party_id`] reports.
-    #[must_use]
-    pub fn with_relying_party_id(mut self, rp_id: impl Into<String>) -> Self {
-        self.rp_id = rp_id.into();
-        self
-    }
-}
-
+mod mock;
 #[cfg(all(feature = "fido2", any(test, feature = "testing")))]
-impl Default for MockFido2Provider {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[cfg(all(feature = "fido2", any(test, feature = "testing")))]
-impl Fido2Provider for MockFido2Provider {
-    fn relying_party_id(&self) -> &str {
-        &self.rp_id
-    }
-
-    fn start_authentication(
-        &self,
-        credentials: &[Passkey],
-    ) -> WebauthnResult<(RequestChallengeResponse, PasskeyAuthentication)> {
-        tracing::debug!(
-            target: "axess::testing::mock_fido2",
-            credential_count = credentials.len(),
-            "MockFido2Provider::start_authentication rejected",
-        );
-        Err(WebauthnError::CredentialNotFound)
-    }
-
-    fn finish_authentication(
-        &self,
-        assertion: &PublicKeyCredential,
-        _state: &PasskeyAuthentication,
-    ) -> WebauthnResult<AuthenticationResult> {
-        tracing::debug!(
-            target: "axess::testing::mock_fido2",
-            credential_id = ?assertion.id,
-            "MockFido2Provider::finish_authentication rejected",
-        );
-        Err(WebauthnError::CredentialNotFound)
-    }
-
-    fn start_registration(
-        &self,
-        user_id: uuid::Uuid,
-        user_name: &str,
-        display_name: &str,
-        exclude: Option<Vec<CredentialID>>,
-    ) -> WebauthnResult<(CreationChallengeResponse, PasskeyRegistration)> {
-        tracing::debug!(
-            target: "axess::testing::mock_fido2",
-            %user_id,
-            user_name,
-            display_name,
-            exclude_count = exclude.as_ref().map(Vec::len).unwrap_or(0),
-            "MockFido2Provider::start_registration rejected",
-        );
-        Err(WebauthnError::CredentialNotFound)
-    }
-
-    fn finish_registration(
-        &self,
-        response: &RegisterPublicKeyCredential,
-        _state: &PasskeyRegistration,
-    ) -> WebauthnResult<Passkey> {
-        tracing::debug!(
-            target: "axess::testing::mock_fido2",
-            credential_id = ?response.id,
-            "MockFido2Provider::finish_registration rejected",
-        );
-        Err(WebauthnError::CredentialNotFound)
-    }
-
-    fn start_discoverable_authentication(
-        &self,
-    ) -> WebauthnResult<(RequestChallengeResponse, DiscoverableAuthentication)> {
-        tracing::debug!(
-            target: "axess::testing::mock_fido2",
-            "MockFido2Provider::start_discoverable_authentication rejected",
-        );
-        Err(WebauthnError::CredentialNotFound)
-    }
-
-    fn finish_discoverable_authentication(
-        &self,
-        assertion: &PublicKeyCredential,
-        _state: DiscoverableAuthentication,
-        keys: &[DiscoverableKey],
-    ) -> WebauthnResult<AuthenticationResult> {
-        tracing::debug!(
-            target: "axess::testing::mock_fido2",
-            credential_id = ?assertion.id,
-            discoverable_key_count = keys.len(),
-            "MockFido2Provider::finish_discoverable_authentication rejected",
-        );
-        Err(WebauthnError::CredentialNotFound)
-    }
-}
+pub use mock::MockFido2Provider;
 
 #[cfg(all(test, feature = "fido2"))]
-mod verifier_tests {
-    use super::*;
-    use std::sync::Mutex;
-
-    /// The default `on_credential_used` is a no-op and must not panic.
-    /// Mock providers + adopter impls that don't care about device
-    /// binding inherit this default.
-    #[test]
-    fn default_on_credential_used_is_noop() {
-        let provider = MockFido2Provider::new();
-        let device_id = axess_identity::testing::device("d-fido2-noop");
-        let cred = CredentialID::from(vec![0u8; 16]);
-        // No assertion, no panic, no return; just confirms the call
-        // path exists and the default impl runs cleanly.
-        provider.on_credential_used(&cred, &device_id);
-    }
-
-    /// Adopters override the hook to capture `(credential_id,
-    /// device_id)` pairs for binding persistence. Verify that an
-    /// override is visible to the trait dispatch path.
-    #[test]
-    fn override_captures_credential_and_device_id() {
-        struct CountingProvider {
-            inner: MockFido2Provider,
-            captured: Mutex<Vec<(Vec<u8>, DeviceId)>>,
-        }
-        impl Fido2Provider for CountingProvider {
-            fn relying_party_id(&self) -> &str {
-                self.inner.relying_party_id()
-            }
-            fn start_authentication(
-                &self,
-                credentials: &[Passkey],
-            ) -> WebauthnResult<(RequestChallengeResponse, PasskeyAuthentication)> {
-                self.inner.start_authentication(credentials)
-            }
-            fn finish_authentication(
-                &self,
-                assertion: &PublicKeyCredential,
-                state: &PasskeyAuthentication,
-            ) -> WebauthnResult<AuthenticationResult> {
-                self.inner.finish_authentication(assertion, state)
-            }
-            fn start_registration(
-                &self,
-                user_id: uuid::Uuid,
-                user_name: &str,
-                display_name: &str,
-                exclude: Option<Vec<CredentialID>>,
-            ) -> WebauthnResult<(CreationChallengeResponse, PasskeyRegistration)> {
-                self.inner
-                    .start_registration(user_id, user_name, display_name, exclude)
-            }
-            fn finish_registration(
-                &self,
-                response: &RegisterPublicKeyCredential,
-                state: &PasskeyRegistration,
-            ) -> WebauthnResult<Passkey> {
-                self.inner.finish_registration(response, state)
-            }
-            fn start_discoverable_authentication(
-                &self,
-            ) -> WebauthnResult<(RequestChallengeResponse, DiscoverableAuthentication)>
-            {
-                self.inner.start_discoverable_authentication()
-            }
-            fn finish_discoverable_authentication(
-                &self,
-                assertion: &PublicKeyCredential,
-                state: DiscoverableAuthentication,
-                keys: &[DiscoverableKey],
-            ) -> WebauthnResult<AuthenticationResult> {
-                self.inner
-                    .finish_discoverable_authentication(assertion, state, keys)
-            }
-            fn on_credential_used(&self, credential_id: &CredentialID, device_id: &DeviceId) {
-                let bytes: Vec<u8> = credential_id.as_ref().to_vec();
-                self.captured.lock().unwrap().push((bytes, *device_id));
-            }
-        }
-
-        let provider = CountingProvider {
-            inner: MockFido2Provider::new(),
-            captured: Mutex::new(Vec::new()),
-        };
-        let device_id = axess_identity::testing::device("d-fido2-override");
-        let cred = CredentialID::from(vec![0xAB, 0xCD, 0xEF]);
-
-        provider.on_credential_used(&cred, &device_id);
-        provider.on_credential_used(&cred, &device_id);
-
-        let captured = provider.captured.lock().unwrap();
-        assert_eq!(captured.len(), 2, "override must run on every call");
-        assert_eq!(captured[0].0, vec![0xAB, 0xCD, 0xEF]);
-        assert_eq!(captured[0].1, device_id);
-    }
-}
+mod ceremony_tests;
 
 #[cfg(all(test, feature = "fido2"))]
 mod credential_tests;
+
+#[cfg(all(test, feature = "fido2"))]
+mod verifier_tests;

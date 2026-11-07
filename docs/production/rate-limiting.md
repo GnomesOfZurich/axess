@@ -324,6 +324,18 @@ Read the IP from the forwarded header only when the immediate
 peer is a trusted proxy; otherwise the rate limiter can be
 spoofed.
 
+#### The IdP logout routes
+
+The back-channel logout route is unauthenticated: it reads the issuer out of
+the token before any signature is checked, and with tenant providers each
+request that names a configured issuer costs a read of the tenant source and
+may rebuild or revalidate the providers it returns. Put a `PeerIp` limit in
+front of it, as in front of the front-channel route, and keep it low: an IdP
+sends a few tokens a minute, from a few addresses. The handler remembers an
+issuer no provider is configured for for 30 seconds
+(`BackChannelLogoutHandler::with_unknown_issuer_memory`), which bounds a loop
+of made-up issuers; only the limit bounds a loop that names a real one.
+
 ### Per-tenant rate limits
 
 For multi-tenant deployments, the rate limit configuration can

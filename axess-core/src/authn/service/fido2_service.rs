@@ -327,7 +327,7 @@ where
             None => return Ok(FactorOutcome::InvalidCredential),
         };
 
-        let FactorConfig::Fido2(_) = config else {
+        let FactorConfig::Fido2(stored) = config else {
             return Ok(FactorOutcome::InvalidCredential);
         };
 
@@ -362,7 +362,9 @@ where
             return Ok(FactorOutcome::InvalidCredential);
         }
 
-        let auth_state: webauthn_rs::prelude::PasskeyAuthentication =
+        // The state names the ceremony that began it; state from before the
+        // ceremonies were typed does not read, and the user begins again.
+        let auth_state: axess_factors::fido2::Fido2Authentication =
             match serde_json::from_value(state_json) {
                 Ok(s) => s,
                 Err(_) => {
@@ -375,7 +377,7 @@ where
         let auth_result = match webauthn.finish_authentication(&assertion, &auth_state) {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!("FIDO2 finish_passkey_authentication failed: {e:?}");
+                tracing::warn!(ceremony = %auth_state.ceremony(), "FIDO2 assertion refused: {e:?}");
                 self.clear_ceremony_timestamp(session, fido2_keys::AUTH_STATE)
                     .await;
                 // Route through the canonical failure helper so FIDO2
@@ -408,9 +410,25 @@ where
                 .await;
         }
 
-        let now = self.inner.clock.now();
+        // What the assertion proved. A trust anchor only from an attested
+        // ceremony, and only when the credential's attestation still
+        // verifies against the anchor the provider holds now.
+        let trust_anchor = match &auth_state {
+            axess_factors::fido2::Fido2Authentication::AttestedPasskey { .. } => stored
+                .credentials
+                .iter()
+                .find(|c| c.cred_id() == auth_result.cred_id())
+                .and_then(|c| webauthn.attests(&c.key))
+                .map(std::sync::Arc::from),
+            _ => None,
+        };
+        let proof = crate::authn::assurance::FactorAssurance::from_fido2_result(
+            &auth_result,
+            trust_anchor,
+            self.inner.clock.now(),
+        );
         session
-            .advance_factor(&FactorKind::Fido2, now, &self.inner.preserved_custom_keys)
+            .advance_factor(proof, &self.inner.preserved_custom_keys)
             .await;
 
         let outcome = self

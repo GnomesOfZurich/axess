@@ -1,11 +1,25 @@
 name: CI
 
+# Work lands on release/next; main changes only by the release pull request
+# from a release branch, and a patch line lives on release/X.Y.x (see
+# docs/project/publishing.md). Every job below runs on a pull request into
+# any of them. Into main, the "Release Version" job also requires the dated
+# CHANGELOG.md section, and the main branch ruleset requires "Release Gate"
+# and the named jobs to pass. The job `name:` values are those required
+# check names: renaming one is a ruleset edit in the same release.
+#
+# release.yml calls this workflow on a release tag before it publishes.
 on:
   push:
-    branches: [main, develop]
+    branches: [main, release/next, 'release/*.x']
   pull_request:
-    branches: [main, develop]
+    branches: [main, release/next, 'release/*.x']
   workflow_call:
+
+# Nothing in this workflow writes to the repository. The Coverage job used
+# to push a badge commit to main; release preparation commits the badge now.
+permissions:
+  contents: read
 
 env:
   RUST_BACKTRACE: 1
@@ -17,7 +31,7 @@ jobs:
     name: Format Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -31,11 +45,14 @@ jobs:
   # Project policy is to bump the version and let downstream `match`
   # failures be loud. Enforce the rule here so a future contributor
   # cannot reintroduce the attribute without removing this gate.
+  #
+  # The name is quoted: unquoted, YAML reads ` #` as a comment and the check
+  # was named "Ban".
   ban_non_exhaustive:
-    name: Ban #[non_exhaustive]
+    name: "Ban #[non_exhaustive]"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Reject any non_exhaustive in first-party crates
         run: |
           set -eu
@@ -46,7 +63,7 @@ jobs:
               -e '#\[ *non_exhaustive *\]' \
               axess axess-core axess-factors axess-macros examples; then
             echo "::error::#[non_exhaustive] is forbidden in first-party crates."
-            echo "See ROADMAP.md / feedback_no_non_exhaustive memory."
+            echo "See CONTRIBUTING.md, 'No #[non_exhaustive] on first-party enums'."
             exit 1
           fi
           echo "OK: no #[non_exhaustive] occurrences."
@@ -63,7 +80,7 @@ jobs:
     name: Ban cargo-mutants markers
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Reject committed cargo-mutants mutation markers
         run: |
           set -eu
@@ -81,7 +98,7 @@ jobs:
             echo "::error::cargo-mutants mutation marker found in committed source."
             echo "A local cargo-mutants run left a stub body (e.g. \`() /* ~ changed by cargo-mutants ~ */\`)"
             echo "in the source. Revert the file to its real implementation before merging."
-            echo "See ROADMAP.md for the systemic fix."
+            echo "Run cargo-mutants through scripts/mutants.sh, which mutates a separate worktree."
             exit 1
           fi
           echo "OK: no cargo-mutants mutation markers in source."
@@ -99,7 +116,7 @@ jobs:
     name: Lockfile Drift
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Verify Cargo.lock is up-to-date and unchanged
@@ -127,7 +144,7 @@ jobs:
     name: Detect orphan .rs files
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Verify every src/*.rs is reachable from its crate root
         run: |
           set -eu
@@ -171,7 +188,7 @@ jobs:
     name: Clippy Lints
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -188,7 +205,7 @@ jobs:
     name: Rustdoc (-D warnings)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Was `-p axess -p axess-core`: two crates of eighteen, which is how 29
@@ -222,6 +239,47 @@ jobs:
       # real type through a module that has never existed.
       - name: Documented imports resolve
         run: ./scripts/check-facade-paths.sh
+
+      # Copy-pasteable `axess = { version = "..." }` snippets name the
+      # workspace version; nothing else keeps them in step with a bump.
+      - name: Documented versions
+        run: ./scripts/check-doc-versions.sh
+
+  # The source-layout rules from AGENTS.md that the release preflight
+  # enforces: no inline test block over the limit, and production files and
+  # functions under their size limits against the recorded baseline.
+  source_rules:
+    name: Source Rules
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Inline test block sizes
+        run: ./scripts/check-inline-tests.sh
+      - name: File and function sizes
+        run: ./scripts/check-file-sizes.sh
+
+  # The book, built and tested with the mdBook the docs workflow publishes
+  # with (both install through scripts/install-mdbook.sh). The docs workflow
+  # runs only after a merge to main, so without this job a book.toml the
+  # pinned mdBook rejects, or a book example that no longer compiles, was
+  # found after the release it shipped in.
+  book:
+    name: Book
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install mdBook + mdbook-mermaid
+        run: ./scripts/install-mdbook.sh
+      - name: Install mermaid assets
+        run: mdbook-mermaid install docs
+      - name: Build book
+        run: mdbook build docs
+      - name: Build the crates the book's examples import
+        run: cargo build -p axess --all-features -p axess-example-minimal
+      - name: Test book code
+        run: mdbook test docs -L target/debug/deps
 
   # Tests
   test:
@@ -267,7 +325,7 @@ jobs:
           --health-retries 10
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -285,11 +343,19 @@ jobs:
             -v "$PWD/examples/fapi/keycloak/fapi-realm.json:/opt/keycloak/data/import/fapi-realm.json:ro" \
             quay.io/keycloak/keycloak:26.0 start-dev --import-realm
 
-      - name: Run unit tests
-        run: cargo test --workspace --all-features --lib
+      # Every test not marked ignored: unit, integration and doc tests, the
+      # release preflight's "Workspace tests" step. This used to be `--lib`
+      # plus `--doc`, which left the non-ignored tests under each crate's
+      # tests/ to the Coverage job alone.
+      - name: Run workspace tests
+        run: cargo test --workspace --all-features
+        env:
+          VALKEY_URL: redis://localhost:6379
+          POSTGRES_URL: postgres://postgres:postgres@localhost:5432/postgres
+          MYSQL_URL: mysql://root:mysql@localhost:3306/axess_test
 
-      # The unit tests above give Keycloak its start-up time; this only waits
-      # for whatever is left of it.
+      # The workspace tests above give Keycloak its start-up time; this only
+      # waits for whatever is left of it.
       - name: Wait for Keycloak
         run: |
           for _ in $(seq 1 60); do
@@ -299,16 +365,15 @@ jobs:
           docker logs axess-keycloak-test | tail -50
           exit 1
 
+      # The script the release preflight runs: the ignored tests against the
+      # live stores, refused when a URL is unset or when nothing passed.
       - name: Run integration tests (with Valkey + Postgres + MySQL + Keycloak)
-        run: cargo test --workspace --all-features -- --ignored
+        run: ./scripts/check-live-stores.sh
         env:
           KEYCLOAK_URL: http://127.0.0.1:8080
           VALKEY_URL: redis://localhost:6379
           POSTGRES_URL: postgres://postgres:postgres@localhost:5432/postgres
           MYSQL_URL: mysql://root:mysql@localhost:3306/axess_test
-
-      - name: Run doc-tests
-        run: cargo test --doc --workspace --all-features
 
   # CockroachDB wire-protocol compatibility. Cockroach speaks the Postgres
   # wire protocol, so the existing `postgres` backend (sqlx::PgPool) should
@@ -343,7 +408,7 @@ jobs:
         env:
           COCKROACH_ARGS: "start-single-node --insecure"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Cockroach defaults to user `root` with no password on `--insecure`
@@ -365,7 +430,7 @@ jobs:
     name: MSRV
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: msrv
         name: Read rust-version from Cargo.toml
         run: |
@@ -389,7 +454,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -453,7 +518,7 @@ jobs:
           - profile: delegated-only
             flags: --no-default-features --features delegated,jwt-rust-crypto
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # `cargo check --lib` rather than `cargo build`: faster (skips
@@ -499,7 +564,7 @@ jobs:
           - oauth,jwt-rust-crypto
           - outbound-oauth,jwt-rust-crypto
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Check axess-factors (${{ matrix.features }} alone)
@@ -510,7 +575,7 @@ jobs:
     name: Examples
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       
       - uses: dtolnay/rust-toolchain@stable
       
@@ -530,7 +595,7 @@ jobs:
     name: Fuzz Smoke
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
         with:
@@ -551,7 +616,7 @@ jobs:
           done
       - name: Upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-crashes
           path: fuzz/artifacts/
@@ -562,7 +627,7 @@ jobs:
     name: Benchmarks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -572,7 +637,7 @@ jobs:
         run: cargo bench -p axess-core --all-features -- --output-format bencher | tee bench-output.txt
 
       - name: Upload benchmark results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bench-results
           path: bench-output.txt
@@ -588,7 +653,7 @@ jobs:
     name: Publish Dry-Run
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # `cargo publish --dry-run` for leaf crates: a true end-to-end check
@@ -631,7 +696,11 @@ jobs:
       github.event_name != 'push' ||
       startsWith(github.ref, 'refs/tags/v')
     steps:
-      - uses: actions/checkout@v4
+      # The whole history and its tags: the baseline is the last release
+      # tag below HEAD, built from git rather than fetched from crates.io.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       # `cache-bin: "true"` (default in v2, pinned explicitly here) keeps
       # ~/.cargo/bin/cargo-semver-checks across runs, so the install step
@@ -648,25 +717,26 @@ jobs:
         run: |
           command -v cargo-semver-checks >/dev/null \
             || cargo install cargo-semver-checks --locked
-      - run: |
-          set -o pipefail
-          if cargo semver-checks check-release --workspace 2>&1 | tee semver.log; then
-            echo "SemVer: OK"
-          elif grep -q "not found in registry" semver.log; then
-            echo "::notice::No registry baseline; SemVer check skipped."
-          else
-            exit 1
-          fi
+      # The script the release preflight runs. It refuses when no release
+      # tag is below HEAD instead of skipping, as the registry baseline did.
+      - name: SemVer checks against the last release tag
+        run: ./scripts/check-semver.sh
 
   # Security audit
   audit:
     name: Security Audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Install audit tools
         run: cargo install cargo-audit@0.22.2 cargo-deny@0.18.3 --locked cargo-cyclonedx
+      # cargo-deny and cargo-audit read different ignore files; a drift
+      # between them means one gate accepts an advisory the other fails.
+      - name: Advisory ignore lists agree (deny.toml vs .cargo/audit.toml)
+        run: |
+          advisory_ids() { grep -oE '^[[:space:]]*"RUSTSEC-[0-9]{4}-[0-9]{4}"' "$1" | tr -d ' "' | sort -u; }
+          diff <(advisory_ids deny.toml) <(advisory_ids .cargo/audit.toml)
       - name: Run security audit
         run: cargo audit --deny warnings
       # Keep advisories on cargo-audit until cargo-deny 0.18.x handles CVSS 4.0.
@@ -674,7 +744,7 @@ jobs:
         run: cargo deny check bans licenses sources
       - name: Generate SBOM (CycloneDX)
         run: cargo cyclonedx --all --format json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sbom
           path: "**/*.cdx.json"
@@ -709,7 +779,7 @@ jobs:
           --health-retries 5
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
@@ -737,45 +807,50 @@ jobs:
       - name: Extract coverage percentage
         id: cov
         run: |
-          pct=$(cargo llvm-cov report --json --summary-only | jq -r '.data[0].totals.lines.percent | round')
-          echo "pct=${pct}" >> $GITHUB_OUTPUT
+          pct=$(./scripts/coverage-badge.sh measured)
+          echo "pct=${pct}" >> "$GITHUB_OUTPUT"
           echo "Coverage: ${pct}%"
       - name: Print summary
         run: |
-          echo "## Coverage: ${{ steps.cov.outputs.pct }}%" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          cat coverage-summary.txt >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## Coverage: ${{ steps.cov.outputs.pct }}%"
+            echo '```'
+            cat coverage-summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload coverage report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-report
           path: coverage-html/
-      - name: Update coverage badge
-        if: github.ref == 'refs/heads/main'
-        run: |
-          pct=${{ steps.cov.outputs.pct }}
-          if [ $(echo "$pct >= 80" | bc) -eq 1 ]; then color="brightgreen";
-          elif [ $(echo "$pct >= 60" | bc) -eq 1 ]; then color="yellow";
-          else color="red"; fi
-          ./scripts/generate-badge.sh coverage "${pct}%" "$color" .github/badges/coverage.svg
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add .github/badges/coverage.svg
-          git diff --cached --quiet || (git commit -m "ci: update coverage badge to ${pct}%" && git push)
+      # No badge commit from here: main changes only by a release pull
+      # request, and its ruleset refuses a push from this job. Release
+      # preparation measures and commits the badge (docs/project/publishing.md,
+      # "Release preparation"), and the last step holds it to this run, after
+      # the summary and the report are out so a refusal still shows them.
+      - name: Crafted cases for the coverage badge check
+        run: ./scripts/coverage-badge-tests.sh
+      # Release preparation commits the badge with the release; a figure more
+      # than one point from this run's is stale (the script says why one).
+      - name: Committed coverage badge matches the measured figure
+        if: github.event_name == 'pull_request' && github.base_ref == 'main'
+        env:
+          PCT: ${{ steps.cov.outputs.pct }}
+        run: ./scripts/coverage-badge.sh check "$PCT"
 
   # Drift check for the derived badges (version, license). Regenerates
   # both from [workspace.package] in Cargo.toml and fails if the
-  # committed SVGs are out of date. Coverage uses the auto-commit
-  # pattern above; this job is deliberately separate because
-  # version/license changes are rare, deliberate edits: drift is a
-  # signal to the contributor, not something CI should silently fix.
+  # committed SVGs are out of date. Coverage is measured rather than
+  # derived, so the Coverage job above checks it within a tolerance; this
+  # job is separate because version/license changes are rare, deliberate
+  # edits: drift is a signal to the contributor, not something CI should
+  # silently fix.
   # Pure bash + sed + awk: no Rust toolchain needed.
   badges:
     name: Badges in sync
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Regenerate derived badges
         run: ./scripts/update-badges.sh
       - name: Fail if badge drift
@@ -786,3 +861,102 @@ jobs:
             echo "Locally run: ./scripts/update-badges.sh && git add .github/badges/ && git commit"
             exit 1
           fi
+
+  # The version being released is the version written down: the workspace
+  # version, the internal crate pins, the tag and the dated CHANGELOG.md
+  # section (scripts/check-release-version.sh says what each refusal
+  # prevents). Strict on a pull request into main, on main and on a release
+  # tag; on release/next and release/X.Y.x before preparation the dated
+  # section is not yet required, and [Unreleased] is what is checked.
+  release_version:
+    name: Release Version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # The main ruleset can require a pull request but not where it comes
+      # from; this refuses one into main from anything but a release branch.
+      - name: A pull request into main comes from a release branch
+        if: github.event_name == 'pull_request' && github.base_ref == 'main'
+        env:
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          set -eu
+          if [ "$HEAD_REPO" != "$GITHUB_REPOSITORY" ]; then
+            echo "::error::refused: main changes only by a pull request from a branch of $GITHUB_REPOSITORY, and this one is from $HEAD_REPO."
+            exit 1
+          fi
+          if ! [[ "$GITHUB_HEAD_REF" =~ ^release/(next|[0-9]+\.[0-9]+\.x)$ ]]; then
+            echo "::error::refused: main changes only by a pull request from release/next or release/X.Y.x, and this one is from '$GITHUB_HEAD_REF'."
+            exit 1
+          fi
+          echo "OK: pull request from $GITHUB_HEAD_REF."
+      - name: Crafted cases for the version check
+        run: ./scripts/check-release-version-tests.sh
+      - name: Version, tag and dated changelog section agree
+        run: |
+          set -eu
+          case "$GITHUB_REF" in
+            refs/tags/v*)
+              ./scripts/check-release-version.sh --tag "$GITHUB_REF_NAME" ;;
+            refs/heads/main)
+              ./scripts/check-release-version.sh ;;
+            *)
+              if [ "${GITHUB_BASE_REF:-}" = main ]; then
+                ./scripts/check-release-version.sh
+              else
+                ./scripts/check-release-version.sh --allow-unreleased
+              fi ;;
+          esac
+
+  # One check that stands for every job above, matrix rows included, so the
+  # main branch ruleset does not have to name each "Feature Isolation (...)"
+  # row and a new row is required the moment it exists. scripts/check-ci-gate.sh
+  # refuses a job that is missing from `needs`. On a pull request a skipped
+  # need is a failure (nothing in this workflow skips on a pull request); on
+  # a push the SemVer job skips by design.
+  release_gate:
+    name: Release Gate
+    if: always()
+    runs-on: ubuntu-latest
+    needs:
+      - fmt
+      - ban_non_exhaustive
+      - ban_cargo_mutants_markers
+      - lockfile_drift
+      - unreachable_sources
+      - clippy
+      - rustdoc
+      - source_rules
+      - book
+      - test
+      - cockroach_compat
+      - msrv
+      - build
+      - feature_isolation
+      - factor_isolation
+      - examples
+      - fuzz
+      - bench
+      - publish_dryrun
+      - semver_checks
+      - audit
+      - coverage
+      - badges
+      - release_version
+    steps:
+      - uses: actions/checkout@v7
+      - name: Every job in ci.yml is a need of this one
+        run: ./scripts/check-ci-gate.sh
+      - name: Every need passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -eu
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then allowed='success'; else allowed='success|skipped'; fi
+          printf '%s' "$NEEDS" | jq -r 'to_entries[] | "\(.key) \(.value.result)"' | sort > results.txt
+          cat results.txt
+          if grep -vE " (${allowed})\$" results.txt; then
+            echo "::error::the jobs above did not pass; the release gate is closed."
+            exit 1
+          fi
+          echo "OK: $(wc -l < results.txt | tr -d ' ') jobs passed."

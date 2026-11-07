@@ -899,3 +899,28 @@ fn a_logged_session_id_is_a_truncated_prefix() {
     assert_eq!(logged, "00000000...");
     assert!(!logged.contains(&id.to_string()));
 }
+
+/// An encrypted Valkey store returns a session's assurance record as it
+/// was saved.
+#[tokio::test]
+#[ignore = "requires a running Valkey (VALKEY_URL)"]
+async fn a_session_carrying_assurance_round_trips() {
+    let client = Client::new(
+        Config::from_url(&live_client_url()).unwrap(),
+        None,
+        None,
+        None,
+    );
+    client.init().await.expect("connect");
+    let store =
+        ValkeySessionStore::new(client, crate::testing::test_key(9)).with_prefix("axt_assured");
+    let id = SessionId::new(&SystemRng);
+    let data = crate::session::data::assured_fixture::assured_session();
+    store
+        .save(&id, &data, Duration::from_secs(60))
+        .await
+        .unwrap();
+    let back = store.load(&id).await.unwrap().expect("stored");
+    assert_eq!(back.auth_state, data.auth_state);
+    store.delete(&id).await.unwrap();
+}

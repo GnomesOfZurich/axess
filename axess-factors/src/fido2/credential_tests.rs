@@ -10,7 +10,7 @@ use serde_json::json;
 const AAAA: &str = "YWFhYQ";
 const BBBB: &str = "YmJiYg";
 
-fn passkey(id: &str, counter: u32) -> Passkey {
+fn passkey(id: &str, counter: u32) -> webauthn_rs::prelude::Passkey {
     // 32 zero bytes, URL-safe base64 without padding.
     let coord = "A".repeat(43);
     serde_json::from_value(json!({

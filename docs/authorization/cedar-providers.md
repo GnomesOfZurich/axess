@@ -334,21 +334,33 @@ policy store and the entity provider, under exactly the
 `Arc<dyn RequestContextProvider>` type, and derive values such as
 MFA status from the session, never from the request.
 
-Without a provider the gate evaluates with an empty context. A policy
-set that never reads `context` is unaffected. A context attribute the
-action's schema declares required makes the request invalid, and the
-policy store denies it; a policy that errors during evaluation is
-denied as well. The one case an empty context can permit is a policy
-that guards an optional attribute with `context has ..` and treats its
-absence as allowed, so declare the attributes policies rely on as
-required, and install a provider wherever policies reason about the
-context. `examples/authz` shows the `DeleteDocument` rule that needs
+Without a provider the gate evaluates with an empty context only when
+no policy in the store mentions `context`. When one does, the gate
+refuses with a 500 and an error log naming the missing
+`Arc<dyn RequestContextProvider>` extension, as it does for a missing
+policy store, because an empty context turns a guarded `forbid` into
+nothing and the `permit` beside it allows. The check is per store, not
+per action. Install the provider as the trait object, not the concrete
+type, and declare the attributes policies rely on as required.
+`examples/authz` shows the `DeleteDocument` rule that needs
 `mfa_verified`. The first request through a gate whose policies mention
 `context`, with no provider installed, logs a warning.
 
 `axess::authz::require`, the function form, takes the `Context` as its
 last argument and evaluates with exactly that; pass `Context::empty()` only
 when no policy reads `context`.
+
+### Authentication assurance
+
+`context.assurance` carries what each factor of the session proved: whether
+the user was verified, whether the credential is synced or device-bound, the
+trust anchor of an attested authenticator, and its age in seconds.
+`AssuranceContextProvider` installs it for `require_authz!`;
+`StandardRequestContext::with_assurance` adds it beside `mfa_verified`. The
+schema types ship as `ASSURANCE_SCHEMA_FRAGMENT`, and a rule annotated with
+`@step_up("<name>")` makes a gate answer `step_up_required` with that name
+when only the assurance is short. See
+[Authentication assurance and ceremonies](assurance.md).
 
 ### When to extend the context
 

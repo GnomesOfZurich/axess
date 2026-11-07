@@ -84,13 +84,13 @@ fn okta_claims() -> serde_json::Value {
         "iat": now,
         "azp": "feed-worker",
         "service": "feed-worker",
-        "organization": "ekekrantz",
+        "organization": "gnomes",
     })
 }
 
-/// The adopter's slug-to-tenant registry: only `ekekrantz` is known.
+/// The adopter's slug-to-tenant registry: only `gnomes` is known.
 fn tenant_lookup() -> impl Fn(&str) -> Option<TenantId> + Send + Sync + 'static {
-    |slug: &str| (slug == "ekekrantz").then(sample_tenant)
+    |slug: &str| (slug == "gnomes").then(sample_tenant)
 }
 
 fn okta_mapper()
@@ -131,13 +131,13 @@ async fn valid_token_resolves_via_custom_mapper() {
         Principal::Workload(w) => {
             assert_eq!(
                 w.workload_id.as_str(),
-                "spiffe://okta.gnomes.local/feed-worker/ekekrantz"
+                "spiffe://okta.gnomes.local/feed-worker/gnomes"
             );
             assert_eq!(w.trust_domain, trust);
             assert_eq!(w.issuer, Issuer::OAuth);
             assert_eq!(w.tenant_id, sample_tenant());
             assert_eq!(w.service_name, "feed-worker");
-            assert_eq!(w.tenant_slug, "ekekrantz");
+            assert_eq!(w.tenant_slug, "gnomes");
             assert_eq!(
                 w.attributes.get("azp"),
                 Some(&serde_json::json!("feed-worker"))
@@ -161,7 +161,7 @@ async fn wrong_iss_rejected_by_verifier() {
             "iat": now,
             "azp": "feed-worker",
             "service": "feed-worker",
-            "organization": "ekekrantz",
+            "organization": "gnomes",
         }),
         &kid,
         &der,
@@ -201,7 +201,7 @@ async fn the_workload_id_carries_the_resolvers_trust_domain() {
         Principal::Workload(w) => {
             assert_eq!(
                 w.workload_id.as_str(),
-                "spiffe://pinned.example/feed-worker/ekekrantz"
+                "spiffe://pinned.example/feed-worker/gnomes"
             );
             assert_eq!(w.trust_domain, trust);
         }
@@ -276,7 +276,7 @@ async fn custom_claim_deser_failure_rejected() {
             "exp": now + 3600,
             "iat": now,
             "azp": "feed-worker",
-            "organization": "ekekrantz",
+            "organization": "gnomes",
         }),
         &kid,
         &der,

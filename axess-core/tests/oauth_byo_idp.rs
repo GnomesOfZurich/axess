@@ -794,9 +794,12 @@ async fn two_tenants_with_a_provider_of_the_same_name_log_in_against_different_i
     let key_b = ClientKey::new();
     let idp_a = Idp::plain(&key_a).await;
     let idp_b = Idp::plain(&key_b).await;
-    let directory = Arc::new(StoredTenantOAuthProviders::new_unencrypted(
-        MemoryTenantOAuthProviderStore::new(),
-    ));
+    let directory = Arc::new(
+        StoredTenantOAuthProviders::new_unencrypted(MemoryTenantOAuthProviderStore::new())
+            .with_egress_policy(
+                axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
+            ),
+    );
     directory
         .upsert(record(tenant("acme"), &idp_a.issuer, &key_a))
         .await
@@ -830,9 +833,12 @@ async fn two_tenants_with_a_provider_of_the_same_name_log_in_against_different_i
 async fn tenant_a_cannot_reach_tenant_bs_provider_even_when_the_name_matches() {
     let key = ClientKey::new();
     let idp = Idp::plain(&key).await;
-    let directory = Arc::new(StoredTenantOAuthProviders::new_unencrypted(
-        MemoryTenantOAuthProviderStore::new(),
-    ));
+    let directory = Arc::new(
+        StoredTenantOAuthProviders::new_unencrypted(MemoryTenantOAuthProviderStore::new())
+            .with_egress_policy(
+                axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
+            ),
+    );
     directory
         .upsert(record(tenant("beta"), &idp.issuer, &key))
         .await
@@ -858,9 +864,12 @@ async fn a_providers_update_in_the_store_is_used_by_the_next_login_without_a_res
     let key = ClientKey::new();
     let first = Idp::plain(&key).await;
     let second = Idp::plain(&key).await;
-    let directory = Arc::new(StoredTenantOAuthProviders::new_unencrypted(
-        MemoryTenantOAuthProviderStore::new(),
-    ));
+    let directory = Arc::new(
+        StoredTenantOAuthProviders::new_unencrypted(MemoryTenantOAuthProviderStore::new())
+            .with_egress_policy(
+                axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
+            ),
+    );
     let stored = directory
         .upsert(record(tenant("acme"), &first.issuer, &key))
         .await
@@ -895,9 +904,12 @@ async fn a_ceremony_begun_before_an_update_does_not_finish_against_the_new_issue
     let key = ClientKey::new();
     let first = Idp::plain(&key).await;
     let second = Idp::plain(&key).await;
-    let directory = Arc::new(StoredTenantOAuthProviders::new_unencrypted(
-        MemoryTenantOAuthProviderStore::new(),
-    ));
+    let directory = Arc::new(
+        StoredTenantOAuthProviders::new_unencrypted(MemoryTenantOAuthProviderStore::new())
+            .with_egress_policy(
+                axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
+            ),
+    );
     directory
         .upsert(record(tenant("acme"), &first.issuer, &key))
         .await
@@ -932,9 +944,12 @@ async fn a_ceremony_begun_before_an_update_does_not_finish_against_the_new_issue
 async fn a_removed_provider_stops_resolving_and_invalidate_forces_a_rebuild() {
     let key = ClientKey::new();
     let idp = Idp::plain(&key).await;
-    let directory = Arc::new(StoredTenantOAuthProviders::new_unencrypted(
-        MemoryTenantOAuthProviderStore::new(),
-    ));
+    let directory = Arc::new(
+        StoredTenantOAuthProviders::new_unencrypted(MemoryTenantOAuthProviderStore::new())
+            .with_egress_policy(
+                axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
+            ),
+    );
     directory
         .upsert(record(tenant("acme"), &idp.issuer, &key))
         .await
@@ -980,9 +995,12 @@ async fn the_global_registration_and_a_tenants_provider_of_one_name_never_shadow
     let tenant_key = ClientKey::new();
     let global_idp = Idp::plain(&global_key).await;
     let tenant_idp = Idp::plain(&tenant_key).await;
-    let directory = Arc::new(StoredTenantOAuthProviders::new_unencrypted(
-        MemoryTenantOAuthProviderStore::new(),
-    ));
+    let directory = Arc::new(
+        StoredTenantOAuthProviders::new_unencrypted(MemoryTenantOAuthProviderStore::new())
+            .with_egress_policy(
+                axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
+            ),
+    );
     directory
         .upsert(record(tenant("acme"), &tenant_idp.issuer, &tenant_key))
         .await
@@ -1032,9 +1050,12 @@ async fn a_tenant_login_is_bound_to_its_tenant_at_completion() {
     use axess_core::authn::error::AuthnError;
     let key = ClientKey::new();
     let idp = Idp::plain(&key).await;
-    let directory = Arc::new(StoredTenantOAuthProviders::new_unencrypted(
-        MemoryTenantOAuthProviderStore::new(),
-    ));
+    let directory = Arc::new(
+        StoredTenantOAuthProviders::new_unencrypted(MemoryTenantOAuthProviderStore::new())
+            .with_egress_policy(
+                axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
+            ),
+    );
     directory
         .upsert(record(tenant("acme"), &idp.issuer, &key))
         .await
@@ -1100,10 +1121,12 @@ fn cipher() -> Arc<FactorSecretCipher> {
 async fn a_credential_is_sealed_in_the_store_and_opens_only_for_its_tenant_and_name() {
     let key = ClientKey::new();
     let idp = Idp::plain(&key).await;
-    let directory = Arc::new(StoredTenantOAuthProviders::new(
-        MemoryTenantOAuthProviderStore::new(),
-        cipher(),
-    ));
+    let directory = Arc::new(
+        StoredTenantOAuthProviders::new(MemoryTenantOAuthProviderStore::new(), cipher())
+            .with_egress_policy(
+                axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
+            ),
+    );
     let stored = directory
         .upsert(record(tenant("acme"), &idp.issuer, &key))
         .await
@@ -1182,9 +1205,12 @@ async fn entra_shaped_idp_certificate_credential_and_tid_claim() {
     .await;
     assert_eq!(idp.issuer, format!("{}/{ENTRA_TID}/v2.0", idp.uri()));
 
-    let directory = Arc::new(StoredTenantOAuthProviders::new_unencrypted(
-        MemoryTenantOAuthProviderStore::new(),
-    ));
+    let directory = Arc::new(
+        StoredTenantOAuthProviders::new_unencrypted(MemoryTenantOAuthProviderStore::new())
+            .with_egress_policy(
+                axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
+            ),
+    );
     let mut rec = record(tenant("acme"), &idp.issuer, &key);
     rec.scopes = vec![
         "openid".into(),
@@ -1269,9 +1295,12 @@ async fn keycloak_shaped_idp_private_key_jwt_with_the_issuer_or_token_endpoint_a
         },
     )
     .await;
-    let directory = Arc::new(StoredTenantOAuthProviders::new_unencrypted(
-        MemoryTenantOAuthProviderStore::new(),
-    ));
+    let directory = Arc::new(
+        StoredTenantOAuthProviders::new_unencrypted(MemoryTenantOAuthProviderStore::new())
+            .with_egress_policy(
+                axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
+            ),
+    );
     directory
         .upsert(record(tenant("acme"), &idp.issuer, &key))
         .await
@@ -1396,7 +1425,11 @@ mod sqlite {
         let (store, pool) = store().await;
         let key = ClientKey::new();
         let idp = Idp::plain(&key).await;
-        let directory = Arc::new(StoredTenantOAuthProviders::new(store, cipher()));
+        let directory = Arc::new(
+            StoredTenantOAuthProviders::new(store, cipher()).with_egress_policy(
+                axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
+            ),
+        );
         directory
             .upsert(record(tenant("acme"), &idp.issuer, &key))
             .await
@@ -1430,9 +1463,12 @@ async fn a_tenant_login_row_is_the_tenants_and_names_no_user_from_the_subject() 
     use axess_core::authn::event::{AuthEventStatus, AuthEventType};
     let key = ClientKey::new();
     let idp = Idp::plain(&key).await;
-    let directory = Arc::new(StoredTenantOAuthProviders::new_unencrypted(
-        MemoryTenantOAuthProviderStore::new(),
-    ));
+    let directory = Arc::new(
+        StoredTenantOAuthProviders::new_unencrypted(MemoryTenantOAuthProviderStore::new())
+            .with_egress_policy(
+                axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
+            ),
+    );
     directory
         .upsert(record(tenant("acme"), &idp.issuer, &key))
         .await
@@ -1481,9 +1517,12 @@ async fn a_scoped_refresh_row_names_the_tenant_and_user_it_was_given() {
     use axess_core::authn::event::{AuthEventStatus, AuthEventType, AuthFailureReason};
     let key = ClientKey::new();
     let idp = Idp::plain(&key).await;
-    let directory = Arc::new(StoredTenantOAuthProviders::new_unencrypted(
-        MemoryTenantOAuthProviderStore::new(),
-    ));
+    let directory = Arc::new(
+        StoredTenantOAuthProviders::new_unencrypted(MemoryTenantOAuthProviderStore::new())
+            .with_egress_policy(
+                axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
+            ),
+    );
     directory
         .upsert(record(tenant("acme"), &idp.issuer, &key))
         .await
@@ -1547,9 +1586,12 @@ async fn a_tenant_provider_gone_at_the_callback_is_audited_and_clears_the_ceremo
     use axess_core::authn::event::AuthFailureReason;
     let key = ClientKey::new();
     let idp = Idp::plain(&key).await;
-    let directory = Arc::new(StoredTenantOAuthProviders::new_unencrypted(
-        MemoryTenantOAuthProviderStore::new(),
-    ));
+    let directory = Arc::new(
+        StoredTenantOAuthProviders::new_unencrypted(MemoryTenantOAuthProviderStore::new())
+            .with_egress_policy(
+                axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
+            ),
+    );
     directory
         .upsert(record(tenant("acme"), &idp.issuer, &key))
         .await

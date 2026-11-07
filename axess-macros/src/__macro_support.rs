@@ -33,29 +33,56 @@ pub fn audit_unbuilt_deny(user_id: &str, action: &str, resource_template: &str, 
     axess_core::authz::audit::emit_early_deny(user_id, action, resource_template, reason);
 }
 
-/// Log, the first time `warned` says so, that `require_authz!` ran with no
-/// `RequestContextProvider` installed while the policies read `context`.
-/// Returns whether it logged.
-///
-/// Such a policy set decides on an empty context: a rule that requires
-/// `context.mfa_verified` denies every request, and a `forbid` written as
-/// `context has mfa_verified && !context.mfa_verified` stops matching. Either
-/// is almost always a missing `Extension<Arc<dyn RequestContextProvider>>`.
-pub fn warn_once_without_context_provider(
+/// The refusal of a denied `require_authz!` request: `step_up_required` with
+/// the step-up when the store says one would permit it
+/// ([`PolicyEvaluator::step_up_for`](axess_core::authz::PolicyEvaluator::step_up_for)),
+/// the plain denial otherwise.
+pub fn refusal(
     store: &axess_core::authz::PolicyStore,
-    warned: &std::sync::atomic::AtomicBool,
+    entities: &cedar_policy::Entities,
+    principal: cedar_policy::EntityUid,
+    action: cedar_policy::EntityUid,
+    resource: cedar_policy::EntityUid,
+    context: cedar_policy::Context,
+) -> axess_core::authz::AuthzRefusal {
+    use axess_core::authz::PolicyEvaluator as _;
+    match store.step_up_for(entities, principal, action, resource, context) {
+        Some(step_up) => {
+            crate::tracing::debug!(
+                macro_name = "require_authz!",
+                %step_up,
+                "denied; a step-up the policies name would permit"
+            );
+            axess_core::authz::AuthzRefusal::StepUpRequired(step_up)
+        }
+        None => axess_core::authz::AuthzRefusal::Denied,
+    }
+}
+
+/// Whether `require_authz!` must refuse because the policies read `context`
+/// and no `RequestContextProvider` extension is installed; logs the refusal
+/// at error level when it must.
+///
+/// Such a policy set would decide on an empty context: a rule that requires
+/// `context.mfa_verified` denies every request, and a `forbid` written as
+/// `context has mfa_verified && !context.mfa_verified` stops matching, so the
+/// `permit` beside it allows. Either is almost always a missing or mistyped
+/// `Extension<Arc<dyn RequestContextProvider>>`, so the gate answers 500 as
+/// it does for a missing `PolicyStore`. A store that never reads `context`
+/// keeps the empty-context path.
+pub fn refuse_without_context_provider(
+    store: &axess_core::authz::PolicyStore,
     action: &str,
 ) -> bool {
-    use std::sync::atomic::Ordering;
-    if !store.mentions_context() || warned.swap(true, Ordering::Relaxed) {
+    if !store.mentions_context() {
         return false;
     }
-    crate::tracing::warn!(
+    crate::tracing::error!(
         macro_name = "require_authz!",
         action,
-        "the policies read `context` but no RequestContextProvider extension is installed; \
-         every check runs on an empty context. Install \
-         Extension(Arc<dyn RequestContextProvider>) earlier in the middleware chain"
+        "missing RequestContextProvider extension while the policies read `context`; \
+         install Extension(Arc<dyn RequestContextProvider>) earlier in the middleware chain \
+         (the trait object, not the concrete provider type)"
     );
     true
 }
@@ -337,8 +364,7 @@ mod tests {
         "attributes": {"mfa": {"type": "Boolean", "required": false}}}}}}}}"#;
 
     #[test]
-    fn a_missing_context_provider_is_warned_once_when_policies_read_the_context() {
-        use std::sync::atomic::AtomicBool;
+    fn a_missing_context_provider_is_refused_only_when_policies_read_the_context() {
         let guarded = axess_core::authz::PolicyStore::from_text(
             "permit(principal, action, resource) when { context has mfa && context.mfa };",
             GUARDED_SCHEMA,
@@ -350,14 +376,9 @@ mod tests {
         )
         .unwrap();
 
-        let warned = AtomicBool::new(false);
-        assert!(!warn_once_without_context_provider(&plain, &warned, "View"));
-        assert!(warn_once_without_context_provider(
-            &guarded, &warned, "View"
-        ));
-        assert!(!warn_once_without_context_provider(
-            &guarded, &warned, "View"
-        ));
+        assert!(!refuse_without_context_provider(&plain, "View"));
+        assert!(refuse_without_context_provider(&guarded, "View"));
+        assert!(refuse_without_context_provider(&guarded, "View"));
     }
 
     #[test]

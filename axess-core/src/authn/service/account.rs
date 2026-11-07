@@ -408,6 +408,12 @@ where
                 );
             }
 
+            // The login is complete: the guesses that led here were right,
+            // so the delay they earned goes. Cleared only now, because a
+            // factor that passed says nothing about the guesses at a later
+            // one.
+            self.clear_throttle_for(user_id, tenant_id).await;
+
             let mut event_builder = AuthEventBuilder::success(AuthEventType::Authenticated)
                 .attributed_to(user_id, tenant_id)
                 .with_session(sid);

@@ -54,7 +54,12 @@ async fn a_new_device_stores_the_digest_of_its_token_and_sends_the_strict_cookie
     let resolver = resolver_for(Some("alice"));
     let parts = req_with(Some("UA"), Some(tenant()), None);
 
-    let id = resolver.resolve(&parts).await.unwrap().expect("created");
+    let id = resolver
+        .resolve(&parts)
+        .await
+        .unwrap()
+        .expect("created")
+        .id();
 
     let set_cookie = issued(&parts).expect("a cookie is issued with a new device");
     for attribute in [
@@ -136,7 +141,12 @@ async fn copied_headers_do_not_inherit_a_trusted_device() {
         .await
         .unwrap();
 
-    let id = resolver.resolve(&parts).await.unwrap().expect("a device");
+    let id = resolver
+        .resolve(&parts)
+        .await
+        .unwrap()
+        .expect("a device")
+        .id();
 
     assert_ne!(
         id, victim.id,
@@ -165,7 +175,12 @@ async fn copied_headers_do_not_inherit_a_trusted_device() {
 async fn the_right_id_with_the_wrong_token_is_not_the_device() {
     let resolver = resolver_for(Some("alice"));
     let first = req_with(Some("UA"), Some(tenant()), None);
-    let id = resolver.resolve(&first).await.unwrap().expect("created");
+    let id = resolver
+        .resolve(&first)
+        .await
+        .unwrap()
+        .expect("created")
+        .id();
     let _ = issued(&first);
 
     let forged = cookie_value(
@@ -173,7 +188,12 @@ async fn the_right_id_with_the_wrong_token_is_not_the_device() {
         &DeviceToken::mint(&axess_rng::testing::MockRng::new(9)),
     );
     let parts = with_cookie(req_with(Some("UA"), Some(tenant()), None), &forged);
-    let resolved = resolver.resolve(&parts).await.unwrap().expect("a device");
+    let resolved = resolver
+        .resolve(&parts)
+        .await
+        .unwrap()
+        .expect("a device")
+        .id();
 
     assert_ne!(resolved, id);
     assert!(
@@ -190,7 +210,8 @@ async fn a_guest_presenting_a_valid_cookie_is_recognised_without_a_write() {
         .resolve(&first)
         .await
         .unwrap()
-        .expect("created");
+        .expect("created")
+        .id();
     let cookie = issued(&first).unwrap();
     let value = cookie
         .split(';')
@@ -216,7 +237,10 @@ async fn a_guest_presenting_a_valid_cookie_is_recognised_without_a_write() {
         MockClock::at(Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).unwrap()),
     );
     let parts = with_cookie(req_with(Some("UA"), Some(tenant()), None), &value);
-    assert_eq!(guest.resolve(&parts).await.unwrap(), Some(id));
+    assert_eq!(
+        guest.resolve(&parts).await.unwrap().map(|b| b.id()),
+        Some(id)
+    );
     assert!(issued(&parts).is_none());
 
     let seen_after = guest
@@ -237,7 +261,7 @@ async fn a_guest_presenting_a_valid_cookie_is_recognised_without_a_write() {
 async fn a_valid_cookie_does_not_open_another_users_device() {
     let alice = resolver_for(Some("alice"));
     let first = req_with(Some("UA"), Some(tenant()), None);
-    let id = alice.resolve(&first).await.unwrap().expect("created");
+    let id = alice.resolve(&first).await.unwrap().expect("created").id();
     let value = issued(&first)
         .unwrap()
         .split(';')
@@ -255,7 +279,7 @@ async fn a_valid_cookie_does_not_open_another_users_device() {
     )
     .with_user_fn(|_| Some(user("bob")));
     let parts = with_cookie(req_with(Some("UA"), Some(tenant()), None), &value);
-    let resolved = bob.resolve(&parts).await.unwrap().expect("a device");
+    let resolved = bob.resolve(&parts).await.unwrap().expect("a device").id();
     assert_ne!(resolved, id, "alice's cookie names alice's device only");
 }
 
@@ -263,7 +287,12 @@ async fn a_valid_cookie_does_not_open_another_users_device() {
 async fn a_revoked_device_is_not_recognised_by_its_token() {
     let resolver = resolver_for(Some("alice"));
     let first = req_with(Some("UA"), Some(tenant()), None);
-    let id = resolver.resolve(&first).await.unwrap().expect("created");
+    let id = resolver
+        .resolve(&first)
+        .await
+        .unwrap()
+        .expect("created")
+        .id();
     let value = issued(&first)
         .unwrap()
         .split(';')
@@ -281,7 +310,12 @@ async fn a_revoked_device_is_not_recognised_by_its_token() {
         .unwrap();
 
     let parts = with_cookie(req_with(Some("UA"), Some(tenant()), None), &value);
-    let resolved = resolver.resolve(&parts).await.unwrap().expect("a device");
+    let resolved = resolver
+        .resolve(&parts)
+        .await
+        .unwrap()
+        .expect("a device")
+        .id();
     assert_ne!(resolved, id);
 }
 
@@ -291,11 +325,19 @@ async fn a_revoked_device_is_not_recognised_by_its_token() {
 async fn the_session_device_is_kept_when_no_token_is_presented() {
     let resolver = resolver_for(Some("alice"));
     let first = req_with(Some("UA"), Some(tenant()), None);
-    let id = resolver.resolve(&first).await.unwrap().expect("created");
+    let id = resolver
+        .resolve(&first)
+        .await
+        .unwrap()
+        .expect("created")
+        .id();
 
     let mut parts = req_with(Some("UA"), Some(tenant()), None);
     parts.extensions.insert(SessionDevice(id));
-    assert_eq!(resolver.resolve(&parts).await.unwrap(), Some(id));
+    assert_eq!(
+        resolver.resolve(&parts).await.unwrap().map(|b| b.id()),
+        Some(id)
+    );
     assert!(issued(&parts).is_none());
     assert_eq!(resolver.lifecycle.store().len(), 1, "no second device");
 }
@@ -304,7 +346,7 @@ async fn the_session_device_is_kept_when_no_token_is_presented() {
 async fn the_session_device_of_another_user_is_not_kept() {
     let alice = resolver_for(Some("alice"));
     let first = req_with(Some("UA"), Some(tenant()), None);
-    let id = alice.resolve(&first).await.unwrap().expect("created");
+    let id = alice.resolve(&first).await.unwrap().expect("created").id();
 
     let bob = LifecycleDeviceResolver::new(
         DefaultFingerprintExtractor::new(fixed_pepper()),
@@ -314,7 +356,7 @@ async fn the_session_device_of_another_user_is_not_kept() {
     .with_user_fn(|_| Some(user("bob")));
     let mut parts = req_with(Some("UA"), Some(tenant()), None);
     parts.extensions.insert(SessionDevice(id));
-    let resolved = bob.resolve(&parts).await.unwrap().expect("a device");
+    let resolved = bob.resolve(&parts).await.unwrap().expect("a device").id();
     assert_ne!(resolved, id);
 }
 

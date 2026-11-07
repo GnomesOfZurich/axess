@@ -176,6 +176,15 @@ pub struct EncryptedDelegatedCredentialStore<S, K> {
     seals: AtomicU64,
 }
 
+/// A stored row with its fields opened.
+struct OpenedRow {
+    plain: StoredDelegation,
+    /// Some field is sealed under a key other than the current one.
+    stale: bool,
+    /// Every field's envelope covers the expiry.
+    expiry_bound: bool,
+}
+
 impl<S, K> EncryptedDelegatedCredentialStore<S, K>
 where
     S: DelegatedCredentialStore,
@@ -329,6 +338,68 @@ where
         })
     }
 
+    /// Open every field of a stored row, under the key each names.
+    fn open_row(
+        &self,
+        tenant: &TenantId,
+        user: &UserId,
+        provider: &str,
+        cred: &StoredDelegation,
+        current_id: Option<&str>,
+    ) -> Result<OpenedRow, String> {
+        let mut stale = false;
+        let mut expiry_bound = true;
+
+        let access = self
+            .open_field(
+                provider,
+                cred,
+                &cred.access_token,
+                FIELD_ACCESS,
+                tenant,
+                user,
+            )
+            .map_err(|e| format!("decrypt access_token: {e}"))?;
+        stale |= access.is_stale(current_id);
+        expiry_bound &= access.binds_expiry();
+        let access_plain = access.plain;
+
+        let refresh_plain = match cred.refresh_token.as_deref() {
+            Some(rt) => {
+                let opened = self
+                    .open_field(provider, cred, rt, FIELD_REFRESH, tenant, user)
+                    .map_err(|e| format!("decrypt refresh_token: {e}"))?;
+                stale |= opened.is_stale(current_id);
+                expiry_bound &= opened.binds_expiry();
+                Some(ZeroizedString::from(opened.plain))
+            }
+            None => None,
+        };
+
+        let plain = StoredDelegation {
+            provider: cred.provider.clone(),
+            access_token: ZeroizedString::from(access_plain),
+            refresh_token: refresh_plain,
+            // An envelope older than the current version does not cover the
+            // expiry, so a store writer could have moved it. The row reads as
+            // expired: the refresh that follows saves a current row from the
+            // provider's answer. It is not re-sealed, which would vouch for
+            // the unauthenticated value.
+            expires_at: if expiry_bound {
+                cred.expires_at
+            } else {
+                Some(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH)
+            },
+            scopes: cred.scopes.clone(),
+            token_type: cred.token_type.clone(),
+        };
+        Ok(OpenedRow {
+            plain,
+            stale,
+            expiry_bound,
+        })
+    }
+
     /// Rewrite a row that was read in an older form, only if the stored row
     /// is still the one that was read. A failure is logged and does not fail
     /// the load.
@@ -400,56 +471,11 @@ where
             }
             None => None,
         };
-        let mut stale = false;
-        let mut expiry_bound = true;
-
-        let access = self
-            .open_field(
-                provider,
-                &cred,
-                &cred.access_token,
-                FIELD_ACCESS,
-                tenant,
-                user,
-            )
-            .map_err(|e| format!("decrypt access_token: {e}"))?;
-        stale |= access.is_stale(current_id.as_deref());
-        expiry_bound &= access.binds_expiry();
-        let access_plain = access.plain;
-
-        let refresh_plain = match cred.refresh_token.as_deref() {
-            Some(rt) => {
-                let opened = self
-                    .open_field(provider, &cred, rt, FIELD_REFRESH, tenant, user)
-                    .map_err(|e| format!("decrypt refresh_token: {e}"))?;
-                stale |= opened.is_stale(current_id.as_deref());
-                expiry_bound &= opened.binds_expiry();
-                Some(ZeroizedString::from(opened.plain))
-            }
-            None => None,
-        };
-
-        let plain = StoredDelegation {
-            provider: cred.provider.clone(),
-            access_token: ZeroizedString::from(access_plain),
-            refresh_token: refresh_plain,
-            // An envelope older than the current version does not cover the
-            // expiry, so a store writer could have moved it. The row reads as
-            // expired: the refresh that follows saves a current row from the
-            // provider's answer. It is not re-sealed, which would vouch for
-            // the unauthenticated value.
-            expires_at: if expiry_bound {
-                cred.expires_at
-            } else {
-                Some(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH)
-            },
-            scopes: cred.scopes.clone(),
-            token_type: cred.token_type.clone(),
-        };
-        if stale && expiry_bound {
-            self.reseal(tenant, user, &cred, &plain).await;
+        let opened = self.open_row(tenant, user, provider, &cred, current_id.as_deref())?;
+        if opened.stale && opened.expiry_bound {
+            self.reseal(tenant, user, &cred, &opened.plain).await;
         }
-        Ok(Some(plain))
+        Ok(Some(opened.plain))
     }
 
     async fn save(
@@ -460,6 +486,30 @@ where
     ) -> Result<(), String> {
         let wrapped = self.seal(tenant, user, credential)?;
         self.inner.save(tenant, user, wrapped).await
+    }
+
+    async fn save_if_unchanged(
+        &self,
+        tenant: &TenantId,
+        user: &UserId,
+        expected: &StoredDelegation,
+        replacement: StoredDelegation,
+    ) -> Result<CredentialSwap, String> {
+        // The inner store compares sealed rows, and the caller holds the
+        // plaintext it read: read the sealed row, open it, and swap against
+        // the sealed row only if it opens to what the caller expected. The
+        // swap is atomic exactly when the inner store's is.
+        let Some(row) = self.inner.load(tenant, user, &expected.provider).await? else {
+            return Ok(CredentialSwap::Changed);
+        };
+        let opened = self.open_row(tenant, user, &expected.provider, &row, None)?;
+        if !opened.plain.same_as(expected) {
+            return Ok(CredentialSwap::Changed);
+        }
+        let sealed = self.seal(tenant, user, replacement)?;
+        self.inner
+            .save_if_unchanged(tenant, user, &row, sealed)
+            .await
     }
 
     async fn revoke(&self, tenant: &TenantId, user: &UserId, provider: &str) -> Result<(), String> {

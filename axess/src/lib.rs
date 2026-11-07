@@ -250,15 +250,15 @@ pub mod backends {
 #[cfg(feature = "device")]
 pub mod device {
     pub use axess_core::{
-        AttestationClass, BindingsUpdate, CachedDeviceStore, CascadingRefreshStore,
+        AttestationClass, BindingsUpdate, BoundDevice, CachedDeviceStore, CascadingRefreshStore,
         DefaultFingerprintExtractor, Device, DeviceBinding, DeviceEventSink,
         DeviceFingerprintExtractor, DeviceLifecycleService, DevicePiiCategory, DevicePiiMapping,
         DevicePiiResolver, DevicePiiStore, DeviceResolver, DeviceStore, DeviceTrustLevel,
         FingerprintHash, LifecycleDeviceResolver, MemoryDevicePiiStore, MemoryDevicePiiStoreError,
         MemoryDeviceStore, MemoryDeviceStoreError, NoopDeviceEventSink, NoopDeviceResolver,
-        OwnerClaim, PiiToken, REDACTED_PLACEHOLDER, RedactedResolver, RevokeDeviceError,
-        SessionUser, StepUpPolicy, StepUpPolicyBuilder, SweepConfig, SweepConfigBuilder,
-        SweepConfigError, SweepCounts, TenantPepperResolver, TrustTransition,
+        OwnerClaim, PiiToken, ProvenDevice, REDACTED_PLACEHOLDER, RedactedResolver,
+        RevokeDeviceError, SessionUser, StepUpPolicy, StepUpPolicyBuilder, SweepConfig,
+        SweepConfigBuilder, SweepConfigError, SweepCounts, TenantPepperResolver, TrustTransition,
         cascade_revoke_by_refresh_family, cascade_revoke_devices, decide_step_up_for_optional,
         decide_step_up_for_user, revoke_device,
     };
@@ -346,7 +346,10 @@ pub mod federation {
     /// FIDO2 / WebAuthn passkey provider.
     #[cfg(feature = "fido2")]
     pub mod fido2 {
-        pub use axess_factors::fido2::{DefaultFido2Provider, Fido2Provider};
+        pub use axess_factors::fido2::{
+            AttestationCaList, DEFAULT_FIDO2_CEREMONY, DefaultFido2Provider, Fido2Authentication,
+            Fido2Ceremony, Fido2Key, Fido2Provider, Fido2Registration, SecurityKeyVerification,
+        };
     }
 
     /// LDAP bind authentication.
@@ -372,6 +375,9 @@ pub mod federation {
         /// beside the refresh token (`DpopKey::to_seed_bytes`,
         /// `DpopKey::from_seed`).
         pub use axess_core::{DpopKey, DpopProof, DpopSigner};
+        /// What the server may fetch for a URL a tenant supplied: the screen
+        /// `StoredTenantOAuthProviders` applies, and its named opt-outs.
+        pub use axess_factors::egress::{EgressPolicy, EgressRefusal, ReservedRange};
 
         /// The by-name helpers (refresh, userinfo, revocation, logout URL)
         /// resolved by a session's or a tenant's provider.
@@ -392,6 +398,15 @@ pub mod federation {
         pub use axess_core::federation::backchannel_logout::{
             BackChannelLogoutHandler, IdpSessionEnded, LogoutAudit, LogoutProviderError,
         };
+        // The `sid` map and the replay log behind a trait, so instances can
+        // share them (`ValkeySidStore` and `ValkeyReplayLog` with `valkey`).
+        pub use axess_core::federation::replay_log::{
+            LogoutReplayLog, Recorded, ReplayFuture, ReplayLogError,
+        };
+        pub use axess_core::federation::sid_map::SidMap;
+        pub use axess_core::federation::sid_store::{SidFuture, SidStore, SidStoreError};
+        #[cfg(feature = "valkey")]
+        pub use axess_core::federation::valkey_logout::{ValkeyReplayLog, ValkeySidStore};
         // The front-channel handler, and the bound form `new` returns, which
         // ends a session only when it is the request's own and is mounted
         // behind the session layer (`new_unbound` makes the plain handler).

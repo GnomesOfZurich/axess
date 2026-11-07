@@ -275,15 +275,21 @@ where
             Some(FactorConfig::Fido2(cfg)) => cfg.credentials,
             _ => Vec::new(),
         };
+        // A security key is not a discoverable credential `webauthn-rs`
+        // verifies here; passkeys and attested passkeys are.
         let keys = credentials
             .iter()
-            .filter(|c| {
-                stored.iter().any(|s| {
-                    s.cred_id() == c.cred_id()
-                        && s.passkey.get_public_key() == c.passkey.get_public_key()
-                })
+            .filter_map(|c| {
+                let offered = c.key.passkey()?;
+                stored
+                    .iter()
+                    .filter_map(|s| s.key.passkey())
+                    .any(|s| {
+                        s.cred_id() == offered.cred_id()
+                            && s.get_public_key() == offered.get_public_key()
+                    })
+                    .then(|| (&offered).into())
             })
-            .map(|c| (&c.passkey).into())
             .collect();
         Ok(keys)
     }
@@ -332,9 +338,14 @@ where
             .begin_authenticating(user.id, user.tenant_id, method.name.clone(), method.steps)
             .await;
 
-        let now = self.inner.clock.now();
+        // The discoverable ceremony is not an attested one: no trust anchor.
+        let proof = crate::authn::assurance::FactorAssurance::from_fido2_result(
+            auth_result,
+            None,
+            self.inner.clock.now(),
+        );
         session
-            .advance_factor(&FactorKind::Fido2, now, &self.inner.preserved_custom_keys)
+            .advance_factor(proof, &self.inner.preserved_custom_keys)
             .await;
 
         // `complete_factor_step` registers the session, re-checks the

@@ -1,0 +1,64 @@
+name: webauthn-rs argon2 watch
+
+# A build with `fido2` carries argon2, password-hash and blake2 in two majors:
+# axess uses argon2 0.6 and webauthn-rs-core reaches 0.5 through crypto-glue.
+# Weekly, scripts/watch-webauthn-argon2.sh reads crates.io for the newest
+# webauthn-rs-core, the newest crypto-glue it admits and that release's argon2
+# requirement. When the requirement leaves 0.5 (or a link in the chain is
+# dropped), this opens one tracking issue; a sentinel title keeps re-runs from
+# opening another.
+#
+# A failed or empty crates.io answer fails the job, so a blind run is a red
+# run. The script needs curl and jq, both on the runner image, and no Rust
+# toolchain.
+
+on:
+  schedule:
+    # Every Monday at 09:00 UTC.
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+
+jobs:
+  check_upstream:
+    name: Check webauthn-rs argon2 line
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read crates.io
+        id: poll
+        run: scripts/watch-webauthn-argon2.sh
+
+      - name: Open tracking issue
+        if: steps.poll.outputs.hit == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SUMMARY: ${{ steps.poll.outputs.summary }}
+        run: |
+          set -euo pipefail
+          title="webauthn-rs has left argon2 0.5"
+          existing=$(gh issue list \
+            --state open \
+            --search "\"$title\" in:title" \
+            --json number \
+            --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            echo "Tracking issue #$existing is already open."
+            exit 0
+          fi
+          body=$(cat <<EOF
+          $SUMMARY
+
+          A \`fido2\` build may now carry a single argon2 line. Bump
+          webauthn-rs (or crypto-glue) to the release named above, check
+          \`cargo tree -d --workspace --all-features\` for argon2,
+          password-hash and blake2, and update the argon2 entry under
+          "Awaiting upstream" in ROADMAP.md and the comments in Cargo.toml and
+          deny.toml that name the duplicate. Then retarget or delete this
+          workflow.
+          EOF
+          )
+          gh issue create --title "$title" --body "$body"

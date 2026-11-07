@@ -91,6 +91,16 @@ pub trait DelegatedCredentialStore: Send + Sync + 'static {
         credential: StoredDelegation,
     ) -> impl Future<Output = Result<(), String>> + Send;
 
+    /// Replace the row only if it still equals `expected`, atomically.
+    /// A store that cannot answers `Ok(CredentialSwap::Unsupported)`.
+    fn save_if_unchanged(
+        &self,
+        tenant: &TenantId,
+        user: &UserId,
+        expected: &StoredDelegation,
+        replacement: StoredDelegation,
+    ) -> impl Future<Output = Result<CredentialSwap, String>> + Send;
+
     fn revoke(
         &self,
         tenant: &TenantId,
@@ -125,6 +135,15 @@ There is no owner type. The triple is passed positionally, so the same
 `save` overwrites. Refresh-token rotation lands there rather than on a
 separate update path, because the store treats the whole credential as
 the unit of write.
+
+`save_if_unchanged` has no default: a refresh writes its result through it,
+so a row the user disconnected (in this process or another) while the IdP
+was being asked is not written back, and a re-seal under a new key cannot
+overwrite a token another request rotated. For a SQL store it is one
+conditional `UPDATE ... WHERE` on the columns of `expected`, answering
+`Saved` when a row changed and `Changed` when none did. A store that cannot
+says so with `Ok(CredentialSwap::Unsupported)`; a refresh then falls back to
+`save` and logs a warning naming the store type once.
 
 Both token fields are `ZeroizedString`, so the in-memory copy zeroes on
 drop. That says nothing about storage: **encryption at rest is the

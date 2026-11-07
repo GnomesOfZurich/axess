@@ -22,6 +22,8 @@
 //! when the handler is built, and an issuer that stops sending leaves nothing
 //! behind.
 
+use crate::federation::replay_log::{LogoutReplayLog, ReplayFuture};
+use axess_factors::oidc::logout_token::JTI_RETENTION_SECS;
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -50,21 +52,34 @@ struct Entry {
     in_flight: bool,
 }
 
-/// What recording a pair did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Recorded {
-    /// The pair was new and is now held.
-    New,
-    /// The log still holds the pair and the token it came from has been
-    /// acted on: a replay.
-    Replay,
-    /// The log holds the pair, and the first delivery of the token is still
-    /// being acted on: it may yet fail and leave the pair forgotten, so the
-    /// resend is asked to come again, not refused.
-    InFlight,
-    /// The pair is new but the issuer's partition is full of live entries
-    /// and has no room. Nothing was recorded or forgotten.
-    Full,
+use crate::federation::replay_log::Recorded;
+
+impl LogoutReplayLog for JtiLog {
+    fn record<'a>(
+        &'a self,
+        issuer: &'a str,
+        jti: &'a str,
+        now: DateTime<Utc>,
+    ) -> ReplayFuture<'a, Recorded> {
+        Box::pin(async move {
+            let cutoff = now - chrono::Duration::seconds(JTI_RETENTION_SECS);
+            Ok(JtiLog::record(self, issuer, jti, now, cutoff))
+        })
+    }
+
+    fn settle<'a>(&'a self, issuer: &'a str, jti: &'a str) -> ReplayFuture<'a, ()> {
+        Box::pin(async move {
+            JtiLog::settle(self, issuer, jti);
+            Ok(())
+        })
+    }
+
+    fn forget<'a>(&'a self, issuer: &'a str, jti: &'a str) -> ReplayFuture<'a, ()> {
+        Box::pin(async move {
+            JtiLog::forget(self, issuer, jti);
+            Ok(())
+        })
+    }
 }
 
 impl JtiLog {

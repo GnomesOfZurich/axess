@@ -60,7 +60,9 @@ let resolver = JwtSvidResolver::new(
     verifier,
     "prod.example.com".parse()?,
     token,
-);
+)
+// Maps the SPIFFE tenant slug to the tenant you registered for it.
+.with_tenant_lookup(|slug| tenants.id_of(slug));
 let principal = resolver.resolve().await?;
 ```
 
@@ -102,7 +104,8 @@ use axess_identity::PrincipalResolver;
 // `bearer_from` and its error are yours; axess has no opinion on how a
 // request without a credential is refused.
 let token = bearer_from(&headers).ok_or(MyError::NoCredential)?;
-let resolver = JwtSvidResolver::new(verifier.clone(), trust_domain.clone(), token);
+let resolver = JwtSvidResolver::new(verifier.clone(), trust_domain.clone(), token)
+    .with_tenant_lookup(|slug| tenants.id_of(slug));
 let principal = resolver.resolve().await?;   // Principal::Workload
 ```
 
@@ -317,8 +320,10 @@ the workload's claims through `principal.attributes`.
 
 The SPIFFE path carries the tenant slug and the `tid` claim carries the
 tenant UUID. Both are written by the issuer, and nothing ties them together
-unless you do. If you have a tenant registry, give the resolver a lookup with
+unless you do. Give the resolver a lookup with
 `JwtSvidResolver::with_tenant_lookup`: it maps the slug to the tenant you
 registered for it, and the token is refused when the slug is unknown or maps
-to a different tenant than `tid`. Without a lookup, the resolver trusts the
-issuer to have kept the two consistent.
+to a different tenant than `tid`. A resolver with no lookup refuses every
+token. Where you have no registry and trust the issuer to have kept the two
+claims consistent, say so with `JwtSvidResolver::without_tenant_cross_check()`,
+a waiver by name in line with the verifier's `allow_any_*` ones.

@@ -125,8 +125,8 @@ verifier composition. It lives in `axess-core` deliberately, not by
 oversight. The choice is between two costs: carve `LocalIdp` into a
 sibling crate that mirrors the verifier/issuer split at workspace
 shape, or accept one feature-gated OP-side module inside the
-orchestrator crate. The carve-out has been considered (see the
-ROADMAP) and rejected on the same reasoning that retired the earlier
+orchestrator crate. The carve-out has been considered and rejected
+on the same reasoning that retired the earlier
 `axess-delegated` crate: the structural benefit is real but small,
 the maintenance overhead of an additional workspace member is real,
 and no adopter is asking for `LocalIdp` as a separate dependency.
@@ -448,5 +448,5 @@ Everything else is detail. The rest of the book is detail.
   and the entity provider contract.
 - *Session lifecycle and crypto envelope* covers the cookie shape, the
   AES-256-GCM envelope, and fingerprint binding.
-- *Contributing* covers the AX-NNN policy, the DST non-negotiable,
+- *Contributing* covers how a change names its ROADMAP entry, the DST non-negotiable,
   and the naming conventions tied back to this chapter.

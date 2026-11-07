@@ -11,7 +11,7 @@
 //!
 //! # Enforcing session validity on protected routes
 //!
-//! The `login_required!` macro checks `is_authenticated()` on the session
+//! The `require_authn!` macro checks `is_authenticated()` on the session
 //! state, but does **not** consult the session registry. If you use
 //! [`AuthnServiceBuilder::with_registry`] for forced-logout support, use
 //! [`require_valid_session`] middleware instead:
@@ -67,8 +67,8 @@ pub(crate) mod oauth_service;
 pub mod session_validator;
 
 pub use builder::{
-    AuthnServiceBuilder, DEFAULT_FLOW_TTL, DEFAULT_PASSWORD_RESET_COOLDOWN,
-    DEFAULT_SIGNUP_VERIFICATION_TTL, RESET_COOLDOWN_CAPACITY,
+    AuthnServiceBuilder, DEFAULT_CANDIDATE_TTL, DEFAULT_FLOW_TTL, DEFAULT_MAX_LIVE_RESET_TOKENS,
+    DEFAULT_PASSWORD_RESET_COOLDOWN, DEFAULT_SIGNUP_VERIFICATION_TTL, RESET_COOLDOWN_CAPACITY,
 };
 #[cfg(feature = "oauth")]
 pub use builder::{DEFAULT_JWKS_REFRESH_INTERVAL, DEFAULT_SID_MAP_CAPACITY};
@@ -309,9 +309,23 @@ where
     /// [`BackChannelLogoutHandler::new`](crate::federation::backchannel_logout::BackChannelLogoutHandler::new)
     /// and the front-channel handler so an IdP-initiated logout finds the
     /// sessions this service created. Clones share one map.
+    ///
+    /// With a shared store set by
+    /// [`with_sid_store`](AuthnServiceBuilder::with_sid_store) this is the
+    /// in-process map, which the login path no longer fills: point the
+    /// handlers at [`sid_store`](Self::sid_store) with their `with_sid_store`.
     #[cfg(feature = "oauth")]
     pub fn sid_map(&self) -> crate::federation::sid_map::SidMap {
         self.inner.sid_map.clone()
+    }
+
+    /// The store the login path fills: the one set with
+    /// [`with_sid_store`](AuthnServiceBuilder::with_sid_store), else the
+    /// in-process [`sid_map`](Self::sid_map). Hand it to the back-channel and
+    /// front-channel handlers so they read what the login wrote.
+    #[cfg(feature = "oauth")]
+    pub fn sid_store(&self) -> Arc<dyn crate::federation::sid_store::SidStore> {
+        self.inner.sid_store()
     }
 
     /// `true` when at least one OAuth/OIDC provider has been registered

@@ -25,4 +25,12 @@ pub trait SessionMetrics: Send + Sync + 'static {
     fn sid_map_evicted(&self, count: u64) {
         let _ = count;
     }
+
+    /// A back-channel logout token verified but named no session this
+    /// instance could find, so nothing ended. The IdP is answered `200`
+    /// either way, as OpenID Connect Back-Channel Logout 1.0 has it for a
+    /// session the endpoint does not know. A steady rate is instances that
+    /// do not share a `sid` store (the token reached an instance that did not
+    /// handle the login), or sessions that already ended.
+    fn back_channel_logout_unmatched(&self) {}
 }

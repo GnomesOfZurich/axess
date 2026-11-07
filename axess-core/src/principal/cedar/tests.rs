@@ -16,13 +16,13 @@ fn sample_human() -> HumanPrincipal {
 
 fn sample_workload() -> WorkloadPrincipal {
     let trust = TrustDomain::new("gnomes.local").unwrap();
-    let wid = WorkloadId::build(&trust, "compute-worker", "ekekrantz").unwrap();
+    let wid = WorkloadId::build(&trust, "compute-worker", "gnomes").unwrap();
     WorkloadPrincipal {
         workload_id: wid,
         trust_domain: trust,
         issuer: Issuer::Cli,
         tenant_id: TenantId::from_bytes([30u8; 16]),
-        tenant_slug: "ekekrantz".to_string(),
+        tenant_slug: "gnomes".to_string(),
         service_name: "compute-worker".to_string(),
         attributes: BTreeMap::new(),
     }
@@ -40,7 +40,7 @@ fn workload_entity_uid_is_namespaced_under_axess_workload() {
     let uid = sample_workload().cedar_entity_uid().unwrap();
     let s = format!("{uid}");
     assert!(s.starts_with("axess::Workload::"), "actual: {s}");
-    assert!(s.contains("spiffe://gnomes.local/compute-worker/ekekrantz"));
+    assert!(s.contains("spiffe://gnomes.local/compute-worker/gnomes"));
 }
 
 #[test]

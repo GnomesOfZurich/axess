@@ -3,7 +3,7 @@
 //! [`AuthSession`] is the primary API surface for handlers. Changes are flushed
 //! to the session store by the [`SessionLayer`](super::layer::SessionLayer) middleware after the handler returns.
 
-use crate::authn::factor::{FactorKind, FactorStep};
+use crate::authn::factor::FactorStep;
 use crate::authn::ids::{TenantId, UserId};
 use crate::session::{
     data::{AdvanceOutcome, AuthState, Impersonation, SessionData, WorkflowState},
@@ -145,6 +145,16 @@ impl AuthSession {
         self.0.0.read().await.data.auth_state.impersonation()
     }
 
+    /// What each factor of the authenticated session proved, and when: the
+    /// most recent proof of each kind. Empty for a session that is not
+    /// authenticated, one that verified no factor (impersonation, signup) and
+    /// one stored before the record existed. Build the Cedar `assurance`
+    /// attribute from it with
+    /// [`AssuranceContext::from_session`](crate::authz::assurance::AssuranceContext::from_session).
+    pub async fn assurance(&self) -> Vec<crate::authn::assurance::FactorAssurance> {
+        self.0.0.read().await.data.auth_state.assurance().to_vec()
+    }
+
     /// Mark the authenticated session as `admin`'s impersonation begun at
     /// `since`. Returns `false`, changing nothing, when the session is not
     /// authenticated.
@@ -223,6 +233,25 @@ impl AuthSession {
     /// use because `DeviceId` is a 16-byte `Copy` UUID newtype.
     pub async fn device_id(&self) -> Option<crate::authn::ids::DeviceId> {
         self.0.0.read().await.data.device_id
+    }
+
+    /// The session's device when the client proved it holds it, `None`
+    /// otherwise (no device, or one a resolver found by fingerprint alone).
+    ///
+    /// The only reading of the session's device that a lockout exemption
+    /// accepts: the per-account lockout lets an account's own device through
+    /// only as a [`ProvenDevice`](crate::device::ProvenDevice), which the
+    /// session layer records when the device resolver reports one (the
+    /// library's [`LifecycleDeviceResolver`](crate::device::LifecycleDeviceResolver)
+    /// does, on the secret token of the device cookie).
+    #[cfg(feature = "device")]
+    pub async fn proven_device(&self) -> Option<crate::device::ProvenDevice> {
+        let inner = self.0.0.read().await;
+        if inner.data.device_proven {
+            inner.data.device_id.map(crate::device::ProvenDevice::new)
+        } else {
+            None
+        }
     }
 
     /// Return a clone of the full session data.
@@ -310,17 +339,19 @@ impl AuthSession {
         tenant_id: TenantId,
         authn_time: DateTime<Utc>,
     ) {
-        self.set_authenticated_keeping(user_id, tenant_id, authn_time, &[])
+        self.set_authenticated_keeping(user_id, tenant_id, authn_time, None, &[])
             .await;
     }
 
-    /// [`set_authenticated`](Self::set_authenticated) that also carries the
-    /// custom keys in `preserved` across the transition.
+    /// [`set_authenticated`](Self::set_authenticated) that records `proof`,
+    /// what the transition itself verified (a federated login), and carries
+    /// the custom keys in `preserved` across the transition.
     pub(crate) async fn set_authenticated_keeping(
         &self,
         user_id: UserId,
         tenant_id: TenantId,
         authn_time: DateTime<Utc>,
+        proof: Option<crate::authn::assurance::FactorAssurance>,
         preserved: &[String],
     ) {
         let mut guard = self.0.0.write().await;
@@ -330,7 +361,7 @@ impl AuthSession {
         guard
             .data
             .auth_state
-            .set_authenticated(user_id, tenant_id, authn_time);
+            .set_authenticated_with(user_id, tenant_id, authn_time, proof);
         crate::session::data::retain_across_login(&mut guard.data.custom, preserved);
         // Bind the session fingerprint immediately so it's set before the
         // response leaves the server (prevents hijack-before-binding window).
@@ -359,6 +390,10 @@ impl AuthSession {
             .data
             .auth_state
             .begin_authenticating(user_id, tenant_id, method_name, steps);
+        // A ceremony an abandoned step-up chose is not this login's.
+        if let Some(custom) = guard.data.custom.as_object_mut() {
+            custom.remove(crate::session::data::STEP_UP_CEREMONY_KEY);
+        }
         // The id the visitor arrived with may have been planted: the partial
         // login lives under a fresh one.
         guard.rotate_id();
@@ -372,21 +407,21 @@ impl AuthSession {
         guard.modified = true;
     }
 
-    /// Advance a multi-factor flow by removing `kind` from the remaining list.
+    /// Advance a multi-factor flow by removing `proof.kind` from the
+    /// remaining list and recording what it proved.
     ///
     /// If `remaining` becomes empty after removal, transitions to
     /// [`AuthState::Authenticated`] automatically.
     pub(crate) async fn advance_factor(
         &self,
-        kind: &FactorKind,
-        authn_time: DateTime<Utc>,
+        proof: crate::authn::assurance::FactorAssurance,
         preserved: &[String],
     ) {
         let mut guard = self.0.0.write().await;
         // Pure state transition lives on AuthState; session-level
         // orchestration (fingerprint binding, id rotation, dirty flag) is
         // dispatched on the outcome.
-        match guard.data.auth_state.advance_factor(kind, authn_time) {
+        match guard.data.auth_state.advance_factor(proof) {
             AdvanceOutcome::Completed => {
                 crate::session::data::retain_across_login(&mut guard.data.custom, preserved);
                 // Bind fingerprint immediately on auth completion.

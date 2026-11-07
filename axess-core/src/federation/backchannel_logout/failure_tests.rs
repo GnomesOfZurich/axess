@@ -163,9 +163,15 @@ async fn a_failed_sid_invalidation_is_retryable_and_the_resend_ends_the_session(
     r.registry.register(&user, &session).await.unwrap();
     let key: SidKey = (ISS.to_string(), "sid-1".to_string());
     r.sid_map
-        .register_subject_session(ISS, "subject-1", user, session);
-    r.sid_map
-        .insert(key.clone(), "subject-1", user, session, chrono::Utc::now());
+        .register_subject_session(ISS, "subject-1", None, user, session);
+    r.sid_map.insert(
+        key.clone(),
+        "subject-1",
+        None,
+        user,
+        session,
+        chrono::Utc::now(),
+    );
     assert!(r.sid_map.contains_key(&key), "the case to refuse exists");
 
     let t = token(serde_json::json!({ "sub": "subject-1", "sid": "sid-1", "jti": "j-outage" }));
@@ -225,11 +231,17 @@ async fn a_partly_failed_sub_logout_keeps_the_failed_session_for_the_retry() {
     for s in [&x, &y] {
         r.registry.register(&user, s).await.unwrap();
         r.sid_map
-            .register_subject_session(ISS, "subject-2", user, *s);
+            .register_subject_session(ISS, "subject-2", None, user, *s);
     }
     let key_y: SidKey = (ISS.to_string(), "sid-y".to_string());
-    r.sid_map
-        .insert(key_y.clone(), "subject-2", user, y, chrono::Utc::now());
+    r.sid_map.insert(
+        key_y.clone(),
+        "subject-2",
+        None,
+        user,
+        y,
+        chrono::Utc::now(),
+    );
     assert_eq!(r.sid_map.subject_len(), 2);
 
     let t = token(serde_json::json!({ "sub": "subject-2", "jti": "j-partial" }));

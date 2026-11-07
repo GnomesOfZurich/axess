@@ -1,4 +1,5 @@
 use super::*;
+use crate::federation::sid_map::SidMap;
 use crate::session::id::SessionId;
 use crate::session::store::SessionRegistryAdapter;
 use crate::session::store::{MemorySessionRegistry, SessionRegistry};
@@ -28,6 +29,7 @@ async fn frontchannel_logout_invalidates_by_sid() {
     sid_map.insert(
         key.clone(),
         "idp-subject",
+        None,
         user_id,
         session_id,
         chrono::Utc::now(),
@@ -61,7 +63,15 @@ async fn frontchannel_logout_unknown_sid_is_noop() {
         "https://idp.example.com".to_string(),
         "nonexistent".to_string(),
     );
-    assert!(handler.sid_map.remove_if(&nonexistent, |_| true).is_none());
+    let some_session = SessionId::new(&MockRng::new(7));
+    assert!(
+        handler
+            .sid_map
+            .remove_if_session(&nonexistent, &some_session)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -123,6 +133,7 @@ async fn handle_frontchannel_logout_drives_registry_and_gates_issuer() {
     sid_map.insert(
         key.clone(),
         "idp-subject",
+        None,
         user_id,
         session_id,
         chrono::Utc::now(),
@@ -202,6 +213,7 @@ async fn a_bound_logout_ends_only_the_callers_own_session() {
     sid_map.insert(
         key.clone(),
         "victim-sub",
+        None,
         victim,
         victim_session,
         chrono::Utc::now(),
@@ -302,7 +314,7 @@ async fn end_by_sid_removes_only_the_mapping_it_matched() {
     let user = axess_identity::testing::user("re-mapped");
     registry.register(&user, &new).await.unwrap();
     let key: SidKey = ("https://idp.example.com".to_string(), "sid-r".to_string());
-    sid_map.insert(key.clone(), "sub-r", user, new, chrono::Utc::now());
+    sid_map.insert(key.clone(), "sub-r", None, user, new, chrono::Utc::now());
     let handler = FrontChannelLogoutHandler::new_unbound(
         sid_map.clone(),
         Arc::new(SessionRegistryAdapter(registry.clone())),

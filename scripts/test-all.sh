@@ -206,7 +206,7 @@ bg_step "Ban #[non_exhaustive]" false bash -c '
   if [ -n "$hits" ]; then
     echo "$hits"
     echo "#[non_exhaustive] is forbidden in first-party crates." >&2
-    echo "See ROADMAP.md / feedback_no_non_exhaustive memory." >&2
+    echo "See CONTRIBUTING.md, \"No #[non_exhaustive] on first-party enums\"." >&2
     exit 1
   fi
   echo "OK: no #[non_exhaustive] occurrences."

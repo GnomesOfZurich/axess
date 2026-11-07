@@ -62,7 +62,10 @@
 //!         })?;
 //!         Ok(SocialClaims {
 //!             subject: id.to_string(),
+//!             // A profile address is the user's own text. Pass it on as
+//!             // verified only when the provider says it checked it.
 //!             email: raw.get("email").and_then(|v| v.as_str()).map(String::from),
+//!             email_verified: false,
 //!             display_name: raw.get("name").and_then(|v| v.as_str()).map(String::from),
 //!             raw: raw.clone(),
 //!         })
@@ -159,9 +162,21 @@ pub struct SocialClaims {
     pub subject: String,
 
     /// Email address if the provider supplied one. May be `None` for
-    /// providers that don't return email or where the user has not
-    /// verified theirs.
+    /// providers that don't return email.
+    ///
+    /// **Not proof of control.** Read it as verified only when
+    /// [`email_verified`](Self::email_verified) is `true`; linking or
+    /// creating an account by an address the provider did not verify lets
+    /// anyone who can put a stranger's address on their profile take that
+    /// stranger's account.
     pub email: Option<String>,
+
+    /// Whether the provider states that it verified [`email`](Self::email)
+    /// (the user proved control of the address to the provider). The claim
+    /// mapper must say so, per provider; there is no default, so a mapper
+    /// cannot forget. When in doubt, `false`: an adopter links accounts by
+    /// email only when this is `true`.
+    pub email_verified: bool,
 
     /// Display name suitable for UI rendering. May be `None`.
     pub display_name: Option<String>,

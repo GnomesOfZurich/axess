@@ -40,6 +40,24 @@ The slot holds an `Arc<dyn PolicyEvaluator>`, so a `MockPolicyEvaluator` in a
 test and a `PolicyStore` in production live in the same slot, and
 `AuthzStore::try_new` is unchanged.
 
+## Route gates
+
+`require_authz!` reads an `Arc<PolicyStore>` from the request extensions. The
+usual wiring builds one `Arc<PolicyStore>`, installs it as that extension and
+hands it to `AuthzStore::try_new`. A reload keeps that object the one that
+decides: the new set is built beside it, validated, and the original
+`PolicyStore` is pointed at it with one atomic write (`PolicyEvaluator::adopt`).
+Every holder of the `Arc`, the gate and the store alike, decides on the next
+set from its next request, with no lock and no change to the wiring. The
+pointer is always from the original to the newest set, never a chain, so a
+thousand reloads leave one hop. `PolicyStore::digest()`, `schema()` and
+`mentions_context()` follow a reload, as do `PolicyEvaluator::digest()`,
+`AuthzStore::policy_digest()` and `PolicyEvaluator::schema()`; `original_digest()` and
+`original_schema()` name the text the object was built from. A gate wired with a different `PolicyStore` than the one handed to the
+store has its own set and is not reloaded; use one `Arc` for both. An
+evaluator that is not a `PolicyStore` (a mock, your own) is replaced in the
+swap slot as before.
+
 ## The reload entry point
 
 ```text
@@ -73,6 +91,24 @@ force. The outcome says so (`cache_invalidated: false`, `announced: false`),
 an error event is logged, and the caller decides. The stale entity sets age
 out by their TTL; an instance that missed the announce catches up by its poll
 (below).
+
+## Bounded steps
+
+The reload lock is held across steps that leave the process, so each is
+bounded by `ReloadTimeouts` (`AuthzStore::with_reload_timeouts`): a follower's
+`PolicySource` read (`source_read`, default 30 seconds), each `ReloadHook` or
+cache invalidation (`hook`, 30 seconds) and the announce (`announce`, 10
+seconds). A hung `ValkeyEntityCache::invalidate_all` SCAN therefore cannot
+queue an emergency `forbid` behind it forever: the step is reported as failed
+and the lock is released. A source read that fails, times out or panics
+counts on the refused counter (`axess_authz_policy_reload_refusals_total`).
+That is the signal for an instance stuck on the policy it started with, so
+alert on it.
+
+Each follower read runs in a task of its own, so a panic in a `PolicySource`
+ends that read, not the follower. `ReloadFollower::is_finished()` is `true`
+only when the follower task itself has ended (the runtime shut down); a
+health check can poll it.
 
 ## Caches
 
@@ -136,6 +172,26 @@ same re-read.
 every instance converge to one digest. A source that is itself mid-update can
 hand two instances different bundles; they converge at the next poll.
 
+**Generations.** A source with a monotonic version (a revision column, a
+sequence number) overrides `PolicySource::load_versioned` and returns
+`VersionedBundle::new(bundle).with_generation(n)`. The follower remembers the
+highest generation it applied and refuses a bundle below it, logging and
+counting the refusal, so a stale replica or cache that serves an older, looser
+set cannot undo a tightening an instance already applied. A bundle with the
+same generation or a higher one applies when its digest differs; a bundle with
+no generation applies whenever its digest differs, as before (the default
+`load_versioned` returns none).
+
+**A local reload on a following instance.** `reload_policies` on an instance
+that follows a source changes that instance only. The instance's own
+announcement is delivered to it as well, and its next read (the notice, or the
+poll at the latest) replaces the local set with the source's bundle, because
+the source is what a follower converges on. A local reload is therefore
+temporary on a following instance, for at most `poll_every`. To make an
+emergency `forbid` last, write it to the source and reload; the local call
+then only makes it take effect sooner. Without `follow_reloads` a local reload
+stands until the next one.
+
 ## Failure modes
 
 | Failure | Result |
@@ -143,7 +199,10 @@ hand two instances different bundles; they converge at the next poll.
 | Policy text does not parse, or fails strict validation | Reload refused; previous set in force; `PolicyParse` / `PolicyValidation` |
 | Schema does not parse | Refused; `SchemaParse` |
 | Provider does not fit the new schema | Refused; the provider's `validate_schema` error; previous set in force |
-| Source cannot be read by the follower | Event logged, nothing applied; retried at the next notice or poll |
+| Source cannot be read by the follower, or the read outlasts `source_read` | Event logged and counted on the refused counter, nothing applied; retried at the next notice or poll |
+| Source read panics | The panic is contained to that read, logged and counted; the follower carries on |
+| A cache or hook, or the announce, outlasts its limit | Swap stands; `cache_invalidated: false` or `announced: false`; the reload lock is released |
+| Source offers an older generation than the one applied | Refused and counted; previous set in force |
 | Source returns a bad bundle to the follower | Refused on that instance only, event logged and counted; previous set in force |
 | Cache invalidation fails | Swap stands; `cache_invalidated: false`; entries age out by TTL |
 | Announce fails | Swap stands; `announced: false`; peers catch up by poll |
@@ -177,8 +236,8 @@ decided by a set that was not valid.
 Nothing changes for an adopter that never calls `reload_policies`: the
 constructors, `try_new` and the request path behave as before, and
 `AuthzCacheMetrics` gains two defaulted methods. The one new direct dependency is
-`arc-swap`, already compiled for `valkey` builds. `PolicyEvaluator` gains a
-defaulted `digest()` method.
+`arc-swap`, already compiled for `valkey` builds. `PolicyEvaluator` gains
+defaulted `digest()` and `adopt()` methods, and `schema()` returns the schema by value.
 
 Reloading authentication providers (OAuth, FIDO2, LDAP) is on its own page,
 [live provider reload](../authentication/live-provider-reload.md). It reuses

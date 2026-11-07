@@ -283,11 +283,16 @@ where
         prev
     });
     let new_id = guard.id;
+    // Authenticated as the user the response names. A handler that changed
+    // who the session is (an administrator assuming a user) registered the
+    // new id for the new user itself, as a login does; the old id belongs to
+    // the other user and says nothing about this one.
     let was_authenticated = guard
         .consume
         .as_ref()
         .and_then(|c| c.loaded.as_ref())
-        .is_some_and(|loaded| loaded.auth_state.is_authenticated());
+        .and_then(|loaded| loaded.auth_state.authenticated_user_id())
+        .is_some_and(|loaded| guard.data.auth_state.authenticated_user_id() == Some(loaded));
     // A request that ran under a stored session requires that row to
     // still be live: a logout that removed it while the request ran
     // must not be undone by moving the data to the new id.

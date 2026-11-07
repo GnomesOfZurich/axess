@@ -38,6 +38,8 @@ tracing = { workspace = true }
 uuid = { workspace = true, default-features = false }
 
 [dev-dependencies]
+# Seals a payload in the tests, as an adopter's seal path would.
+aes-gcm = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, default-features = false, features = ["rt", "macros", "sync"] }
 

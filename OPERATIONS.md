@@ -53,7 +53,7 @@ let crypto = SessionCrypto::new(new_key)
 | Encryption key | **Must be identical** across all instances |
 | Session store | Valkey, PostgreSQL, or MySQL (shared). SQLite is single-instance only. |
 | Session registry | Valkey-backed (`ValkeySessionRegistry`). In-memory is single-instance only. |
-| OIDC sid_map | In-memory per instance. Back-channel logout works when the IdP sends to the instance that handled the login. Use sticky sessions or a shared store for full coverage. |
+| OIDC sid_map | In-memory per instance by default. Back-channel logout then works when the IdP sends to the instance that handled the login. With several instances, keep it in Valkey: `AuthnServiceBuilder::with_sid_store(ValkeySidStore)` and the handlers pointed at `authn.sid_store()` with `with_sid_store`, plus `with_replay_log(ValkeyReplayLog)`. Count the misses with `back_channel_logout_unmatched`. |
 | Rate limit buckets | In-memory per instance. For distributed rate limiting, use an external solution (e.g. Valkey-based sliding window at the reverse proxy). |
 
 ### Health checks
@@ -171,7 +171,7 @@ async fn main() -> anyhow::Result<()> {
 | `MemorySessionRegistry` contents | **No** | Same; fresh registry on restart. |
 | Refresh tokens (SQL / Valkey) | Yes | Hash + family in DB; rotation continues seamlessly. |
 | JWKS cache | **No** (re-fetched) | First post-restart OAuth callback warms it. |
-| `sid_map` (back-channel logout) | **No** | OIDC `sid` → local session mapping is in-process. Sessions remain valid; only the `sid`-keyed lookup is lost, so a back-channel logout that arrives before re-login will silently no-op. Acceptable; the session still expires on its TTL. |
+| `sid_map` (back-channel logout) | **No**, unless `with_sid_store(ValkeySidStore)` | OIDC `sid` → local session mapping is in-process by default. Sessions remain valid; only the `sid`-keyed lookup is lost, so a back-channel logout that arrives before re-login, or at another instance, is answered `200` and ends nothing (`back_channel_logout_unmatched` counts it). The session still expires on its TTL. A Valkey store keeps the mapping where every instance reads it. |
 | In-flight HTTP request being served | Yes (via `with_graceful_shutdown`) | Axum waits for active connections to close before returning from `serve`. |
 | In-flight `cleanup_expired` query | Aborted | The next scheduled cleanup picks up the slack. |
 | In-flight `refresh_jwks` HTTP call | Aborted | The next request triggers a fresh fetch on demand. |

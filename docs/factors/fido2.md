@@ -125,6 +125,24 @@ TOTP-style second factors look like. New deployments should default
 to passkeys; older deployments adopting WebAuthn alongside existing
 flows often start with non-resident and migrate.
 
+## Choosing the ceremony
+
+User verification and attestation are not settings of the `Webauthn`
+instance: WebAuthn fixes them in each challenge, and `webauthn-rs` makes that
+choice a typed ceremony. `Fido2Ceremony` names the one an operation runs:
+`Passkey` (verification required, the default), `SecurityKey` with
+`SecurityKeyVerification::Preferred` or `Discouraged`, and `AttestedPasskey`
+against a trust anchor `DefaultFido2Provider::with_trust_anchor` holds by
+name. Registration runs `Fido2Options::registration_ceremony` (or one call's
+choice through `begin_fido2_registration_with`), a login's FIDO2 step runs
+`Fido2Options::login_ceremony`, and a step-up for a named action runs the
+ceremony its policy's `@step_up` annotation names. A credential is stored as
+the `Fido2Key` its ceremony registered, and a login offers only the
+credentials its ceremony accepts. Each assertion records what it proved
+(user verification, synced or device-bound, an attestation trust anchor) on
+the session, where Cedar reads it: see
+[Authentication assurance and ceremonies](../authorization/assurance.md).
+
 ## Storage
 
 Each registered credential is one row in the factor store. The row

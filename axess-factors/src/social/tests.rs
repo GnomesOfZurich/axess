@@ -18,6 +18,7 @@ fn github_style_mapper(raw: &serde_json::Value) -> Result<SocialClaims, SocialEr
     Ok(SocialClaims {
         subject: id.to_string(),
         email: raw.get("email").and_then(|v| v.as_str()).map(String::from),
+        email_verified: raw.get("email_verified").and_then(|v| v.as_bool()) == Some(true),
         display_name: raw.get("name").and_then(|v| v.as_str()).map(String::from),
         raw: raw.clone(),
     })
@@ -152,6 +153,10 @@ async fn happy_path_exchanges_code_then_fetches_userinfo() {
         .expect("userinfo");
     assert_eq!(claims.subject, "12345");
     assert_eq!(claims.email.as_deref(), Some("octocat@example.com"));
+    assert!(
+        !claims.email_verified,
+        "an address the mapper did not vouch for is not verified"
+    );
     assert_eq!(claims.display_name.as_deref(), Some("The Octocat"));
     assert_eq!(
         claims.raw.get("login").and_then(|v| v.as_str()),

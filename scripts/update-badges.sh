@@ -11,9 +11,9 @@
 # Status ("alpha", "beta", etc.) is an editorial choice: change it by
 # regenerating status.svg via generate-badge.sh directly.
 #
-# Coverage is handled by ci.yml (auto-commit pattern) since it updates
-# on every push, not on deliberate edits like version/license. That job
-# stays as-is; it is unrelated to this script.
+# Coverage is measured, not derived, so scripts/coverage-badge.sh writes it
+# during release preparation and the Coverage job in ci.yml checks it on
+# the release pull request.
 #
 # CI runs this script and `git diff --exit-code .github/badges/version.svg
 # .github/badges/license.svg`. If the committed badges drift from the

@@ -6,6 +6,7 @@
 //! [`MockPolicyEvaluator`][crate::testing::mock_policy::MockPolicyEvaluator]
 //! in tests to evaluate authz flows without any Cedar policy files.
 
+use arc_swap::ArcSwapOption;
 use cedar_policy::{
     Authorizer, Context, Decision, Entities, Entity, EntityTypeName, EntityUid, PolicySet, Request,
     Schema, ValidationMode, Validator,
@@ -13,6 +14,7 @@ use cedar_policy::{
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use super::error::AuthzError;
 
@@ -112,9 +114,14 @@ pub trait PolicyEvaluator: Send + Sync {
         context: Context,
     ) -> AuthzDecision;
 
-    /// Return the Cedar schema if available. Used to validate entity providers
-    /// at startup via [`AuthzEntityProvider::validate_schema`][super::provider::AuthzEntityProvider::validate_schema].
-    fn schema(&self) -> Option<&Schema> {
+    /// The Cedar schema this evaluator decides with now, if it has one. Used
+    /// to validate entity providers via
+    /// [`AuthzEntityProvider::validate_schema`][super::provider::AuthzEntityProvider::validate_schema].
+    ///
+    /// Returned by value: an evaluator that is reloaded in place (see
+    /// [`adopt`](Self::adopt)) may replace its set while a borrow lives, so
+    /// the schema is the one in force at the moment of the call.
+    fn schema(&self) -> Option<Schema> {
         None
     }
 
@@ -124,13 +131,64 @@ pub trait PolicyEvaluator: Send + Sync {
     fn digest(&self) -> Option<String> {
         None
     }
+
+    /// Take `next` as the policy set this evaluator decides with from now on,
+    /// so that every holder of this very object sees the reload.
+    ///
+    /// [`AuthzStore::reload_policies`](super::session::AuthzStore::reload_policies)
+    /// calls this on the evaluator it was built with. [`PolicyStore`]
+    /// accepts, which is why a gate holding the same `Arc<PolicyStore>`
+    /// decides on a reloaded set without any change to how it was wired. The
+    /// default refuses and hands `next` back, and the caller then replaces
+    /// its own evaluator instead; an evaluator that is not a `PolicyStore`
+    /// has nothing shared to update.
+    ///
+    /// # Errors
+    ///
+    /// `next`, returned unchanged, when this evaluator cannot adopt it.
+    fn adopt(&self, next: Arc<PolicyStore>) -> Result<(), Arc<PolicyStore>> {
+        Err(next)
+    }
+
+    /// The step-up that would turn this denied request into an allow, when
+    /// one would: the question a gate asks after a deny, to answer
+    /// `step_up_required` instead of a plain denial (see
+    /// [`AuthzRefusal`](super::assurance::AuthzRefusal)).
+    ///
+    /// [`PolicyStore`] re-evaluates the request once per step-up its
+    /// policies' `@step_up` annotations name, weakest first, with the
+    /// context's `assurance` attribute replaced by the request's own plus
+    /// the best proof that step-up can yield, and answers the first that
+    /// permits. The re-evaluations emit no decision event. The default
+    /// answers `None`: an evaluator that is not a `PolicyStore` names no
+    /// step-up.
+    fn step_up_for(
+        &self,
+        entities: &Entities,
+        principal: EntityUid,
+        action: EntityUid,
+        resource: EntityUid,
+        context: Context,
+    ) -> Option<crate::authn::assurance::StepUp> {
+        let _ = (entities, principal, action, resource, context);
+        None
+    }
 }
 
 // ── PolicyStore ───────────────────────────────────────────────────────────────
 
-/// Compiled, immutable Cedar policy set + schema + authorizer.
+/// Compiled Cedar policy set + schema + authorizer.
 ///
 /// Construct once at startup and wrap in `Arc` for sharing across requests.
+///
+/// A store is replaced as a whole, never edited: a reload through
+/// [`AuthzStore::reload_policies`](super::session::AuthzStore::reload_policies)
+/// builds a new store and points this one at it, so a decision on this
+/// object, from the `require_authz!` gate or from the `AuthzStore`, uses the
+/// newest set with one atomic load and no lock. [`digest`](Self::digest),
+/// [`schema`](Self::schema) and [`mentions_context`](Self::mentions_context)
+/// follow a reload; [`original_digest`](Self::original_digest) and
+/// [`original_schema`](Self::original_schema) name the text it was built from.
 /// The namespace is intentionally NOT stored here; it lives on
 /// [`AuthzStore`][super::session::AuthzStore] so that entity UID construction
 /// and policy evaluation use the same configured namespace.
@@ -153,8 +211,15 @@ pub struct PolicyStore {
     action_types: HashSet<EntityTypeName>,
     /// Whether any policy mentions `context`.
     mentions_context: bool,
+    /// The step-ups the policies' `@step_up` annotations name, weakest
+    /// first, without repeats.
+    step_ups: Vec<crate::authn::assurance::StepUp>,
     /// [`policy_set_digest`] of the text this store was built from.
     digest: String,
+    /// The store a reload put in force, when this one has been replaced. It
+    /// never has a successor of its own: a reload points the original at the
+    /// newest, so the chain stays one link long.
+    successor: ArcSwapOption<PolicyStore>,
 }
 
 /// Why the provider's entities could not be evaluated with the schema's
@@ -194,28 +259,43 @@ impl PolicyStore {
         // the check is a text search: a false positive (the word in a
         // comment or a string) only makes a warning fire that need not.
         let mentions_context = policy_set.to_string().contains("context");
+        let step_ups = step_up::annotated_step_ups(&policy_set)?;
 
         Ok(Self {
             policy_set,
             mentions_context,
+            step_ups,
             digest: policy_set_digest(policy_text, schema_json),
             schema,
             authorizer: Authorizer::new(),
             action_entities,
             action_types,
+            successor: ArcSwapOption::empty(),
         })
     }
 
-    /// The digest of the text this store was built from, see
-    /// [`policy_set_digest`].
-    pub fn digest(&self) -> &str {
+    /// The digest of the policy set this object decides with now, see
+    /// [`policy_set_digest`]: after a reload, the reloaded set's.
+    pub fn digest(&self) -> String {
+        match self.successor.load().as_deref() {
+            Some(next) => next.digest.clone(),
+            None => self.digest.clone(),
+        }
+    }
+
+    /// The digest of the text this object was built from, whatever has been
+    /// reloaded since. Prefer [`digest`](Self::digest).
+    pub fn original_digest(&self) -> &str {
         &self.digest
     }
 
     /// Whether any policy mentions `context`. A request evaluated on an empty
     /// context against such a store is probably missing its context provider.
     pub fn mentions_context(&self) -> bool {
-        self.mentions_context
+        match self.successor.load().as_deref() {
+            Some(next) => next.mentions_context,
+            None => self.mentions_context,
+        }
     }
 
     /// The provider's entities plus the schema's action entities.
@@ -264,8 +344,20 @@ impl PolicyStore {
             .map_err(|e| ActionEntitiesError::Merge(Box::new(e)))
     }
 
-    /// Access the Cedar schema (e.g. for entity provider validation).
-    pub fn schema(&self) -> &Schema {
+    /// The Cedar schema this object decides with now (e.g. for entity
+    /// provider validation): after a reload, the reloaded set's. It is
+    /// returned by value because a reload may replace the set while a
+    /// borrow lives.
+    pub fn schema(&self) -> Schema {
+        match self.successor.load().as_deref() {
+            Some(next) => next.schema.clone(),
+            None => self.schema.clone(),
+        }
+    }
+
+    /// The schema this object was built with, whatever has been reloaded
+    /// since. Prefer [`schema`](Self::schema).
+    pub fn original_schema(&self) -> &Schema {
         &self.schema
     }
 }
@@ -292,6 +384,63 @@ impl DecisionSubject {
 
 impl PolicyEvaluator for PolicyStore {
     fn is_authorized(
+        &self,
+        entities: &Entities,
+        principal: EntityUid,
+        action: EntityUid,
+        resource: EntityUid,
+        context: Context,
+    ) -> AuthzDecision {
+        match self.successor.load().as_deref() {
+            Some(next) => next.decide(entities, principal, action, resource, context),
+            None => self.decide(entities, principal, action, resource, context),
+        }
+    }
+
+    fn schema(&self) -> Option<Schema> {
+        Some(PolicyStore::schema(self))
+    }
+
+    fn digest(&self) -> Option<String> {
+        Some(PolicyStore::digest(self))
+    }
+
+    fn step_up_for(
+        &self,
+        entities: &Entities,
+        principal: EntityUid,
+        action: EntityUid,
+        resource: EntityUid,
+        context: Context,
+    ) -> Option<crate::authn::assurance::StepUp> {
+        let request = step_up::DeniedRequest {
+            entities,
+            principal,
+            action,
+            resource,
+            context,
+        };
+        match self.successor.load().as_deref() {
+            Some(next) => next.step_up_for_denied(request),
+            None => self.step_up_for_denied(request),
+        }
+    }
+
+    fn adopt(&self, next: Arc<PolicyStore>) -> Result<(), Arc<PolicyStore>> {
+        // A store handed in is flattened to its own newest set, so the chain
+        // from the original stays one link.
+        let next = match next.successor.load_full() {
+            Some(newest) => newest,
+            None => next,
+        };
+        self.successor.store(Some(next));
+        Ok(())
+    }
+}
+
+impl PolicyStore {
+    /// One decision against this store's own set.
+    fn decide(
         &self,
         entities: &Entities,
         principal: EntityUid,
@@ -426,14 +575,6 @@ impl PolicyEvaluator for PolicyStore {
             }
         }
     }
-
-    fn schema(&self) -> Option<&Schema> {
-        Some(&self.schema)
-    }
-
-    fn digest(&self) -> Option<String> {
-        Some(self.digest.clone())
-    }
 }
 
 // ── UID builder helpers ───────────────────────────────────────────────────────
@@ -451,6 +592,8 @@ pub(super) fn make_uid(
     // `alice` and chokes on `"` or `\`, so two ids could name one entity.
     super::provider::make_entity_uid(namespace, type_name, id)
 }
+
+mod step_up;
 
 #[cfg(test)]
 mod decision_log;

@@ -382,7 +382,17 @@ where
                 reg.invalidate_session(admin_user_id, &admin_sid).await,
                 "ending an impersonation",
             );
-            if !reg.register(&target_user.id, &sid).await {
+            // The administrator's standing is the impersonation's: an entry
+            // under the administrator that the session layer reads on every
+            // request, so ending the administrator's sessions ends this one.
+            let anchored = match session.impersonation().await {
+                Some(imp) => {
+                    reg.register(admin_user_id, &imp.registry_anchor(&target_user.id))
+                        .await
+                }
+                None => false,
+            };
+            if !anchored || !reg.register(&target_user.id, &sid).await {
                 tracing::error!(
                     admin_user_id = %admin_user_id,
                     target_user_id = %target_user.id,
@@ -449,6 +459,13 @@ where
                 reg.invalidate_session(target, &sid).await,
                 "ending an impersonation",
             );
+            if let Some(imp) = session.impersonation().await {
+                note_revocation(
+                    reg.invalidate_session(&imp.admin, &imp.registry_anchor(target))
+                        .await,
+                    "ending an impersonation",
+                );
+            }
         }
         session.clear().await;
         session.regenerate().await;

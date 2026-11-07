@@ -612,3 +612,42 @@ async fn the_bearer_scheme_is_case_insensitive_and_spaces_are_trimmed() {
         assert!(has, "{header} reads as the token it carries");
     }
 }
+
+/// The issuer of a token nobody has verified is the attacker's text: the
+/// error carries a bounded, escaped copy, not the whole of it.
+#[test]
+fn an_untrusted_issuer_is_echoed_bounded_and_escaped() {
+    let (private_der, jwks, kid) = rsa_keypair();
+    let config = make_config(jwks);
+    let mut claims = valid_claims();
+    // Far past the echo cap, and inside the token size limit so the issuer
+    // check, not the size check, is what refuses it.
+    let forged = format!("evil\nWARN forged line\r\u{1b}[31m{}", "x".repeat(4 * 1024));
+    claims["iss"] = serde_json::json!(forged);
+    let token = sign_jwt(&private_der, &kid, &claims);
+
+    let header = format!("Bearer {token}");
+    let err = validate_bearer_token(Some(&header), &config).unwrap_err();
+
+    let text = err.to_string();
+    assert!(matches!(err, BearerError::UntrustedIssuer(_)), "{text}");
+    assert!(
+        text.len() <= "untrusted issuer: ".len() + MAX_ISSUER_ECHO_BYTES + 64,
+        "the error carries {} bytes",
+        text.len()
+    );
+    assert!(!text.chars().any(char::is_control), "{text:?}");
+    assert!(text.ends_with("..."), "the cut is marked: {text}");
+}
+
+#[test]
+fn a_short_issuer_is_echoed_whole_and_a_cut_keeps_characters_whole() {
+    assert_eq!(
+        echo_issuer("https://evil.example.com"),
+        "https://evil.example.com"
+    );
+    let multibyte = "é".repeat(MAX_ISSUER_ECHO_BYTES);
+    let echoed = echo_issuer(&multibyte);
+    assert!(echoed.ends_with("..."));
+    assert!(echoed.trim_end_matches("...").chars().all(|c| c == 'é'));
+}

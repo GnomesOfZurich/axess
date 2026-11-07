@@ -27,6 +27,7 @@
 //! elsewhere in the crate (e.g. `authn/service/fido2_service.rs` alongside
 //! `federation/fido2.rs`) to keep IDE tabs distinguishable.
 
+pub mod assurance;
 pub mod audit;
 pub mod error;
 pub mod event;

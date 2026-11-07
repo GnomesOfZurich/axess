@@ -14,6 +14,7 @@ use crate::testing::mock_random::MockRng;
 use axess_clock::SystemClock;
 use axess_factors::oauth::MockOAuthProvider;
 use axess_factors::oidc::logout_token::BACKCHANNEL_LOGOUT_EVENT;
+use axess_factors::oidc::logout_token::decode_jwt_payload;
 use axum::extract::{Form, State};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
@@ -321,6 +322,7 @@ async fn sid_only_logout_invalidates_session() {
     sid_map.insert(
         key.clone(),
         "idp-subject",
+        None,
         user_id,
         session_id,
         chrono::Utc::now(),
@@ -353,7 +355,7 @@ async fn sid_only_logout_invalidates_session() {
 
     // Session should be invalidated, and its mapping gone.
     assert!(!registry.is_valid(&user_id, &session_id).await.unwrap());
-    assert!(!handler.sid_map.contains_key(&key));
+    assert!(handler.sid_map.get(&key, None).await.unwrap().is_none());
 }
 
 /// Oversized JWT is rejected before parsing (R2-4: DoS prevention).
@@ -468,6 +470,7 @@ async fn handler_invalidates_session_and_rejects_jti_replay() {
     sid_map.insert(
         (ISS.to_string(), "some-sid".to_string()),
         &user_id.to_string(),
+        None,
         user_id,
         session_id,
         chrono::Utc::now(),
@@ -584,6 +587,7 @@ async fn sub_does_not_log_out_a_user_who_never_signed_in_through_the_issuer() {
     sid_map.insert(
         ("https://other-idp.example.com".to_string(), "s".to_string()),
         &victim.to_string(),
+        None,
         victim,
         session_id,
         chrono::Utc::now(),
@@ -608,6 +612,7 @@ async fn non_uuid_sub_does_not_block_sid_logout() {
     sid_map.insert(
         (ISS.to_string(), "sid-1".to_string()),
         "idp-subject",
+        None,
         user,
         session_id,
         chrono::Utc::now(),
@@ -648,6 +653,7 @@ async fn sub_ends_only_the_sessions_the_issuer_established() {
     sid_map.insert(
         (ISS.to_string(), "a".into()),
         &user.to_string(),
+        None,
         user,
         via_issuer,
         now,
@@ -655,6 +661,7 @@ async fn sub_ends_only_the_sessions_the_issuer_established() {
     sid_map.insert(
         ("https://other-idp.example.com".to_string(), "b".into()),
         &user.to_string(),
+        None,
         user,
         via_other_issuer,
         now,

@@ -6,7 +6,7 @@ Before opening a PR for non-trivial work, please file an issue first; this lets 
 
 ## Before you submit
 
-1. **Fork** the repository and create a topic branch from `main`.
+1. **Fork** the repository and create a topic branch from `release/next` (see [Branches and pull requests](#branches-and-pull-requests)).
 2. **Tests**; add or update tests for every behaviour change. The library uses deterministic simulation testing (DST); inject `MockClock` / `MockRng` rather than calling `SystemTime::now()` or `rand::rng()` directly.
 3. **Run the full check locally:**
    ```bash
@@ -15,7 +15,15 @@ Before opening a PR for non-trivial work, please file an issue first; this lets 
    cargo test --workspace --all-features
    ```
 4. **Update `CHANGELOG.md`**; add an entry under the `[unreleased]` section describing the change. Behaviour-changing entries belong under `### Changed (breaking)` if they alter a public API.
-5. **Open a PR** with a description that covers the *why*; link the issue, summarise the design choice, and call out any deliberate trade-offs.
+5. **Open a PR** against `release/next` with a description that covers the *why*; link the issue, summarise the design choice, and call out any deliberate trade-offs.
+
+## Branches and pull requests
+
+Pull requests target `release/next`, never `main`. `main` holds only releases, one squashed commit each, and changes only by the release pull request a maintainer opens from a release branch; GitHub refuses any other change to it.
+
+A fix for a line that is already released goes to its `release/X.Y.x` branch when one exists (for example `release/0.18.x`); the maintainers release it from there and merge it forward into `release/next`. When no such branch exists, target `release/next` and say in the pull request that the fix should reach a released line; a maintainer cuts the branch from the release tag if a patch release is warranted.
+
+A pull request into `release/next` or `release/X.Y.x` runs every job of [`.github/workflows/ci.yml`](.github/workflows/ci.yml): formatting, clippy, the test suite with the live stores, the feature matrix, MSRV, the documentation gates, the book, semver, audit and the publish dry-runs. Your changelog entry goes under `## [Unreleased]`, or under the upcoming version's `## [X.Y.Z] - unreleased` heading once the version is known. The full release gate, including the dated changelog section and the coverage badge, runs on the release pull request into `main`; [`docs/project/publishing.md`](docs/project/publishing.md) describes the release side.
 
 ## Coding conventions
 
@@ -103,13 +111,9 @@ a backstop for what it does cover, not the record.
 
 `#[non_exhaustive]` trades one breakage class (adding variants) for another (every downstream `match` needs a wildcard arm forever, even when the caller wants compile-time exhaustiveness on a closed set). Project policy is to bump the version and let downstream `match` failures be loud. CI enforces this; the `ban_non_exhaustive` workflow job rejects any PR that introduces the attribute.
 
-### No ticket-meta date stamps pre-v0.1.0
+### No tracking keys or date stamps in code
 
-Source-code comments do not carry `// AX-NNN (YYYY-MM-DD):` markers. The CHANGELOG is the authoritative timeline; in-source stamps add noise without information a future reader can use. ROADMAP + CHANGELOG retain their AX-NNN references unchanged.
-
-### Closed AX-NNN references get stripped
-
-Once an AX-NNN case closes, every reference in source / doc-strings / test names is stripped, preserving the rationale comment but dropping the case number. Open + deferred cases stay referenced.
+Source comments, doc strings and test names carry no tracking keys and no date stamps. A comment says what holds and why; a test name says what it proves. The CHANGELOG is the timeline, and the ROADMAP names its entries by what they are.
 
 ### Promoting a module out of `axess-core`
 

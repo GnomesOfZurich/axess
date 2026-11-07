@@ -20,7 +20,10 @@ use axess_core::testing::{
     mock_authn::{MockFactorStore, MockIdentityStore},
     test_session,
 };
-use axess_factors::fido2::{DefaultFido2Provider, Fido2Provider};
+use axess_factors::fido2::{
+    DefaultFido2Provider, Fido2Authentication, Fido2Ceremony, Fido2Key, Fido2Provider,
+    Fido2Registration,
+};
 use common::{session_for, test_tenant, test_user, uid};
 use url::Url;
 use webauthn_rs::prelude::*;
@@ -92,32 +95,35 @@ impl Fido2Provider for AcceptingProvider {
     }
     fn start_authentication(
         &self,
-        c: &[Passkey],
-    ) -> WebauthnResult<(RequestChallengeResponse, PasskeyAuthentication)> {
-        self.0.start_authentication(c)
+        ceremony: &Fido2Ceremony,
+        c: &[Fido2Key],
+    ) -> WebauthnResult<(RequestChallengeResponse, Fido2Authentication)> {
+        self.0.start_authentication(ceremony, c)
     }
     fn finish_authentication(
         &self,
         _: &PublicKeyCredential,
-        _: &PasskeyAuthentication,
+        _: &Fido2Authentication,
     ) -> WebauthnResult<AuthenticationResult> {
         Ok(result_for(AAAA))
     }
     fn start_registration(
         &self,
+        ceremony: &Fido2Ceremony,
         id: uuid::Uuid,
         name: &str,
         display: &str,
         exclude: Option<Vec<CredentialID>>,
-    ) -> WebauthnResult<(CreationChallengeResponse, PasskeyRegistration)> {
-        self.0.start_registration(id, name, display, exclude)
+    ) -> WebauthnResult<(CreationChallengeResponse, Fido2Registration)> {
+        self.0
+            .start_registration(ceremony, id, name, display, exclude)
     }
     fn finish_registration(
         &self,
         _: &RegisterPublicKeyCredential,
-        _: &PasskeyRegistration,
-    ) -> WebauthnResult<Passkey> {
-        Ok(passkey(BBBB))
+        _: &Fido2Registration,
+    ) -> WebauthnResult<Fido2Key> {
+        Ok(passkey(BBBB).into())
     }
     fn start_discoverable_authentication(
         &self,

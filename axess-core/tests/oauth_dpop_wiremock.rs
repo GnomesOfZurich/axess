@@ -640,9 +640,12 @@ fn tenant_record(idp: &Idp, dpop: TenantDpop) -> TenantOAuthProviderRecord {
 async fn tenant_directory(
     record: TenantOAuthProviderRecord,
 ) -> Arc<StoredTenantOAuthProviders<MemoryTenantOAuthProviderStore>> {
-    let directory = Arc::new(StoredTenantOAuthProviders::new_unencrypted(
-        MemoryTenantOAuthProviderStore::new(),
-    ));
+    let directory = Arc::new(
+        StoredTenantOAuthProviders::new_unencrypted(MemoryTenantOAuthProviderStore::new())
+            .with_egress_policy(
+                axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
+            ),
+    );
     directory.upsert(record).await.expect("upsert");
     directory
 }

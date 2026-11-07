@@ -50,6 +50,9 @@ ROOT = pathlib.Path(".")
 # *type* had no way through the gate at all and the only recourse was
 # ALLOW, which would have been a false claim about provenance.
 REMOVED = {
+    # 0.18.0: `Fido2Credential::passkey` is `Fido2Credential::key`; the
+    # "0.17.0 to 0.18.0" section and the assurance page name the old field.
+    "Fido2Credential::passkey",
     # 0.17.0: `AuthnMetrics` is replaced by one trait per concern; the
     # "0.16.0 to 0.17.0" section and the observability page name it.
     "AuthnMetrics",
@@ -134,6 +137,13 @@ ALLOW = {
     "CreationChallengeResponse", "RegisterPublicKeyCredential",
     "RequestChallengeResponse", "PublicKeyCredential",
     "AttestationConveyancePreference", "ResidentKeyRequirement",
+    "UserVerificationPolicy", "verify_attestation",
+    # webauthn-rs-core's expert constructor, named by the assurance page to
+    # say axess does not build on it.
+    "WebauthnCore", "new_unsafe_experts_only",
+    # webauthn-rs 0.6.0-dev byte types, named by the 0.17.0 to 0.18.0 page
+    # as what 0.6.2 replaced with `Vec<u8>`.
+    "Base64UrlSafeData", "HumanBinaryData",
     # The `iggy` crate's client, named in the analytics-sink recipe.
     "IggyClient",
     # Not ours: the `getrandom` crate, and `cluster`, which is a feature of

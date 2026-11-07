@@ -378,6 +378,7 @@ fn session_for(record: &RefreshToken) -> SessionData {
             factors_completed: Vec::new(),
             impersonator: None,
             ldap_groups: None,
+            assurance: Vec::new(),
         },
         fingerprint: None,
         // Rotated session inherits the device link from the token
@@ -386,6 +387,9 @@ fn session_for(record: &RefreshToken) -> SessionData {
         // it from request headers; typically yielding the same id, but
         // an unnecessary round-trip and a lost association on the gap.
         device_id: record.device_id,
+        // A refresh token record says which device it was issued to, not
+        // that this request proved it; the next request resolves it again.
+        device_proven: false,
         custom: serde_json::Value::default(),
         revision: 0,
         touched_at: None,

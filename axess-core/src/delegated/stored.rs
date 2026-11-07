@@ -57,4 +57,6 @@ mod endpoint_tests;
 #[cfg(test)]
 mod response_tests;
 #[cfg(test)]
+mod revoke_race_tests;
+#[cfg(test)]
 mod tests;

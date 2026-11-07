@@ -16,7 +16,8 @@ where
     I: IdentityStore,
     F: FactorStore<Error = I::Error>,
 {
-    /// Refresh the JWKS of every registered OAuth provider once and return
+    /// Refresh the JWKS of every registered OAuth provider, and of every
+    /// tenant provider the tenant registry holds built, once and return
     /// the providers whose refresh failed, with their errors.
     ///
     /// This is the body of every tick of
@@ -29,13 +30,10 @@ where
     pub async fn refresh_all_jwks(
         &self,
     ) -> Vec<(std::sync::Arc<str>, axess_factors::oauth::OAuthError)> {
-        let providers: Vec<_> = self
-            .inner
-            .oauth_providers
-            .load()
-            .values()
-            .cloned()
-            .collect();
+        let providers = live_providers(
+            self.inner.oauth_providers.handle(),
+            self.inner.tenant_oauth_providers.clone(),
+        )();
         axess_factors::oauth::refresh_providers_jwks(&providers).await
     }
 
@@ -94,20 +92,31 @@ where
     /// ```
     pub fn spawn_jwks_refresh(&self, interval: std::time::Duration) -> tokio::task::JoinHandle<()> {
         spawn_refresh_loop(
-            live_providers(self.inner.oauth_providers.handle()),
+            live_providers(
+                self.inner.oauth_providers.handle(),
+                self.inner.tenant_oauth_providers.clone(),
+            ),
             interval,
         )
     }
 }
 
-/// A provider source that reads the live registry on every call, so a
+/// A provider source that reads the live registries on every call, so a
 /// reloaded provider is the one refreshed and a removed one is no longer
-/// polled. It holds the swap slot and not the service, so the loop never
-/// keeps the service alive.
+/// polled. It reads the service's own providers and the tenant providers the
+/// tenant registry holds built. It holds the swap slot and the tenant
+/// registry and not the service, so the loop never keeps the service alive.
 pub(crate) fn live_providers(
     slot: std::sync::Arc<arc_swap::ArcSwap<crate::federation::oauth::OAuthProviderRegistry>>,
+    tenants: Option<std::sync::Arc<dyn crate::federation::oauth_tenant::TenantOAuthProviders>>,
 ) -> impl Fn() -> Vec<std::sync::Arc<dyn axess_factors::oauth::OAuthProvider>> + Send + 'static {
-    move || slot.load().values().cloned().collect()
+    move || {
+        let mut providers: Vec<_> = slot.load().values().cloned().collect();
+        if let Some(tenants) = &tenants {
+            providers.extend(tenants.built_providers());
+        }
+        providers
+    }
 }
 
 /// The refresh loop: one pass over the providers `current` yields per

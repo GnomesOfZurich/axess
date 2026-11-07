@@ -21,8 +21,8 @@ ignore = [
     #
     # Reachability, stated precisely because an earlier version of this note
     # called it transitive-only and that was wrong:
-    #   - Transitively, via sqlx-mysql, openidconnect and crypto-glue
-    #     (webauthn-rs).
+    #   - Transitively, via sqlx-mysql and openidconnect (rsa 0.9), and via
+    #     crypto-glue (webauthn-rs), which carries the 0.10.0-rc line.
     #   - Directly, as an optional runtime dependency of axess-core enabled by
     #     `local-idp`, for RSA-2048 keygen and PKCS#1 parsing in
     #     `LocalIdpSigningKey`.
@@ -42,19 +42,15 @@ ignore = [
     # Resolution: wait for rsa crate maintainers to release a fix.
     "RUSTSEC-2023-0071",
 
-    # rand 0.8.x: unsound with custom logger using rand::rng() (RUSTSEC-2026-0097)
-    # Transitive dep. Axess doesn't use rand::rng() with a custom logger.
-    # Resolution: wait for upstream deps to bump to rand 0.9+.
-    "RUSTSEC-2026-0097",
-
     # crypto-bigint 0.5.5: timing variability in operations meant to be
     # constant-time (RUSTSEC-2026-0387). Patched only in 0.7.6.
     #
     # Reachability: through p256 0.13 (local-idp keygen and PKCS#8 encoding,
     # the FAPI client's key loading, ES256 signing and verification under
-    # `jwt-rust-crypto`) and through elliptic-curve 0.13 in crypto-glue
-    # (webauthn-rs). jsonwebtoken 11.1, openidconnect 4.0.1 and crypto-glue
-    # all pin p256 0.13 themselves, so no change in axess removes it.
+    # `jwt-rust-crypto`), which axess-core and axess-factors depend on
+    # directly, and which jsonwebtoken 11.1 pins itself. openidconnect 4.1.0
+    # and crypto-glue 0.2 (webauthn-rs 0.6.2) are on p256 0.14 and
+    # crypto-bigint 0.7, so they no longer reach 0.5.5.
     #
     # Risk, read against the 0.5.5 source on 2026-10-24: the advisory's named
     # defects (`UintRef` equality exiting early, `BoxedMontyForm::invert`
@@ -68,8 +64,8 @@ ignore = [
     # that signs ES256 over an attacker-reachable interface can take the
     # `jwt-aws-lc` backend, which does not route through this crate.
     #
-    # Resolution: remove when jsonwebtoken, openidconnect and webauthn-rs
-    # move to p256 0.14 (elliptic-curve 0.14, crypto-bigint 0.7).
+    # Resolution: remove when jsonwebtoken moves to p256 0.14 (elliptic-curve
+    # 0.14, crypto-bigint 0.7) and axess's own p256 pin follows.
     "RUSTSEC-2026-0387",
 ]
 
@@ -104,26 +100,30 @@ allow-wildcard-paths = true
 # the named root, so one entry covers the whole RustCrypto cohort under a
 # git-pinned crate rather than 15+ individual `skip` lines.
 skip-tree = [
-    # `webauthn-rs v0.6.0-dev` (git-pinned dev release) sits on the
-    # RustCrypto 0.10 cohort, aead 0.5, aes 0.8, aes-gcm 0.10, cipher 0.4,
-    # block-buffer 0.10, crypto-common 0.1, ctr 0.9, digest 0.10, ghash 0.5,
-    # hkdf 0.12, hmac 0.12, inout 0.1, polyval 0.6, sha1 0.10, sha2 0.10,
-    # universal-hash 0.5, cpufeatures 0.2: while axess uses the 0.11
-    # cohort (aes-gcm 0.11 via the workspace pin). The whole tree
-    # underneath webauthn-rs is a mirrored old-cohort. Also carries older
-    # asn1-rs / der-parser / oid-registry / const-oid via x509-parser 0.16.
-    { crate = "webauthn-rs@0.6.0-dev", reason = "git-pinned dev release, still on the RustCrypto 0.10 / x509-parser 0.16 cohort" },
+    # `webauthn-rs v0.6.2` reaches, through `crypto-glue` 0.2, the
+    # elliptic-curve 0.14 cohort (p256 / p384 0.14, ecdsa 0.17, crypto-bigint
+    # 0.7, der 0.8, pkcs8 0.11, spki 0.8, sec1 0.8, signature 3) and a
+    # pre-release `rsa 0.10.0-rc`, while axess itself and jsonwebtoken stay on
+    # p256 0.13 and rsa 0.9; `argon2 0.5` (with password-hash 0.5 and
+    # blake2 0.10) beside the argon2 0.6 axess uses; and scrypt 0.12,
+    # pbkdf2 0.13 and salsa20 0.11 beside the older lines other crates
+    # carry. Its hash and cipher crates are the digest 0.11 cohort axess
+    # uses, so those no longer duplicate.
+    { crate = "webauthn-rs@0.6.2", reason = "crypto-glue 0.2 is on elliptic-curve 0.14, rsa 0.10.0-rc and argon2 0.5 beside axess's p256 0.13, rsa 0.9 and argon2 0.6" },
 
-    # `getrandom` fans two WASI stdlib shims (`wasip3 → wit-bindgen 0.51`,
-    # `wasip2 → wit-bindgen 0.57`) plus `r-efi` for UEFI targets. None
-    # of these are linked in a non-WASI / non-UEFI axess build.
+    # `getrandom 0.3.4` fans a WASI stdlib shim (`wasip2 → wit-bindgen
+    # 0.57`) plus `r-efi 5` for UEFI targets, beside the `r-efi 6` of
+    # getrandom 0.4.3 (which needs no entry of its own). None of these are
+    # linked in a non-WASI / non-UEFI axess build.
     { crate = "getrandom@0.3.4", reason = "wasi/uefi shim tree (wit-bindgen, r-efi); not linked in axess targets" },
-    { crate = "getrandom@0.4.2", reason = "wasi/uefi shim tree (wit-bindgen, r-efi); not linked in axess targets" },
 
-    # `openidconnect 4.0.1` + `oauth2 5.0.0` still on rand 0.8 / rand_core
-    # 0.6 / base64 0.21 / syn 1.x transitives; axess itself is on rand
-    # 0.10 / rand_core 0.10 / base64 0.22 / syn 2.x directly.
-    { crate = "openidconnect@4.0.1", reason = "still on rand 0.8, base64 0.21, syn 1.x cohort" },
+    # `openidconnect 4.1.0` + `oauth2 5.0.0` still on rand 0.8 / rand_core
+    # 0.6, hmac 0.12 / sha2 0.10, base64 0.22 and thiserror 1; axess itself
+    # is on rand 0.10 / rand_core 0.10, the digest 0.11 cohort, base64 0.23
+    # and thiserror 2.
+    # It is also a release ahead of jsonwebtoken 11.1 on ed25519-dalek (3
+    # against 2, with curve25519-dalek 5 against 4).
+    { crate = "openidconnect@4.1.0", reason = "still on rand 0.8, hmac 0.12 / sha2 0.10, base64 0.22 and thiserror 1; ahead of jsonwebtoken on ed25519-dalek 3" },
 
     # `sqlx 0.9` pulls its own copies of hashbrown, thiserror, itertools,
     # socket2, windows-sys at older majors from the database-driver
@@ -139,7 +139,7 @@ skip-tree = [
     # `cedar-policy-core` transitively pulls `lalrpop` for grammar
     # generation; lalrpop 0.22 carries older unicode-width / hashbrown
     # majors that don't reach runtime.
-    { crate = "cedar-policy-core@4.12.0", reason = "lalrpop build-time transitives carry older unicode-width/hashbrown/itertools" },
+    { crate = "cedar-policy-core@4.14.1", reason = "lalrpop build-time transitives carry older unicode-width/hashbrown/itertools" },
 ]
 
 [sources]

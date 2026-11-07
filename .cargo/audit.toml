@@ -29,17 +29,9 @@ ignore = [
     # Resolution: wait for rsa crate maintainers to release a fix.
     "RUSTSEC-2023-0071",
 
-    # rand 0.8.x: unsound with custom logger using rand::rng() (RUSTSEC-2026-0097)
-    # Pulled transitively by: sqlx-postgres, sqlx-mysql, openidconnect, fred, crypto-glue.
-    # Risk to axess: none. Axess does not use rand::rng() with a custom logger.
-    # The unsoundness requires a specific interaction between rand::rng() and
-    # a custom global logger that calls rand: not a pattern axess uses.
-    # Resolution: wait for upstream deps to bump to rand 0.9+.
-    "RUSTSEC-2026-0097",
-
     # crypto-bigint 0.5.5: timing variability in constant-time operations (RUSTSEC-2026-0387)
-    # Pulled transitively through p256 0.13 by jsonwebtoken, openidconnect and
-    # crypto-glue (webauthn-rs), and by axess-core/axess-factors' own p256 0.13.
+    # Pulled transitively through p256 0.13 by jsonwebtoken, and by
+    # axess-core/axess-factors' own p256 0.13.
     # Risk to axess: low. The advisory's named defects are 0.7-series code absent
     # from 0.5.5; the 0.5.5 operations p256 uses are written branch-free. Full
     # reasoning in deny.toml. ES256 signers can use the `jwt-aws-lc` backend.

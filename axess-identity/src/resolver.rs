@@ -1,6 +1,6 @@
 //! `PrincipalResolver` trait + `CliResolver` impl.
 //!
-//! The trait shape is the workload-identity roadmap pattern: one
+//! The trait shape is the workload-identity pattern: one
 //! async method, one return type, multiple impls. Adopters select the
 //! impl appropriate to their context (CLI bootstrap for workers;
 //! session extraction provided in axess-core for HTTP handlers);
@@ -168,7 +168,7 @@ mod tests {
             .trust_domain(trust.clone())
             .service_name("compute-worker")
             .tenant_id(sample_tenant())
-            .tenant_slug("ekekrantz")
+            .tenant_slug("gnomes")
             .build()
             .unwrap();
         let principal = resolver.resolve().await.unwrap();
@@ -176,12 +176,12 @@ mod tests {
             Principal::Workload(w) => {
                 assert_eq!(
                     w.workload_id.as_str(),
-                    "spiffe://gnomes.local/compute-worker/ekekrantz"
+                    "spiffe://gnomes.local/compute-worker/gnomes"
                 );
                 assert_eq!(w.trust_domain, trust);
                 assert_eq!(w.issuer, Issuer::Cli);
                 assert_eq!(w.tenant_id, sample_tenant());
-                assert_eq!(w.tenant_slug, "ekekrantz");
+                assert_eq!(w.tenant_slug, "gnomes");
                 assert_eq!(w.service_name, "compute-worker");
                 assert!(w.attributes.is_empty());
             }
@@ -196,7 +196,7 @@ mod tests {
             .trust_domain(trust)
             .service_name("feed-worker")
             .tenant_id(sample_tenant())
-            .tenant_slug("ekekrantz")
+            .tenant_slug("gnomes")
             .build()
             .unwrap();
         let a = resolver.resolve().await.unwrap();
@@ -209,7 +209,7 @@ mod tests {
         let err = CliResolver::builder()
             .service_name("compute-worker")
             .tenant_id(sample_tenant())
-            .tenant_slug("ekekrantz")
+            .tenant_slug("gnomes")
             .build()
             .unwrap_err();
         assert!(matches!(err, IdentityError::InvalidComponent(_)));
@@ -221,7 +221,7 @@ mod tests {
         let err = CliResolver::builder()
             .trust_domain(trust)
             .tenant_id(sample_tenant())
-            .tenant_slug("ekekrantz")
+            .tenant_slug("gnomes")
             .build()
             .unwrap_err();
         assert!(matches!(err, IdentityError::InvalidComponent(_)));
@@ -233,7 +233,7 @@ mod tests {
         let err = CliResolver::builder()
             .trust_domain(trust)
             .service_name("compute-worker")
-            .tenant_slug("ekekrantz")
+            .tenant_slug("gnomes")
             .build()
             .unwrap_err();
         assert!(matches!(err, IdentityError::InvalidComponent(_)));
@@ -258,7 +258,7 @@ mod tests {
             .trust_domain(trust)
             .service_name("compute worker")
             .tenant_id(sample_tenant())
-            .tenant_slug("ekekrantz")
+            .tenant_slug("gnomes")
             .build()
             .unwrap_err();
         assert!(matches!(err, IdentityError::InvalidComponent(_)));
@@ -271,7 +271,7 @@ mod tests {
             .trust_domain(trust)
             .service_name("compute-worker")
             .tenant_id(sample_tenant())
-            .tenant_slug("ekekrantz")
+            .tenant_slug("gnomes")
             .attribute("worker_pid", serde_json::json!(12345))
             .attribute("hostname", serde_json::json!("worker-1.local"))
             .build()

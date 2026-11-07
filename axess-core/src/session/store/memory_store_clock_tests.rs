@@ -327,3 +327,17 @@ async fn zero_ttl_writes_store_nothing_and_remove_the_entry() {
         assert_eq!(store.inner.len(), 0, "cycle: no entry is left behind");
     }
 }
+
+/// The in-memory store returns a session's assurance record as it was saved.
+#[tokio::test]
+async fn a_session_carrying_assurance_round_trips() {
+    let store = MemorySessionStore::new();
+    let id = SessionId::new(&SystemRng);
+    let data = crate::session::data::assured_fixture::assured_session();
+    store
+        .save(&id, &data, Duration::from_secs(60))
+        .await
+        .unwrap();
+    let back = store.load(&id).await.unwrap().expect("stored");
+    assert_eq!(back.auth_state, data.auth_state);
+}

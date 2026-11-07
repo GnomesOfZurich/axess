@@ -24,12 +24,12 @@ fn put(
     session: SessionId,
     at: DateTime<Utc>,
 ) -> Option<SidEntry> {
-    map.insert(key, &user.to_string(), user, session, at)
+    map.insert(key, &user.to_string(), None, user, session, at)
 }
 
 /// Register a session of a user whose IdP subject is their local id.
 fn reg(map: &SidMap, issuer: &str, user: UserId, session: SessionId) {
-    map.register_subject_session(issuer, &user.to_string(), user, session);
+    map.register_subject_session(issuer, &user.to_string(), None, user, session);
 }
 
 /// End every session of `subject` under `issuer` the way the back-channel
@@ -150,9 +150,16 @@ fn a_linked_subject_finds_its_sessions_under_the_local_user() {
     let s = Sessions::new();
     let local = user("local-user");
     let (with_sid, without_sid) = (s.next(), s.next());
-    map.insert(key(ISS, "s1"), "google-oauth2|1234", local, with_sid, at(0));
-    map.register_subject_session(ISS, "google-oauth2|1234", local, with_sid);
-    map.register_subject_session(ISS, "google-oauth2|1234", local, without_sid);
+    map.insert(
+        key(ISS, "s1"),
+        "google-oauth2|1234",
+        None,
+        local,
+        with_sid,
+        at(0),
+    );
+    map.register_subject_session(ISS, "google-oauth2|1234", None, local, with_sid);
+    map.register_subject_session(ISS, "google-oauth2|1234", None, local, without_sid);
 
     // The local id names nobody to the IdP.
     assert!(end_subject(&map, ISS, &local.to_string()).is_empty());
@@ -497,10 +504,10 @@ fn a_displaced_mapping_is_restored_only_into_a_vacant_key_for_a_live_session() {
     let (a, b) = (user("a"), user("b"));
     let (sa, sb) = (s.next(), s.next());
     reg(&map, ISS, a, sa);
-    map.insert(key(ISS, "x"), &a.to_string(), a, sa, at(5));
+    map.insert(key(ISS, "x"), &a.to_string(), None, a, sa, at(5));
 
     let displaced = map
-        .insert_displacing(key(ISS, "x"), &b.to_string(), b, sb, at(9))
+        .insert_displacing(key(ISS, "x"), &b.to_string(), None, b, sb, at(9))
         .expect("a's mapping is displaced");
     assert_eq!((displaced.user, displaced.session), (a, sa));
     assert_eq!(displaced.inserted_at, at(5));
@@ -517,4 +524,65 @@ fn a_displaced_mapping_is_restored_only_into_a_vacant_key_for_a_live_session() {
     // An ended session is not resurrected.
     map.remove_if(&key(ISS, "x"), |_| true);
     assert!(!map.restore_if_vacant(key(ISS, "x"), displaced));
+}
+
+/// A mapping and a subject record carry the tenant they were recorded for. A
+/// tenant scope sees that tenant's records only; no scope sees all; a record
+/// made without a tenant is out of reach of every tenant scope.
+#[test]
+fn a_tenant_scope_sees_only_that_tenants_records() {
+    let map = SidMap::new();
+    let s = Sessions::new();
+    let (a, b, c) = (user("a"), user("b"), user("c"));
+    let (sa, sb, sc) = (s.next(), s.next(), s.next());
+    let (acme, beta) = (
+        axess_identity::testing::tenant("acme"),
+        axess_identity::testing::tenant("beta"),
+    );
+    for (u, session, tenant, sid) in [
+        (a, sa, Some(acme), "sid-a"),
+        (b, sb, Some(beta), "sid-b"),
+        (c, sc, None, "sid-c"),
+    ] {
+        map.register_subject_session(ISS, "sub", tenant, u, session);
+        map.insert_displacing(key(ISS, sid), "sub", tenant, u, session, at(1));
+    }
+
+    assert_eq!(
+        map.subject_sessions_in(ISS, "sub", Some(&acme)),
+        vec![(a, sa)]
+    );
+    assert_eq!(
+        map.subject_sessions_in(ISS, "sub", Some(&beta)),
+        vec![(b, sb)]
+    );
+    let mut all = vec![(a, sa), (b, sb), (c, sc)];
+    all.sort_unstable();
+    assert_eq!(map.subject_sessions_in(ISS, "sub", None), all);
+    assert_eq!(map.subject_sessions(ISS, "sub"), all);
+
+    assert!(map.get_in(&key(ISS, "sid-a"), Some(&acme)).is_some());
+    assert!(map.get_in(&key(ISS, "sid-a"), Some(&beta)).is_none());
+    assert!(map.get_in(&key(ISS, "sid-c"), Some(&acme)).is_none());
+    assert!(map.get_in(&key(ISS, "sid-c"), None).is_some());
+}
+
+/// A displaced mapping keeps its tenant through a restore.
+#[test]
+fn a_restored_mapping_keeps_its_tenant() {
+    let map = SidMap::new();
+    let s = Sessions::new();
+    let (a, b) = (user("a"), user("b"));
+    let (sa, sb) = (s.next(), s.next());
+    let acme = axess_identity::testing::tenant("acme");
+    map.register_subject_session(ISS, "sub-a", Some(acme), a, sa);
+    map.register_subject_session(ISS, "sub-b", Some(acme), b, sb);
+    map.insert_displacing(key(ISS, "x"), "sub-a", Some(acme), a, sa, at(5));
+    let displaced = map
+        .insert_displacing(key(ISS, "x"), "sub-b", Some(acme), b, sb, at(9))
+        .expect("displaced");
+    assert_eq!(displaced.tenant, Some(acme));
+    map.remove_session(&sb);
+    assert!(map.restore_if_vacant(key(ISS, "x"), displaced));
+    assert!(map.get_in(&key(ISS, "x"), Some(&acme)).is_some());
 }

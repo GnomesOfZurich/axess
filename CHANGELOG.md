@@ -8,6 +8,76 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-11-07
+
+### Changed (breaking)
+
+- `PolicyStore::digest()` returns a `String` and `PolicyStore::schema()` a `Schema`, because both follow a policy reload, and `PolicyEvaluator::schema` returns `Option<Schema>` by value for the same reason; `original_digest()` and `original_schema()` borrow the text the object was built from.
+- `webauthn-rs` moves from the `=0.6.0-dev` pre-release pin to the 0.6.2 release (`^0.6.2`): `CredentialID`, re-exported from `axess_factors::fido2`, is now `Vec<u8>` instead of `HumanBinaryData`, `webauthn_rs::prelude` no longer exports `Base64UrlSafeData`, and a FIDO2 assertion or registration whose binary fields use the standard base64 alphabet is refused (URL-safe base64, padded or not, is what parses).
+- `DelegatedCredentialStore::save_if_unchanged` has no default, so a custom store has to answer the compare-and-swap question: implement it atomically, or return `CredentialSwap::Unsupported` explicitly (a refresh then falls back to the unconditional save and logs a warning naming the store type once).
+- `SidMap::insert`, `insert_displacing` and `register_subject_session` take the tenant of the login as an `Option<TenantId>` (`None` for a global provider's login) and the tenant-less forms are gone, so a record can no longer be made that a tenant provider's logout silently never finds; the login path passes the tenant of a tenant provider and `None` for a global one.
+- `JwtSvidResolver` refuses every token at `resolve` unless it has a tenant lookup (`with_tenant_lookup`) or the named waiver `without_tenant_cross_check()`, so a token whose `tid` claim and SPIFFE tenant slug cannot be cross-checked no longer resolves to a principal whose slug and id may name two tenants.
+- `IdentityPasswordReset::store_reset_token(user_id, token_hash, expires_at, now, max_live)` returns whether it stored the token: a store keeps up to `max_live` live reset tokens per user, `verify_reset_token` and `check_reset_token` match any of them, and a successful `verify_reset_token` deletes all of them.
+- `IdentityAdmin::delete_candidates_created_before(before, limit)` is a required method, behind `purge_expired_candidates`.
+- `TenantOAuthProviders::built_providers` is a required method (no default), so a registry says which providers the JWKS refresh covers.
+- `OidcError::EgressRefused { setting, range }` is a new variant: an egress refusal names the setting and the reason, never the URL or an address.
+- `DeviceResolver::resolve` returns `Option<BoundDevice>`; the per-account lockout exempts only a `ProvenDevice` (`AuthSession::proven_device`, `SessionData::device_proven`), which only `resolve_proven` yields.
+- `SocialClaims` has an `email_verified: bool` field with no default, so a claim mapper states whether the provider verified `email`; link accounts by email only when it is `true`.
+- `Fido2Provider::start_registration` and `start_authentication` take the `Fido2Ceremony` to run, `start_authentication` takes `&[Fido2Key]`, the ceremony state is `Fido2Registration` / `Fido2Authentication`, `finish_registration` returns a `Fido2Key`, and `Fido2Credential::passkey` is `Fido2Credential::key`, so a credential keeps the type of the ceremony that registered it (a passkey row is still stored in the shape 0.17 reads).
+- `Fido2Options` gains `registration_ceremony` and `login_ceremony` (both `DEFAULT_FIDO2_CEREMONY`, the passkey ceremony), and a FIDO2 login offers only the credentials its ceremony accepts.
+- `AuthState::Authenticating` and `AuthState::Authenticated` gain `assurance` and `StandardRequestContext` gains `assurance`; a session stored before this release carries none and satisfies no policy that reads `context.assurance`.
+- `require_authz!` answers `{"error": "step_up_required", "step_up": "<name>"}` instead of `Access denied` when a step-up a policy's `@step_up` annotation names would permit the request, and a policy set whose annotation names no step-up is refused at build and reload.
+
+### Added
+
+- `axess_events::envelope_aad_v2`, `envelope_aad_for` and `EnvelopeFields` bind status, actor, time, envelope version, trace context, algorithm and key id into the AAD of an encrypted event under a new tag, `open_aads_for` lists the AADs to open an event with (the new tag, then the first), and `envelope_aad` is deprecated for sealing and kept for opening events sealed before.
+- `SidStore` (`SidMap` in process, `ValkeySidStore` behind `valkey`), `AuthnServiceBuilder::with_sid_store`, `AuthnService::sid_store` and the logout handlers' `with_sid_store` let a back-channel logout end a session that another instance logged in.
+- `LogoutReplayLog` (`ValkeyReplayLog` behind `valkey`, `BackChannelLogoutHandler::with_replay_log`) shares the `jti` replay log between instances, and `SessionMetrics::back_channel_logout_unmatched` (`BackChannelLogoutHandler::with_metrics`) counts a verified token that found no session.
+- `LogoutTokenClaims::tenant` and `DisplacedSid::tenant` hold the tenant of a login; `SidMap::get_in` and `subject_sessions_in` read the map scoped to a tenant.
+- A session records what each factor proved at login and every step-up (`FactorAssurance`: kind, time from the injected clock, user verification, attestation trust anchor, synced or device-bound; `AuthSession::assurance`), and `AssuranceContext`, `AssuranceContextProvider`, `ASSURANCE_SCHEMA_FRAGMENT` and `merge_assurance_schema` expose it to Cedar as `context.assurance`, so "a user-verified, device-bound passkey from the last five minutes" is one policy.
+- `AuthzRefusal`, `AuthzSession::require_with_step_up` and `PolicyEvaluator::step_up_for` tell a denial from a shortfall a step-up would cure, naming the step-up (`StepUp`) and nothing of the policy, and `RequestAuthnService::begin_step_up_for` begins it with the FIDO2 ceremony it names.
+- `Fido2Ceremony` chooses the typed WebAuthn ceremony per operation (passkey, security key with UV preferred or discouraged, attested passkey against a named `AttestationCaList`), with `begin_fido2_registration_with`, `DefaultFido2Provider::with_trust_anchor` and `with_presence_only_security_keys`, and an attested login records its trust anchor only while the credential's attestation still verifies against it.
+
+### Fixed
+
+- A policy reload now reaches `require_authz!` gates: `reload_policies` points the `PolicyStore` the `AuthzStore` was built with at the new set, so the gate that holds the same `Arc<PolicyStore>` decides on it with no change to the wiring (`PolicyEvaluator` gains the defaulted `adopt`).
+- `require_authz!` answers 500 with a named error log when the policies read `context` and no `Arc<dyn RequestContextProvider>` extension is installed, instead of deciding on an empty context.
+- A policy reload is bounded in time: a follower's `PolicySource` read, each reload hook or cache invalidation and the announce stop at `ReloadTimeouts` (30, 30 and 10 seconds, `AuthzStore::with_reload_timeouts`), so a stalled step no longer holds the reload lock; a source that cannot be read, times out or panics counts on the refused counter, a panic ends only that read, and `ReloadFollower::is_finished` reports a dead follower.
+- A follower no longer goes back to an older bundle: a `PolicySource` that overrides the new defaulted `load_versioned` returns a `VersionedBundle` with a generation, and the follower refuses a generation below the highest it applied and counts the refusal; a local `reload_policies` on a following instance lasts until its next read of the source, as the reload page now says.
+- The scheduled upstream watch, which never matched because it parsed `cargo search` output that the runner prints in colour, now reads crates.io's API (`scripts/watch-webauthn-argon2.sh`), fails on a failed or empty answer, and watches `webauthn-rs` leaving `argon2` 0.5 through `crypto-glue`.
+- `EncryptedDelegatedCredentialStore` implements `save_if_unchanged` over the sealed rows (atomic exactly when the inner store's is), so a revoke from another process while a refresh is in flight is not overwritten on the store production uses; a store without the compare-and-swap keeps the unconditional save and logs a warning naming its type once.
+- The back-channel logout route remembers an issuer the tenant source has no provider for for 30 seconds (`BackChannelLogoutHandler::with_unknown_issuer_memory`, zero turns it off; a provider added through `LiveTenantOAuthProviders` or `StoredTenantOAuthProviders` is found at once, because a remembered miss is trusted only while the new `TenantOAuthProviders::generation` is unchanged), so an anonymous loop of tokens naming made-up issuers costs one source read per interval and not one per request; the handler and rate-limiting docs name `RateLimitLayer` for the route and say what it bounds.
+- A back-channel logout token ends only the sessions of the tenant whose provider verified it, so two tenants on one issuer no longer end each other's sessions of the same subject, and a token verified by a global provider stays unscoped.
+- A refresh in flight no longer brings back a delegated credential the user just revoked: `StoredDelegationSession::revoke` takes the refresh lock, so it runs after a refresh in flight, and the refreshed credential is written with `save_if_unchanged` against the row the refresh started from, so a deleted or replaced row is not overwritten (a store without compare-and-swap keeps the plain save, ordered by the lock within one process).
+- An impersonation ends when the administrator who began it is suspended, deleted or has their sessions ended: `begin_impersonation` registers an entry for the administrator (`Impersonation::registry_anchor`) that the session layer reads on every request, and `end_impersonation` removes it.
+- Tenant provider URLs are screened: `StoredTenantOAuthProviders` refuses an issuer, and every endpoint its discovery document names, that is not HTTPS or that is in a loopback, private, link-local, unique-local, shared-address or metadata range, and refuses a connection to a host name that resolves into one; `EgressPolicy::screened()` is the default, `unscreened()` the named opt-out and `screened_allowing_loopback_http()` the test opt-in (`with_egress_policy`, `OAuthProviderConfig::discover_screened`).
+- An unverified `Candidate` account holds its identifier for `DEFAULT_CANDIDATE_TTL` (24 hours, `with_candidate_ttl`): the next `begin_signup` for it deletes the row and starts afresh.
+- A factor that passes no longer clears the guess throttle; it is cleared when the whole login completes, so wrong guesses at a second factor keep their delay.
+- A new password reset request no longer invalidates a live link: an account holds up to `DEFAULT_MAX_LIVE_RESET_TOKENS` (3, `with_max_live_reset_tokens`) live tokens, a request beyond that is refused as throttled and audited `live_tokens_full`, and using any one token consumes them all; a flood of made-up identifiers no longer fills the per-instance cooldown record and refuses a real user's reset, since a full record drops its oldest cooldown, so a refusal falls only on an identifier that is itself cooling down.
+- `purge_expired_candidates(limit)` deletes the expired `Candidate` accounts nobody asked for again, one `AccountDeleted` audit row each.
+- The JWKS refresh loop and `refresh_all_jwks` include the tenant providers a tenant registry holds built (`TenantOAuthProviders::built_providers`) and refresh up to `JWKS_REFRESH_CONCURRENCY` providers at once.
+- A user holds at most `DEFAULT_MAX_UNKNOWN_DEVICES_PER_USER` `Unknown` devices (`with_max_unknown_devices_per_user`); the least recently seen are deleted when a cookieless login would create another.
+- `BearerError::UntrustedIssuer` carries the unverified issuer cut to `MAX_ISSUER_ECHO_BYTES` with control characters escaped.
+- `DeviceLifecycleService::ensure_device` says that a fingerprint is not proof of a device; the lockout exemption reads only a device `resolve_proven` yielded.
+- A handler that changes who a session is (an administrator assuming a user) no longer has the session layer end it as "revoked while its id rotated": the new id was registered for the new user, as a login does.
+- The weekly mutation sweep finishes and cannot pass blind: it runs as round-robin shards sized from the measured per-mutant cost, with each mutant's build and tests time-bounded, and fails by name when a shard is missing, cancelled, unfinished or short, where every scheduled run since 2026-06-07 had been cancelled at the 6 h job limit and passed with a warning.
+- `cargo mutants -f <file>` mutates only that file: `.cargo/mutants.toml` no longer lists `examine_globs`, which cargo-mutants widened with the command-line `--file` instead of narrowing to it.
+- Every GitHub Action the workflows use runs on Node 24, which GitHub now forces in place of the deprecated Node 20: `actions/checkout` v7, `upload-artifact` v7, `download-artifact` v8, `upload-pages-artifact` v5, `deploy-pages` v5, `configure-pages` v6, `attest-build-provenance` v4 and `softprops/action-gh-release` v3, with `Swatinem/rust-cache` v2 already there.
+- Comments, docs and CI messages that pointed at ROADMAP entries or tracking keys that do not exist now say where the thing lives: the macro tests in `axess/tests/macro_tests.rs`, the `#[non_exhaustive]` policy in CONTRIBUTING.md and `scripts/mutants.sh`.
+- The mutants that survived in `axess-cache` and `client_ip` are caught: `ClockTtlCache::invalidate_entries_by` and `client_ip::layer` are tested, every `Source` name is pinned through `as_str`, `Display` and serde, a single-flight test that hung when the counters read zero fails in 10 s instead, and the no-op `count > 0` guards around the invalidation counters, which made `>` and `>=` indistinguishable, are gone.
+
+### Changed
+
+- A release is published from its `v*` tag, which the tag workflow creates when a release pull request merges into `main` (by hand on a patch line): the release workflow refuses a tag that is not on `main` or a `release/X.Y.x` branch or that disagrees with the workspace version or its dated changelog section, and publishes to crates.io only after the maintainer approves the deployment.
+- Pull requests target `release/next`, and `main` changes only by a release pull request, which runs every release preflight step as a required CI check ([publishing runbook](docs/project/publishing.md)).
+- After a release from `main`, the release workflow levels `release/next` with `main` (moved to the released commit when nothing newer is on it, `main` merged into it otherwise, a conflict reported by name), so the branch is never deleted or recut by hand.
+
+### Dependencies
+
+- `cedar-policy` 4.14.0 -> 4.14.1 in `axess`, `axess-core`, `axess-macros` and the authz example: entity parse and schema-conformance errors are reported in a fixed order, and `Entities::add_entities` applies only the last of several entries with one uid (validating all of them); no call axess makes changes behaviour.
+- `openidconnect` 4.0.1 -> 4.1.0 in `axess-core` and `axess-factors`: it moves to p256 / p384 0.14, ed25519-dalek 3 and base64 0.22, and changes nothing in ID token validation, discovery, redirects or secret comparison.
+- `base64` 0.22.1 -> 0.23.1 in the workspace, the fuzz crate and every example, with default features off and `std` on so the `simd-unsafe` engines (0.23's only `unsafe` code) stay out of what axess asks for; the examples' `thiserror` requirement reads 2.0.21 like the workspace's.
+
 ## [0.17.0] - 2026-11-06
 
 ### Changed (breaking)
@@ -78,6 +148,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 - `with_max_payload` on the SQL session stores (64 KiB by default, as Valkey).
 - `hash_new_password(password, &PasswordRules)` refuses an over-long or rule-failing password before hashing (`NewPasswordError`); `PasswordRules::accepts` is the one check, and `MAX_PASSWORD_BYTES` lives in `axess-factors`.
 - A breached-password check at password choice: `AuthnServiceBuilder::with_breached_password_check` takes a `BreachedPasswordCheck`, after which a password reset, and an application's own signup or change through `AuthnService::check_chosen_password` and `hash_chosen_password`, refuse a password the check knows (`NewPasswordError::Breached`, audit reason `password_breached`) and by default one it could not screen (`BreachCheckUnavailable`, opt-out `allow_unchecked_when_breach_check_unavailable()`); `PasswordRules::breached_check` exempts a tenant; `range_prefix` and `count_in_range` are the k-anonymity range protocol's pure halves, `hash_new_password_checked` the free-function form, and `BreachedPasswordList` (under `testing`) a fixed list for tests and examples.
+
+### Changed (breaking)
+
+- `PolicyStore::digest()` returns a `String` and `PolicyStore::schema()` a `Schema`, because both follow a policy reload; `original_digest()` and `original_schema()` borrow the text the object was built from.
 
 ### Fixed
 
@@ -243,6 +317,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 - The sqlite example's key file is never rewritten: a valid key only narrows
   the mode, a new file is linked into place whole, a file with no key stops
   the start.
+
+### Changed (breaking)
+
+- `PolicyStore::digest()` returns a `String` and `PolicyStore::schema()` a `Schema`, because both follow a policy reload; `original_digest()` and `original_schema()` borrow the text the object was built from.
 
 ### Fixed
 
@@ -544,6 +622,10 @@ Behaviour:
 - **Testing**: `AuthSessionTestExt::set_impersonator`, `CallLog::on`,
   `arm_record_event_hang`, `arm_get_user_failure`.
 
+### Changed (breaking)
+
+- `PolicyStore::digest()` returns a `String` and `PolicyStore::schema()` a `Schema`, because both follow a policy reload; `original_digest()` and `original_schema()` borrow the text the object was built from.
+
 ### Fixed
 
 - **A one-shot session value cannot be handed out twice or written back**:
@@ -785,6 +867,10 @@ and, unconditionally, on `aes-gcm`; `webauthn-rs` is pinned `=0.6.0-dev`;
 - The example crates gain a pinned Kubernetes mapper, the local IdP's key
   retirement route, a logout route and a sealing key for TOTP enrolments.
 
+### Changed (breaking)
+
+- `PolicyStore::digest()` returns a `String` and `PolicyStore::schema()` a `Schema`, because both follow a policy reload; `original_digest()` and `original_schema()` borrow the text the object was built from.
+
 ### Fixed
 
 - Logins: parallel logins at a session cap no longer revoke each other; the
@@ -897,6 +983,10 @@ and, unconditionally, on `aes-gcm`; `webauthn-rs` is pinned `=0.6.0-dev`;
 - `axess_factors::http_body`: bounded reads for remote response bodies.
 - Live Postgres and MySQL suites for the session and device stores, run by
   CI's ignored-test step.
+
+### Changed (breaking)
+
+- `PolicyStore::digest()` returns a `String` and `PolicyStore::schema()` a `Schema`, because both follow a policy reload; `original_digest()` and `original_schema()` borrow the text the object was built from.
 
 ### Fixed
 
@@ -1091,6 +1181,10 @@ and, unconditionally, on `aes-gcm`; `webauthn-rs` is pinned `=0.6.0-dev`;
 - `SidMap::register_subject_session`, `take_subject_sessions`,
   `forget_subject_session`, `sweep_subject_candidates`, `subject_len`.
 
+### Changed (breaking)
+
+- `PolicyStore::digest()` returns a `String` and `PolicyStore::schema()` a `Schema`, because both follow a policy reload; `original_digest()` and `original_schema()` borrow the text the object was built from.
+
 ### Fixed
 
 - ID-token verification keys refresh: a token signed with a key the IdP
@@ -1183,6 +1277,10 @@ and, unconditionally, on `aes-gcm`; `webauthn-rs` is pinned `=0.6.0-dev`;
 - `EntityState::effective_at(now)`.
 - `Issuer::Custom` serializes as `{"kind":"custom","label":"..."}`.
 
+### Changed (breaking)
+
+- `PolicyStore::digest()` returns a `String` and `PolicyStore::schema()` a `Schema`, because both follow a policy reload; `original_digest()` and `original_schema()` borrow the text the object was built from.
+
 ### Fixed
 
 - **One-time codes replayed in parallel.** Two concurrent requests with the
@@ -1240,6 +1338,10 @@ and, unconditionally, on `aes-gcm`; `webauthn-rs` is pinned `=0.6.0-dev`;
 - **Dependencies**: cedar-policy 4.14.0, lru 0.19.0, parking_lot 0.13.0,
   sha2 0.11.1, proptest 1.12.0, rkyv 0.8.18, zeroize 1.9.1, uuid 1.29.0,
   tokio 1.54.1, serde_json 1.0.154.
+
+### Changed (breaking)
+
+- `PolicyStore::digest()` returns a `String` and `PolicyStore::schema()` a `Schema`, because both follow a policy reload; `original_digest()` and `original_schema()` borrow the text the object was built from.
 
 ### Fixed
 
@@ -1450,6 +1552,10 @@ believed a header the caller writes.
   under the `trace-id` feature.
 
 - **`IpPolicy::restricts`** and **`MockIdentityStore::with_ip_policy`**.
+
+### Changed (breaking)
+
+- `PolicyStore::digest()` returns a `String` and `PolicyStore::schema()` a `Schema`, because both follow a policy reload; `original_digest()` and `original_schema()` borrow the text the object was built from.
 
 ### Fixed
 
@@ -1679,6 +1785,10 @@ lives in the commit log and in `platform/.claude/decisions/`.
   those should prefer ES256 or `jwt-aws-lc`. The exception stands, accurately
   justified.
 
+### Changed (breaking)
+
+- `PolicyStore::digest()` returns a `String` and `PolicyStore::schema()` a `Schema`, because both follow a policy reload; `original_digest()` and `original_schema()` borrow the text the object was built from.
+
 ### Fixed
 
 - **Twenty-three chapters described a library that does not exist.** Worth
@@ -1836,6 +1946,10 @@ Three breaking changes, all single struct fields; see
   `testing::mock_tracing`, so it is now optional and pulled by the `testing`
   feature.
 
+### Changed (breaking)
+
+- `PolicyStore::digest()` returns a `String` and `PolicyStore::schema()` a `Schema`, because both follow a policy reload; `original_digest()` and `original_schema()` borrow the text the object was built from.
+
 ### Fixed
 
 - **Every intra-doc link in the workspace resolves.** 29 diagnostics under
@@ -1940,6 +2054,10 @@ CSRF, provider registration, session-key rotation.
   functional break: the crate was already present transitively for
   most feature combinations.
 
+### Changed (breaking)
+
+- `PolicyStore::digest()` returns a `String` and `PolicyStore::schema()` a `Schema`, because both follow a policy reload; `original_digest()` and `original_schema()` borrow the text the object was built from.
+
 ### Fixed
 
 - Fingerprint verification under rotation no longer invalidates
@@ -2038,6 +2156,10 @@ CSRF, provider registration, session-key rotation.
 
 ## [0.3.3] - 2026-08-08
 
+### Changed (breaking)
+
+- `PolicyStore::digest()` returns a `String` and `PolicyStore::schema()` a `Schema`, because both follow a policy reload; `original_digest()` and `original_schema()` borrow the text the object was built from.
+
 ### Fixed
 
 - `session` + `csrf`: a fresh guest's session id is now stable across
@@ -2079,6 +2201,10 @@ CSRF, provider registration, session-key rotation.
 ---
 
 ## [0.3.1] - 2026-08-02
+
+### Changed (breaking)
+
+- `PolicyStore::digest()` returns a `String` and `PolicyStore::schema()` a `Schema`, because both follow a policy reload; `original_digest()` and `original_schema()` borrow the text the object was built from.
 
 ### Fixed
 

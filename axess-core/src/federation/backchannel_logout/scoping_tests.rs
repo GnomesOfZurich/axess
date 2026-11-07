@@ -76,11 +76,12 @@ async fn a_token_with_sub_and_sid_ends_only_the_sid_session() {
     let sub = "idp-subject-s";
     for s in [&x, &y] {
         registry.register(&user, s).await.unwrap();
-        sid_map.register_subject_session(ISS, sub, user, *s);
+        sid_map.register_subject_session(ISS, sub, None, user, *s);
     }
     sid_map.insert(
         (ISS.to_string(), "sid-x".to_string()),
         sub,
+        None,
         user,
         x,
         chrono::Utc::now(),
@@ -141,11 +142,13 @@ async fn a_full_replay_log_answers_503_and_still_catches_the_oldest_replay() {
     let registry = MemorySessionRegistry::new();
     let h = handler(&registry, SidMap::new());
     let now = h.clock.now();
-    let cutoff = now - chrono::Duration::seconds(JTI_RETENTION_SECS);
     for n in 0..JTI_CACHE_MAX {
         let jti = format!("fill-{n}");
-        assert_eq!(h.seen_jtis.record(ISS, &jti, now, cutoff), Recorded::New);
-        h.seen_jtis.settle(ISS, &jti);
+        assert_eq!(
+            h.replay.record(ISS, &jti, now).await.unwrap(),
+            Recorded::New
+        );
+        h.replay.settle(ISS, &jti).await.unwrap();
     }
 
     let fresh = token("client-a", serde_json::json!({"sid": "s", "jti": "new"}));
@@ -174,6 +177,7 @@ async fn azp_picks_the_provider_among_the_clients_in_aud() {
     sid_map.insert(
         (ISS.to_string(), "sid-b".to_string()),
         "idp-subject-b",
+        None,
         user,
         session,
         chrono::Utc::now(),

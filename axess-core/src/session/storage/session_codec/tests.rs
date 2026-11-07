@@ -121,3 +121,11 @@ fn plaintext_codec_is_unchanged() {
         sample().custom
     );
 }
+
+#[test]
+fn an_encrypted_session_carrying_assurance_round_trips() {
+    let data = crate::session::data::assured_fixture::assured_session();
+    let blob = codec().encode_bytes(&id(3), &data).unwrap();
+    let back = codec().decode_bytes(&id(3), &blob).unwrap();
+    assert_eq!(back.auth_state, data.auth_state);
+}

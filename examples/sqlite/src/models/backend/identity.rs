@@ -599,6 +599,36 @@ impl axess::authn::IdentityAdmin for OurBackend {
         tx.commit().await?;
         Ok(())
     }
+
+    /// The oldest candidates first. The age is compared on the parsed
+    /// timestamp, not the stored text, whose sub-second digits vary.
+    async fn delete_candidates_created_before(
+        &self,
+        before: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<User>, Self::Error> {
+        let rows = sqlx::query(
+            "SELECT id, tenant_id, identifier, display_name, status, status_cause, failed_attempts,
+                    locked_until, created_by, created_at, updated_by, updated_at
+             FROM users
+             WHERE status = 'candidate'",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        let mut expired = Vec::new();
+        for row in &rows {
+            let user = user_from_row(self.clock(), row)?;
+            if user.created_at < before {
+                expired.push(user);
+            }
+        }
+        expired.sort_by_key(|u| u.created_at);
+        expired.truncate(limit);
+        for user in &expired {
+            self.delete_user(&user.id).await?;
+        }
+        Ok(expired)
+    }
 }
 
 fn status_to_db(status: &EntityState) -> &'static str {
@@ -619,23 +649,58 @@ impl axess::authn::IdentityPasswordReset for OurBackend {
         user_id: &UserId,
         token_hash: &str,
         expires_at: DateTime<Utc>,
-    ) -> Result<(), Self::Error> {
-        // Upsert: a new reset request invalidates any prior outstanding
-        // token for the same user (a stale-token recipient cannot race
-        // the legitimate one).
+        now: DateTime<Utc>,
+        max_live: usize,
+    ) -> Result<bool, Self::Error> {
+        // One transaction: drop the user's expired tokens, count the live
+        // ones, insert unless they are full. A new request never replaces a
+        // live token.
+        let mut tx = self.pool().begin().await?;
+        let rows = sqlx::query(
+            "SELECT token_hash, expires_at FROM password_reset_tokens WHERE user_id = ?1",
+        )
+        .bind(user_id.to_string())
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut live = 0usize;
+        let mut present = false;
+        for row in &rows {
+            let hash: String = row.get("token_hash");
+            let text: String = row.get("expires_at");
+            let is_live =
+                DateTime::parse_from_rfc3339(&text).is_ok_and(|at| at.with_timezone(&Utc) > now);
+            if is_live {
+                live += 1;
+                present |= hash == token_hash;
+            } else {
+                sqlx::query(
+                    "DELETE FROM password_reset_tokens WHERE user_id = ?1 AND token_hash = ?2",
+                )
+                .bind(user_id.to_string())
+                .bind(&hash)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        if present {
+            tx.commit().await?;
+            return Ok(true);
+        }
+        if live >= max_live {
+            tx.commit().await?;
+            return Ok(false);
+        }
         sqlx::query(
             "INSERT INTO password_reset_tokens (user_id, token_hash, expires_at)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(user_id) DO UPDATE SET
-                 token_hash = excluded.token_hash,
-                 expires_at = excluded.expires_at",
+             VALUES (?1, ?2, ?3)",
         )
         .bind(user_id.to_string())
         .bind(token_hash)
         .bind(expires_at.to_rfc3339())
-        .execute(self.pool())
+        .execute(&mut *tx)
         .await?;
-        Ok(())
+        tx.commit().await?;
+        Ok(true)
     }
 
     async fn verify_reset_token(
@@ -644,51 +709,18 @@ impl axess::authn::IdentityPasswordReset for OurBackend {
         token_hash: &str,
         now: DateTime<Utc>,
     ) -> Result<bool, Self::Error> {
-        // Single transaction: SELECT, compare in constant time, delete on
-        // match (single-use). A token whose stored hash matches but has
-        // expired counts as a miss and is left in place so the row expires
-        // via a future sweep (the example backend does not run a periodic
-        // cleaner).
-        use subtle::ConstantTimeEq;
-
+        // One transaction: compare against each live token in constant time,
+        // and on a match delete every token of the user.
         let mut tx = self.pool().begin().await?;
-        let row = sqlx::query(
-            "SELECT token_hash, expires_at FROM password_reset_tokens WHERE user_id = ?1",
-        )
-        .bind(user_id.to_string())
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        let Some(row) = row else {
-            tx.commit().await?;
-            return Ok(false);
-        };
-        let stored_hash: String = row.get("token_hash");
-        let expires_at_str: String = row.get("expires_at");
-        let Ok(expires_at) = DateTime::parse_from_rfc3339(&expires_at_str) else {
-            tx.commit().await?;
-            return Ok(false);
-        };
-        if expires_at.with_timezone(&Utc) <= now {
-            tx.commit().await?;
-            return Ok(false);
+        let matched = Self::any_live_match(&mut tx, user_id, token_hash, now).await?;
+        if matched {
+            sqlx::query("DELETE FROM password_reset_tokens WHERE user_id = ?1")
+                .bind(user_id.to_string())
+                .execute(&mut *tx)
+                .await?;
         }
-        if stored_hash
-            .as_bytes()
-            .ct_eq(token_hash.as_bytes())
-            .unwrap_u8()
-            != 1
-        {
-            tx.commit().await?;
-            return Ok(false);
-        }
-
-        sqlx::query("DELETE FROM password_reset_tokens WHERE user_id = ?1")
-            .bind(user_id.to_string())
-            .execute(&mut *tx)
-            .await?;
         tx.commit().await?;
-        Ok(true)
+        Ok(matched)
     }
 
     async fn check_reset_token(
@@ -697,29 +729,40 @@ impl axess::authn::IdentityPasswordReset for OurBackend {
         token_hash: &str,
         now: DateTime<Utc>,
     ) -> Result<bool, Self::Error> {
-        // The same comparison as `verify_reset_token`, without the delete.
-        use subtle::ConstantTimeEq;
+        let mut tx = self.pool().begin().await?;
+        let matched = Self::any_live_match(&mut tx, user_id, token_hash, now).await?;
+        tx.commit().await?;
+        Ok(matched)
+    }
+}
 
-        let row = sqlx::query(
+impl OurBackend {
+    /// Whether any live token of the user equals `token_hash`; every row is
+    /// compared, in constant time each.
+    async fn any_live_match(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        user_id: &UserId,
+        token_hash: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool, BackendError> {
+        use subtle::ConstantTimeEq;
+        let rows = sqlx::query(
             "SELECT token_hash, expires_at FROM password_reset_tokens WHERE user_id = ?1",
         )
         .bind(user_id.to_string())
-        .fetch_optional(self.pool())
+        .fetch_all(&mut **tx)
         .await?;
-        let Some(row) = row else {
-            return Ok(false);
-        };
-        let stored_hash: String = row.get("token_hash");
-        let expires_at_str: String = row.get("expires_at");
-        let Ok(expires_at) = DateTime::parse_from_rfc3339(&expires_at_str) else {
-            return Ok(false);
-        };
-        Ok(expires_at.with_timezone(&Utc) > now
-            && stored_hash
-                .as_bytes()
-                .ct_eq(token_hash.as_bytes())
-                .unwrap_u8()
-                == 1)
+        let mut found = subtle::Choice::from(0);
+        for row in &rows {
+            let stored: String = row.get("token_hash");
+            let text: String = row.get("expires_at");
+            let live =
+                DateTime::parse_from_rfc3339(&text).is_ok_and(|at| at.with_timezone(&Utc) > now);
+            if live {
+                found |= stored.as_bytes().ct_eq(token_hash.as_bytes());
+            }
+        }
+        Ok(bool::from(found))
     }
 }
 
