@@ -30,7 +30,7 @@
 //! [`FactorSecretCipher`]: crate::authn::factor_secret::FactorSecretCipher
 
 mod directory;
-#[cfg(all(test, feature = "testing-oauth"))]
+#[cfg(all(test, feature = "oauth"))]
 mod directory_tests;
 mod live;
 mod memory;

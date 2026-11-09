@@ -23,7 +23,7 @@ impl<D: DeviceStore> DeviceGate for CheckedAgainst<'_, D> {
         user: &'a UserId,
     ) -> Pin<Box<dyn Future<Output = Result<(), DeviceRefusal>> + Send + 'a>> {
         Box::pin(async move {
-            match self.0.load(tenant, device).await {
+            match self.0.load_fresh(tenant, device).await {
                 Ok(Some(device)) if device.trust_level != DeviceTrustLevel::Revoked => {
                     match device.user_id.as_ref() {
                         Some(owner) if owner != user => Err(DeviceRefusal::OtherOwner),
@@ -58,9 +58,11 @@ impl<'a, F> Refresh<'a, F> {
     /// [`revoke_device`](crate::device::revoke_device) revokes the device
     /// and its tokens together; this check is the second line for tokens
     /// that escaped it, and the only one for a store that cannot revoke by
-    /// device. It costs one device-store read per refresh, so put a
-    /// [`CachedDeviceStore`](crate::device::CachedDeviceStore) in front of a
-    /// slow store.
+    /// device. It costs one device-store read per refresh, and the read is
+    /// [`load_fresh`](crate::device::DeviceStore::load_fresh): a
+    /// [`CachedDeviceStore`](crate::device::CachedDeviceStore) does not
+    /// answer it from its cache, so a device revoked on another instance
+    /// stops the next refresh and not the one after the cache's TTL.
     ///
     /// The check and the rotation are two store operations, so a device
     /// revoked between them is still rotated once: the child carries the

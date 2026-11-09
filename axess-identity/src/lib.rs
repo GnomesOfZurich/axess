@@ -103,6 +103,15 @@ impl Principal {
 /// The SPIRE variant lands when a concrete adopter use case arrives;
 /// it is deliberately not yet present so the enum doesn't carry a
 /// constructor that no resolver impl ever produces.
+///
+/// A custom issuer is built only through [`Issuer::custom`], which refuses a
+/// built-in label by name; the variant cannot be written out by hand:
+///
+/// ```compile_fail
+/// use axess_identity::Issuer;
+/// // issuer_custom_variant_not_constructible_outside_crate
+/// let _ = Issuer::Custom("oauth".to_string());
+/// ```
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(into = "IssuerRepr", try_from = "IssuerRepr"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -135,7 +144,20 @@ pub enum Issuer {
     /// which validates the label format (`[a-z0-9_]{1,32}`).
     ///
     /// [`OAuth`]: Self::OAuth
-    Custom(String),
+    Custom(CustomLabel),
+}
+
+/// The label of an [`Issuer::Custom`]. Its field is private and the only
+/// way to make one is [`Issuer::custom`], so every label in a program has
+/// passed the format check and is not the wire string of a built-in issuer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CustomLabel(String);
+
+impl CustomLabel {
+    /// The label, as it appears in audit rows and policies.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl Issuer {
@@ -171,7 +193,7 @@ impl Issuer {
                 "Issuer::custom label must match [a-z0-9_], got {s:?}"
             )));
         }
-        Ok(Self::Custom(s.to_string()))
+        Ok(Self::Custom(CustomLabel(s.to_string())))
     }
 
     /// Stable lowercase wire-string for this variant. Use as the
@@ -182,7 +204,7 @@ impl Issuer {
             Self::JwtSvid => "jwt_svid",
             Self::Mtls => "mtls",
             Self::OAuth => "oauth",
-            Self::Custom(s) => s.as_str(),
+            Self::Custom(label) => label.as_str(),
         }
     }
 }
@@ -214,7 +236,7 @@ impl From<Issuer> for IssuerRepr {
             Issuer::JwtSvid => Self::JwtSvid,
             Issuer::Mtls => Self::Mtls,
             Issuer::OAuth => Self::OAuth,
-            Issuer::Custom(label) => Self::Custom { label },
+            Issuer::Custom(label) => Self::Custom { label: label.0 },
         }
     }
 }

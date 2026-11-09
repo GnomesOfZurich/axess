@@ -49,8 +49,11 @@ impl BackChannelLogoutHandler {
     /// client ids in `unverified` (its unverified payload), or `None` when no
     /// provider of the issuer has a client id the token names.
     ///
-    /// Errors: [`LogoutProviderError::Ambiguous`] when more than one provider
-    /// (global or a tenant's) matches; [`LogoutProviderError::Unavailable`]
+    /// A global provider that matches is the answer whatever tenant providers
+    /// match too.
+    ///
+    /// Errors: [`LogoutProviderError::Ambiguous`] when more than one tenant
+    /// provider matches; [`LogoutProviderError::Unavailable`]
     /// when the one match is a tenant's provider that could not be built;
     /// [`LogoutProviderError::Source`] when the tenant source fails.
     pub(super) async fn entry_for(
@@ -83,6 +86,36 @@ impl BackChannelLogoutHandler {
         let found = source.providers_for_issuer(iss).await?;
         if global.is_none() && found.providers.is_empty() && found.broken.is_empty() {
             self.unknown_issuers.remember(iss, now, generation);
+        }
+        // The global registration is the operator's: a tenant's record with
+        // the same issuer and client id never shadows it, whether it builds
+        // or not, and cannot make the token ambiguous.
+        if global.is_some() {
+            let shadowing = found
+                .providers
+                .iter()
+                .filter(|p| {
+                    p.provider
+                        .client_id()
+                        .is_some_and(|client_id| addressed_to(unverified, client_id))
+                })
+                .map(|p| (p.tenant, &p.name))
+                .chain(
+                    found
+                        .broken
+                        .iter()
+                        .filter(|b| addressed_to(unverified, &b.client_id))
+                        .map(|b| (b.tenant, &b.name)),
+                );
+            for (tenant, name) in shadowing {
+                tracing::warn!(
+                    %tenant,
+                    provider = %name,
+                    "back-channel logout: a tenant provider has the issuer and client id of a \
+                     global one and is ignored"
+                );
+            }
+            return Ok(global);
         }
         let mut tenant_matches: Vec<ProviderEntry> = Vec::new();
         for built in found.providers {

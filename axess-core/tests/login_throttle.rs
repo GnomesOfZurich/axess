@@ -19,8 +19,8 @@ use axess_core::authn::{
 use axess_core::blocking::KdfExecutor;
 use axess_core::client_ip::Source;
 use axess_core::testing::mock_authn::{MockFactorStore, MockIdentityStore};
-use axess_core::testing::mock_tracing::TracingCapture;
 use axess_core::testing::test_session;
+use axess_testing::mock_tracing::TracingCapture;
 use chrono::{TimeZone, Utc};
 use common::{password_config, password_method, test_tenant, test_user, uid, user_scope};
 use std::net::{IpAddr, Ipv4Addr};

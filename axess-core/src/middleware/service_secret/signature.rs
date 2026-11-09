@@ -2,7 +2,7 @@
 //! it.
 
 use super::rejection::{Rejection, peer_of};
-use super::{ServiceSecret, ServiceSecrets};
+use super::{ServiceCaller, ServiceSecret, ServiceSecrets};
 use crate::session::hmac::new_signer;
 use axess_clock::{Clock, SystemClock};
 use axum::{
@@ -366,7 +366,11 @@ impl SignedRequests {
 /// The memory is per process: behind a load balancer with several
 /// instances, a replay that reaches a different instance within the
 /// tolerance is not caught. Only verified signatures are remembered, so a
-/// caller without the secret cannot grow it.
+/// caller without the secret cannot grow it. What is remembered is the
+/// request (its caller, stamp, method, target and body), not the tag it
+/// arrived with, so a request accepted under one scheme is a replay when it
+/// comes again under another (`v3` stripped to `v2`, `v1` upgraded to `v2`);
+/// two requests that differ only in a signed header are one request.
 ///
 /// Expired entries are swept at most once per `max(tolerance / 8, 1 s)` of
 /// the configured clock, by whichever request wins the claim on the sweep
@@ -573,7 +577,10 @@ impl Verifier {
             if seen.forgotten_through.is_some_and(|mark| stamp <= mark) {
                 return Err(Rejection::StaleStamp);
             }
-            let tag = tag.bytes();
+            // The request is remembered, not the tag it arrived with: a
+            // header that carries several schemes, or the same request
+            // re-sent under another scheme, is one request.
+            let tag = replay_key(&caller, stamp, &parts.method, &target, &body);
             if seen.live.contains_key(&tag) || seen.ahead.contains_key(&tag) {
                 return Err(Rejection::Replay(caller));
             }
@@ -660,12 +667,30 @@ enum Scheme {
     V3([u8; 32]),
 }
 
-impl Scheme {
-    fn bytes(&self) -> [u8; 32] {
-        match self {
-            Self::V1(tag) | Self::V2(tag) | Self::V3(tag) => *tag,
-        }
+/// What the replay cache remembers about an accepted request: a digest of the
+/// caller, the stamp, the method, the target and the body, none of which
+/// depends on the scheme that carried the signature. Each field is length
+/// prefixed, so no two requests share a digest by shifting a boundary.
+fn replay_key(
+    caller: &ServiceCaller,
+    stamp: i64,
+    method: &Method,
+    target: &str,
+    body: &[u8],
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"axess-service-replay-v1");
+    for field in [
+        caller.name().as_bytes(),
+        &stamp.to_be_bytes(),
+        method.as_str().as_bytes(),
+        target.as_bytes(),
+        body,
+    ] {
+        digest.update(u64::try_from(field.len()).unwrap_or(u64::MAX).to_be_bytes());
+        digest.update(field);
     }
+    digest.finalize().into()
 }
 
 /// The tags a header carried, by scheme.

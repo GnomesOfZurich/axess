@@ -321,9 +321,9 @@ impl<E: std::error::Error + Send + Sync + 'static> AuthnError<E> {
         // response carries, rounded up so a fraction of a second is never
         // "retry now".
         let busy_secs = match &self {
-            AuthnError::Busy { retry_after } | AuthnError::Throttled { retry_after } => {
-                Some(retry_after.as_millis().div_ceil(1000).max(1) as u64)
-            }
+            AuthnError::Busy { retry_after } | AuthnError::Throttled { retry_after } => Some(
+                u64::try_from(retry_after.as_millis().div_ceil(1000).max(1)).unwrap_or(u64::MAX),
+            ),
             _ => None,
         };
         let until_secs = until.and_then(|t| retry_secs_from(t, now)).or(busy_secs);

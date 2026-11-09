@@ -57,7 +57,9 @@ where
     /// audit row reason `live_tokens_full`. Using any one token consumes all of
     /// the account's tokens.
     ///
-    /// A `ttl` of zero, or one longer than seven days, is refused with
+    /// A `ttl` of zero, or one longer than the cap
+    /// ([`with_max_password_reset_ttl`](crate::authn::service::AuthnServiceBuilder::with_max_password_reset_ttl),
+    /// seven days unless set), is refused with
     /// [`AuthnError::Internal`] before anything is looked up, so a bad value
     /// fails the same way for a registered and an unregistered identifier.
     ///
@@ -86,7 +88,8 @@ where
         ttl: std::time::Duration,
     ) -> Result<Option<String>, AuthnError<I::Error>> {
         let now = self.inner.clock.now();
-        let expires_at = Self::reset_token_expiry(now, ttl)?;
+        let expires_at =
+            Self::reset_token_expiry(now, ttl, self.inner.hardening.max_password_reset_ttl)?;
 
         // The same input limits `begin_login` applies. An identifier or
         // tenant outside them is looked up as the empty string, which no
@@ -216,20 +219,47 @@ where
     }
 
     /// When a reset token issued at `now` for `ttl` expires. A `ttl` of zero,
-    /// or one longer than seven days, is refused.
+    /// or one longer than `cap`, is refused.
     fn reset_token_expiry(
         now: chrono::DateTime<chrono::Utc>,
         ttl: std::time::Duration,
+        cap: std::time::Duration,
     ) -> Result<chrono::DateTime<chrono::Utc>, AuthnError<I::Error>> {
+        let cap = chrono::Duration::from_std(cap).unwrap_or(chrono::Duration::MAX);
         chrono::Duration::from_std(ttl)
             .ok()
-            .filter(|d| *d > chrono::Duration::zero() && *d <= chrono::Duration::days(7))
+            .filter(|d| *d > chrono::Duration::zero() && *d <= cap)
             .and_then(|d| now.checked_add_signed(d))
             .ok_or_else(|| {
                 AuthnError::Internal(
-                    "password reset ttl must be positive and at most seven days".to_string(),
+                    "password reset ttl must be positive and at most the configured cap"
+                        .to_string(),
                 )
             })
+    }
+
+    /// As [`begin_password_reset`](Self::begin_password_reset), with the
+    /// lifetime the service was configured with
+    /// ([`with_password_reset_ttl`](crate::authn::service::AuthnServiceBuilder::with_password_reset_ttl)).
+    ///
+    /// # Errors
+    ///
+    /// [`AuthnError::Internal`] naming the missing setting when no lifetime
+    /// was configured, before anything is looked up; otherwise as
+    /// `begin_password_reset`.
+    pub async fn begin_password_reset_with_default_ttl(
+        &self,
+        identifier: &str,
+        tenant_identifier: &str,
+    ) -> Result<Option<String>, AuthnError<I::Error>> {
+        let Some(ttl) = self.inner.hardening.password_reset_ttl else {
+            return Err(AuthnError::Internal(
+                "no password reset ttl is configured: call with_password_reset_ttl, or pass a ttl to begin_password_reset"
+                    .to_string(),
+            ));
+        };
+        self.begin_password_reset(identifier, tenant_identifier, ttl)
+            .await
     }
 
     /// Resolve the account a reset is asked for: the tenant, the user in it
@@ -256,7 +286,10 @@ where
             .find_tenant(tenant_identifier)
             .await
             .map_err(AuthnError::Store)?;
-        let tenant_active = tenant.as_ref().is_some_and(|t| t.status.is_active());
+        let now = self.inner.clock.now();
+        let tenant_active = tenant
+            .as_ref()
+            .is_some_and(|t| t.status.clone().effective_at(now).allows_login());
         let tenant_id = tenant.map_or(crate::authn::ids::TenantId::SYSTEM, |t| t.id);
 
         // The user lookup runs for every tenant outcome so the number of
@@ -429,7 +462,12 @@ where
             .get_tenant(&user.tenant_id)
             .await
             .map_err(AuthnError::Store)?
-            .is_some_and(|t| t.status.is_active());
+            .is_some_and(|t| {
+                t.status
+                    .clone()
+                    .effective_at(self.inner.clock.now())
+                    .allows_login()
+            });
         if !tenant_active {
             tracing::warn!(user_id = %user.id, tenant = %user.tenant_id, "password reset refused: tenant is missing or not active");
             return Ok(Some("tenant_not_active"));

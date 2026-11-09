@@ -122,6 +122,10 @@ pub struct IssueRequest<'a> {
 /// returned exactly once; only the hash is persisted. Callers must
 /// transmit the plaintext to the client over a secure channel.
 ///
+/// The token is anchored at `now`: use this at the moment of a login. A token
+/// issued from a session that authenticated earlier is issued with
+/// [`issue_refresh_token_from_login`], which anchors it at that login.
+///
 /// If the user already has `config.max_per_user` active tokens, the oldest ones
 /// are revoked to make room, atomically with the insert
 /// ([`RefreshTokenStore::issue_capped`]). A config that fails
@@ -132,6 +136,46 @@ pub async fn issue_refresh_token<S: RefreshTokenStore>(
     store: &S,
     rng: &impl SecureRng,
     now: DateTime<Utc>,
+) -> Result<(String, RefreshToken), RefreshError<S::Error>> {
+    issue_anchored(req, config, store, rng, now, None).await
+}
+
+/// Issue a refresh token to a user whose session authenticated at
+/// `authenticated_at`, which may be well before `now`.
+///
+/// The record carries `authenticated_at`: the family's absolute lifetime
+/// ([`RefreshTokenConfig::max_lifetime`]) counts from it, and every session
+/// rotated from the token has it as its `authn_time`. A refresh token is
+/// therefore never a way to make an old authentication look new.
+///
+/// A session whose authentication is already past the family's lifetime
+/// gets [`RefreshError::Expired`] and nothing is stored. Otherwise as
+/// [`issue_refresh_token`].
+pub async fn issue_refresh_token_from_login<S: RefreshTokenStore>(
+    req: IssueRequest<'_>,
+    config: &RefreshTokenConfig,
+    store: &S,
+    rng: &impl SecureRng,
+    now: DateTime<Utc>,
+    authenticated_at: DateTime<Utc>,
+) -> Result<(String, RefreshToken), RefreshError<S::Error>> {
+    config.check()?;
+    if config
+        .lifetime_end(authenticated_at)
+        .is_some_and(|end| end <= now)
+    {
+        return Err(RefreshError::Expired);
+    }
+    issue_anchored(req, config, store, rng, now, Some(authenticated_at)).await
+}
+
+async fn issue_anchored<S: RefreshTokenStore>(
+    req: IssueRequest<'_>,
+    config: &RefreshTokenConfig,
+    store: &S,
+    rng: &impl SecureRng,
+    now: DateTime<Utc>,
+    authn_time: Option<DateTime<Utc>>,
 ) -> Result<(String, RefreshToken), RefreshError<S::Error>> {
     config.check()?;
     config
@@ -144,7 +188,7 @@ pub async fn issue_refresh_token<S: RefreshTokenStore>(
             .map(|raw| device_binding::bind(&raw, req.device_id.as_ref(), config.pepper())),
         ..req
     };
-    let (plaintext, record) = build_refresh_token(req, config, rng, now, None);
+    let (plaintext, record) = build_refresh_token(req, config, rng, now, authn_time);
 
     // The cap is enforced by the store, in the same transaction as the
     // insert: a count read here and acted on afterwards would let two
@@ -313,7 +357,7 @@ fn build_refresh_token_for(
 
     // Sliding expiry, capped by the family's absolute lifetime when one is
     // configured. A token issued at login descends from `now`.
-    let mut expires_at = now + config.ttl;
+    let mut expires_at = crate::lifetime::expiry_after_signed(now, config.ttl);
     if let Some(end) = config.lifetime_end(authn_time.unwrap_or(now)) {
         expires_at = expires_at.min(end);
     }

@@ -321,6 +321,9 @@ impl<K: LocalIdpKeyStore> LocalIdp<K> {
     }
 
     /// Remove the [`DEFAULT_MAX_TTL`] cap; only for intended long-lived tokens.
+    /// A token that is already expired, or whose `nbf` is after its `exp`, is
+    /// still refused ([`IssuanceError::InvalidLifetime`]): only the upper
+    /// bound goes.
     pub fn without_max_ttl(mut self) -> Self {
         self.max_ttl = None;
         self
@@ -375,15 +378,17 @@ impl<K: LocalIdpKeyStore> LocalIdp<K> {
     ) -> Result<String, IssuanceError<K::Error>> {
         let state = self.state.read().await;
 
-        if let Some(max_ttl) = self.max_ttl {
-            let now = self.clock.now();
-            enforce_max_ttl_fallible(claims, max_ttl, now).map_err(|refusal| match refusal {
+        // The lifetime checks (not already expired, `nbf` not after `exp`)
+        // hold with or without a cap: without one the cap is unbounded.
+        let max_ttl = self.max_ttl.unwrap_or(Duration::MAX);
+        enforce_max_ttl_fallible(claims, max_ttl, self.clock.now()).map_err(
+            |refusal| match refusal {
                 TtlRefusal::Exceeds { observed, max } => {
                     IssuanceError::LifetimeExceedsCap { observed, max }
                 }
                 TtlRefusal::Invalid(fault) => IssuanceError::InvalidLifetime(fault),
-            })?;
-        }
+            },
+        )?;
 
         if self.require_audience
             && (claims.audience.is_empty() || claims.audience.iter().any(String::is_empty))

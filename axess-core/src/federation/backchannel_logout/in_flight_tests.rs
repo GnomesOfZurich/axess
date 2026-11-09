@@ -2,6 +2,7 @@
 //! retryable, not a replay, since the first delivery may yet fail.
 
 use super::*;
+use crate::federation::replay_log::ReplayFuture;
 use crate::session::id::SessionId;
 use crate::session::store::{
     MemorySessionRegistry, RevocationError, SessionRegistry, SessionRegistryAdapter,
@@ -10,6 +11,7 @@ use crate::testing::mock_random::MockRng;
 use axess_clock::SystemClock;
 use axess_factors::oauth::MockOAuthProvider;
 use axess_factors::oidc::logout_token::BACKCHANNEL_LOGOUT_EVENT;
+use axess_testing::stall::{Gate, abort_inside};
 use axum::extract::{Form, State};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use std::future::Future;
@@ -124,5 +126,89 @@ async fn a_resend_while_the_first_delivery_runs_is_retryable_and_a_later_one_is_
         post(&handler, token()).await,
         Err(StatusCode::BAD_REQUEST),
         "once acted on, the same token is a replay"
+    );
+}
+
+/// The real in-process log, except that `settle` parks on a gate: where a
+/// shared log does network I/O.
+struct GatedSettle {
+    inner: Arc<jti_log::JtiLog>,
+    gate: Gate,
+}
+
+impl LogoutReplayLog for GatedSettle {
+    fn record<'a>(
+        &'a self,
+        issuer: &'a str,
+        jti: &'a str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> ReplayFuture<'a, Recorded> {
+        LogoutReplayLog::record(&*self.inner, issuer, jti, now)
+    }
+
+    fn settle<'a>(&'a self, issuer: &'a str, jti: &'a str) -> ReplayFuture<'a, ()> {
+        Box::pin(async move {
+            self.gate.wait().await;
+            LogoutReplayLog::settle(&*self.inner, issuer, jti).await
+        })
+    }
+
+    fn forget<'a>(&'a self, issuer: &'a str, jti: &'a str) -> ReplayFuture<'a, ()> {
+        LogoutReplayLog::forget(&*self.inner, issuer, jti)
+    }
+}
+
+/// A delivery cancelled while its outcome is being written to a shared log
+/// does not leave the pair in flight: the IdP's resend is acted on or refused
+/// as a replay, never answered "come again" until retention ends.
+#[tokio::test]
+async fn a_cancelled_finish_does_not_leave_the_pair_in_flight() {
+    let registry = MemorySessionRegistry::new();
+    let log = Arc::new(jti_log::JtiLog::new(16));
+    let gate = Gate::new();
+    let sid_map = SidMap::new();
+    let session = SessionId::new(&MockRng::new(11));
+    let user = axess_identity::testing::user("user-cancel");
+    registry.register(&user, &session).await.unwrap();
+    sid_map.insert(
+        (ISS.to_string(), "sid-slow".to_string()),
+        "idp-subject-cancel",
+        None,
+        user,
+        session,
+        chrono::Utc::now(),
+    );
+    let providers: Vec<Arc<dyn OAuthProvider>> = vec![Arc::new(
+        MockOAuthProvider::new("slow")
+            .with_issuer(ISS)
+            .with_client_id(CLIENT),
+    )];
+    let handler = BackChannelLogoutHandler::new(
+        &providers,
+        Arc::new(SessionRegistryAdapter(registry.clone())),
+        sid_map,
+        Arc::new(SystemClock),
+    )
+    .expect("handler")
+    .with_replay_log(Arc::new(GatedSettle {
+        inner: log.clone(),
+        gate: gate.clone(),
+    }));
+
+    let delivery = {
+        let handler = handler.clone();
+        tokio::spawn(async move {
+            let _ = post(&handler, token()).await;
+        })
+    };
+    abort_inside(&gate, delivery).await;
+
+    let resend = LogoutReplayLog::record(&*log, ISS, "slow-1", chrono::Utc::now())
+        .await
+        .expect("the log answers");
+    assert_ne!(
+        resend,
+        Recorded::InFlight,
+        "the pair is stuck in flight after a cancelled delivery"
     );
 }

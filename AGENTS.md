@@ -25,7 +25,7 @@ Keep these boundaries intact:
 
 ## Repository Map
 
-10 crates. One facade + one orchestrator + one verifier crate hold most public surface; the rest are foundation / specialised carve-outs.
+11 crates. One facade + one orchestrator + one verifier crate hold most public surface; the rest are foundation / specialised carve-outs.
 
 ```
 axess/              Facade crate. Re-exports the public API from
@@ -68,6 +68,11 @@ axess-identity/     Typed IDs (UserId, TenantId, WorkloadId,
 axess-events/       Event types and (forthcoming) async sinks.
 
 axess-strings/      Shared string newtypes / helpers.
+
+axess-testing/      Dev-dependency fixtures: tracing capture (`mock_tracing`)
+                    and the OIDC-over-wiremock IdP fixture (`oauth_wiremock`).
+                    Reachable from no production edge
+                    (scripts/check-test-crate-edges.sh).
 
 axess-macros/       require_authn!, require_partial_authn!,
                     require_authz! procedural macros.
@@ -211,10 +216,10 @@ All tests deterministic and reproducible, no flaky timing dependencies.
 
 ## Security Principles
 
-- **No `unsafe` code.** `#![forbid(unsafe_code)]` is declared at the root of all ten published crates, with no exceptions (the `examples/*` members do not declare it). `axess-strings` was the last holdout: its `repr.rs` held an Umbra-style union behind `#![deny(unsafe_code)]` plus a scoped allow, and was replaced with a safe enum in 0.6.0. A crate that needs `unsafe` needs a decision first, not an allow.
+- **No `unsafe` code.** `#![forbid(unsafe_code)]` is declared at the root of all eleven published crates, with no exceptions (the `examples/*` members do not declare it). `axess-strings` was the last holdout: its `repr.rs` held an Umbra-style union behind `#![deny(unsafe_code)]` plus a scoped allow, and was replaced with a safe enum in 0.6.0. A crate that needs `unsafe` needs a decision first, not an allow.
 - **Constant-time comparisons** (`subtle::ConstantTimeEq`): HMAC cookie verification, TOTP/HOTP codes, OAuth CSRF state, session fingerprint, refresh token device binding.
 - **Secret zeroization**: password hashes (`ZeroizedString`), TOTP/HOTP secrets (`Zeroizing`), signing key (`Drop` zeroing).
-- **Timing equalization**: `begin_login` runs dummy queries on unknown-user path to prevent user enumeration.
+- **Timing equalization**: `begin_login` runs dummy queries on the unknown-user path so its store calls match a known user's, but it is identifier-first: a known account answers `FactorRequired` (and names the factor kind) where an unknown one answers `InvalidCredentials`, so used alone it tells a caller whether an account exists. A combined username-and-password form uses `login_with_password`, which answers every path alike and spends one Argon2id run on each.
 - **Refresh token security**: SHA-256 hash-only storage, family tracking (reuse of rotated token revokes entire family); `device` feature adds cascade revocation across refresh families.
 - **Session hardening**: ID cycling (fixation prevention), HMAC fingerprint binding, `max_custom_bytes` DoS limit (64 KiB).
 - **OAuth/OIDC**: HTTPS enforced on discovery URLs (loopback exempted), PKCE on all authorization code flows. `openidconnect` activated with `timing-resistant-secret-traits` (secret-bearing types refuse `PartialEq` / `Hash`, forcing constant-time comparison). `azp` checked when `aud` is multi-element array.

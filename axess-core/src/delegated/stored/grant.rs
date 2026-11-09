@@ -63,6 +63,10 @@ pub struct GrantContext {
 /// `GrantContext` somewhere it can be retrieved when the IdP
 /// redirects back to the adopter's callback handler.
 ///
+/// The authorization endpoint must be HTTPS (or HTTP to a loopback host,
+/// for a local IdP in development): any other is refused with
+/// [`DelegatedError::Transport`] before the URL is built.
+///
 /// `scopes_override`: pass an empty slice to use the provider's
 /// `default_scopes`; pass a non-empty slice to override.
 ///
@@ -75,6 +79,10 @@ pub fn begin_grant(
     scopes_override: &[String],
     rng: &dyn SecureRng,
 ) -> Result<(Url, GrantContext), DelegatedError> {
+    // The browser is sent here with the client id, the PKCE challenge and the
+    // state in the URL: refused before any of them is drawn.
+    crate::outbound_http::require_https_or_loopback(&provider.authorization_endpoint)
+        .map_err(|reason| DelegatedError::Transport(reason.to_string()))?;
     let verifier = random_token(rng);
     let state = random_token(rng);
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));

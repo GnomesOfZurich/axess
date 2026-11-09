@@ -20,6 +20,22 @@
 //! Each module is feature-gated; `lib.rs` re-exports everything at the
 //! crate root so downstream code can import via either path.
 
+// The `testing` feature compiles deterministic clocks and random sources and
+// constructors that skip key checks. A release build that links it ships
+// those in a production binary, and cargo feature unification lets any one
+// dependent switch it on for the whole build, so the build refuses by name.
+// `allow-testing-in-release` is the named opt-out for a build that means it.
+#[cfg(all(
+    feature = "testing",
+    not(debug_assertions),
+    not(feature = "allow-testing-in-release")
+))]
+compile_error!(
+    "the `testing` feature of axess-factors is enabled in a release build; it ships test doubles in a \
+     production binary. Remove the feature from the release build, or enable \
+     `allow-testing-in-release` to keep it on purpose."
+);
+
 /// Server-issued [`EmailOtpConfig`](email_otp::EmailOtpConfig): the typed
 /// challenge state for the out-of-band email factor (`email_otp` feature).
 /// RFC 7523 client assertions (`private_key_jwt`), shared by the outbound
@@ -160,9 +176,10 @@ pub use password::breached::{
 };
 #[cfg(feature = "password")]
 pub use password::{
-    MAX_PASSWORD_BYTES, NewPasswordError, PasswordConfig, PasswordRules, PasswordVerifyError,
-    generate_password_hash, generate_password_hash_with_rng, generate_password_salt,
-    hash_new_password, hash_new_password_checked, hash_password_with_salt, password_needs_rehash,
+    Argon2Cost, Argon2CostError, MAX_PASSWORD_BYTES, NewPasswordError, PasswordConfig,
+    PasswordRules, PasswordVerifyError, generate_password_hash, generate_password_hash_with_rng,
+    generate_password_salt, hash_new_password, hash_new_password_checked, hash_password_with_salt,
+    hash_password_with_salt_and_cost, password_needs_rehash, password_needs_rehash_for,
     verify_password,
 };
 

@@ -11,8 +11,11 @@ use axess_rng::{SecureRng, SystemRng};
 use std::sync::Arc;
 
 pub use account_limits::{DEFAULT_CANDIDATE_TTL, DEFAULT_MAX_LIVE_RESET_TOKENS};
+pub use hardening::DEFAULT_MAX_PASSWORD_RESET_TTL;
 
 mod account_limits;
+mod hardening;
+pub(crate) use hardening::AccountHardening;
 mod breached_password;
 mod removers;
 use removers::{RefreshStoreRevoker, RowRemover};
@@ -74,6 +77,9 @@ where
     /// or delete factors; see
     /// [`with_impersonated_credential_changes_allowed`](Self::with_impersonated_credential_changes_allowed).
     pub(crate) impersonated_credential_changes: bool,
+    /// Password hashing cost, password reset lifetime and cap, and the
+    /// impersonation recency rule; see the setters in `hardening`.
+    pub(crate) hardening: AccountHardening,
     /// Where a locked account's own devices are looked up; see
     /// [`with_device_store`](Self::with_device_store).
     #[cfg(feature = "device")]
@@ -217,6 +223,7 @@ where
             candidate_ttl: DEFAULT_CANDIDATE_TTL,
             max_live_reset_tokens: DEFAULT_MAX_LIVE_RESET_TOKENS,
             impersonated_credential_changes: false,
+            hardening: AccountHardening::default(),
             reveal_lockout_on_begin: false,
             #[cfg(feature = "device")]
             known_devices: None,
@@ -549,6 +556,23 @@ where
     /// purpose, and audits it, opts in here.
     pub fn with_impersonated_credential_changes_allowed(mut self) -> Self {
         self.impersonated_credential_changes = true;
+        self
+    }
+
+    /// Require the administrator to have authenticated within `max_age` to
+    /// begin an impersonation.
+    ///
+    /// An impersonation lets one session act as another user, so a session
+    /// left open on a shared machine, or a stolen cookie, should not be able
+    /// to begin one hours after the administrator signed in. With this set,
+    /// `begin_impersonation` refuses an administrator session whose
+    /// authentication is older than `max_age` with
+    /// [`AuthnError::NoFlow`](crate::authn::error::AuthnError::NoFlow) and a
+    /// failed audit row with the reason `authn_too_old`; the administrator
+    /// authenticates again (a step-up) and retries. The default is no limit.
+    /// A few minutes is the usual choice.
+    pub fn with_impersonation_max_authn_age(mut self, max_age: std::time::Duration) -> Self {
+        self.hardening.impersonation_max_authn_age = Some(max_age);
         self
     }
 

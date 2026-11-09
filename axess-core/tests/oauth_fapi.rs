@@ -1,24 +1,23 @@
 //! FAPI + PAR_INFLIGHT mutation coverage: single-use marker, audit-event emission, logout delegation.
 
-#![cfg(feature = "testing-oauth")]
+#![cfg(all(feature = "testing", feature = "oauth"))]
 
 mod common;
 
 use axess_clock::Clock;
 use axess_core::authn::AuditContext;
 use axess_core::authn::event::AuthFailureReason;
+use axess_core::testing::oauth_provider::oauth_setup_provider;
 use axess_core::{
     authn::service::AuthnService,
     testing::{
         MockClock,
         mock_authn::{MockFactorStore, MockIdentityStore},
-        oauth_wiremock::{
-            oauth_generate_rsa_keypair, oauth_mount_oidc_endpoints, oauth_setup_provider,
-        },
         test_session,
     },
 };
 use axess_factors::oauth::OAuthLoginOptions;
+use axess_testing::oauth_wiremock::{oauth_generate_rsa_keypair, oauth_mount_oidc_endpoints};
 use common::test_tenant;
 use wiremock::MockServer;
 
@@ -309,7 +308,7 @@ async fn csrf_mismatch_records_failure_audit_event() {
     let server = MockServer::start().await;
     let (_, jwk, _) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &jwk).await;
-    let provider = oauth_setup_provider(&server).await;
+    let provider = oauth_setup_provider(&server.uri()).await;
 
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
     let authn = AuthnService::builder(identity.clone(), MockFactorStore::new())
@@ -377,7 +376,7 @@ async fn begin_oauth_login_clears_stale_expected_tenant() {
     let server = MockServer::start().await;
     let (_, jwk, _) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &jwk).await;
-    let provider = oauth_setup_provider(&server).await;
+    let provider = oauth_setup_provider(&server.uri()).await;
 
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
     let authn = AuthnService::builder(identity, MockFactorStore::new())

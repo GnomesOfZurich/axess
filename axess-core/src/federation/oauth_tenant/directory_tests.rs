@@ -4,10 +4,10 @@
 
 use super::*;
 use crate::authn::ids::testing::tenant;
-use crate::testing::oauth_wiremock::{oauth_generate_rsa_keypair, oauth_mount_oidc_endpoints};
 use axess_factors::FactorSecret;
 use axess_factors::client_assertion::{ClientAssertionError, SignerSpec};
 use axess_factors::oauth::OAuthError;
+use axess_testing::oauth_wiremock::{oauth_generate_rsa_keypair, oauth_mount_oidc_endpoints};
 use wiremock::MockServer;
 
 const DISCOVERY: &str = "/.well-known/openid-configuration";
@@ -430,4 +430,147 @@ async fn the_generation_moves_when_a_record_is_written_removed_or_invalidated() 
         .await
         .expect("remove");
     assert_ne!(directory.generation(), g2);
+}
+
+// ── One (issuer, client id) pair belongs to one tenant ────────────────────
+
+const SHARED_ISSUER: &str = "https://idp.shared.example";
+
+fn refused_text(result: Result<TenantOAuthProviderRecord, OAuthError>) -> String {
+    match result {
+        Err(OAuthError::Config(text)) => text,
+        other => panic!("expected a refusal, got {:?}", other.map(|r| r.name)),
+    }
+}
+
+/// A second tenant cannot register the issuer and client id a first one holds:
+/// the pair would make every logout token addressed to that client ambiguous
+/// and refused.
+#[tokio::test]
+async fn a_tenant_cannot_register_a_pair_another_tenant_holds() {
+    let directory = directory();
+    directory
+        .upsert(record("acme", SHARED_ISSUER, "client-x", secret()))
+        .await
+        .unwrap();
+
+    let text = refused_text(
+        directory
+            .upsert(record("beta", SHARED_ISSUER, "client-x", secret()))
+            .await,
+    );
+
+    assert!(
+        text.contains("already registered by another tenant"),
+        "{text}"
+    );
+    assert!(!text.contains("acme"), "the holder is not named: {text}");
+    assert!(
+        !text.contains(SHARED_ISSUER),
+        "the issuer is not echoed: {text}"
+    );
+    assert!(
+        directory
+            .store()
+            .get(&tenant("beta"), "sso")
+            .await
+            .unwrap()
+            .is_none(),
+        "nothing was written"
+    );
+}
+
+/// What stays allowed: a tenant updating its own record, one issuer with
+/// different client ids, one client id at different issuers.
+#[tokio::test]
+async fn the_pairs_that_do_not_collide_are_registered() {
+    let directory = directory();
+    directory
+        .upsert(record("acme", SHARED_ISSUER, "client-x", secret()))
+        .await
+        .unwrap();
+
+    directory
+        .upsert(record("acme", SHARED_ISSUER, "client-x", secret()))
+        .await
+        .expect("a tenant updates its own record");
+    directory
+        .upsert(record("beta", SHARED_ISSUER, "client-y", secret()))
+        .await
+        .expect("another client id at the same issuer");
+    directory
+        .upsert(record(
+            "gamma",
+            "https://idp.other.example",
+            "client-x",
+            secret(),
+        ))
+        .await
+        .expect("the same client id at another issuer");
+}
+
+/// A broken record counts as holding its pair, so a tenant cannot take the
+/// pair of a record that does not build.
+#[tokio::test]
+async fn a_record_that_does_not_build_still_holds_its_pair() {
+    let directory = directory();
+    directory
+        .upsert(record("acme", SHARED_ISSUER, "client-x", unloadable_key()))
+        .await
+        .unwrap();
+
+    let text = refused_text(
+        directory
+            .upsert(record("beta", SHARED_ISSUER, "client-x", secret()))
+            .await,
+    );
+
+    assert!(
+        text.contains("already registered by another tenant"),
+        "{text}"
+    );
+}
+
+/// The global registration's pair is not a tenant's to take, whichever tenant
+/// asks.
+#[tokio::test]
+async fn a_tenant_cannot_register_the_pair_of_the_global_provider() {
+    let directory = directory().with_global_registration(SHARED_ISSUER, "client-x");
+
+    let text = refused_text(
+        directory
+            .upsert(record("acme", SHARED_ISSUER, "client-x", secret()))
+            .await,
+    );
+
+    assert!(
+        text.contains("already registered by the global provider"),
+        "{text}"
+    );
+    directory
+        .upsert(record("acme", SHARED_ISSUER, "client-y", secret()))
+        .await
+        .expect("another client id at the same issuer");
+}
+
+/// Registrations in one process are serialised: of two tenants racing for one
+/// pair, one wins and one is refused.
+#[tokio::test]
+async fn two_tenants_racing_for_one_pair_do_not_both_win() {
+    let directory = Arc::new(directory());
+    let mut set = tokio::task::JoinSet::new();
+    for label in ["acme", "beta", "gamma", "delta"] {
+        let directory = directory.clone();
+        set.spawn(async move {
+            directory
+                .upsert(record(label, SHARED_ISSUER, "client-x", secret()))
+                .await
+                .is_ok()
+        });
+    }
+    let mut won = 0;
+    while let Some(done) = set.join_next().await {
+        won += usize::from(done.unwrap());
+    }
+    assert_eq!(won, 1);
 }

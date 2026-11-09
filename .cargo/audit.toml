@@ -29,6 +29,23 @@ ignore = [
     # Resolution: wait for rsa crate maintainers to release a fix.
     "RUSTSEC-2023-0071",
 
+    # libsqlite3-sys 0.37.0: bundled SQLite before 3.54.0 can return
+    # uninitialised page-cache memory when it opens a database together with
+    # a `-wal` file of a different page size (RUSTSEC-2026-0459,
+    # CVE-2026-119375). Severity 6.8 (medium). Fixed in 0.39.0, which no
+    # sqlx release accepts yet: sqlx-sqlite 0.9.0 requires < 0.38.0.
+    #
+    # Reachability: only a process that opens a database file, with its
+    # `-wal`, that a less trusted party could have written. The SQLite
+    # session and identity stores open the database the application
+    # configures for itself; a deployment that lets another party place
+    # that file is exposed. A build that links the system SQLite (3.54.0 or
+    # later) instead of the bundled source is not affected.
+    #
+    # Resolution: move to the sqlx release that accepts libsqlite3-sys 0.39,
+    # and drop this entry in the same commit.
+    "RUSTSEC-2026-0459",
+
     # crypto-bigint 0.5.5: timing variability in constant-time operations (RUSTSEC-2026-0387)
     # Pulled transitively through p256 0.13 by jsonwebtoken, and by
     # axess-core/axess-factors' own p256 0.13.

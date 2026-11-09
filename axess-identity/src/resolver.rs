@@ -161,6 +161,10 @@ mod tests {
         TenantId::from_bytes([9u8; 16])
     }
 
+    #[cfg_attr(
+        miri,
+        ignore = "the tokio runtime starts an I/O driver, which Miri does not support"
+    )]
     #[tokio::test]
     async fn cli_resolver_builds_workload_principal() {
         let trust = TrustDomain::new("gnomes.local").unwrap();
@@ -189,6 +193,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        miri,
+        ignore = "the tokio runtime starts an I/O driver, which Miri does not support"
+    )]
     #[tokio::test]
     async fn cli_resolver_resolve_is_idempotent() {
         let trust = TrustDomain::new("gnomes.local").unwrap();
@@ -264,6 +272,10 @@ mod tests {
         assert!(matches!(err, IdentityError::InvalidComponent(_)));
     }
 
+    #[cfg_attr(
+        miri,
+        ignore = "the tokio runtime starts an I/O driver, which Miri does not support"
+    )]
     #[tokio::test]
     async fn cli_resolver_carries_attributes() {
         let trust = TrustDomain::new("gnomes.local").unwrap();

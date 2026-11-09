@@ -39,6 +39,8 @@
 - [Backends: SQLite, Postgres, MySQL, Valkey](sessions/backends.md)
 - [Cookies, fingerprinting, hijack detection](sessions/security.md)
 - [Schema migration](sessions/migration.md)
+- [Design: absolute times in the sealed blob](sessions/sealed-blob-times.md)
+- [Design: a MAC over refresh-token rows](sessions/refresh-row-mac.md)
 
 # Part VI: Identity and tenancy
 
@@ -69,9 +71,11 @@
 - [Rate limiting](production/rate-limiting.md)
 - [Observability and metrics](production/observability.md)
 - [Security posture](production/security-posture.md)
+- [The strict security profile](production/strict-profile.md)
 - [Behind an mTLS terminator](production/mtls.md)
 - [Operations runbook](production/operations.md)
 - [Migration guide](production/migrating.md)
+  - [0.18.0 to 0.19.0](production/migrating/0.18.0-to-0.19.0.md)
   - [0.17.0 to 0.18.0](production/migrating/0.17.0-to-0.18.0.md)
   - [0.16.0 to 0.17.0](production/migrating/0.16.0-to-0.17.0.md)
   - [0.15.0 to 0.16.0](production/migrating/0.15.0-to-0.16.0.md)
@@ -95,3 +99,9 @@
 - [Contributing](project/contributing.md)
 - [Mutation testing](project/mutation-testing.md)
 - [Publishing runbook](project/publishing.md)
+- [Dependency plan](project/dependencies/README.md)
+  - [RSA verify-only](project/dependencies/rsa-verify-only.md)
+  - [One JOSE verification core](project/dependencies/jose-core.md)
+  - [One RustCrypto major](project/dependencies/rustcrypto-major.md)
+  - [One stored-data format](project/dependencies/stored-format.md)
+  - [Regex validators](project/dependencies/regex-validators.md)

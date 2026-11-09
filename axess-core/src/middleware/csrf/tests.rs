@@ -1203,7 +1203,7 @@ fn same_site_none_without_secure_is_refused_at_construction() {
 /// session and factor-secret keys do.
 #[test]
 fn a_constant_signing_key_is_logged_at_error() {
-    let capture = crate::testing::mock_tracing::TracingCapture::install();
+    let capture = axess_testing::mock_tracing::TracingCapture::install();
     let placeholder = [7u8; 32];
     assert!(crate::session::is_constant_key(&placeholder));
     let config = CsrfConfig::new(placeholder);

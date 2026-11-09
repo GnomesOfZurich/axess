@@ -36,6 +36,32 @@ pub(super) fn registry_key(prefix: &str, user_id: &str) -> String {
     format!("{prefix}:reg:{user_id}")
 }
 
+/// The sorted set beside a user's registry set that holds when each session
+/// was registered, never moved by use. The registry set's score slides
+/// forward as a session is used, so it says when the session was last seen;
+/// this one says which session is the oldest.
+pub(super) fn registered_at_key(prefix: &str, user_id: &str) -> String {
+    format!("{prefix}:reg-at:{user_id}")
+}
+
+/// The live members of a registry set in registration order, oldest first.
+///
+/// `live` pairs each live member with its score in the registry set (the
+/// time it was last seen); `registered` holds, in the same order, the time it
+/// was registered where the registration set has one. A member registered
+/// before the registration set existed has none and is ordered by its score,
+/// the best time known for it. Ties break on the member, so the order is the
+/// same on every node.
+pub(super) fn oldest_first(live: Vec<(String, f64)>, registered: &[Option<f64>]) -> Vec<String> {
+    let mut rows: Vec<(f64, String)> = live
+        .into_iter()
+        .zip(registered.iter().copied().chain(std::iter::repeat(None)))
+        .map(|((member, seen), at)| (at.unwrap_or(seen), member))
+        .collect();
+    rows.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    rows.into_iter().map(|(_, member)| member).collect()
+}
+
 /// Pub/sub channel published when a single session is invalidated.
 pub(super) fn revocation_session_channel(prefix: &str, session_id: &str) -> String {
     format!("{prefix}:revoked-session:{session_id}")

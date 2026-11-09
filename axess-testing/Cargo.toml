@@ -1,0 +1,36 @@
+[package]
+name = "axess-testing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/axess-testing"
+readme = "README.md"
+description = """
+Test fixtures for axess adopters: a tracing capture and an OIDC identity
+provider fixture over wiremock. A dev-dependency only; kept out of production
+dependency graphs on purpose.
+"""
+keywords = ["testing", "oidc", "tracing", "authentication", "axum"]
+categories = ["development-tools::testing", "authentication"]
+exclude = ["tests/", "benches/"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+# The cancellation helpers (`stall`) wait on a Notify and sleep.
+tokio = { workspace = true, features = ["sync", "time", "rt"] }
+base64 = { workspace = true }
+# RUSTSEC-2023-0071 (Marvin Attack on RSA private-key operations) does not
+# apply here: the key is generated for a fixture and signs nothing a network
+# peer can time.
+rsa = { version = "0.9.10", features = ["pkcs5"] }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+wiremock = "0.6.5"

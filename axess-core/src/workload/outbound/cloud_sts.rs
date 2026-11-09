@@ -62,3 +62,33 @@ fn encode_path_segment(raw: &str) -> String {
     }
     out
 }
+
+/// Text from a remote identity provider, made safe for an error message that
+/// is meant for a log line: a control character (a line break, an escape
+/// sequence) and the Unicode line and paragraph separators are written as
+/// escapes, so one response cannot forge a log line or rewrite the terminal,
+/// and the result is cut to at most `max_bytes` bytes with `...` marking the
+/// cut. The caller bounds `text`: the escapes of a response already capped
+/// by the body reader are a few times its length at most.
+#[cfg(feature = "azure-fic")]
+fn log_safe(text: &str, max_bytes: usize) -> String {
+    const CUT: &str = "...";
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    if out.len() <= max_bytes {
+        return out;
+    }
+    let mut end = max_bytes.saturating_sub(CUT.len());
+    while !out.is_char_boundary(end) {
+        end -= 1;
+    }
+    out.truncate(end);
+    out.push_str(CUT);
+    out
+}

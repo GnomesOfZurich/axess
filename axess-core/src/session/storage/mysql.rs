@@ -53,7 +53,7 @@
 use crate::session::storage::session_codec::{
     DEFAULT_MAX_PAYLOAD_BYTES, Decoded, SessionCodec, SqlStoreError, expires_at,
 };
-use crate::session::storage::sql_helpers::log_cleanup_outcome;
+use crate::session::storage::sql_helpers::{log_cleanup_outcome, require_cleanup_interval};
 use crate::session::{
     data::SessionData,
     id::SessionId,
@@ -238,7 +238,12 @@ impl MysqlSessionStore {
     /// Spawn a background task that calls [`cleanup_expired`](Self::cleanup_expired)
     /// on a fixed interval. See the Postgres backend doc for the rationale
     /// (same shape, same lifetime requirements).
+    ///
+    /// # Panics
+    ///
+    /// When `interval` is zero: the value is refused here, at startup, by name.
     pub fn spawn_cleanup_task(&self, interval: Duration) -> tokio::task::JoinHandle<()> {
+        require_cleanup_interval("mysql", interval);
         let store = self.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
@@ -638,7 +643,7 @@ mod mysql_tests {
     use super::*;
     use crate::session::data::SessionData;
     use crate::session::id::SessionId;
-    use crate::testing::mock_tracing::TracingCapture;
+    use axess_testing::mock_tracing::TracingCapture;
     use sqlx::mysql::MySqlPoolOptions;
 
     fn unreachable_pool() -> MySqlPool {

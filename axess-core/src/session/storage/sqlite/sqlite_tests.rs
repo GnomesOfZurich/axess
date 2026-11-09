@@ -41,10 +41,14 @@ fn payload_with_custom() -> SessionData {
 
 /// A zero TTL stores nothing, so `update` must say the session was not
 /// kept; a sub-second TTL is raised to one second and the session stays
-/// loadable.
+/// loadable. The store reads its clock in whole seconds, so the save and
+/// the load must see the same second: a fixed clock, not the wall.
 #[tokio::test]
 async fn zero_ttl_update_reports_false_and_sub_second_ttl_stays_loadable() {
-    let store = store().await;
+    let clock = Arc::new(axess_clock::testing::MockClock::now());
+    let pool = memory_pool().await;
+    let store = SqliteSessionStore::plaintext_insecure(pool).with_clock(clock);
+    store.init_schema().await.expect("init_schema");
     let id = sample_id();
     store
         .save(&id, &payload_with_custom(), Duration::from_secs(60))
@@ -458,4 +462,23 @@ async fn a_session_carrying_assurance_round_trips() {
         .unwrap();
     let back = store.load(&id).await.unwrap().expect("stored");
     assert_eq!(back.auth_state, data.auth_state);
+}
+
+/// A zero cleanup interval is refused by name where the task is spawned,
+/// not by a panic inside the task that nobody sees.
+#[tokio::test]
+#[should_panic(expected = "the cleanup interval must be greater than zero")]
+async fn spawn_cleanup_task_refuses_a_zero_interval_by_name() {
+    let s = store().await;
+    drop(s.spawn_cleanup_task(Duration::ZERO));
+}
+
+/// A non-zero interval spawns a task that keeps running.
+#[tokio::test]
+async fn spawn_cleanup_task_keeps_running_with_a_small_interval() {
+    let s = store().await;
+    let handle = s.spawn_cleanup_task(Duration::from_millis(5));
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert!(!handle.is_finished());
+    handle.abort();
 }

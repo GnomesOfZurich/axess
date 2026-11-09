@@ -77,6 +77,8 @@ pub struct MockIdentityStore {
     /// When set, `get_user` fails: a user-table outage, for tests of what a
     /// flow records when the lookup of a principal cannot be made.
     fail_get_user: Arc<std::sync::atomic::AtomicBool>,
+    /// When set, `account_status` fails: a status-table outage.
+    fail_account_status: Arc<std::sync::atomic::AtomicBool>,
     /// Password history per user: `user_id -> Vec<hash>`.
     password_history: Arc<Mutex<HashMap<String, Vec<String>>>>,
     /// Active password reset tokens: `user_id -> (token_hash, expires_at)`.
@@ -125,6 +127,7 @@ impl MockIdentityStore {
             hang_record_event: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fail_store_reset_token: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fail_get_user: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fail_account_status: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             password_history: Default::default(),
             reset_tokens: Default::default(),
             password_rules: Default::default(),
@@ -212,6 +215,21 @@ impl MockIdentityStore {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Arm the status-table outage: subsequent `account_status` calls fail
+    /// with [`MockStoreError::Unavailable`] until
+    /// [`disarm_account_status_failure`](Self::disarm_account_status_failure).
+    pub fn arm_account_status_failure(&self) {
+        self.fail_account_status
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// End the status-table outage armed by
+    /// [`arm_account_status_failure`](Self::arm_account_status_failure).
+    pub fn disarm_account_status_failure(&self) {
+        self.fail_account_status
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// End the user-table outage armed by
     /// [`arm_get_user_failure`](Self::arm_get_user_failure).
     pub fn disarm_get_user_failure(&self) {
@@ -261,11 +279,12 @@ impl MockIdentityStore {
         self
     }
 
-    /// The tenant of the registered user with this id, if any.
-    pub(crate) fn tenant_of(&self, user_id: &UserId) -> Option<TenantId> {
+    /// The tenant and the identifier (username) of the registered user with
+    /// this id, if any.
+    pub(crate) fn holder_of(&self, user_id: &UserId) -> Option<(TenantId, Arc<str>)> {
         lock(&self.users)
             .get(user_id.to_string().as_str())
-            .map(|user| user.tenant_id)
+            .map(|user| (user.tenant_id, user.identifier.clone()))
     }
 
     /// Register a tenant (indexed by ID and by identifier/slug).
@@ -382,6 +401,12 @@ impl crate::authn::store::IdentityLookup for MockIdentityStore {
 
     async fn account_status(&self, user_id: &UserId) -> Result<EntityState, Self::Error> {
         note(&self.call_log, "account_status");
+        if self
+            .fail_account_status
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(MockStoreError::Unavailable);
+        }
         Ok(lock(&self.users)
             .get(user_id.to_string().as_str())
             .map(|u| u.status.clone())

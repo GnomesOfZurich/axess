@@ -47,6 +47,23 @@ pub trait DeviceStore: Send + Sync + Clone + 'static {
         id: &DeviceId,
     ) -> impl Future<Output = Result<Option<Device>, Self::Error>> + Send;
 
+    /// Load the device by id from the authoritative store, never from a
+    /// cache.
+    ///
+    /// What a decision that a stale row would get wrong reads: the refresh
+    /// device check, where a revocation another instance made must stop the
+    /// next refresh and not the one after the cache expires. The default is
+    /// [`load`](Self::load), right for a store that has no cache of its own;
+    /// [`CachedDeviceStore`](crate::device::CachedDeviceStore) overrides it
+    /// to read through.
+    fn load_fresh(
+        &self,
+        tenant_id: &TenantId,
+        id: &DeviceId,
+    ) -> impl Future<Output = Result<Option<Device>, Self::Error>> + Send {
+        self.load(tenant_id, id)
+    }
+
     /// Look up a device by its keyed fingerprint within a tenant. Used as
     /// the fast-path during request handling when no `device_id` cookie is
     /// present yet. Collisions must be vanishingly rare given a

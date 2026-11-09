@@ -686,3 +686,88 @@ fn real_ip_is_canonicalised_like_every_other_source() {
     let got = ip_from_headers_trusted(&headers, proxy(), &trusted);
     assert_eq!(got, "203.0.113.9".parse::<IpAddr>().unwrap());
 }
+
+// ── Forwarded entries with a port or brackets ───────────────────────────
+
+/// Proxies in the field write the peer's address as `ip:port`, `[v6]:port` or
+/// `[v6]`. Each is the address it carries; none stops the walk and hands the
+/// request to the proxy's own address.
+#[test]
+fn forwarded_entries_with_a_port_or_brackets_are_read_as_their_address() {
+    let client: IpAddr = "203.0.113.9".parse().unwrap();
+    let client_v6: IpAddr = "2001:db8::1".parse().unwrap();
+    for (header, want) in [
+        ("203.0.113.9:4711", client),
+        ("192.0.2.5, 203.0.113.9:4711", client),
+        ("203.0.113.9:4711, 10.0.0.8:1234", client),
+        ("203.0.113.9, 10.0.0.8:1234", client),
+        ("[2001:db8::1]:443", client_v6),
+        ("[2001:db8::1]", client_v6),
+        ("[2001:db8::1]:443, 10.0.0.8", client_v6),
+        ("2001:db8::1", client_v6),
+        ("[::ffff:203.0.113.9]:80", client),
+    ] {
+        let got = ip_from_headers_trusted(&xff(header), proxy(), &trusted_proxy_set());
+        assert_eq!(got, want, "{header}");
+    }
+}
+
+/// What still cannot be read stops the walk at the peer, as a junk entry does.
+#[test]
+fn forwarded_entries_that_are_not_an_address_still_stop_the_walk() {
+    for header in [
+        "203.0.113.9:99999",
+        "203.0.113.9:",
+        "[2001:db8::1",
+        "2001:db8::1]:443",
+        "[203.0.113.9]:80x",
+        "203.0.113.9:80:80",
+        "[2001:db8::1]junk",
+        "",
+    ] {
+        let got = ip_from_headers_trusted(&xff(header), proxy(), &trusted_proxy_set());
+        assert_eq!(got, proxy(), "{header:?}");
+    }
+}
+
+/// A trusted proxy whose chain cannot be read is a deployment fault worth a
+/// line in the log, without the entry in it (the entry is the client's).
+#[test]
+fn an_unreadable_chain_from_a_trusted_peer_is_warned_about_without_the_entry() {
+    use axess_testing::mock_tracing::TracingCapture;
+    let capture = TracingCapture::install();
+
+    let got = ip_from_headers_trusted(
+        &xff("203.0.113.9, level=INFO forged line"),
+        proxy(),
+        &trusted_proxy_set(),
+    );
+
+    assert_eq!(got, proxy());
+    let warnings: Vec<_> = capture
+        .events()
+        .into_iter()
+        .filter(|e| e.level == tracing::Level::WARN)
+        .collect();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].target.contains("client_ip"), "{}", warnings[0]);
+    assert!(!warnings[0].message.contains("forged"), "{}", warnings[0]);
+}
+
+#[test]
+fn a_readable_chain_is_not_warned_about() {
+    use axess_testing::mock_tracing::TracingCapture;
+    let capture = TracingCapture::install();
+
+    ip_from_headers_trusted(&xff("203.0.113.9:4711"), proxy(), &trusted_proxy_set());
+    ip_from_headers_trusted(&xff("10.0.0.7, 10.0.0.8"), proxy(), &trusted_proxy_set());
+
+    assert!(
+        capture
+            .events()
+            .iter()
+            .all(|e| e.level != tracing::Level::WARN),
+        "{:?}",
+        capture.events()
+    );
+}

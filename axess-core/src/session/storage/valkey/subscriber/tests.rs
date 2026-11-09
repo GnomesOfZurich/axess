@@ -99,7 +99,7 @@ async fn a_closed_connection_is_rechecked_after_the_reconnect() {
     let a = shared.register(channels(1));
     let b = shared.register(channels(2));
 
-    shared.dispatch_closed();
+    shared.dispatch_closed(0);
     assert_eq!(a.slot.next().await, Event::Closed);
     assert_eq!(b.slot.next().await, Event::Closed);
     assert!(shared.lock().lost);
@@ -165,4 +165,75 @@ async fn a_wall_clock_step_back_does_not_hold_off_the_reconnect() {
         backoff.ready(),
         "the backoff has elapsed; the wall clock's step back must not hold the attempt off"
     );
+}
+
+/// A connection of the given generation that was never initialised, with
+/// dispatcher and reconnector tasks that never finish: state to hold in a
+/// subscriber without a server.
+fn idle_connection(generation: u64) -> (Connection, tokio::task::AbortHandle) {
+    let client = Client::new(
+        Config::from_url("redis://127.0.0.1:1").expect("a valid url"),
+        None,
+        None,
+        None,
+    );
+    let reconnector = tokio::spawn(std::future::pending::<()>());
+    let probe = reconnector.abort_handle();
+    let connection = Connection {
+        client,
+        dispatcher: tokio::spawn(std::future::pending::<()>()),
+        reconnector,
+        generation,
+    };
+    (connection, probe)
+}
+
+/// The dispatcher of a replaced connection reports its close late: the
+/// newer connection stays, its reconnector keeps running, and no watcher is
+/// told anything.
+#[tokio::test]
+async fn a_stale_dispatchers_close_does_not_drop_the_new_connection() {
+    let shared = SharedSubscriber::new();
+    let watcher = shared.register(channels(1));
+    let (connection, probe) = idle_connection(2);
+    {
+        let mut state = shared.lock();
+        state.generation = 2;
+        state.connection = Some(connection);
+    }
+
+    shared.dispatch_closed(1);
+
+    assert_eq!(
+        shared
+            .current_connection()
+            .map(|(_, generation)| generation),
+        Some(2),
+        "a stale close took the live connection"
+    );
+    assert!(!probe.is_finished(), "the live reconnector was aborted");
+    assert_eq!(wakeups(&watcher), 0);
+    assert!(!shared.lock().lost);
+    assert!(shared.is_replaced(1));
+    assert!(!shared.is_replaced(2));
+}
+
+/// The close of the current connection drops it, tells the watchers and
+/// records the loss.
+#[tokio::test]
+async fn a_current_dispatchers_close_drops_its_connection() {
+    let shared = SharedSubscriber::new();
+    let watcher = shared.register(channels(1));
+    let (connection, _) = idle_connection(2);
+    {
+        let mut state = shared.lock();
+        state.generation = 2;
+        state.connection = Some(connection);
+    }
+
+    shared.dispatch_closed(2);
+
+    assert!(shared.current_connection().is_none());
+    assert_eq!(watcher.slot.next().await, Event::Closed);
+    assert!(shared.lock().lost);
 }

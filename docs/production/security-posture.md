@@ -23,11 +23,11 @@ cargo feature and will not pick one for you. Anything enabling
 ```toml
 [dependencies]
 # Pure Rust, builds anywhere. The default choice.
-axess = { version = "0.18.0", features = ["jwt", "jwt-rust-crypto"] }
+axess = { version = "0.19.0", features = ["jwt", "jwt-rust-crypto"] }
 
 # aws-lc-rs: wraps the FIPS-validated aws-lc, needs a C toolchain
 # (and NASM on Windows), and does not build on every target.
-axess = { version = "0.18.0", features = ["jwt", "jwt-aws-lc"] }
+axess = { version = "0.19.0", features = ["jwt", "jwt-aws-lc"] }
 ```
 
 Naming neither is a compile error. Naming both is allowed,
@@ -130,6 +130,28 @@ For the mechanism behind a specific control: *Session lifecycle and crypto
 envelope* for encryption at rest, *Audit pipeline* for retention, *Refresh
 tokens and session continuity* for refresh-token hygiene, *Multi-tenancy*
 for the lockout policy.
+
+## Test doubles in a release build
+
+The `testing` feature compiles deterministic clocks and random sources,
+mock stores and constructors that skip the constant-key refusal. A release
+build that links them ships them in a production binary, and cargo feature
+unification lets any one dependent switch the feature on for the whole
+build. `axess-core`, `axess-factors`, `axess-rng` and `axess-clock` therefore
+refuse to compile when `testing` is on and debug assertions are off, and the
+error names the feature. A build that means it (a benchmark, a test run in
+release mode) enables `allow-testing-in-release`, which `axess` and
+`axess-core` forward to the crates beneath them.
+
+The release preflight and the Hardening workflow check the same thing from
+the other side: `scripts/supply-chain.sh` reads each published crate's and
+each example's normal dependency tree with `cargo tree -e features,normal`
+and fails when it carries `testing`, `testing-oauth` or `memory`, or when
+wiremock resolves. The `oauth` and `fapi` examples enable `testing` for the
+mock stores and mock provider they demonstrate, and are named in that
+script; they are demonstrations, not release targets. A test in
+`axess/tests/testing_unreachable.rs` compiles a program that names
+`axess::testing` without the feature and expects the compiler to refuse it.
 
 ## Failing closed
 

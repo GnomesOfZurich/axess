@@ -4,18 +4,16 @@
 //!
 //! Every IdP is a wiremock server on localhost.
 //!
-//! Run with: `cargo test -p axess-core --features testing-oauth,jwt-aws-lc --test jwks_refresh_live`
+//! Run with: `cargo test -p axess-core --features testing,oauth,jwt-aws-lc --test jwks_refresh_live`
 
-#![cfg(feature = "testing-oauth")]
+#![cfg(all(feature = "testing", feature = "oauth"))]
 
 mod common;
 
 use axess_core::authn::service::AuthnService;
-use axess_core::testing::{
-    mock_authn::{MockFactorStore, MockIdentityStore},
-    oauth_wiremock::{oauth_generate_rsa_keypair, oauth_mount_oidc_endpoints},
-};
+use axess_core::testing::mock_authn::{MockFactorStore, MockIdentityStore};
 use axess_factors::oauth::{OAuthError, OAuthProviderBuilder, OAuthProviderConfig};
+use axess_testing::oauth_wiremock::{oauth_generate_rsa_keypair, oauth_mount_oidc_endpoints};
 use common::{test_tenant, test_user};
 use std::time::Duration;
 use wiremock::MockServer;

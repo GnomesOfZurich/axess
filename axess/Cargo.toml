@@ -38,10 +38,15 @@ cedar-policy = { version = "4.14.1", optional = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+axess-testing = { workspace = true }
 axum = { workspace = true, features = ["macros"] }
 chrono = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tower = { version = "0.5.3", features = ["util"] }
+# Compiles the program in tests/ui that names `axess::testing` without the
+# feature and checks the compiler refuses it. Dev-only: it never reaches an
+# adopter's build.
+trybuild = "1.0.122"
 
 [features]
 default = ["authz", "device"]
@@ -51,6 +56,11 @@ authz = ["axess-core/authz", "axess-macros/authz", "dep:cedar-policy"]
 device = ["axess-core/device"]
 memory = ["axess-core/memory"]
 testing = ["axess-core/testing", "axess-factors/testing", "axess-identity/testing", "memory"]
+# The named opt-out for the release-build guard: with `testing` on and
+# debug assertions off the crate refuses to compile, because the feature
+# ships test doubles in a production binary. Enable this only for a build
+# that means it (a benchmark, a release-mode test run).
+allow-testing-in-release = ["axess-core/allow-testing-in-release", "axess-factors/allow-testing-in-release"]
 
 # HTTP middleware
 accept-client-id = ["axess-core/accept-client-id"]

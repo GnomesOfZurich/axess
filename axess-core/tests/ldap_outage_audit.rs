@@ -10,12 +10,12 @@ use axess_core::authn::factor::LdapBindFactorConfig;
 use axess_core::authn::factor::{FactorConfig, FactorCredential, FactorKind, ZeroizedString};
 use axess_core::authn::service::AuthnService;
 use axess_core::authn::store::AuthMethod;
-use axess_core::testing::mock_tracing::TracingCapture;
 use axess_core::testing::{
     mock_authn::{MockFactorStore, MockIdentityStore},
     test_session,
 };
 use axess_factors::ldap::{LdapBindResult, LdapError, LdapProvider};
+use axess_testing::mock_tracing::TracingCapture;
 use common::{test_tenant, test_user, uid, user_scope};
 use std::{future::Future, pin::Pin};
 

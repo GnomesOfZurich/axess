@@ -6,17 +6,15 @@
 //! mock instant years in the past, so a verifier that read the wall clock
 //! would refuse all of them.
 //!
-//! Run with: `cargo test -p axess-core --features testing-oauth,jwt-rust-crypto --test oauth_dst`
+//! Run with: `cargo test -p axess-core --features testing,oauth,jwt-rust-crypto --test oauth_dst`
 
-#![cfg(feature = "testing-oauth")]
+#![cfg(all(feature = "testing", feature = "oauth"))]
 
 use axess_clock::testing::MockClock;
-use axess_core::testing::oauth_wiremock::{
-    oauth_discover_provider, oauth_generate_rsa_keypair, oauth_mount_oidc_endpoints,
-    oauth_setup_provider,
-};
+use axess_core::testing::oauth_provider::{oauth_discover_provider, oauth_setup_provider};
 use axess_factors::oauth::{OAuthError, OAuthProvider};
 use axess_rng::{SecureRng, testing::MockRng};
+use axess_testing::oauth_wiremock::{oauth_generate_rsa_keypair, oauth_mount_oidc_endpoints};
 use chrono::TimeZone;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde_json::json;
@@ -50,7 +48,7 @@ async fn logout_jwt_exp_follows_the_injected_clock() {
     let (private_der, jwk, kid) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &jwk).await;
     let clock = mock_clock();
-    let provider = oauth_discover_provider(&server)
+    let provider = oauth_discover_provider(&server.uri())
         .await
         .with_clock(clock.clone())
         .build()
@@ -89,7 +87,7 @@ async fn exchange_with(clock: Option<Arc<MockClock>>) -> Result<(), OAuthError> 
     let issuer = server.uri();
     let (private_der, jwk, kid) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &jwk).await;
-    let mut provider = oauth_discover_provider(&server).await;
+    let mut provider = oauth_discover_provider(&server.uri()).await;
     if let Some(clock) = clock {
         provider = provider.with_clock(clock);
     }
@@ -157,7 +155,7 @@ async fn begin_with_seed(seed: u64) -> (url::Url, String, String) {
     let server = MockServer::start().await;
     let (_, jwk, _) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &jwk).await;
-    let provider = oauth_setup_provider(&server).await;
+    let provider = oauth_setup_provider(&server.uri()).await;
     let authn = AuthnService::builder(MockIdentityStore::new(), MockFactorStore::new())
         .with_oauth_provider(provider)
         .with_rng(MockRng::new(seed))
@@ -209,7 +207,7 @@ async fn dpop_iat_and_jti_come_from_the_service_clock_and_rng() {
     let server = MockServer::start().await;
     let (_, jwk, _) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &jwk).await;
-    let provider = oauth_setup_provider(&server).await;
+    let provider = oauth_setup_provider(&server.uri()).await;
     let clock = mock_clock();
     let authn = AuthnService::builder(MockIdentityStore::new(), MockFactorStore::new())
         .with_oauth_provider(provider)
@@ -294,7 +292,7 @@ async fn refresh_all_jwks_follows_the_provider_clock() {
     let (_, jwk, _) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &jwk).await;
     let clock = mock_clock();
-    let provider = oauth_discover_provider(&server)
+    let provider = oauth_discover_provider(&server.uri())
         .await
         .with_clock(clock.clone())
         .build()
@@ -322,7 +320,7 @@ async fn refresh_all_jwks_reports_the_failing_provider() {
     let server = MockServer::start().await;
     let (_, jwk, _) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &jwk).await;
-    let provider = oauth_setup_provider(&server).await;
+    let provider = oauth_setup_provider(&server.uri()).await;
     let authn = authn_with(provider).await;
 
     server.reset().await;
@@ -362,7 +360,7 @@ async fn cached_jwks_expire_after_the_maximum_age() {
     let (private_der, jwk, kid) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &jwk).await;
     let clock = mock_clock();
-    let provider = oauth_discover_provider(&server)
+    let provider = oauth_discover_provider(&server.uri())
         .await
         .with_clock(clock.clone())
         .build()
@@ -394,7 +392,7 @@ async fn builder_started_refresh_loop_runs_and_stops_with_the_service() {
     let server = MockServer::start().await;
     let (_, jwk, _) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &jwk).await;
-    let provider = oauth_setup_provider(&server).await;
+    let provider = oauth_setup_provider(&server.uri()).await;
     let at_discovery = jwks_requests(&server).await;
 
     let authn = axess_core::authn::service::AuthnService::builder(
@@ -459,7 +457,7 @@ async fn id_token_signed_with_a_rotated_key_verifies_after_the_refresh() {
     let server = MockServer::start().await;
     let (_, old_jwk, _) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &old_jwk).await;
-    let provider = oauth_discover_provider(&server)
+    let provider = oauth_discover_provider(&server.uri())
         .await
         .with_clock(mock_clock())
         .build()
@@ -486,7 +484,7 @@ async fn id_token_signed_with_an_unpublished_key_is_refused_after_one_refresh() 
     let server = MockServer::start().await;
     let (_, jwk, _) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &jwk).await;
-    let provider = oauth_discover_provider(&server)
+    let provider = oauth_discover_provider(&server.uri())
         .await
         .with_clock(mock_clock())
         .build()
@@ -517,7 +515,7 @@ async fn id_token_is_refused_while_the_key_set_is_expired() {
     let (private_der, jwk, kid) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &jwk).await;
     let clock = mock_clock();
-    let provider = oauth_discover_provider(&server)
+    let provider = oauth_discover_provider(&server.uri())
         .await
         .with_clock(clock.clone())
         .build()
@@ -561,7 +559,7 @@ async fn refresh_response_id_token_with_a_rotated_key_verifies() {
     let server = MockServer::start().await;
     let (_, old_jwk, _) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &old_jwk).await;
-    let provider = oauth_discover_provider(&server)
+    let provider = oauth_discover_provider(&server.uri())
         .await
         .with_clock(mock_clock())
         .build()

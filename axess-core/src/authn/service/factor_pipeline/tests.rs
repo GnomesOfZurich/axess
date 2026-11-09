@@ -503,7 +503,7 @@ async fn persist_fail_with_update_logs_warning_when_retries_exhausted() {
     // warning. Kills the `delete !` mutation on `if !applied { warn!() }`
     // at factor_pipeline.rs:269; under the mutation the warning is
     // emitted ONLY on the success path, never on this exhaustion path.
-    use crate::testing::mock_tracing::TracingCapture;
+    use axess_testing::mock_tracing::TracingCapture;
 
     let capture = TracingCapture::install();
 

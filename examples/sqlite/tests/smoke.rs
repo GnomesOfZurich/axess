@@ -440,3 +440,86 @@ async fn the_login_page_offers_no_password_weaker_than_the_rules() {
         "{password:?}: no digit"
     );
 }
+
+/// Send `method path` with the cookies and CSRF token of a signup form, from
+/// one fixed client address, and return the status.
+async fn from_one_address(
+    router: &axum::Router,
+    method: &str,
+    path: &str,
+    csrf: &(String, String),
+) -> StatusCode {
+    let (cookies, token) = csrf;
+    let mut request = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("cookie", cookies.as_str());
+    let body = if method == "POST" {
+        request = request.header("content-type", "application/x-www-form-urlencoded");
+        Body::from(format!("_csrf={token}&code=000000&username=x&password=x"))
+    } else {
+        Body::empty()
+    };
+    let mut request = request.body(body).unwrap();
+    request
+        .extensions_mut()
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+            [203, 0, 113, 9],
+            40_000,
+        ))));
+    router.clone().oneshot(request).await.unwrap().status()
+}
+
+/// Spend the ten submissions one form allows a minute from one address.
+async fn fill(router: &axum::Router, path: &str, csrf: &(String, String)) {
+    for i in 0..10 {
+        let status = from_one_address(router, "POST", path, csrf).await;
+        assert_ne!(status, StatusCode::TOO_MANY_REQUESTS, "{path} request {i}");
+    }
+    let status = from_one_address(router, "POST", path, csrf).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{path} is limited");
+}
+
+/// Each sensitive form has a rate-limit bucket of its own: a client address
+/// that has used up one form's budget is still served by the others.
+#[tokio::test]
+async fn auth_forms_have_independent_rate_limit_buckets() {
+    for (full, others) in [
+        (
+            "/recovery-code",
+            ["/signup", "/reset-password", "/totp"].as_slice(),
+        ),
+        (
+            "/reset-password",
+            ["/recovery-code", "/signup", "/totp"].as_slice(),
+        ),
+        ("/signup", ["/recovery-code", "/totp"].as_slice()),
+    ] {
+        let router = app().await;
+        let csrf = signup_form(&router).await;
+        fill(&router, full, &csrf).await;
+        for other in others {
+            let status = from_one_address(&router, "POST", other, &csrf).await;
+            assert_ne!(
+                status,
+                StatusCode::TOO_MANY_REQUESTS,
+                "{other} shares the bucket of {full}"
+            );
+        }
+        let status = from_one_address(&router, "GET", "/verify-email", &csrf).await;
+        assert_ne!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "/verify-email shares the bucket of {full}"
+        );
+    }
+}
+
+/// Markup in what a visitor typed does not come back as markup in an error
+/// message: every message is escaped where the page is built.
+#[tokio::test]
+async fn an_error_message_never_carries_markup_back() {
+    let router = app().await;
+    let outcome = post_signup_as(&router, "%3Cscript%3Ealert(1)%3C%2Fscript%3E", "short").await;
+    assert!(!outcome.contains("<script>alert"), "{outcome}");
+}

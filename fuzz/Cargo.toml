@@ -1,6 +1,6 @@
 [package]
 name = "axess-fuzz"
-version = "0.18.0"
+version = "0.19.0"
 publish = false
 edition = "2024"
 
@@ -17,7 +17,18 @@ libfuzzer-sys = "0.4.13"
 serde_json = "1.0.154"
 rmp-serde = "1.3.1"
 base64 = { version = "0.23.1", default-features = false, features = ["std"] }
-axess-core = { path = "../axess-core", features = ["memory", "oauth", "jwt-rust-crypto", "sqlite", "valkey"] }
+axess-core = { path = "../axess-core", features = ["memory", "oauth", "jwt-rust-crypto", "sqlite", "valkey", "service-secret"] }
+# The egress module, the logout-token decoder and the PKCE predicate.
+axess-factors = { path = "../axess-factors", features = ["oidc"] }
+# `build_uids`, the template rendering behind the authorization macros.
+axess-macros = { path = "../axess-macros", features = ["authz"] }
+# The Clock trait, for a fixed clock in the service-secret target.
+axess-clock = { path = "../axess-clock" }
+axum = { version = "0.8.9", default-features = false }
+tokio = { version = "1.54.1", features = ["rt"] }
+tower = { version = "0.5.3", features = ["util"] }
+chrono = "0.4.45"
+# libfuzzer-sys re-exports `arbitrary`; no separate dependency.
 
 # Each fuzz target is a separate `[[bin]]` so cargo-fuzz can build them
 # individually. `path = "fuzz_targets/<name>.rs"` matches the layout
@@ -48,6 +59,48 @@ bench = false
 [[bin]]
 name = "pkce_verifier_predicate"
 path = "fuzz_targets/pkce_verifier_predicate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "egress_reserved_embedded_v4"
+path = "fuzz_targets/egress_reserved_embedded_v4.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "service_secret_replay_any_scheme"
+path = "fuzz_targets/service_secret_replay_any_scheme.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "throttle_math_props"
+path = "fuzz_targets/throttle_math_props.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cookie_config_prefix"
+path = "fuzz_targets/cookie_config_prefix.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cedar_uid_injective"
+path = "fuzz_targets/cedar_uid_injective.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "client_ip_forwarded"
+path = "fuzz_targets/client_ip_forwarded.rs"
 test = false
 doc = false
 bench = false

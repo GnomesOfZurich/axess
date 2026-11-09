@@ -66,6 +66,12 @@ where
         if removed.is_none() {
             return Ok(false);
         }
+        // The id is free to register again, to this user or another.
+        self.inner
+            .factors
+            .release_fido2_credential(&user.tenant_id, &user.id, credential_id.as_slice())
+            .await
+            .map_err(AuthnError::Store)?;
 
         self.emit_audit(
             AuthEventBuilder::success(AuthEventType::FactorDisabled)

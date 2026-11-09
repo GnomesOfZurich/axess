@@ -38,7 +38,11 @@
 ///    tenant (`"Ledger:{$tenant}/{id}"`). Never take a tenant qualifier from
 ///    a path segment: the caller chooses the URL. An id may name at most one
 ///    path placeholder, checked at compile time, because two caller-supplied
-///    values joined by a literal can be re-split into other pairs.
+///    values joined by a literal can be re-split into other pairs. For the
+///    same reason two placeholders may not touch (`"Doc:{$tenant}{id}"` does
+///    not compile), and when an id has two or more placeholders a value that
+///    holds a character of the template's literal text (the `/` of
+///    `"Ledger:{$tenant}/{id}"`) is denied as an invalid resource.
 ///
 /// The principal is always `User:<id>` with the id the authenticated session
 /// carries: user ids are issued by the application and held in the session,

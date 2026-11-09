@@ -10,6 +10,7 @@
 //! plumbing outside the `Clock` seam, and a test advancing a `MockClock`
 //! does not wake it.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::error::OAuthError;
@@ -25,30 +26,53 @@ pub const JWKS_REFRESH_CONCURRENCY: usize = 8;
 /// A failure never stops the pass: each provider is attempted, and one that
 /// hangs until its client timeout holds back its own slot only, not the
 /// providers behind it. An empty result means every refresh succeeded (or
-/// was coalesced by the provider's own debounce). Failures are logged at
+/// was coalesced by the provider's own debounce); a refresh that panicked is
+/// a failure, reported under its provider's name. Failures are logged at
 /// `warn`; the order of the returned failures is the order they finished in.
 pub async fn refresh_providers_jwks(
     providers: &[Arc<dyn OAuthProvider>],
 ) -> Vec<(Arc<str>, OAuthError)> {
     let mut failures = Vec::new();
     let mut running = tokio::task::JoinSet::new();
+    // The name of each running task, kept outside it: a task that panics
+    // takes its provider with it, and its name is all that is left to report.
+    let mut names: HashMap<tokio::task::Id, Arc<str>> = HashMap::new();
     let mut pending = providers.iter().cloned();
     loop {
         while running.len() < JWKS_REFRESH_CONCURRENCY
             && let Some(provider) = pending.next()
         {
-            running.spawn(async move {
+            let name = provider.name().clone();
+            let handle = running.spawn(async move {
                 let outcome = provider.refresh_jwks().await;
                 (provider, outcome)
             });
+            names.insert(handle.id(), name);
         }
-        let Some(done) = running.join_next().await else {
+        let Some(done) = running.join_next_with_id().await else {
             break;
         };
-        // A refresh that panicked is its provider's failure alone.
-        let Ok((provider, outcome)) = done else {
-            tracing::warn!("a JWKS refresh task ended abnormally");
-            continue;
+        let (provider, outcome) = match done {
+            Ok((id, finished)) => {
+                names.remove(&id);
+                finished
+            }
+            // A refresh that panicked (or was cancelled) is its provider's
+            // failure: reported, never counted as a success.
+            Err(ended) => {
+                let name = names
+                    .remove(&ended.id())
+                    .unwrap_or_else(|| Arc::from("unknown provider"));
+                tracing::warn!(
+                    provider = %name,
+                    "JWKS refresh task ended abnormally; will retry next tick"
+                );
+                failures.push((
+                    name,
+                    OAuthError::Discovery("the JWKS refresh did not complete".to_string()),
+                ));
+                continue;
+            }
         };
         match outcome {
             Ok(()) => tracing::debug!(provider = %provider.name(), "JWKS refresh ok"),
@@ -138,6 +162,9 @@ pub fn spawn_jwks_refresh(
         }
     })
 }
+
+#[cfg(test)]
+mod tests;
 
 #[cfg(test)]
 mod ticker_tests {

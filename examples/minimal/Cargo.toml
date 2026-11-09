@@ -15,7 +15,12 @@ publish = false
 [dependencies]
 # `memory` for the in-process session store, `testing` for
 # `InMemoryBackend`. Both are what let this run with no database.
-axess = { path = "../../axess", version = "=0.18.0", features = ["memory", "testing"] }
+# Demo built on the in-memory backend of `testing`: it opts out of the release-build guard by name.
+axess = { path = "../../axess", version = "=0.19.0", features = ["memory", "testing", "allow-testing-in-release"] }
 axum = "0.8.9"
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "net"] }
 serde = { version = "1.0.229", features = ["derive"] }
+
+[dev-dependencies]
+# `test_session` gives the login handler's test a session without a router.
+axess-core = { path = "../../axess-core", version = "=0.19.0", features = ["testing"] }

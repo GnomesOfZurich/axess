@@ -16,6 +16,9 @@
 //! - **Cached**: [`load(tenant, id)`](DeviceStore::load): per-request
 //!   hot path. Every authenticated request that needs a device record
 //!   for trust-level evaluation hits this. Cache hit → no storage I/O.
+//! - **Read through**: [`load_fresh(tenant, id)`](DeviceStore::load_fresh),
+//!   which the refresh device check uses: a revocation made on another
+//!   instance stops the next refresh here, not after the TTL.
 //! - **Not cached**:
 //!   - [`find_by_fingerprint`](DeviceStore::find_by_fingerprint):
 //!     cold path during first sighting before a `device_id` cookie
@@ -82,7 +85,9 @@ const DEFAULT_CAPACITY: usize = 10_000;
 /// next load forces a re-fetch. Within a single pod, mutations
 /// invalidate explicitly so this only matters for cross-pod
 /// propagation, for which there is no invalidation bus: another pod
-/// sees the change when its entry expires.
+/// sees the change in a cached [`load`](DeviceStore::load) when its entry
+/// expires. The refresh device check does not wait for that: it reads
+/// through [`load_fresh`](DeviceStore::load_fresh).
 const DEFAULT_TTL_SECS: u64 = 60;
 
 /// Cache key: `(tenant_id, device_id)`. Tenant scoping is mandatory
@@ -204,6 +209,11 @@ where
         self.rebuilt()
     }
 
+    /// The cache time-to-live in force.
+    pub fn ttl(&self) -> Duration {
+        self.ttl
+    }
+
     /// Builder: inject a [`Clock`] for deterministic-simulation testing.
     /// Keeps the capacity and TTL set so far.
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
@@ -267,6 +277,33 @@ where
                 Err(None) => Ok(None),
                 Err(Some(e)) => Err(e),
             }
+        }
+    }
+
+    fn load_fresh(
+        &self,
+        tenant_id: &TenantId,
+        id: &DeviceId,
+    ) -> impl Future<Output = Result<Option<Device>, Self::Error>> + Send {
+        // Read through, for the decisions a stale row gets wrong. Another
+        // instance's revocation invalidates only that instance's cache, so
+        // this read is the one that sees it at once. A row found revoked
+        // is dropped from the cache so this instance's own cached reads
+        // stop serving the old one too.
+        let key = (*tenant_id, *id);
+        let cache = self.cache.clone();
+        let inner = self.inner.clone();
+        let tenant = *tenant_id;
+        let device = *id;
+        async move {
+            let fresh = inner.load(&tenant, &device).await?;
+            if fresh
+                .as_ref()
+                .is_none_or(|d| d.trust_level == DeviceTrustLevel::Revoked)
+            {
+                cache.invalidate(&key);
+            }
+            Ok(fresh)
         }
     }
 

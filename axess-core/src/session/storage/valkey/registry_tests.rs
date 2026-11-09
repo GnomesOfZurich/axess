@@ -336,3 +336,59 @@ async fn valkey_registry_scores_with_the_servers_clock() {
     let skew = (score.unwrap() - server_ms as f64).abs();
     assert!(skew < 1500.0, "score is {skew} ms from the server's clock");
 }
+
+/// The cap evicts the oldest registration. A session used since it was
+/// registered keeps its place in the order: before, its score moved forward
+/// with each use and the newer session sorted ahead of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Valkey (VALKEY_URL)"]
+async fn valkey_active_sessions_stays_oldest_first_after_is_valid_bump() {
+    let prefix = format!("axt_order_{}", UserId::new(&SystemRng));
+    let ttl = Duration::from_secs(10);
+    let t0 = Utc::now();
+    let user = UserId::new(&SystemRng);
+    let (older, newer) = (SessionId::new(&SystemRng), SessionId::new(&SystemRng));
+    let at = |secs: i64| {
+        ValkeySessionRegistry::with_options(
+            Client::new(Config::from_url(&live_url()).unwrap(), None, None, None),
+            prefix.clone(),
+            ttl,
+        )
+        .with_clock(Arc::new(MockClock::at(
+            t0 + chrono::Duration::seconds(secs),
+        )))
+    };
+    let (r0, r1, r7, r8) = (at(0), at(1), at(7), at(8));
+    for r in [&r0, &r1, &r7, &r8] {
+        r.client.init().await.unwrap();
+    }
+    r0.register(&user, &older).await.unwrap();
+    r1.register(&user, &newer).await.unwrap();
+    // Past half the lifetime, so the check moves the score forward.
+    assert!(r7.is_valid(&user, &older).await.unwrap());
+    assert_eq!(
+        r8.active_sessions(&user).await.unwrap(),
+        vec![older, newer],
+        "the cap would evict the newer session instead of the oldest"
+    );
+}
+
+/// A forced logout of one session and of the whole user leaves no
+/// registration time behind to be counted or ordered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Valkey (VALKEY_URL)"]
+async fn valkey_invalidation_removes_the_registration_times() {
+    let prefix = format!("axt_orderdel_{}", UserId::new(&SystemRng));
+    let user = UserId::new(&SystemRng);
+    let (a, b) = (SessionId::new(&SystemRng), SessionId::new(&SystemRng));
+    let registry =
+        ValkeySessionRegistry::with_options(connect().await, prefix, Duration::from_secs(60));
+    registry.register(&user, &a).await.unwrap();
+    registry.register(&user, &b).await.unwrap();
+    registry.invalidate_session(&user, &a).await.unwrap();
+    assert_eq!(registry.active_sessions(&user).await.unwrap(), vec![b]);
+    registry.invalidate_user(&user).await.unwrap();
+    assert!(registry.active_sessions(&user).await.unwrap().is_empty());
+    registry.register(&user, &a).await.unwrap();
+    assert_eq!(registry.active_sessions(&user).await.unwrap(), vec![a]);
+}

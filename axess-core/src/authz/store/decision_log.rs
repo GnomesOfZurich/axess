@@ -1,7 +1,7 @@
 //! The decision event is rendered only when something listens for it.
 
 use super::*;
-use crate::testing::mock_tracing::TracingCapture;
+use axess_testing::mock_tracing::TracingCapture;
 
 const SCHEMA: &str = r#"{
     "TestApp": {

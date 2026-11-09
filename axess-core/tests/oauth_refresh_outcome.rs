@@ -1,14 +1,13 @@
 //! The refresh-token exchange against a wiremock IdP: an ID token is optional
 //! (OIDC Core 12.2) and its nonce, when present, must be the original one.
 //!
-//! Run with: `cargo test -p axess-core --features testing-oauth,jwt-rust-crypto --test oauth_refresh_outcome`
+//! Run with: `cargo test -p axess-core --features testing,oauth,jwt-rust-crypto --test oauth_refresh_outcome`
 
-#![cfg(feature = "testing-oauth")]
+#![cfg(all(feature = "testing", feature = "oauth"))]
 
-use axess_core::testing::oauth_wiremock::{
-    oauth_generate_rsa_keypair, oauth_mount_oidc_endpoints, oauth_setup_provider,
-};
+use axess_core::testing::oauth_provider::oauth_setup_provider;
 use axess_factors::oauth::{OAuthError, OAuthProvider, OAuthProviderConfig};
+use axess_testing::oauth_wiremock::{oauth_generate_rsa_keypair, oauth_mount_oidc_endpoints};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde_json::json;
 use wiremock::{
@@ -27,7 +26,7 @@ async fn idp() -> Idp {
     let server = MockServer::start().await;
     let (der, jwk, kid) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &jwk).await;
-    let provider = oauth_setup_provider(&server).await;
+    let provider = oauth_setup_provider(&server.uri()).await;
     Idp {
         server,
         der,

@@ -12,7 +12,7 @@ use axess_core::session::{
     },
 };
 use axess_core::testing::AuthSessionTestExt;
-use axess_core::testing::mock_tracing::TracingCapture;
+use axess_testing::mock_tracing::TracingCapture;
 use axum::{
     Router,
     body::Body,

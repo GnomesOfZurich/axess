@@ -40,12 +40,15 @@
 //! | Key pattern | Type | Purpose |
 //! |---|---|---|
 //! | `{prefix}:sess:{session_id}` | String (msgpack bytes or encrypted) | Session data |
-//! | `{prefix}:reg:{user_id}` | Sorted set (member = session ID, score = `register` instant in epoch ms) | Session registry |
+//! | `{prefix}:reg:{user_id}` | Sorted set (member = session ID, score = `register` instant, moved forward by use, in epoch ms) | Session registry: liveness |
+//! | `{prefix}:reg-at:{user_id}` | Sorted set (member = session ID, score = `register` instant in epoch ms, never moved) | Session registry: eviction order |
 //!
 //! # Registry data type
 //!
 //! The registry uses a Redis **sorted set** keyed on the `register`-time
-//! epoch milliseconds as the score. The time is the Valkey server's own
+//! epoch milliseconds as the score; the score of the first set moves forward
+//! as a session is used, so a second sorted set holds the registration time
+//! that `active_sessions` orders by. The time is the Valkey server's own
 //! (`TIME`), so app nodes with skewed clocks agree on scores and expiry
 //! cutoffs; a [`Clock`](axess_clock::Clock) injected with `with_clock`
 //! (tests) replaces it. This is load-bearing

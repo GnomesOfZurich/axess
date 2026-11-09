@@ -72,6 +72,12 @@ impl UnknownIssuers {
                 return;
             }
         }
-        seen.insert(issuer.to_string(), (now + self.ttl, generation));
+        seen.insert(
+            issuer.to_string(),
+            (
+                crate::lifetime::expiry_after_signed(now, self.ttl),
+                generation,
+            ),
+        );
     }
 }

@@ -122,7 +122,8 @@ pub(super) fn check_cookie_rules(name: &str, secure: bool, path: &str, same_site
         same_site != SameSite::None || secure,
         "CsrfConfig: `SameSite=None` requires `secure = true` (browsers reject the cookie otherwise)"
     );
-    if name.starts_with("__Host-") {
+    use crate::session::config::has_prefix_ignoring_case;
+    if has_prefix_ignoring_case(name, "__Host-") {
         assert!(
             secure,
             "CsrfConfig: cookie name `{name}` requires `secure = true`"
@@ -131,7 +132,7 @@ pub(super) fn check_cookie_rules(name: &str, secure: bool, path: &str, same_site
             path == "/",
             "CsrfConfig: cookie name `{name}` requires `path = \"/\"`"
         );
-    } else if name.starts_with("__Secure-") {
+    } else if has_prefix_ignoring_case(name, "__Secure-") {
         assert!(
             secure,
             "CsrfConfig: cookie name `{name}` requires `secure = true`"

@@ -13,6 +13,12 @@ use std::sync::{Arc, Mutex};
 
 /// An auth method and whether it is enabled.
 type ScopedMethod = (AuthMethod, bool);
+/// `(tenant, credential id) -> user`: the passkey credential claims a store holds.
+#[cfg(feature = "fido2")]
+type Fido2Claims = Arc<Mutex<HashMap<(String, Vec<u8>), String>>>;
+
+/// A write another request makes to a stored factor row.
+type ConcurrentWrite = Arc<dyn Fn(&FactorConfig) -> FactorConfig + Send + Sync>;
 
 /// In-memory [`FactorStore`] for unit tests.
 ///
@@ -23,6 +29,11 @@ pub struct MockFactorStore {
     call_log: Option<CallLog>,
     /// `scope_key::factor_kind_str` -> FactorConfig
     configs: Arc<Mutex<HashMap<String, FactorConfig>>>,
+    /// `(tenant, credential id) -> user` claims taken by
+    /// `claim_fido2_credential`, decided under one lock so two racing
+    /// registrations cannot both win.
+    #[cfg(feature = "fido2")]
+    fido2_claims: Fido2Claims,
     /// `user_id -> Vec<AuthMethod>` (legacy test fixture keyed by user)
     methods: Arc<Mutex<HashMap<String, Vec<AuthMethod>>>>,
     /// `scope.key()` -> Vec<(method, enabled)>: storage for
@@ -37,6 +48,10 @@ pub struct MockFactorStore {
     /// before the armed losses begin; see
     /// [`arm_cas_failures_after`](Self::arm_cas_failures_after).
     cas_skip_remaining: Arc<std::sync::atomic::AtomicUsize>,
+    /// What a concurrent writer does to the stored row at the moment an armed
+    /// swap loss fires; see
+    /// [`arm_concurrent_write_on_lost_swap`](Self::arm_concurrent_write_on_lost_swap).
+    concurrent_write: Arc<Mutex<Option<ConcurrentWrite>>>,
     /// Number of `resolve_factor` calls that go through normally before the
     /// armed outages begin; see
     /// [`arm_resolve_failures_after`](Self::arm_resolve_failures_after).
@@ -123,6 +138,18 @@ impl MockFactorStore {
             .store(skip, std::sync::atomic::Ordering::SeqCst);
         self.cas_failures_remaining
             .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Make each swap loss armed by
+    /// [`arm_cas_failures`](Self::arm_cas_failures) a real one: when it
+    /// fires, `write` is first applied to the stored row, as another request
+    /// writing between this one's read and its swap would. Without it a
+    /// loss leaves the row as it was.
+    pub fn arm_concurrent_write_on_lost_swap(
+        &self,
+        write: impl Fn(&FactorConfig) -> FactorConfig + Send + Sync + 'static,
+    ) {
+        *lock(&self.concurrent_write) = Some(Arc::new(write));
     }
 
     /// The first `skip` calls to `resolve_factor` behave normally, then the
@@ -222,6 +249,12 @@ impl FactorStore for MockFactorStore {
         if remaining > 0 {
             self.cas_failures_remaining
                 .store(remaining - 1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(write) = lock(&self.concurrent_write).clone() {
+                let key = Self::config_key(scope, &prior.kind());
+                lock(&self.configs)
+                    .entry(key)
+                    .and_modify(|stored| *stored = write(stored));
+            }
             return Ok(false);
         }
 
@@ -287,6 +320,42 @@ impl FactorStore for MockFactorStore {
             }
         }
         Ok(None)
+    }
+
+    #[cfg(feature = "fido2")]
+    async fn claim_fido2_credential(
+        &self,
+        tenant_id: &TenantId,
+        user_id: &UserId,
+        credential_id: &[u8],
+    ) -> Result<bool, Self::Error> {
+        // A passkey stored before claims existed (or seeded directly) holds
+        // its id too.
+        let holder = self
+            .fido2_credential_holder(tenant_id, credential_id)
+            .await?;
+        if holder.is_some_and(|holder| &holder != user_id) {
+            return Ok(false);
+        }
+        let mut claims = lock(&self.fido2_claims);
+        let key = (tenant_id.to_string(), credential_id.to_vec());
+        let user = user_id.to_string();
+        Ok(claims.entry(key).or_insert(user.clone()) == &user)
+    }
+
+    #[cfg(feature = "fido2")]
+    async fn release_fido2_credential(
+        &self,
+        tenant_id: &TenantId,
+        user_id: &UserId,
+        credential_id: &[u8],
+    ) -> Result<(), Self::Error> {
+        let key = (tenant_id.to_string(), credential_id.to_vec());
+        let mut claims = lock(&self.fido2_claims);
+        if claims.get(&key).is_some_and(|u| *u == user_id.to_string()) {
+            claims.remove(&key);
+        }
+        Ok(())
     }
 
     async fn available_methods(

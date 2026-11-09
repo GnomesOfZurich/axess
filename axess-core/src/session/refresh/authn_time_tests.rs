@@ -86,3 +86,35 @@ async fn a_row_without_authn_time_reads_as_its_issue_time() {
         .unwrap();
     assert_eq!(authn_time_of(&session), login_time());
 }
+
+#[tokio::test]
+async fn an_extreme_ttl_never_panics_issuance() {
+    for extreme in axess_testing::durations::extreme_durations() {
+        let Ok(ttl) = Duration::from_std(extreme.value) else {
+            continue;
+        };
+        if ttl.is_zero() {
+            continue;
+        }
+        let config = RefreshTokenConfig {
+            ttl,
+            max_lifetime: None,
+            ..test_config()
+        };
+        let issued = issue_refresh_token(
+            IssueRequest {
+                user_id: &fixture_user(),
+                tenant_id: &fixture_tenant(),
+                device_info: None,
+                family_id: None,
+                device_id: None,
+            },
+            &config,
+            &store_at_login(),
+            &MockRng::new(3),
+            login_time(),
+        )
+        .await;
+        assert!(issued.is_ok(), "ttl of {}: {issued:?}", extreme.name);
+    }
+}

@@ -204,6 +204,11 @@ pub struct AppState {
     pub factor_cipher: Arc<FactorSecretCipher>,
 }
 
+/// Session limits tighter than the library's defaults (24 hours idle, 7 days
+/// in all), as a bank would set them; the README says why.
+const STRICT_IDLE_TTL: Duration = Duration::from_secs(15 * 60);
+const STRICT_MAX_SESSION_AGE: Duration = Duration::from_secs(10 * 60 * 60);
+
 /// Where the example keeps the key its TOTP secrets are sealed under.
 const FACTOR_KEY_FILE: &str = "db/factor-secret.key";
 
@@ -429,7 +434,8 @@ pub async fn build_router(pool: SqlitePool) -> (Router, SqliteSessionStore) {
         signing_key,
         Arc::new(axess::SessionRegistryAdapter(registry.clone())),
     )
-    .with_ttl(Duration::from_secs(86400))
+    .with_ttl(STRICT_IDLE_TTL)
+    .with_max_session_age(Some(STRICT_MAX_SESSION_AGE))
     .with_secure(secure)
     .with_metrics(sinks.clone());
 
@@ -466,8 +472,9 @@ pub async fn build_router(pool: SqlitePool) -> (Router, SqliteSessionStore) {
     };
     let login_limit = limiter(10);
     let forgot_limit = limiter(5);
-    // Signup, second factor, reset completion, mail verification, TOTP setup.
-    let auth_limit = limiter(10);
+    // Every other form gets a `limiter(10)` of its own where it is routed
+    // below. Cloning one limiter onto several routes would share its bucket
+    // (the clones keep one store), and the forms would spend one budget.
 
     let state_backend = backend.clone();
     let factor_cipher = factor_secret_cipher();
@@ -510,19 +517,16 @@ pub async fn build_router(pool: SqlitePool) -> (Router, SqliteSessionStore) {
         )
         .route(
             "/signup",
-            get(auth::signup_page).merge(post(auth::post_signup).layer(auth_limit.clone())),
+            get(auth::signup_page).merge(post(auth::post_signup).layer(limiter(10))),
         )
-        .route(
-            "/verify-email",
-            get(auth::verify_email).layer(auth_limit.clone()),
-        )
+        .route("/verify-email", get(auth::verify_email).layer(limiter(10)))
         .route(
             "/totp",
-            get(auth::totp_page).merge(post(auth::post_totp).layer(auth_limit.clone())),
+            get(auth::totp_page).merge(post(auth::post_totp).layer(limiter(10))),
         )
         .route(
             "/recovery-code",
-            post(auth::post_recovery_code).layer(auth_limit.clone()),
+            post(auth::post_recovery_code).layer(limiter(10)),
         )
         .route(
             "/forgot-password",
@@ -532,7 +536,7 @@ pub async fn build_router(pool: SqlitePool) -> (Router, SqliteSessionStore) {
         .route(
             "/reset-password",
             get(auth::reset_password_page)
-                .merge(post(auth::post_reset_password).layer(auth_limit.clone())),
+                .merge(post(auth::post_reset_password).layer(limiter(10))),
         );
 
     // The rest.
@@ -543,7 +547,7 @@ pub async fn build_router(pool: SqlitePool) -> (Router, SqliteSessionStore) {
         // Every route that needs a signed-in user goes through
         // `protected::router`, which guards them with `require_authn!`. A
         // handler registered here directly runs for guests too.
-        .merge(protected::router(auth_limit))
+        .merge(protected::router(limiter(10)))
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics_endpoint))
         .with_state(state)

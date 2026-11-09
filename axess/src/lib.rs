@@ -259,8 +259,9 @@ pub mod device {
         OwnerClaim, PiiToken, ProvenDevice, REDACTED_PLACEHOLDER, RedactedResolver,
         RevokeDeviceError, SessionUser, StepUpPolicy, StepUpPolicyBuilder, SweepConfig,
         SweepConfigBuilder, SweepConfigError, SweepCounts, TenantPepperResolver, TrustTransition,
-        cascade_revoke_by_refresh_family, cascade_revoke_devices, decide_step_up_for_optional,
-        decide_step_up_for_user, revoke_device,
+        cascade_revoke_by_refresh_family, cascade_revoke_by_refresh_family_and_tokens,
+        cascade_revoke_devices, decide_step_up_for_optional, decide_step_up_for_user,
+        revoke_device,
     };
 }
 

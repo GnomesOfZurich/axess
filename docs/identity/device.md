@@ -434,9 +434,12 @@ in the application.
 
 The `CachedDeviceStore` decorator wraps any `DeviceStore` with an
 LRU+TTL cache. The cache key is `(tenant_id, device_id)`; the
-cache value is the `Device` record. The TTL is short (a few
-seconds) so revocations propagate quickly; the LRU bound
-constrains memory under fan-out scenarios.
+cache value is the `Device` record. The default TTL is 60 seconds and
+`with_ttl` sets it; the LRU bound constrains memory under fan-out
+scenarios. The refresh device check (`Refresh::device_store`) does not
+read the cache: it calls `DeviceStore::load_fresh`, which
+`CachedDeviceStore` answers from the backing store, so a revocation made
+on another instance stops the next refresh whatever the TTL is.
 
 Revoking a device is `revoke_device` (device and refresh tokens), or
 `DeviceStore::set_trust_level(tenant_id, id, DeviceTrustLevel::Revoked,
@@ -445,8 +448,9 @@ through a `CachedDeviceStore` drops the cached row once the write finishes,
 and also when the future running it is dropped after the store has
 committed (a cancelled request), so the instance you wrote through never
 serves the pre-write row. Other instances and other processes learn of the
-change when their cached entry expires, a few seconds later by default: keep
-the TTL short for that reason.
+change in a cached `load` when their entry expires, 60 seconds later by
+default: keep the TTL short for that reason. The refresh device check reads
+through, so it does not wait for that.
 
 `delete` is the harder form, removing the record outright. Prefer
 `Revoked` where the audit trail matters: a deleted device leaves no

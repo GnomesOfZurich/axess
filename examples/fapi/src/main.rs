@@ -73,8 +73,14 @@ use axum::{
 use jsonwebtoken::Algorithm;
 use serde::Deserialize;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+
+/// Session limits tighter than the library's defaults (24 hours idle, 7 days
+/// in all), as a bank would set them; the README says why.
+const STRICT_IDLE_TTL: Duration = Duration::from_secs(15 * 60);
+const STRICT_MAX_SESSION_AGE: Duration = Duration::from_secs(10 * 60 * 60);
 
 type Service = AuthnService<MockIdentityStore, MockFactorStore>;
 
@@ -187,6 +193,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         signing_key,
         Arc::new(SessionRegistryAdapter(registry)),
     )
+    .with_ttl(STRICT_IDLE_TTL)
+    .with_max_session_age(Some(STRICT_MAX_SESSION_AGE))
     .with_secure(secure_cookies());
 
     let allowed_email_domains = if is_live {
@@ -443,22 +451,17 @@ impl ClientKey {
 }
 
 /// Whether the issuer's host is `localhost` or `127.0.0.1`: the only issuers
-/// the published development key may sign for.
+/// the published development key may sign for. The issuer is parsed the way
+/// an HTTP client parses it, so what is judged is the host that would be
+/// connected to, not a guess at where the host ends.
 fn is_local_issuer(issuer: &str) -> bool {
-    let Some((_, rest)) = issuer.split_once("://") else {
+    let Ok(url) = url::Url::parse(issuer) else {
         return false;
     };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    // A `user@` prefix is not the host: `http://localhost@evil.example/`.
-    let host_port = authority.rsplit('@').next().unwrap_or("");
-    let host = host_port.rsplit_once(':').map_or(host_port, |(h, port)| {
-        if port.bytes().all(|b| b.is_ascii_digit()) {
-            h
-        } else {
-            host_port
-        }
-    });
-    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1"
+    matches!(url.scheme(), "http" | "https")
+        && url
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1")
 }
 
 async fn build_live_provider() -> Result<(OAuthProviderConfig, String), Box<dyn std::error::Error>>
@@ -690,6 +693,11 @@ async fn local_user(state: &AppState, claims: &OAuthClaims) -> Result<User, Stri
         .map_err(|e| e.to_string())?
     {
         return Ok(user);
+    }
+    // An address the IdP did not verify is whatever the account holder typed:
+    // it says nothing about the domain, so it cannot create a user.
+    if claims.email_verified != Some(true) {
+        return Err("the identity's e-mail address is not verified".to_string());
     }
     if !domain_allowed(&state.allowed_email_domains, claims.email.as_deref()) {
         return Err("the identity's e-mail domain is not allowed to sign up".to_string());

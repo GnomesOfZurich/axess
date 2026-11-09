@@ -367,7 +367,7 @@ async fn a_token_body_over_the_cap_is_refused() {
 async fn a_token_body_at_the_cap_is_read() {
     let server = MockServer::start().await;
     let body = padded_json(
-        r#"{"access_token":"t","pad":""#,
+        r#"{"access_token":"t","token_type":"Bearer","pad":""#,
         crate::http_body::MAX_TOKEN_BODY_BYTES,
     );
     serve(&server, "/login/oauth/access_token", body).await;
@@ -645,4 +645,140 @@ async fn the_client_builder_cannot_restore_redirects() {
         .unwrap();
     let result = provider.fetch_userinfo("tok").await;
     assert!(result.is_err(), "{result:?}");
+}
+
+// ── redirect_uri and token_type ──────────────────────────────────────────────
+
+/// The code comes back to the redirect URI, so a remote one must be HTTPS:
+/// refused when the provider is built, without echoing it.
+#[tokio::test]
+async fn a_cleartext_redirect_uri_to_a_remote_host_is_refused_at_construction() {
+    let mock = MockServer::start().await;
+    let config = |redirect_uri: &str| {
+        let mut config = cleartext_config(
+            format!("{}/token", mock.uri()),
+            format!("{}/user", mock.uri()),
+        );
+        config.redirect_uri = redirect_uri.into();
+        config
+    };
+
+    let refused = SocialProvider::new(config("http://app.example.com/cb"), github_style_mapper);
+
+    match refused {
+        Err(SocialError::Config(message)) => {
+            assert!(message.contains("redirect_uri"), "{message}");
+            assert!(!message.contains("app.example.com"), "{message}");
+        }
+        other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
+    }
+    for accepted in ["http://127.0.0.1:8080/cb", "https://app.example.com/cb"] {
+        assert!(
+            SocialProvider::new(config(accepted), github_style_mapper).is_ok(),
+            "{accepted}"
+        );
+    }
+}
+
+/// The token is used as a bearer token: one issued under another scheme, or
+/// under none, is refused.
+#[tokio::test]
+async fn a_token_response_that_is_not_bearer_is_refused() {
+    for body in [
+        serde_json::json!({"access_token": "tok", "token_type": "mac"}),
+        serde_json::json!({"access_token": "tok", "token_type": "DPoP"}),
+        serde_json::json!({"access_token": "tok"}),
+        serde_json::json!({"access_token": "tok", "token_type": null}),
+    ] {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/login/oauth/access_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body.clone()))
+            .mount(&mock)
+            .await;
+
+        let err = make_provider(&mock)
+            .exchange_code(STATE, STATE, "c", VERIFIER)
+            .await
+            .expect_err("a token that is not a bearer token is refused");
+
+        assert!(
+            matches!(&err, SocialError::InvalidResponse(m) if m.contains("token_type")),
+            "{body}: {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_bearer_token_response_is_accepted_in_either_case() {
+    for token_type in ["Bearer", "bearer", "BEARER"] {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/login/oauth/access_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"access_token": "tok", "token_type": token_type}),
+            ))
+            .mount(&mock)
+            .await;
+
+        let token = make_provider(&mock)
+            .exchange_code(STATE, STATE, "c", VERIFIER)
+            .await
+            .expect("a bearer token");
+
+        assert_eq!(&*token, "tok", "{token_type}");
+    }
+}
+
+// ── The named opt-in for a provider that omits token_type ───────────────────
+
+async fn exchange_with(
+    body: serde_json::Value,
+    opt_in: bool,
+) -> Result<ZeroizedString, SocialError> {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/login/oauth/access_token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&mock)
+        .await;
+    let provider = make_provider(&mock);
+    let provider = if opt_in {
+        provider.accept_missing_token_type()
+    } else {
+        provider
+    };
+    provider.exchange_code(STATE, STATE, "c", VERIFIER).await
+}
+
+/// With the opt-in a missing `token_type` is read as Bearer; a present one
+/// that is not Bearer is still refused, and without it a missing one is.
+#[tokio::test]
+async fn a_missing_token_type_is_read_as_bearer_only_when_asked() {
+    for body in [
+        serde_json::json!({"access_token": "tok"}),
+        serde_json::json!({"access_token": "tok", "token_type": null}),
+    ] {
+        let token = exchange_with(body.clone(), true)
+            .await
+            .expect("accepted with the opt-in");
+        assert_eq!(&*token, "tok");
+        assert!(
+            matches!(
+                exchange_with(body, false).await,
+                Err(SocialError::InvalidResponse(m)) if m.contains("token_type")
+            ),
+            "refused by default"
+        );
+    }
+    for wrong in ["mac", "DPoP"] {
+        let body = serde_json::json!({"access_token": "tok", "token_type": wrong});
+        assert!(
+            matches!(
+                exchange_with(body, true).await,
+                Err(SocialError::InvalidResponse(m)) if m.contains("token_type")
+            ),
+            "{wrong} is refused even with the opt-in"
+        );
+    }
 }

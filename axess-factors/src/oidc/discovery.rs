@@ -65,11 +65,22 @@ pub struct DiscoveryDocument {
 
 impl DiscoveryDocument {
     /// Fetch and parse the discovery document at
-    /// `{issuer_url}/.well-known/openid-configuration`.
+    /// `{issuer_url}/.well-known/openid-configuration`, under the default
+    /// egress policy, [`EgressPolicy::screened`](crate::egress::EgressPolicy::screened).
     ///
-    /// Enforces HTTPS (loopback exemption for `localhost`, `127.0.0.1`,
-    /// `[::1]`); plain HTTP elsewhere would let an on-path attacker
-    /// rewrite the `jwks_uri` and break signature verification.
+    /// The issuer URL and every URL the document names (`jwks_uri` and the
+    /// endpoint fields) must be HTTPS to a host outside the reserved ranges;
+    /// a refusal is [`OidcError::EgressRefused`]. Build `http_client` with
+    /// [`EgressPolicy::client_builder`](crate::egress::EgressPolicy::client_builder)
+    /// so the addresses a host name resolves to are screened when the
+    /// connection is made. An identity provider on the deployment's own
+    /// network is reached through [`fetch_screened`](Self::fetch_screened) with
+    /// the named opt-out [`EgressPolicy::unscreened`](crate::egress::EgressPolicy::unscreened),
+    /// which keeps the transport rule: HTTPS, or HTTP to loopback.
+    ///
+    /// # Errors
+    ///
+    /// As [`fetch_screened`](Self::fetch_screened).
     pub async fn fetch(
         issuer_url: &str,
         http_client: &openidconnect::reqwest::Client,
@@ -77,7 +88,7 @@ impl DiscoveryDocument {
         Self::fetch_screened(
             issuer_url,
             http_client,
-            crate::egress::EgressPolicy::unscreened(),
+            crate::egress::EgressPolicy::default(),
         )
         .await
     }
@@ -90,8 +101,9 @@ impl DiscoveryDocument {
     ///
     /// # Errors
     ///
-    /// As [`fetch`](Self::fetch), and [`OidcError::EgressRefused`] for a URL the
-    /// policy refuses.
+    /// Plain HTTP to a host that is not loopback ends the fetch with
+    /// [`OidcError::NonHttpsIssuer`], and [`OidcError::EgressRefused`] is a
+    /// URL the policy refuses.
     pub async fn fetch_screened(
         issuer_url: &str,
         http_client: &openidconnect::reqwest::Client,
@@ -200,15 +212,47 @@ pub struct Discovery {
 
 impl Discovery {
     /// Fetch the discovery document at `issuer_url`, then fetch the
-    /// JWKS at the `jwks_uri` it advertises, returning a primed cache.
+    /// JWKS at the `jwks_uri` it advertises, returning a primed cache, under
+    /// the default egress policy,
+    /// [`EgressPolicy::screened`](crate::egress::EgressPolicy::screened).
     ///
     /// The supplied client is reused for the JWKS fetch and cloned into
-    /// the resulting cache for subsequent refreshes.
+    /// the resulting cache for subsequent refreshes. The issuer URL and the
+    /// `jwks_uri` are screened, as in [`DiscoveryDocument::fetch`]; the named
+    /// opt-out is [`fetch_screened`](Self::fetch_screened) with
+    /// [`EgressPolicy::unscreened`](crate::egress::EgressPolicy::unscreened).
+    ///
+    /// # Errors
+    ///
+    /// As [`fetch_screened`](Self::fetch_screened).
     pub async fn fetch(
         issuer_url: &str,
         http_client: &openidconnect::reqwest::Client,
     ) -> Result<Self, OidcError> {
-        let document = DiscoveryDocument::fetch(issuer_url, http_client).await?;
+        Self::fetch_screened(
+            issuer_url,
+            http_client,
+            crate::egress::EgressPolicy::default(),
+        )
+        .await
+    }
+
+    /// As [`fetch`](Self::fetch), with `policy` applied to the issuer URL, to
+    /// every endpoint the document names and to `jwks_uri`, before the key
+    /// set is fetched. Build `http_client` with
+    /// [`EgressPolicy::client_builder`](crate::egress::EgressPolicy::client_builder)
+    /// so the addresses a host name resolves to are screened too.
+    ///
+    /// # Errors
+    ///
+    /// As [`DiscoveryDocument::fetch_screened`], and the key set's own
+    /// fetch errors.
+    pub async fn fetch_screened(
+        issuer_url: &str,
+        http_client: &openidconnect::reqwest::Client,
+        policy: crate::egress::EgressPolicy,
+    ) -> Result<Self, OidcError> {
+        let document = DiscoveryDocument::fetch_screened(issuer_url, http_client, policy).await?;
         let jwks_cache = JwksCache::fetch(document.jwks_uri.clone(), http_client).await?;
         Ok(Self {
             document,

@@ -580,6 +580,50 @@ async fn claims_that_are_not_this_sessions_do_not_complete() {
     }
 }
 
+/// A callback that arrives on another provider's path than the one the login
+/// began with is a mix-up attempt: it is refused before the code is redeemed
+/// anywhere, and nothing is signed in. The login through its own path still
+/// completes.
+#[tokio::test]
+async fn callback_on_another_providers_path_is_refused() {
+    let one = Idp::start("client-a").await;
+    let two = Idp::start("client-b").await;
+    let app = app_with(
+        vec![settings("one", &one), settings("two", &two)],
+        Provisioning::JustInTime,
+    )
+    .await;
+    let mut browser = Browser::new(&app);
+
+    let start = browser.get("/auth/login/one").await;
+    let to_idp = url::Url::parse(&start.location.expect("redirect")).expect("url");
+    let query: HashMap<_, _> = to_idp.query_pairs().into_owned().collect();
+
+    let reply = browser
+        .get(&format!(
+            "/auth/callback/two?code=the-code&state={}",
+            query["state"]
+        ))
+        .await;
+
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+    assert!(
+        one.token_requests().await.is_empty(),
+        "code redeemed at one"
+    );
+    assert!(
+        two.token_requests().await.is_empty(),
+        "code redeemed at two"
+    );
+    assert!(app.identities.is_empty());
+    let profile = browser.get("/profile").await;
+    assert_eq!(profile.location.as_deref(), Some("/"));
+
+    // The same browser can still finish the login on the right path.
+    let control = browser.sign_in(&one, "one", &ALICE).await;
+    assert_eq!(control.location.as_deref(), Some("/profile?welcome=1"));
+}
+
 /// A provider that did not verify the address cannot create a user under a
 /// policy that asks for one.
 #[tokio::test]
@@ -696,6 +740,62 @@ async fn refresh_presents_the_stored_token_and_keeps_the_rotated_one() {
     assert_eq!(bodies.len(), 2);
     assert!(bodies[0].contains("refresh_token=refresh-1"));
     assert!(bodies[1].contains("refresh_token=refresh-2"));
+}
+
+/// Two refreshes that arrive together present the stored token once: the IdP
+/// here rejects any refresh token it has already rotated, as one that detects
+/// reuse does, and the later refresh presents the rotated token.
+#[tokio::test]
+async fn concurrent_refreshes_present_the_stored_token_once() {
+    let idp = Idp::start("client-a").await;
+    let app = app_with(vec![settings("idp", &idp)], Provisioning::JustInTime).await;
+    let mut first = Browser::new(&app);
+    first.sign_in_with(&idp, "idp", &ALICE, Some("r1")).await;
+    let mut second = Browser {
+        router: app.router.clone(),
+        cookies: first.cookies.clone(),
+    };
+
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_string_contains("grant_type=refresh_token"))
+        .and(body_string_contains("refresh_token=r1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(200))
+                .set_body_json(json!({
+                    "access_token": "access-2", "token_type": idp.token_type,
+                    "expires_in": 3600, "refresh_token": "r2",
+                })),
+        )
+        .up_to_n_times(1)
+        .mount(&idp.server)
+        .await;
+    idp.queue_refresh("r2", "r3", None).await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_string_contains("grant_type=refresh_token"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({ "error": "invalid_grant" })))
+        .mount(&idp.server)
+        .await;
+
+    let (a, b) = tokio::join!(first.post("/auth/refresh"), second.post("/auth/refresh"));
+
+    for reply in [&a, &b] {
+        assert_ne!(reply.status, StatusCode::BAD_GATEWAY, "{}", reply.body);
+    }
+    let presented: Vec<String> = idp
+        .token_requests()
+        .await
+        .into_iter()
+        .map(|(_, body)| body)
+        .filter(|body| body.contains("grant_type=refresh_token"))
+        .collect();
+    assert_eq!(presented.len(), 1, "{presented:?}");
+    assert!(presented[0].contains("refresh_token=r1"));
+
+    let later = first.post("/auth/refresh").await;
+    assert_eq!(later.status, StatusCode::OK, "{}", later.body);
 }
 
 /// An IdP that advertises DPoP binds the tokens to a key the login made; the

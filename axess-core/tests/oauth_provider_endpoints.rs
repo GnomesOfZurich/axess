@@ -2,12 +2,12 @@
 //! discovery advertises, the ones configuration supplies, the post-logout
 //! redirect allowlist.
 //!
-//! Run with: `cargo test -p axess-core --features testing-oauth --test oauth_provider_endpoints`
+//! Run with: `cargo test -p axess-core --features testing,oauth --test oauth_provider_endpoints`
 
-#![cfg(feature = "testing-oauth")]
+#![cfg(all(feature = "testing", feature = "oauth"))]
 
-use axess_core::testing::oauth_wiremock::{oauth_discovery_document, oauth_generate_rsa_keypair};
 use axess_factors::oauth::{OAuthError, OAuthProvider, OAuthProviderBuilder, OAuthProviderConfig};
+use axess_testing::oauth_wiremock::{oauth_discovery_document, oauth_generate_rsa_keypair};
 use serde_json::json;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,

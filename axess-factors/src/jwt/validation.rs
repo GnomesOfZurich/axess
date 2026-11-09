@@ -233,6 +233,34 @@ pub fn verify_jwt(
     allowed_algorithms: &[Algorithm],
     clock: &dyn Clock,
 ) -> Result<serde_json::Value, JwtError> {
+    verify_jwt_with_typ(token, jwks, config, allowed_algorithms, clock, None)
+}
+
+/// As [`verify_jwt`], and when `expected_typ` is `Some`, the token's JOSE
+/// `typ` header must be that media type.
+///
+/// The comparison ignores case and a leading `application/` on both sides
+/// (RFC 7515 section 4.1.9), so `at+jwt`, `AT+JWT` and `application/at+jwt`
+/// are one type. A token with no `typ`, or with another one, is refused with
+/// [`JwtError::VerificationFailed`] before its signature is looked at. With
+/// `None` the header type is not read, which is what [`verify_jwt`] does.
+///
+/// A key that signs more than one kind of token (ID tokens, access tokens,
+/// logout tokens, DPoP proofs) makes the type the only thing that tells one
+/// kind from another (RFC 8725 section 3.11). The values a deployment
+/// requires: `at+jwt` for an access token (RFC 9068), `logout+jwt` for a
+/// logout token, `dpop+jwt` for a DPoP proof (RFC 9449),
+/// `oauth-authz-req+jwt` for a signed authorization request (RFC 9101, which
+/// FAPI 2.0 message signing requires) and `token-introspection+jwt` for a
+/// signed introspection response (RFC 9701).
+pub fn verify_jwt_with_typ(
+    token: &str,
+    jwks: &JwkSet,
+    config: &ValidationConfig,
+    allowed_algorithms: &[Algorithm],
+    clock: &dyn Clock,
+    expected_typ: Option<&str>,
+) -> Result<serde_json::Value, JwtError> {
     // 0. A provider, before anything asks jsonwebtoken to verify: with both
     // backends compiled in it has no default and panics. See
     // `crate::jwt::ensure_crypto_provider`.
@@ -268,6 +296,14 @@ pub fn verify_jwt(
 
     // 1. Decode header (no signature check).
     let header = decode_header(token).map_err(|e| JwtError::InvalidHeader(format!("{e}")))?;
+
+    if let Some(expected) = expected_typ
+        && !typ_matches(header.typ.as_deref(), expected)
+    {
+        return Err(JwtError::VerificationFailed(format!(
+            "the JOSE `typ` header is not `{expected}`"
+        )));
+    }
 
     // 2. Check algorithm against allowlist. A symmetric algorithm is refused
     // whatever the allowlist says: a JWKS is public, so an HMAC key in it
@@ -362,6 +398,21 @@ pub fn verify_jwt(
     check_time_claims(&token_data.claims, config, clock)?;
 
     Ok(token_data.claims)
+}
+
+/// A media type as RFC 7515 section 4.1.9 compares it: without case, and
+/// without a leading `application/`.
+fn normalized_typ(typ: &str) -> String {
+    let lower = typ.to_ascii_lowercase();
+    lower
+        .strip_prefix("application/")
+        .map(str::to_owned)
+        .unwrap_or(lower)
+}
+
+/// Whether a header's `typ` (absent: `None`) is the type required.
+fn typ_matches(presented: Option<&str>, expected: &str) -> bool {
+    presented.is_some_and(|typ| normalized_typ(typ) == normalized_typ(expected))
 }
 
 /// Manual `exp` / `nbf` validation against the injected clock.

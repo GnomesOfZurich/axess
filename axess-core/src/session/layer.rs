@@ -721,7 +721,7 @@ mod weak_signing_key_tests {
 mod with_secure_warning_tests {
     use super::*;
     use crate::session::store::MemorySessionStore;
-    use crate::testing::mock_tracing::TracingCapture;
+    use axess_testing::mock_tracing::TracingCapture;
 
     #[test]
     fn with_secure_false_emits_warning() {
@@ -766,7 +766,7 @@ mod with_secure_warning_tests {
 mod with_path_warning_tests {
     use super::*;
     use crate::session::store::MemorySessionStore;
-    use crate::testing::mock_tracing::TracingCapture;
+    use axess_testing::mock_tracing::TracingCapture;
 
     fn warnings(capture: &TracingCapture) -> usize {
         capture

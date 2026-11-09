@@ -9,7 +9,7 @@
 //!
 //! ```toml
 //! [dev-dependencies]
-//! axess = { version = "0.18.0", features = ["testing"] }
+//! axess = { version = "0.19.0", features = ["testing"] }
 //! ```
 //!
 //! Individual mocks inside this module may carry *additional* gates tied
@@ -34,7 +34,9 @@
 //! - `mock_clock`: re-export of [`axess_clock::testing::MockClock`].
 //! - `mock_random`: re-export of [`axess_rng::testing::MockRng`].
 //! - `mock_refresh_store`: `MemoryRefreshTokenStore` + error type.
-//! - `mock_tracing`: `tracing-subscriber` helper for capturing spans in tests.
+//! - `valkey_fake` (tests of this crate only): an in-memory Valkey keyspace
+//!   that logs each command and runs a hook between two of them, so a race
+//!   between pods is a deterministic test.
 //! - `mock_policy` (feature `authz`): Cedar policy fixtures.
 //! - `MockResolver` (re-exported from [`axess_identity::testing`]): `PrincipalResolver` stub.
 //!
@@ -45,12 +47,17 @@
 //!   production [`LocalIdp`](crate::local_idp::LocalIdp); the primitives
 //!   live in [`crate::local_idp::primitives`] (out of this `testing`
 //!   tree) so production code does not have to import from here.
-//! - `oauth_wiremock` (feature `testing-oauth`): OIDC IdP-against-wiremock
-//!   fixture. Mounts a discovery document, JWKS endpoint, and gives the
-//!   caller an [`OAuthProviderConfig`](axess_factors::oauth::OAuthProviderConfig)
-//!   wired to the in-process server. Adopters use this to exercise the
-//!   `begin_oauth_login` / `finish_oauth_login` / `complete_oauth_login`
-//!   ceremony without provisioning a real IdP.
+//! - `oauth_provider` (features `testing` and `oauth`): an
+//!   [`OAuthProviderConfig`](axess_factors::oauth::OAuthProviderConfig)
+//!   discovered from an identity provider at a given address. Pair it with
+//!   `axess_testing::oauth_wiremock`, which stands the provider up, to
+//!   exercise the `begin_oauth_login` / `finish_oauth_login` /
+//!   `complete_oauth_login` ceremony without provisioning a real IdP.
+//!   The tracing capture and the wiremock fixture live in the
+//!   `axess-testing` crate, a dev-dependency, so that no production
+//!   dependency graph can reach `wiremock`. The edge-value tables
+//!   (`durations`, `ipv6_forms`) and the cancellation helpers (`stall`) live
+//!   there too.
 //!
 //! ### Other helpers
 //!
@@ -64,12 +71,14 @@ pub mod mock_clock;
 pub mod mock_random;
 pub mod mock_refresh_store;
 
-pub mod mock_tracing;
 pub mod recording_metrics;
 pub mod store_contract;
 
 #[cfg(all(test, any(feature = "postgres", feature = "mysql")))]
 pub(crate) mod sql_live;
+
+#[cfg(all(test, feature = "valkey-cache"))]
+pub(crate) mod valkey_fake;
 
 // Authz mocks are not restricted to #[cfg(test)] so that downstream crates
 // can use them in their own test suites.
@@ -81,11 +90,10 @@ pub mod mock_policy;
 #[cfg(feature = "local-idp")]
 pub mod local_idp;
 
-/// OIDC IdP-against-wiremock fixture for adopter test suites that drive the
-/// OAuth/OIDC ceremony end-to-end. Gated on the `testing-oauth` feature
-/// (pulls in `wiremock` + `rsa`).
-#[cfg(feature = "testing-oauth")]
-pub mod oauth_wiremock;
+/// A provider discovered from an identity provider at a given address, for
+/// adopter test suites that drive the OAuth/OIDC ceremony end-to-end.
+#[cfg(feature = "oauth")]
+pub mod oauth_provider;
 
 /// A 32-byte key for tests that is not a single repeated byte, so the
 /// constructors that refuse a placeholder accept it. Distinct seeds give

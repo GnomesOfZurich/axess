@@ -9,8 +9,9 @@
 //! `#[ignore]` test below.
 
 use super::internal::{
-    CYCLE_SCRIPT, DEFAULT_MAX_PAYLOAD_BYTES, ValkeyStoreError, log_session_id, registry_key,
-    revocation_session_channel, revocation_user_channel, script_unavailable, session_key,
+    CYCLE_SCRIPT, DEFAULT_MAX_PAYLOAD_BYTES, ValkeyStoreError, log_session_id, oldest_first,
+    registry_key, revocation_session_channel, revocation_user_channel, script_unavailable,
+    session_key,
 };
 use super::registry::ValkeySessionRegistry;
 use super::store::ValkeySessionStore;
@@ -923,4 +924,30 @@ async fn a_session_carrying_assurance_round_trips() {
     let back = store.load(&id).await.unwrap().expect("stored");
     assert_eq!(back.auth_state, data.auth_state);
     store.delete(&id).await.unwrap();
+}
+
+/// The eviction order is the order of registration: a session used since
+/// (its score moved forward) still sorts by when it was registered.
+#[test]
+fn oldest_first_orders_by_registration_not_by_last_use() {
+    // A was registered at 0 and used at 7; B was registered at 1 and not used.
+    let live = vec![("B".to_string(), 1.0), ("A".to_string(), 7.0)];
+    let registered = [Some(1.0), Some(0.0)];
+    assert_eq!(oldest_first(live, &registered), vec!["A", "B"]);
+}
+
+/// A member registered before the registration set existed is ordered by
+/// its score, and ties break on the member.
+#[test]
+fn oldest_first_falls_back_to_the_score_and_breaks_ties_on_the_member() {
+    let live = vec![
+        ("c".to_string(), 5.0),
+        ("b".to_string(), 5.0),
+        ("a".to_string(), 9.0),
+    ];
+    assert_eq!(
+        oldest_first(live, &[None, None, Some(1.0)]),
+        vec!["a", "b", "c"]
+    );
+    assert!(oldest_first(Vec::new(), &[]).is_empty());
 }

@@ -166,14 +166,18 @@ where
     revoked
 }
 
-/// Revoke every device bound to a given refresh-token family.
+/// Revoke every device bound to a given refresh-token family, and only the
+/// devices.
 ///
 /// Composes [`DeviceStore::find_by_refresh_family`] +
-/// [`cascade_revoke_devices`]: the canonical wiring for refresh-token-
-/// family compromise. Designed to be called from a
-/// [`RefreshTokenStore`]
-/// override of `on_token_compromise` (or equivalent application hook)
-/// once a rotated-out refresh token is detected being reused.
+/// [`cascade_revoke_devices`]. It marks each device
+/// [`Revoked`](DeviceTrustLevel::Revoked) and nothing else: a refresh token
+/// of another family bound to the same device keeps refreshing unless the
+/// refresh is checked against the device
+/// ([`Refresh::device_store`](crate::session::refresh::Refresh::device_store)).
+/// What to wire into [`RefreshTokenStore::on_token_compromise`] is
+/// [`cascade_revoke_by_refresh_family_and_tokens`], which also revokes the
+/// tokens.
 ///
 /// Returns `Ok(count)` where `count` is the number of devices the
 /// underlying [`DeviceStore`] reported as successfully revoked. Errors
@@ -196,6 +200,41 @@ pub async fn cascade_revoke_by_refresh_family<D: DeviceStore>(
         .await?;
     let targets: Vec<(TenantId, DeviceId)> = devices.iter().map(|d| (d.tenant_id, d.id)).collect();
     Ok(cascade_revoke_devices(device_store, &targets, now).await)
+}
+
+/// Revoke every device bound to a given refresh-token family, and every
+/// refresh token bound to those devices.
+///
+/// Composes [`DeviceStore::find_by_refresh_family`] +
+/// [`cascade_revoke_devices_and_tokens`]: the canonical wiring for
+/// refresh-token-family compromise, called from an override of
+/// [`RefreshTokenStore::on_token_compromise`] once a rotated-out refresh
+/// token is detected being reused. A token of another family issued to the
+/// same device is revoked with it, so the thief holding a second family on
+/// the device does not keep access.
+///
+/// Returns `Ok(count)`, the number of devices whose row and tokens were both
+/// revoked. A lookup error is propagated; a failure on one device is logged
+/// and counted as a miss. A refresh store that cannot revoke by device
+/// ([`DeviceTokenRevocation::Unsupported`]) fails every device; use
+/// [`cascade_revoke_by_refresh_family`] there. See that function for why
+/// `family_id` is a `&str`.
+pub async fn cascade_revoke_by_refresh_family_and_tokens<D, R>(
+    device_store: &D,
+    refresh_store: &R,
+    tenant_id: &TenantId,
+    family_id: &str,
+    now: DateTime<Utc>,
+) -> Result<u64, D::Error>
+where
+    D: DeviceStore,
+    R: RefreshTokenStore,
+{
+    let devices = device_store
+        .find_by_refresh_family(tenant_id, family_id)
+        .await?;
+    let targets: Vec<(TenantId, DeviceId)> = devices.iter().map(|d| (d.tenant_id, d.id)).collect();
+    Ok(cascade_revoke_devices_and_tokens(device_store, refresh_store, &targets, now).await)
 }
 
 #[cfg(test)]

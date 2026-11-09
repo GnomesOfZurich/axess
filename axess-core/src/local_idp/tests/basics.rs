@@ -588,3 +588,39 @@ async fn an_expired_claim_set_is_an_invalid_lifetime() {
         ))
     ));
 }
+
+/// Removing the cap removes the cap, not the check that a token can be
+/// valid: an expired token, or one whose `nbf` is after its `exp`, is never
+/// minted.
+#[tokio::test]
+async fn an_uncapped_idp_still_refuses_invalid_lifetimes() {
+    let idp = es256_idp().await.without_max_ttl();
+    let now = Utc::now();
+
+    let expired = MintClaims::new("w", now - Duration::hours(1)).with_audience("api");
+    let never_valid = MintClaims::new("w", now + Duration::hours(1))
+        .with_not_before(now + Duration::hours(2))
+        .with_audience("api");
+
+    for (claims, want) in [
+        (&expired, crate::local_idp::LifetimeFault::AlreadyExpired),
+        (
+            &never_valid,
+            crate::local_idp::LifetimeFault::NotBeforeAfterExpiry,
+        ),
+    ] {
+        assert!(
+            matches!(idp.mint(claims).await, Err(IssuanceError::InvalidLifetime(f)) if f == want),
+            "mint: {want}"
+        );
+        assert!(
+            matches!(
+                idp.mint_with_header(claims, Header::default()).await,
+                Err(IssuanceError::InvalidLifetime(f)) if f == want
+            ),
+            "mint_with_header: {want}"
+        );
+    }
+    let long = MintClaims::new("w", now + Duration::days(30)).with_audience("api");
+    assert!(idp.mint(&long).await.is_ok(), "a long lifetime still mints");
+}

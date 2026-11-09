@@ -11,23 +11,23 @@
 //! ```text
 //! podman compose -f examples/fapi/keycloak/compose.yml up -d
 //! KEYCLOAK_URL=http://127.0.0.1:8080 cargo test -p axess-core \
-//!     --features testing-oauth,jwt-aws-lc --test oauth_keycloak_live -- --ignored
+//!     --features testing,oauth,jwt-aws-lc --test oauth_keycloak_live -- --ignored
 //! ```
 //!
 //! `KEYCLOAK_URL` must be the host the issuer is served under: the realm's
 //! `issuer` is derived from it.
 
-#![cfg(feature = "testing-oauth")]
+#![cfg(all(feature = "testing", feature = "oauth"))]
 
 use axess_core::authn::AuditContext;
 use axess_core::authn::service::AuthnService;
 use axess_core::testing::{
     mock_authn::{MockFactorStore, MockIdentityStore},
-    oauth_wiremock::oauth_generate_rsa_keypair,
     test_session,
 };
 use axess_factors::client_assertion::ClientAssertionSigner;
 use axess_factors::oauth::{OAuthError, OAuthLoginOptions, OAuthProviderConfig};
+use axess_testing::oauth_wiremock::oauth_generate_rsa_keypair;
 use jsonwebtoken::{Algorithm, EncodingKey};
 use serde_json::{Value, json};
 

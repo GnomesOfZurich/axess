@@ -79,9 +79,9 @@ zeroize = { workspace = true }
 # Foundation crates' `testing` features are gated; enabling here makes
 # `axess_rng::testing::MockRng` / `axess_identity::testing::*` visible
 # during `cargo test` without forcing production consumers to compile them.
-axess-clock = { workspace = true, features = ["testing"] }
+axess-clock = { workspace = true, features = ["testing", "allow-testing-in-release"] }
 axess-identity = { workspace = true, features = ["testing"] }
-axess-rng = { workspace = true, features = ["testing"] }
+axess-rng = { workspace = true, features = ["testing", "allow-testing-in-release"] }
 # rcgen mints SPIFFE-shape X509-SVID certs for mTLS resolver tests.
 rcgen = "0.14.10"
 rsa = { version = "0.9.10", features = ["pkcs5"] }
@@ -99,6 +99,11 @@ default = ["password", "totp", "hotp", "email_otp", "recovery_code"]
 # Test doubles for the production surfaces (`oauth::MockOAuthProvider`).
 # Off by default so a production build does not compile or export them.
 testing = []
+# The named opt-out for the release-build guard: with `testing` on and
+# debug assertions off the crate refuses to compile, because the feature
+# ships test doubles in a production binary. Enable this only for a build
+# that means it (a benchmark, a release-mode test run).
+allow-testing-in-release = []
 
 # Symmetric credential factors
 email_otp = ["dep:chrono"]

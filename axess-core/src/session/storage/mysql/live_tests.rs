@@ -507,3 +507,12 @@ async fn a_session_carrying_assurance_round_trips() {
     assert_eq!(back.auth_state, data.auth_state);
     assert_eq!(back.auth_state.assurance(), data.auth_state.assurance());
 }
+
+/// A zero cleanup interval is refused by name where the task is spawned.
+#[tokio::test]
+#[ignore = "requires a running MySQL (MYSQL_URL)"]
+#[should_panic(expected = "the cleanup interval must be greater than zero")]
+async fn spawn_cleanup_task_refuses_a_zero_interval_by_name() {
+    let s = store().await;
+    drop(s.spawn_cleanup_task(Duration::ZERO));
+}

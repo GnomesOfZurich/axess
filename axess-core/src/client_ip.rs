@@ -443,6 +443,35 @@ enum ChainOutcome {
     NoAnswer,
 }
 
+/// The address in one `X-Forwarded-For` entry. Proxies write the peer as a
+/// bare address, `ip:port`, `[v6]:port` or `[v6]`; the port is dropped. An
+/// entry that is none of these has no address: it is not guessed at.
+fn forwarded_entry_address(entry: &str) -> Option<IpAddr> {
+    let entry = entry.trim();
+    if let Ok(addr) = entry.parse::<IpAddr>() {
+        return Some(addr);
+    }
+    if let Ok(socket) = entry.parse::<SocketAddr>() {
+        return Some(socket.ip());
+    }
+    entry
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .and_then(|inner| inner.parse::<std::net::Ipv6Addr>().ok())
+        .map(IpAddr::V6)
+}
+
+/// A trusted peer sent a forwarded chain that cannot be read, so the request
+/// is attributed to the peer itself. The entry is the client's and stays out
+/// of the line.
+fn warn_unreadable_chain() {
+    tracing::warn!(
+        target: "axess::client_ip",
+        "a trusted proxy sent an X-Forwarded-For chain that cannot be read; the request is \
+         attributed to the proxy"
+    );
+}
+
 /// The client according to the forwarded headers: the rightmost entry
 /// that no trusted hop vouches for.
 ///
@@ -464,19 +493,19 @@ fn client_from_chain(headers: &axum::http::HeaderMap, trusted: &TrustedProxies) 
             // A line that is not valid UTF-8 cannot be reasoned about, and
             // skipping it would silently shorten the chain.
             let Ok(text) = value.to_str() else {
+                warn_unreadable_chain();
                 return ChainOutcome::NoAnswer;
             };
             entries.extend(text.split(','));
         }
         for entry in entries.iter().rev() {
-            match entry
-                .trim()
-                .parse::<std::net::IpAddr>()
-                .map(|addr| addr.to_canonical())
-            {
-                Ok(addr) if trusted.trusts_hop(addr) => continue,
-                Ok(addr) => return ChainOutcome::Client(addr),
-                Err(_) => return ChainOutcome::NoAnswer,
+            match forwarded_entry_address(entry).map(|addr| addr.to_canonical()) {
+                Some(addr) if trusted.trusts_hop(addr) => continue,
+                Some(addr) => return ChainOutcome::Client(addr),
+                None => {
+                    warn_unreadable_chain();
+                    return ChainOutcome::NoAnswer;
+                }
             }
         }
         return ChainOutcome::NoAnswer;

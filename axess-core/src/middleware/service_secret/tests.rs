@@ -720,7 +720,7 @@ fn the_warn_throttle_survives_a_clock_step_back() {
 /// steps back, and the next replay still produces a warn-level line.
 #[tokio::test]
 async fn a_replay_after_a_clock_step_back_is_still_warned_about() {
-    use crate::testing::mock_tracing::TracingCapture;
+    use axess_testing::mock_tracing::TracingCapture;
     let capture = TracingCapture::install();
     let clock = MockClock::at(chrono::DateTime::from_timestamp(1000, 0).expect("in range"));
     let (v, secrets) = verifier(&clock, addressed());
@@ -895,4 +895,110 @@ async fn the_default_body_limit_is_256_kib() {
         status("x".repeat(256 * 1024 + 1), EPOCH + 1).await,
         StatusCode::PAYLOAD_TOO_LARGE
     );
+}
+
+// ── A request is accepted once, whichever scheme carried it ───────────────
+
+fn hex_tag(tag: [u8; 32]) -> String {
+    tag.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A request to `/hook` carrying `header` as its signature.
+fn with_header(header: &str, body: &str) -> Request<Body> {
+    Request::builder()
+        .method(Method::POST)
+        .uri("/hook")
+        .header(SIGNATURE_HEADER, header)
+        .body(Body::from(body.to_owned()))
+        .expect("request")
+}
+
+/// `t=<at>,v1=<tag>` for the request the caller signs.
+fn v1_header(at: i64, body: &str) -> String {
+    let key = secret("caller", RELAY).signing_key;
+    let tag = signature::sign_bytes(&key, at, &Method::POST, "/hook", body.as_bytes());
+    format!("t={at},v1={}", hex_tag(tag))
+}
+
+/// `t=<at>,v2=<tag>` for the request the caller signs.
+fn v2_header(at: i64, body: &str) -> String {
+    let key = secret("caller", RELAY).signing_key;
+    let tag = signature::sign_bytes_v2(&key, at, &Method::POST, "/hook", AUDIENCE, body.as_bytes());
+    format!("t={at},v2={}", hex_tag(tag))
+}
+
+fn both_windows() -> SignedRequests {
+    let until = Utc.timestamp_opt(EPOCH + 1_000, 0).single().expect("valid");
+    addressed()
+        .accept_v2_until(until)
+        .accept_unaddressed_until(until)
+}
+
+/// What `sign_for` sends (`v2` and `v3`) is accepted once; the same request
+/// with the `v3` stripped is a replay of it, not a fresh request.
+#[tokio::test]
+async fn a_replay_stripped_to_a_lower_scheme_is_refused() {
+    let app = signed_app(&clock(), both_windows());
+    let full = secret("caller", RELAY).signer().sign_for(
+        AUDIENCE,
+        EPOCH,
+        &Method::POST,
+        "/hook",
+        &HeaderMap::new(),
+        b"x",
+    );
+    let full = full.to_str().expect("ascii");
+    assert_eq!(send(&app, with_header(full, "x")).await.0, StatusCode::OK);
+
+    let stripped = v2_header(EPOCH, "x");
+    assert_eq!(
+        send(&app, with_header(&stripped, "x")).await.0,
+        StatusCode::UNAUTHORIZED,
+        "a v3 request replayed as v2"
+    );
+}
+
+/// A request accepted under `v1` is not accepted again under `v2`, and one
+/// accepted under `v2` is not accepted again under `v1`.
+#[tokio::test]
+async fn a_request_is_not_accepted_again_under_another_scheme() {
+    let app = signed_app(&clock(), both_windows());
+    assert_eq!(
+        send(&app, with_header(&v1_header(EPOCH + 1, "y"), "y"))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(&app, with_header(&v2_header(EPOCH + 1, "y"), "y"))
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED,
+        "a v1 request replayed as v2"
+    );
+
+    assert_eq!(
+        send(&app, with_header(&v2_header(EPOCH + 2, "z"), "z"))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(&app, with_header(&v1_header(EPOCH + 2, "z"), "z"))
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED,
+        "a v2 request replayed as v1"
+    );
+}
+
+/// Two callers that send the same request in the same second are two
+/// requests: what is remembered is the request of one caller.
+#[tokio::test]
+async fn the_same_request_from_two_callers_is_not_a_replay() {
+    let app = signed_app(&clock(), addressed());
+    for value in [RELAY, OTHER] {
+        let req = signed(value, EPOCH, Method::POST, "/hook", "same");
+        assert_eq!(send(&app, req).await.0, StatusCode::OK);
+    }
 }

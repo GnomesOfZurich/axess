@@ -1,0 +1,14 @@
+error[E0433]: cannot find `testing` in `axess`
+ --> tests/ui/testing_unreachable.rs:4:23
+  |
+4 |     let _key = axess::testing::test_key;
+  |                       ^^^^^^^ could not find `testing` in `axess`
+  |
+note: found an item that was configured out
+ --> src/lib.rs
+  |
+  | #[cfg(feature = "testing")]
+  |       ------------------- the item is gated behind the `testing` feature
+  | #[cfg_attr(docsrs, doc(cfg(feature = "testing")))]
+  | pub mod testing {
+  |         ^^^^^^^

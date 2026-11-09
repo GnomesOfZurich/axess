@@ -28,7 +28,7 @@ The shortest functional `Cargo.toml` looks like this.
 
 ```toml
 [dependencies]
-axess = "0.18"             # facade -- depend on this, never on the internal crates
+axess = "0.19"             # facade -- depend on this, never on the internal crates
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tower = "0.5"             # transitively from axum, but listed for clarity
@@ -38,10 +38,12 @@ The defaults of the `axess` facade enable `authz` and `device`.
 Everything else is opt-in via features. For this chapter we will also
 turn on `memory` for the in-memory session store and `testing` for
 `InMemoryBackend`. Both are development conveniences; a deployment with a
-real database needs neither.
+real database needs neither, and a release build with `testing` on
+refuses to compile (see *Test doubles in a release build* in the security
+posture chapter).
 
 ```toml
-axess = { version = "0.18.0", features = ["memory", "testing"] }
+axess = { version = "0.19.0", features = ["memory", "testing"] }
 ```
 
 The complete feature reference lives in the
@@ -84,8 +86,9 @@ section.
 
 `InMemoryBackend::new()` constructs a backend that holds users, factor
 configurations, and authentication-attempt logs in memory. The
-convenience method `with_user_password` seeds one user (`alice`, in
-tenant `default`, with the Argon2id-hashed password `Gnomes2+`).
+convenience method `with_default_tenant` registers the tenant `default`, which a
+login names and looks up, and `with_user_password` seeds one user (`alice`, in
+that tenant, with the Argon2id-hashed password `Gnomes2+`).
 Production replaces this with a real backend that implements
 `IdentityStore` and `FactorStore` against your database. The trait
 surface is identical.
@@ -148,6 +151,12 @@ password prompt for an account that is locked or does not exist.
 `with_lockout_revealed_on_begin`; by default a locked account gets
 `InvalidCredentials`, as an unknown identifier does, so nothing is
 learned about the account before any proof.)
+
+Each of those early refusals first calls `burn_password_check`, which
+spends one Argon2id verification against a fixed dummy hash. Without it
+an unknown username is answered in about a millisecond and a real one in
+tens, and the difference tells a guesser which usernames exist.
+`login_with_password` makes both calls and does this for you.
 
 `verify_factor` returns a `FactorOutcome`: the answer to "did this one
 credential check out, and are we done?" `Authenticated` is the terminal

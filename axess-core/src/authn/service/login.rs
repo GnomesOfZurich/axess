@@ -8,7 +8,7 @@ use crate::authn::{
     event::{AuthEventBuilder, AuthEventType, AuthFailureReason},
     factor::{FactorCredential, FactorKind, FactorStep},
     store::{FactorStore, IdentityStore},
-    types::EntityState,
+    types::{EntityState, StatusCause},
 };
 #[cfg(feature = "fido2")]
 use crate::authn::{factor::FactorConfig, types::AuthnScope};
@@ -35,6 +35,21 @@ where
     /// Updates the session to `Authenticating`.
     ///
     /// Returns a [`LoginOutcome`] describing what the UI should do next.
+    ///
+    /// # Enumeration
+    ///
+    /// This is the identifier-first step of a login, and it tells the caller
+    /// whether the identifier has an account: a known, active account
+    /// answers [`LoginOutcome::FactorRequired`] (naming the kind of its first
+    /// factor) and an unknown one answers
+    /// [`LoginOutcome::InvalidCredentials`]. The store calls of the two paths
+    /// are made to match (the dummy reads of an unknown identifier), but the
+    /// answers differ, and a known path also rotates the session id and
+    /// writes an audit row the unknown path does not. A deployment whose
+    /// first screen asks for the identifier alone has chosen to show that
+    /// difference. A username-and-password form should call
+    /// [`login_with_password`](Self::login_with_password), which answers
+    /// every path as a wrong password does.
     #[tracing::instrument(skip(self, identifier, session), fields(tenant = %tenant_identifier))]
     pub async fn begin_login(
         &self,
@@ -169,6 +184,14 @@ where
             // of on a free-text tag. The other non-active states keep the
             // tag, having no status of their own.
             let locked = status.is_suspended() || derived.is_some();
+            // What the opt-in may show is a lockout only: an operator's
+            // hold answers like an unknown account, as the audit row alone
+            // tells apart.
+            let status_lockout = matches!(
+                &status,
+                EntityState::Suspended(d) if d.cause == StatusCause::Lockout
+            );
+            let revealable = status_lockout || derived.is_some();
             let builder = if locked {
                 AuthEventBuilder::locked(AuthEventType::LoginAttempt)
             } else {
@@ -179,7 +202,7 @@ where
                 .await?;
             if locked {
                 self.inner.metrics.auth_flow.account_locked();
-                if !self.inner.reveal_lockout_on_begin {
+                if !self.inner.reveal_lockout_on_begin || !revealable {
                     // The caller has proved nothing yet; `Locked` would tell
                     // them the account exists and is being guessed at. The
                     // audit row above carries the lockout.
@@ -188,7 +211,7 @@ where
                 // Surface the lockout expiry so UIs can render
                 // "locked until X" on the begin path.
                 let until = match (&status, derived) {
-                    (EntityState::Suspended(detail), _) => detail.until,
+                    (EntityState::Suspended(detail), _) if status_lockout => detail.until,
                     (_, Some(lock)) => lock.until,
                     _ => None,
                 };

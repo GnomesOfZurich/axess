@@ -167,6 +167,10 @@ mod tests {
         })
     }
 
+    #[cfg_attr(
+        miri,
+        ignore = "the tokio runtime starts an I/O driver, which Miri does not support"
+    )]
     #[tokio::test]
     async fn mock_returns_canned_human_principal() {
         let canned = sample_human();
@@ -175,6 +179,10 @@ mod tests {
         assert_eq!(resolved, canned);
     }
 
+    #[cfg_attr(
+        miri,
+        ignore = "the tokio runtime starts an I/O driver, which Miri does not support"
+    )]
     #[tokio::test]
     async fn mock_returns_canned_workload_principal() {
         let canned = sample_workload();
@@ -183,6 +191,10 @@ mod tests {
         assert_eq!(resolved, canned);
     }
 
+    #[cfg_attr(
+        miri,
+        ignore = "the tokio runtime starts an I/O driver, which Miri does not support"
+    )]
     #[tokio::test]
     async fn mock_is_idempotent_across_calls() {
         let mock = MockResolver::new(sample_human());
@@ -191,6 +203,10 @@ mod tests {
         assert_eq!(a, b);
     }
 
+    #[cfg_attr(
+        miri,
+        ignore = "the tokio runtime starts an I/O driver, which Miri does not support"
+    )]
     #[tokio::test]
     async fn mock_not_authenticated_returns_error() {
         let mock = MockResolver::not_authenticated();
@@ -198,6 +214,10 @@ mod tests {
         assert!(matches!(err, IdentityError::NotAuthenticated));
     }
 
+    #[cfg_attr(
+        miri,
+        ignore = "the tokio runtime starts an I/O driver, which Miri does not support"
+    )]
     #[tokio::test]
     async fn mock_invalid_component_carries_message() {
         let mock = MockResolver::invalid_component("oops");

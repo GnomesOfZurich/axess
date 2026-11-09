@@ -4,9 +4,9 @@
 //! deployment opts out, and refreshes with the key the login returned, after
 //! a restart too.
 //!
-//! Run with: `cargo test -p axess-core --features testing-oauth --test oauth_dpop_wiremock`
+//! Run with: `cargo test -p axess-core --features testing,oauth --test oauth_dpop_wiremock`
 
-#![cfg(feature = "testing-oauth")]
+#![cfg(all(feature = "testing", feature = "oauth"))]
 
 use axess_core::authn::AuditContext;
 use axess_core::authn::ids::TenantId;
@@ -17,7 +17,6 @@ use axess_core::federation::oauth_tenant::{
 };
 use axess_core::testing::{
     mock_authn::{MockFactorStore, MockIdentityStore},
-    oauth_wiremock::{oauth_discovery_document, oauth_generate_rsa_keypair},
     test_session,
 };
 use axess_factors::FactorSecret;
@@ -26,6 +25,7 @@ use axess_factors::oauth::{
     DpopKey, FapiConfig, OAuthClaims, OAuthError, OAuthLoginOptions, OAuthProvider as _,
     OAuthProviderBuilder, OAuthProviderConfig, SenderConstraint,
 };
+use axess_testing::oauth_wiremock::{oauth_discovery_document, oauth_generate_rsa_keypair};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde_json::{Value, json};

@@ -270,7 +270,12 @@ is in progress).
    is answered only when the service is built with
    `AuthnServiceBuilder::with_lockout_revealed_on_begin`, for a
    first-party form where "locked until" is worth more than concealing
-   that the account exists and is being guessed at.
+   that the account exists and is being guessed at. It shows a lockout
+   only: an administrative suspension, a pending verification or a closure
+   answers `InvalidCredentials` either way. `begin_login` is the
+   identifier-first step, so a known account answers `FactorRequired` where
+   an unknown one answers `InvalidCredentials`; a username-and-password
+   form calls `login_with_password`, which answers every path alike.
 2. **Loads the method** that applies under the scope hierarchy (see
    *Scope hierarchy*): the sequence of steps this user will walk.
 3. **Transitions the session** to `Authenticating`, with `remaining` set

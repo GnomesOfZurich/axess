@@ -33,6 +33,15 @@ sessions for a bounded time keeps the anchor alive while the impersonation is
 in use. The anchor counts as one of the administrator's registered sessions for
 `with_max_sessions_per_user`; evicting it ends the impersonation.
 
+**Who may begin one.** An administrator cannot impersonate themselves
+(refused with `NoFlow` and a failed row whose reason is `self_impersonation`).
+`AuthnServiceBuilder::with_impersonation_max_authn_age(window)` makes
+`begin_impersonation` refuse an administrator session whose authentication is
+older than `window` (`NoFlow`, reason `authn_too_old`); the administrator
+steps up and retries. The default is no limit. An impersonation that fails
+after the administrator's entry was registered ends that entry too, so it is
+not left counting against the administrator's sessions.
+
 **Also fixed here.** When a handler changes who a session is, the layer used to
 read the old id as the new user's revoked one and end the session. A rotation
 in which the user changed is now treated like a login's.
@@ -73,8 +82,10 @@ every `mtls_endpoint_aliases` entry. Redirects are off.
 
 **Failure modes.** A refusal is an `OAuthError::Config` that names the setting
 and the range, never the URL. A client behind an egress proxy that resolves
-names itself sees the proxy's address, not the destination's: put such a
-deployment on `unscreened()` and filter at the proxy.
+names itself would hide the destination from the screen, so a screened client
+never follows `HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY` from the environment:
+put such a deployment on `unscreened()`, which follows them as a plain client
+does, and filter at the proxy.
 
 ## An unverified candidate holds its identifier for a bounded time
 

@@ -57,6 +57,16 @@ one bucket, and a tenant IP policy cannot be satisfied.
 wrong is not a crash: it is a forged address that looks like a real one,
 which is why *Session security* in the book spends a section on it.
 
+## Session limits
+
+The library's defaults are a session that lives 24 hours idle and 7 days in
+all. This example sets its own, 15 minutes idle (`STRICT_IDLE_TTL`) and 10
+hours in all (`STRICT_MAX_SESSION_AGE`), the values the security review
+recommends for a bank: a session left open on a shared machine, or a stolen
+cookie, is useful for far less time. The two constants are the whole change;
+raise them for a product that wants longer sessions, and copy them if yours
+should be strict. The library defaults are unchanged.
+
 ## What it deliberately leaves out
 
 No database, no TOTP, no OAuth, no CSRF layer, no rate limiting. Each has

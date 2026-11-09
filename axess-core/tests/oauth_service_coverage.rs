@@ -1,24 +1,24 @@
 //! Mutation-coverage backfill for `oauth_service`: size guards, expiry
 //! boundary, revoke, and the JWKS single-flight + min-interval debounce.
 
-#![cfg(feature = "testing-oauth")]
+#![cfg(all(feature = "testing", feature = "oauth"))]
 
 mod common;
 
 use axess_core::authn::AuditContext;
+use axess_core::testing::oauth_provider::oauth_setup_provider;
 use axess_core::{
     authn::service::AuthnService,
     testing::{
         MockClock,
         mock_authn::{MockFactorStore, MockIdentityStore},
-        oauth_wiremock::{
-            oauth_discovery_document, oauth_generate_rsa_keypair, oauth_mount_oidc_endpoints,
-            oauth_setup_provider,
-        },
         test_session,
     },
 };
 use axess_factors::oauth::OAuthLoginOptions;
+use axess_testing::oauth_wiremock::{
+    oauth_discovery_document, oauth_generate_rsa_keypair, oauth_mount_oidc_endpoints,
+};
 use common::test_tenant;
 use serde_json::json;
 use wiremock::{
@@ -120,7 +120,7 @@ async fn oauth_ceremony_not_expired_at_exact_boundary() {
     let server = MockServer::start().await;
     let (_, jwk, _) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &jwk).await;
-    let provider = oauth_setup_provider(&server).await;
+    let provider = oauth_setup_provider(&server.uri()).await;
 
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
     let clock = MockClock::now();
@@ -211,7 +211,7 @@ async fn jwks_concurrent_refreshes_coalesce_to_single_fetch() {
         .mount(&server)
         .await;
 
-    let provider = Arc::new(oauth_setup_provider(&server).await);
+    let provider = Arc::new(oauth_setup_provider(&server.uri()).await);
 
     // Setup may fetch JWKS once or twice (OIDC discovery prefetch + the
     // explicit cache prime). Snapshot whatever it landed on as our

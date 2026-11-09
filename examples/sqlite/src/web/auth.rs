@@ -115,33 +115,39 @@ pub async fn post_login(
         .await
     {
         Ok(FactorOutcome::Authenticated) => Redirect::to("/dashboard").into_response(),
-        Ok(FactorOutcome::FactorRequired(FactorKind::Totp)) => {
-            Redirect::to("/totp").into_response()
-        }
+        Ok(FactorOutcome::FactorRequired(next)) => next_factor_response(next),
         Ok(FactorOutcome::InvalidCredential) => {
             Html(login_with_error("Invalid username or password.", &csrf)).into_response()
         }
-        // Only the attempt that locks the account answers `Locked`; a login
-        // against an account already locked answers `InvalidCredential`
-        // above, as an unknown username does, so the form never says that
-        // an account exists and is locked.
-        Ok(FactorOutcome::Locked { .. }) => Html(login_with_error(
-            "Account locked due to too many failed attempts. Try again later.",
-            &csrf,
-        ))
-        .into_response(),
+        // `login_with_password` answers a lock as a wrong password, so the
+        // form never says that an account exists and is locked; the arm is
+        // here because the outcome is a variant, and says the same thing.
+        Ok(FactorOutcome::Locked { .. }) => {
+            Html(login_with_error("Invalid username or password.", &csrf)).into_response()
+        }
         // Guesses from this address are being slowed down. The form says
         // what a wrong password says, so a guesser learns nothing new.
         Ok(FactorOutcome::Throttled { .. }) => {
             Html(login_with_error("Invalid username or password.", &csrf)).into_response()
         }
-        Ok(FactorOutcome::FactorRequired(other)) => {
-            tracing::warn!(kind = ?other, "unexpected factor kind after password");
-            error_page("Unsupported factor type.").into_response()
-        }
         Err(err) => {
             tracing::warn!(error = %err, "login_with_password error");
             error_page("An internal error occurred. Please try again.").into_response()
+        }
+    }
+}
+
+/// The page of the factor the login still needs, for an outcome that is
+/// `FactorRequired`. The session is `Authenticating` and stays so; only a
+/// factor this example has a page for gets one, any other is an error page
+/// that says so. It never goes to `/dashboard`, which would only send a
+/// partly authenticated user back to `/login`.
+pub fn next_factor_response(next: FactorKind) -> axum::response::Response {
+    match next {
+        FactorKind::Totp => Redirect::to("/totp").into_response(),
+        other => {
+            tracing::warn!(kind = ?other, "the next factor has no page in this example");
+            error_page("Unsupported factor type.").into_response()
         }
     }
 }
@@ -212,10 +218,8 @@ async fn second_factor(
             // Session is locked; send back to login to start fresh.
             Redirect::to("/login").into_response()
         }
-        Ok(FactorOutcome::FactorRequired(_)) => {
-            // Shouldn't happen in this two-factor flow.
-            Redirect::to("/dashboard").into_response()
-        }
+        // The method asks for a further factor: send the user to its page.
+        Ok(FactorOutcome::FactorRequired(next)) => next_factor_response(next),
         Err(err) => {
             tracing::warn!(error = %err, "totp verify_factor error");
             error_page("An internal error occurred.").into_response()
@@ -997,6 +1001,7 @@ pub async fn post_reset_password(
 // ── HTML helpers ──────────────────────────────────────────────────────────────
 
 fn login_with_error(msg: &str, csrf: &CsrfToken) -> String {
+    let msg = html_escape(msg);
     let form = LOGIN_FORM.replace("__CSRF_INPUT__", &csrf_hidden_input(csrf));
     format!(
         r#"<!doctype html><html><head><title>Login</title></head><body>
@@ -1008,6 +1013,7 @@ fn login_with_error(msg: &str, csrf: &CsrfToken) -> String {
 }
 
 fn totp_with_error(msg: &str, csrf: &CsrfToken) -> String {
+    let msg = html_escape(msg);
     let form =
         format!("{TOTP_FORM}\n{RECOVERY_FORM}").replace("__CSRF_INPUT__", &csrf_hidden_input(csrf));
     format!(
@@ -1032,6 +1038,7 @@ fn totp_already_enrolled() -> (StatusCode, Html<String>) {
 }
 
 fn error_page(msg: &str) -> Html<String> {
+    let msg = html_escape(msg);
     Html(format!(
         r#"<!doctype html><html><head><title>Error</title></head><body>
 <h1>Error</h1><p>{msg}</p>
@@ -1111,6 +1118,7 @@ const SIGNUP_CHECK_EMAIL: &str = r#"<!doctype html><html><head><title>Sign Up</t
 </body></html>"#;
 
 fn signup_with_error(msg: &str, csrf: &CsrfToken) -> String {
+    let msg = html_escape(msg);
     let form = SIGNUP_FORM.replace("__CSRF_INPUT__", &csrf_hidden_input(csrf));
     format!(
         r#"<!doctype html><html><head><title>Sign Up</title></head><body>

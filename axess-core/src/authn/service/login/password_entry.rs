@@ -29,6 +29,9 @@ where
     /// A locked account is answered `InvalidCredential` here, not `Locked`:
     /// telling a caller who has not yet proved anything that the account
     /// exists and is locked is the enumeration this method exists to avoid.
+    /// That holds for the guess that reaches the limit and for a request
+    /// that races into a lock after `begin_login`, whichever way the
+    /// lockout is reported (as an outcome or as an error).
     /// The audit row still records the lockout. `begin_login` conceals the
     /// lock the same way unless the service was built with
     /// [`with_lockout_revealed_on_begin`](crate::authn::AuthnServiceBuilder::with_lockout_revealed_on_begin);
@@ -71,14 +74,20 @@ where
             LoginOutcome::FactorRequired(FactorKind::Password) => {
                 let credential =
                     FactorCredential::Password(crate::authn::factor::ZeroizedString::new(password));
-                match self.verify_factor(&credential, session).await? {
+                match self.verify_factor(&credential, session).await {
                     // Refused before any hash ran: spend the one hash every
                     // other path spends, and say what a wrong password says.
-                    FactorOutcome::Throttled { .. } => {
+                    Ok(FactorOutcome::Throttled { .. })
+                    | Err(AuthnError::Locked { .. } | AuthnError::NotActive(_)) => {
                         self.burn_password_check(password).await?;
                         Ok(FactorOutcome::InvalidCredential)
                     }
-                    outcome => Ok(outcome),
+                    // The attempt that crossed the limit, or one that raced
+                    // past `begin_login` into a lock: only an account that
+                    // exists can be locked, so it answers as a wrong
+                    // password does. The audit row carries the lockout.
+                    Ok(FactorOutcome::Locked { .. }) => Ok(FactorOutcome::InvalidCredential),
+                    result => result,
                 }
             }
             other => {
@@ -98,18 +107,23 @@ where
     ///
     /// What [`login_with_password`](Self::login_with_password) runs on the
     /// paths that have no stored hash to check, so their cost matches the
-    /// path that has one. The dummy hash is made once with the library's
-    /// default parameters, inside the first call, which is therefore still
-    /// one executor job.
+    /// path that has one. The dummy hash is made once per service under the
+    /// configured [`Argon2Cost`](axess_factors::Argon2Cost), inside the first
+    /// call, which is therefore still one executor job.
     pub async fn burn_password_check(&self, password: &str) -> Result<(), AuthnError<I::Error>> {
-        static DUMMY_HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let dummy_hash = std::sync::Arc::clone(&self.inner.hardening.dummy_password_hash);
+        let cost = self.inner.hardening.argon2_cost;
         let salt = axess_factors::generate_password_salt(&self.inner.rng);
         let candidate = zeroize::Zeroizing::new(password.to_owned());
         self.inner
             .kdf
             .run(move || {
-                let dummy = DUMMY_HASH.get_or_init(|| {
-                    axess_factors::hash_password_with_salt("axess dummy password", &salt)
+                let dummy = dummy_hash.get_or_init(|| {
+                    axess_factors::hash_password_with_salt_and_cost(
+                        "axess dummy password",
+                        &salt,
+                        cost,
+                    )
                 });
                 let _ = axess_factors::verify_password(candidate.as_str(), dummy);
             })

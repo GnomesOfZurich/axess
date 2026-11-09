@@ -41,10 +41,100 @@ pub const MAX_PASSWORD_BYTES: usize = 1024;
 /// Bytes of salt in a new hash.
 pub const PASSWORD_SALT_LEN: usize = 16;
 
+/// The Argon2id cost parameters new password hashes are made under.
+///
+/// The default is the pinned [`ARGON2_M_COST_KIB`], [`ARGON2_T_COST`] and
+/// [`ARGON2_P_COST`] (the OWASP minimum). A hash already stored keeps
+/// verifying under whatever it was made with: only new hashes, and the
+/// rehash a login does when a stored hash differs
+/// ([`password_needs_rehash_for`]), take this cost.
+///
+/// Memory below [`ARGON2_M_COST_KIB`] is refused, so a cost chosen here can
+/// only equal or exceed the floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Argon2Cost {
+    m_cost_kib: u32,
+    t_cost: u32,
+    p_cost: u32,
+}
+
+/// Why an [`Argon2Cost`] was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Argon2CostError {
+    /// The memory cost is below [`ARGON2_M_COST_KIB`].
+    BelowFloor,
+    /// The hashing library refuses the combination (zero iterations or
+    /// lanes, memory under eight KiB per lane, or a value out of range).
+    Invalid,
+}
+
+impl fmt::Display for Argon2CostError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::BelowFloor => "Argon2id memory cost is below the 19 MiB floor",
+            Self::Invalid => "Argon2id parameters are not a valid combination",
+        })
+    }
+}
+
+impl std::error::Error for Argon2CostError {}
+
+impl Default for Argon2Cost {
+    /// The pinned parameters: 19 MiB, two passes, one lane.
+    fn default() -> Self {
+        Self {
+            m_cost_kib: ARGON2_M_COST_KIB,
+            t_cost: ARGON2_T_COST,
+            p_cost: ARGON2_P_COST,
+        }
+    }
+}
+
+impl Argon2Cost {
+    /// A cost of `m_cost_kib` KiB of memory, `t_cost` passes and `p_cost`
+    /// lanes.
+    ///
+    /// # Errors
+    ///
+    /// [`Argon2CostError::BelowFloor`] for memory under [`ARGON2_M_COST_KIB`];
+    /// [`Argon2CostError::Invalid`] when the hashing library refuses the
+    /// combination.
+    pub fn new(m_cost_kib: u32, t_cost: u32, p_cost: u32) -> Result<Self, Argon2CostError> {
+        if m_cost_kib < ARGON2_M_COST_KIB {
+            return Err(Argon2CostError::BelowFloor);
+        }
+        Params::new(m_cost_kib, t_cost, p_cost, None).map_err(|_| Argon2CostError::Invalid)?;
+        Ok(Self {
+            m_cost_kib,
+            t_cost,
+            p_cost,
+        })
+    }
+
+    /// Memory cost in KiB.
+    pub fn m_cost_kib(self) -> u32 {
+        self.m_cost_kib
+    }
+
+    /// Number of passes.
+    pub fn t_cost(self) -> u32 {
+        self.t_cost
+    }
+
+    /// Number of lanes.
+    pub fn p_cost(self) -> u32 {
+        self.p_cost
+    }
+
+    fn argon2(self) -> Argon2<'static> {
+        let params = Params::new(self.m_cost_kib, self.t_cost, self.p_cost, None)
+            .expect("an Argon2Cost is validated when it is built");
+        Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+    }
+}
+
 fn argon2() -> Argon2<'static> {
-    let params = Params::new(ARGON2_M_COST_KIB, ARGON2_T_COST, ARGON2_P_COST, None)
-        .expect("the compiled-in Argon2 parameters are valid");
-    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+    Argon2Cost::default().argon2()
 }
 
 /// Why [`verify_password`] did not accept a password.
@@ -96,6 +186,13 @@ pub fn verify_password(password: impl AsRef<[u8]>, hash: &str) -> Result<(), Pas
 /// that does not parse answers false: [`verify_password`] refuses it, so no
 /// login reaches the point of replacing it.
 pub fn password_needs_rehash(hash: &str) -> bool {
+    password_needs_rehash_for(hash, Argon2Cost::default())
+}
+
+/// As [`password_needs_rehash`], against `cost` instead of the pinned
+/// parameters: true for a well-formed hash made under any other cost, higher
+/// or lower.
+pub fn password_needs_rehash_for(hash: &str, cost: Argon2Cost) -> bool {
     let Ok(parsed) = argon2::PasswordHash::new(hash) else {
         return false;
     };
@@ -104,9 +201,9 @@ pub fn password_needs_rehash(hash: &str) -> bool {
     };
     parsed.algorithm != argon2::ARGON2ID_IDENT
         || parsed.version != Some(u32::from(Version::V0x13))
-        || params.m_cost() != ARGON2_M_COST_KIB
-        || params.t_cost() != ARGON2_T_COST
-        || params.p_cost() != ARGON2_P_COST
+        || params.m_cost() != cost.m_cost_kib
+        || params.t_cost() != cost.t_cost
+        || params.p_cost() != cost.p_cost
 }
 
 /// Draw a fresh salt from `rng`.
@@ -125,7 +222,17 @@ pub fn hash_password_with_salt(
     password: impl AsRef<[u8]>,
     salt: &[u8; PASSWORD_SALT_LEN],
 ) -> String {
-    argon2()
+    hash_password_with_salt_and_cost(password, salt, Argon2Cost::default())
+}
+
+/// As [`hash_password_with_salt`], under `cost` instead of the pinned
+/// parameters.
+pub fn hash_password_with_salt_and_cost(
+    password: impl AsRef<[u8]>,
+    salt: &[u8; PASSWORD_SALT_LEN],
+    cost: Argon2Cost,
+) -> String {
+    cost.argon2()
         .hash_password_with_salt(password.as_ref(), salt)
         .expect("Argon2id hashing with fixed valid parameters cannot fail")
         .to_string()

@@ -78,6 +78,17 @@ fn suspended(until: Option<chrono::DateTime<chrono::Utc>>) -> EntityState {
     )
 }
 
+/// A suspension a store materialised from a failed-attempt lockout.
+fn lockout_suspension(until: Option<chrono::DateTime<chrono::Utc>>) -> EntityState {
+    EntityState::Suspended(
+        StatusDetail::lockout(
+            "too many failures",
+            chrono::Utc::now() - chrono::Duration::days(2),
+        )
+        .with_until(until),
+    )
+}
+
 fn identity(t: EntityState, u: EntityState) -> MockIdentityStore {
     MockIdentityStore::new()
         .with_tenant(tenant(t))
@@ -212,7 +223,7 @@ async fn a_counter_lockout_is_concealed_on_begin_by_default() {
 #[tokio::test]
 async fn a_revealed_lockout_names_its_end() {
     let future = chrono::Utc::now() + chrono::Duration::hours(1);
-    let id = identity(EntityState::Active, suspended(Some(future)));
+    let id = identity(EntityState::Active, lockout_suspension(Some(future)));
     let observer = id.clone();
     let outcome = AuthnService::builder(id, MockFactorStore::new())
         .with_lockout_revealed_on_begin()
@@ -225,6 +236,25 @@ async fn a_revealed_lockout_names_its_end() {
         "{outcome:?}"
     );
     assert_eq!(locked_rows(&observer), 1);
+}
+
+#[tokio::test]
+async fn a_revealed_lockout_does_not_reveal_an_administrative_suspension() {
+    // The opt-in shows a lockout's end to the caller. An operator's hold is
+    // not a lockout: it answers as an unknown identifier does, and its end
+    // stays private.
+    let future = chrono::Utc::now() + chrono::Duration::hours(1);
+    let id = identity(EntityState::Active, suspended(Some(future)));
+    let outcome = AuthnService::builder(id, MockFactorStore::new())
+        .with_lockout_revealed_on_begin()
+        .build()
+        .with_audit_context(AuditContext::default())
+        .begin_login("alice", "acme", &session())
+        .await;
+    assert!(
+        matches!(outcome, Ok(LoginOutcome::InvalidCredentials)),
+        "{outcome:?}"
+    );
 }
 
 #[tokio::test]

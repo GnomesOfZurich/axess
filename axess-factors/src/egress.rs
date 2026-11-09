@@ -31,7 +31,10 @@ use std::sync::Arc;
 pub enum ReservedRange {
     /// `127.0.0.0/8`, `::1`: this machine.
     Loopback,
-    /// `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`: the private network.
+    /// `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`: the private network;
+    /// also the IPv4 special-purpose ranges that are not globally reachable
+    /// (`192.0.0.0/24`, the documentation ranges, `198.18.0.0/15`,
+    /// `240.0.0.0/4`) and the locally used NAT64 prefix.
     Private,
     /// `169.254.0.0/16`, `fe80::/10`: the local link.
     LinkLocal,
@@ -63,19 +66,48 @@ impl ReservedRange {
         }
     }
 
-    /// The reserved range `ip` is in, or `None` for a public address. An
-    /// IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) is judged as the IPv4
-    /// address it carries.
+    /// The reserved range `ip` is in, or `None` for a public address.
+    ///
+    /// An IPv6 address that carries an IPv4 address is judged as the IPv4
+    /// address it carries, in every form that does: IPv4-mapped
+    /// (`::ffff:a.b.c.d`), IPv4-compatible (`::a.b.c.d`), NAT64
+    /// (`64:ff9b::/96`) and 6to4 (`2002:a.b.c.d::/48`). The locally used
+    /// NAT64 prefix `64:ff9b:1::/48` is never global: it is judged as the
+    /// IPv4 address in its last 32 bits when that one is reserved, and as
+    /// private otherwise.
     #[must_use]
     pub fn of(ip: IpAddr) -> Option<Self> {
         match ip {
             IpAddr::V4(v4) => of_v4(v4),
-            IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-                Some(v4) => of_v4(v4),
-                None => of_v6(v6),
-            },
+            IpAddr::V6(v6) => of_v6_embedding(v6),
         }
     }
+}
+
+/// The range of an IPv6 address, looking through the forms that carry IPv4.
+fn of_v6_embedding(ip: Ipv6Addr) -> Option<ReservedRange> {
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return of_v4(v4);
+    }
+    let seg = ip.segments();
+    let o = ip.octets();
+    let last = Ipv4Addr::new(o[12], o[13], o[14], o[15]);
+    if seg[..6] == [0; 6] && !ip.is_loopback() && !ip.is_unspecified() {
+        // `::a.b.c.d` is judged by the address in it; `::` and `::1` below.
+        return of_v4(last).or_else(|| of_v6(ip));
+    }
+    if seg[0] == 0x0064 && seg[1] == 0xff9b {
+        if seg[2..6] == [0; 4] {
+            return of_v4(last);
+        }
+        if seg[2] == 1 {
+            return of_v4(last).or(Some(ReservedRange::Private));
+        }
+    }
+    if seg[0] == 0x2002 {
+        return of_v4(Ipv4Addr::new(o[2], o[3], o[4], o[5]));
+    }
+    of_v6(ip)
 }
 
 fn of_v4(ip: Ipv4Addr) -> Option<ReservedRange> {
@@ -94,9 +126,21 @@ fn of_v4(ip: Ipv4Addr) -> Option<ReservedRange> {
         Some(ReservedRange::Unspecified)
     } else if ip.is_multicast() || ip.is_broadcast() {
         Some(ReservedRange::Multicast)
+    } else if is_special_purpose_v4(o) {
+        Some(ReservedRange::Private)
     } else {
         None
     }
+}
+
+/// The IANA special-purpose IPv4 ranges that are not globally reachable and
+/// that no other range names: `192.0.0.0/24` (protocol assignments),
+/// `192.0.2.0/24`, `198.51.100.0/24` and `203.0.113.0/24` (documentation),
+/// `198.18.0.0/15` (benchmarking) and `240.0.0.0/4` (reserved).
+fn is_special_purpose_v4(o: [u8; 4]) -> bool {
+    matches!(o, [192, 0, 0 | 2, _] | [198, 51, 100, _] | [203, 0, 113, _])
+        || (o[0] == 198 && (o[1] & 0xfe) == 18)
+        || o[0] >= 240
 }
 
 fn of_v6(ip: Ipv6Addr) -> Option<ReservedRange> {
@@ -250,11 +294,19 @@ impl EgressPolicy {
     /// and a name that changes its answer after [`check_url`](Self::check_url)
     /// is caught. A URL whose host is an address needs no lookup and is
     /// caught by `check_url`; check every URL before the client uses it.
+    ///
+    /// A screened policy never follows a proxy from the environment
+    /// (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`): a proxy resolves the
+    /// target's name itself and connects on its own, so the resolver above
+    /// would never see the address it connects to. A deployment that must go
+    /// through a proxy either filters at the proxy and uses
+    /// [`unscreened`](Self::unscreened), which follows the environment as a
+    /// plain client does, or reaches the identity provider directly.
     pub fn client_builder(self) -> openidconnect::reqwest::ClientBuilder {
         let builder = openidconnect::reqwest::ClientBuilder::new()
             .redirect(openidconnect::reqwest::redirect::Policy::none());
         if self.is_screened() {
-            builder.dns_resolver(Arc::new(ScreenedResolver {
+            builder.no_proxy().dns_resolver(Arc::new(ScreenedResolver {
                 allow_loopback: self.loopback_http(),
             }))
         } else {

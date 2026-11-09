@@ -7,7 +7,7 @@
 //! identity) can opt in to the richer surface without re-implementing
 //! signature plumbing.
 
-use crate::jwt::validation::{ALLOWED_ALGORITHMS, JwtError, ValidationConfig, verify_jwt};
+use crate::jwt::validation::{ALLOWED_ALGORITHMS, JwtError, ValidationConfig, verify_jwt_with_typ};
 use axess_clock::{Clock, SystemClock};
 use jsonwebtoken::Algorithm;
 use jsonwebtoken::jwk::JwkSet;
@@ -134,6 +134,8 @@ pub struct JwtVerifier<R = NoReplay> {
     /// expires is a credential with no end, and the replay store cannot
     /// bound it.
     require_exp: bool,
+    /// The JOSE `typ` a token must carry; `None` does not read it.
+    expected_typ: Option<String>,
     replay: Option<R>,
     /// The caller chose to accept any audience (see
     /// [`allow_any_audience`](JwtVerifier::allow_any_audience)).
@@ -160,6 +162,7 @@ impl JwtVerifier<NoReplay> {
             clock_skew: Duration::from_secs(60),
             require_nbf: false,
             require_exp: true,
+            expected_typ: None,
             replay: None,
             audience_waived: false,
             issuer_waived: false,
@@ -246,6 +249,11 @@ impl<R> JwtVerifier<R> {
         self.expected_audience.is_some()
     }
 
+    /// The clock-skew tolerance applied to `exp` and `nbf` (default 60 s).
+    pub fn clock_skew(&self) -> Duration {
+        self.clock_skew
+    }
+
     /// Override the clock-skew tolerance applied to `exp` and `nbf`.
     pub fn with_clock_skew(mut self, skew: Duration) -> Self {
         self.clock_skew = skew;
@@ -266,6 +274,26 @@ impl<R> JwtVerifier<R> {
         self
     }
 
+    /// Require the token's JOSE `typ` header to be `typ`, compared without
+    /// regard to case and with a leading `application/` dropped (RFC 7515
+    /// section 4.1.9). A token with no `typ`, or another one, is refused.
+    ///
+    /// Off by default: without this call the header type is not read, so an
+    /// ID token, a logout token and a DPoP proof signed by the same key
+    /// verify here as whatever the caller expects, as long as `iss` and
+    /// `aud` match. Set it wherever one key signs more than one kind of
+    /// token (RFC 8725 section 3.11). The values: `at+jwt` for an access
+    /// token (RFC 9068), `logout+jwt` for a logout token, `dpop+jwt` for a
+    /// DPoP proof (RFC 9449), `oauth-authz-req+jwt` for a signed
+    /// authorization request (RFC 9101; FAPI 2.0 message signing requires
+    /// it) and `token-introspection+jwt` for a signed introspection
+    /// response (RFC 9701).
+    #[must_use]
+    pub fn with_typ(mut self, typ: impl Into<String>) -> Self {
+        self.expected_typ = Some(typ.into());
+        self
+    }
+
     /// Attach a replay store. Tokens verified by the resulting verifier
     /// must carry a `jti` claim; if the store reports it already used
     /// the verification fails. Replaces any previously configured store.
@@ -278,6 +306,7 @@ impl<R> JwtVerifier<R> {
             clock_skew: self.clock_skew,
             require_nbf: self.require_nbf,
             require_exp: self.require_exp,
+            expected_typ: self.expected_typ,
             replay: Some(store),
             audience_waived: self.audience_waived,
             issuer_waived: self.issuer_waived,
@@ -339,12 +368,13 @@ impl<R: JtiReplayStore> JwtVerifier<R> {
                 .jwks
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            verify_jwt(
+            verify_jwt_with_typ(
                 token,
                 &guard,
                 &config,
                 &self.allowed_algorithms,
                 &*self.clock,
+                self.expected_typ.as_deref(),
             )?
         };
 

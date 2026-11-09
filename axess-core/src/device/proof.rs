@@ -223,6 +223,11 @@ impl DeviceCookieConfig {
         &self.name
     }
 
+    /// The lifetime the cookie is sent with.
+    pub fn max_age(&self) -> Duration {
+        self.max_age
+    }
+
     /// The `Set-Cookie` header value that stores `token` for device `id`.
     pub(crate) fn set_cookie(&self, id: &DeviceId, token: &DeviceToken) -> Option<HeaderValue> {
         let mut cookie = Cookie::new(self.name.to_string(), cookie_value(id, token));
