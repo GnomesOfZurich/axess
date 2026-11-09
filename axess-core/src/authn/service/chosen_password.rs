@@ -136,10 +136,13 @@ where
         self.check_chosen_password(password, rules).await?;
         let salt = axess_factors::generate_password_salt(&self.inner.rng);
         let candidate = zeroize::Zeroizing::new(password.to_owned());
+        let cost = self.inner.hardening.argon2_cost;
         let hash = self
             .inner
             .kdf
-            .run(move || axess_factors::hash_password_with_salt(candidate.as_str(), &salt))
+            .run(move || {
+                axess_factors::hash_password_with_salt_and_cost(candidate.as_str(), &salt, cost)
+            })
             .await?;
         Ok(hash)
     }

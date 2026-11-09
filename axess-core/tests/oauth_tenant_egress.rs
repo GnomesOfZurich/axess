@@ -1,4 +1,4 @@
-#![cfg(feature = "testing-oauth")]
+#![cfg(all(feature = "testing", feature = "oauth"))]
 //! A tenant writes the issuer URL of its identity provider, and the document
 //! behind it names more URLs. The directory fetches them, so it refuses the
 //! ones that reach the loopback interface, the private network or a cloud
@@ -9,10 +9,10 @@ use axess_core::federation::oauth_tenant::{
     MemoryTenantOAuthProviderStore, StoredTenantOAuthProviders, TenantClientCredential, TenantDpop,
     TenantOAuthProviderRecord, TenantOAuthProviderStore, TenantOAuthProviders,
 };
-use axess_core::testing::oauth_wiremock::{oauth_discovery_document, oauth_generate_rsa_keypair};
 use axess_factors::FactorSecret;
 use axess_factors::egress::EgressPolicy;
 use axess_factors::oauth::OAuthError;
+use axess_testing::oauth_wiremock::{oauth_discovery_document, oauth_generate_rsa_keypair};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -98,6 +98,28 @@ async fn upsert_refuses_issuers_in_reserved_ranges_by_name() {
     }
 }
 
+/// An IPv6 literal that carries a reserved IPv4 address is refused as the
+/// range of the address it carries, in every form the shared table lists.
+#[tokio::test]
+async fn upsert_refuses_ipv6_forms_that_carry_a_reserved_ipv4_address() {
+    use axess_testing::ipv6_forms::embedding_v4;
+    use std::net::Ipv4Addr;
+
+    let directory = directory();
+    for (v4, range) in [
+        (Ipv4Addr::new(127, 0, 0, 1), "loopback"),
+        (Ipv4Addr::new(10, 0, 0, 5), "private"),
+        (Ipv4Addr::new(169, 254, 169, 254), "metadata"),
+    ] {
+        for form in embedding_v4(v4) {
+            let issuer = format!("https://[{}]", form.addr);
+            let err = directory.upsert(record(&issuer)).await.unwrap_err();
+            let text = refusal(err);
+            assert!(text.contains(range), "{} {}: {text}", form.name, form.addr);
+        }
+    }
+}
+
 #[tokio::test]
 async fn an_endpoint_the_document_names_is_refused_by_name() {
     for (field, url, range) in [
@@ -137,7 +159,7 @@ async fn an_endpoint_the_document_names_is_refused_by_name() {
 async fn the_unscreened_opt_out_reaches_a_loopback_idp() {
     let server = MockServer::start().await;
     let (_der, jwk, _kid) = oauth_generate_rsa_keypair();
-    axess_core::testing::oauth_wiremock::oauth_mount_oidc_endpoints(&server, &jwk).await;
+    axess_testing::oauth_wiremock::oauth_mount_oidc_endpoints(&server, &jwk).await;
     let directory = directory().with_egress_policy(EgressPolicy::unscreened());
     directory.upsert(record(&server.uri())).await.unwrap();
 

@@ -6,12 +6,26 @@ the session-load or token-verify hot path.
 
 ## Targets
 
+Each target calls the library's own public functions and holds them to an
+independent statement of what they must do; none keeps a copy of a decoder.
+
 | Target                       | Surface under test                                        |
 |------------------------------|-----------------------------------------------------------|
-| `session_data_msgpack`       | `rmp_serde::from_slice::<SessionData>(...)`; SQL/Valkey decode path. |
-| `session_data_json`          | `serde_json::from_slice::<SessionData>(...)`; legacy-row fallback decode path. |
-| `jwt_payload_split`          | Back-channel-logout JWT split + base64url + JSON decode (mirrors `decode_jwt_payload`). |
-| `pkce_verifier_predicate`    | RFC 7636 §4.1 `code_verifier` predicate (mirrors `is_valid_pkce_verifier`). |
+| `session_data_msgpack`       | `rmp_serde::from_slice::<SessionData>(...)`; SQL/Valkey decode path (panic-only). |
+| `session_data_json`          | `serde_json::from_slice::<SessionData>(...)`; legacy-row fallback decode path (panic-only). |
+| `jwt_payload_split`          | The real logout-token, ID-token and bearer-token payload decoders, against the contract (size cap, three segments, base64url JSON). |
+| `pkce_verifier_predicate`    | The real `axess_factors::pkce::is_valid_verifier`, against RFC 7636 section 4.1 written out. |
+| `client_ip_forwarded`        | `TrustedProxies::client_ip` against a right-to-left reference walk of `X-Forwarded-For`. |
+| `egress_reserved_embedded_v4`| `ReservedRange::of` and `EgressPolicy::check_url`: an IPv6 form that embeds a reserved IPv4 address is reserved too. |
+| `service_secret_replay_any_scheme` | The signed-request middleware end to end: no replay under any signature scheme, no mutated tag accepted. |
+| `throttle_math_props`        | `Throttle::delay_after`, `retry_after` and `subject`: no panic, monotone, never fails open, keyed per /64. |
+| `cookie_config_prefix`       | `SessionConfig` builder: any `__Host-` or `__Secure-` spelling meets its prefix rules or is refused. |
+| `cedar_uid_injective`        | `build_uids`: distinct tenant and id pairs never render to one resource UID. |
+
+The last five encode defects that are being fixed. Until a fix lands the
+target is expected to find its input, and `.github/workflows/hardening.yml`
+lets that one run fail without failing the workflow; the file names the date
+each allowance comes off.
 
 ## Running locally
 
@@ -19,7 +33,7 @@ the session-load or token-verify hot path.
 
 ```bash
 rustup install nightly
-cargo install cargo-fuzz --locked
+cargo install cargo-fuzz@0.13.2 --locked
 ```
 
 Then, from the repo root:
@@ -30,7 +44,10 @@ cargo +nightly fuzz run session_data_msgpack -- -max_total_time=60
 cargo +nightly fuzz run session_data_json    -- -max_total_time=60
 cargo +nightly fuzz run jwt_payload_split    -- -max_total_time=60
 cargo +nightly fuzz run pkce_verifier_predicate -- -max_total_time=60
+cargo +nightly fuzz run client_ip_forwarded -- -max_total_time=60
 ```
+
+The other five targets run the same way, by name.
 
 `-max_total_time` is libFuzzer's seconds-budget flag; drop it to fuzz
 indefinitely. Crashing inputs are written to `fuzz/artifacts/<target>/`.
@@ -54,8 +71,9 @@ fuzzer needs to execute millions of inputs to be useful.
 ## CI
 
 The `Fuzz Smoke` job in `.github/workflows/ci.yml` builds every target
-and runs each for ~30 seconds on every PR. Catch-on-PR is the goal;
-deeper soak runs belong in a scheduled workflow.
+and runs the first four for ~30 seconds on every PR. The `Hardening`
+workflow (`.github/workflows/hardening.yml`) runs all ten for 120 seconds
+each on every pull request and nightly, and uploads crash inputs.
 
 ## Cargo.lock
 

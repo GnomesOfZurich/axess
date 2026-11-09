@@ -1,0 +1,23 @@
+# cargo-deny policy for what a release build can link: dev-dependency edges
+# are left out of the graph, so a crate listed under `deny` fails the check
+# when any normal or build edge reaches it.
+#
+# `wiremock` is the mock HTTP server behind `axess-testing`, the adopters'
+# dev-dependency fixture crate. It may appear in this graph only as a
+# dependency of `axess-testing`, a workspace member that no other member
+# depends on outside `[dev-dependencies]`.
+# `scripts/check-test-crate-edges.sh` checks the other half: that no member
+# reaches `axess-testing` by a normal or build edge.
+#
+# Run: cargo deny --config deny-production.toml check bans
+
+[graph]
+all-features = true
+exclude-dev = true
+
+[bans]
+multiple-versions = "allow"
+wildcards = "allow"
+deny = [
+    { crate = "wiremock", wrappers = ["axess-testing"], reason = "a mock HTTP server: reachable only through the dev-dependency fixture crate" },
+]

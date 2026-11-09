@@ -1,6 +1,6 @@
 [package]
 name = "axess-example-workload-identity"
-version = "0.18.0"
+version = "0.19.0"
 edition = "2024"
 rust-version.workspace = true
 publish = false
@@ -32,9 +32,9 @@ categories = ["authentication"]
 # `aws-sts` and `azure-fic` back the cloud walkthroughs in
 # `docs/workload-identity/aws.md` and `azure.md`, whose compiled code is
 # `tests/cloud_aws.rs` and `tests/cloud_azure.rs`.
-axess = { path = "../../axess", version = "=0.18.0", features = ["jwt-rust-crypto", "service-secret", "local-idp", "aws-sts", "azure-fic"] }
-axess-factors = { path = "../../axess-factors", version = "=0.18.0", features = ["jwt-rust-crypto"] }
-axess-identity = { path = "../../axess-identity", version = "=0.18.0" }
+axess = { path = "../../axess", version = "=0.19.0", features = ["jwt-rust-crypto", "service-secret", "local-idp", "aws-sts", "azure-fic"] }
+axess-factors = { path = "../../axess-factors", version = "=0.19.0", features = ["jwt-rust-crypto"] }
+axess-identity = { path = "../../axess-identity", version = "=0.19.0" }
 axum = { version = "0.8.9", features = ["json"] }
 chrono = "0.4.45"
 jsonwebtoken = "11.1.0"
@@ -50,10 +50,10 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # `axess_identity::PrincipalResolver` is the trait the integration
 # tests call into; the workspace crate is already a runtime dep
 # above, so the dev-dep just adds nothing extra.
-axess-identity = { path = "../../axess-identity", version = "=0.18.0" }
+axess-identity = { path = "../../axess-identity", version = "=0.19.0" }
 # `MockClock` pins JwtVerifier's notion of "now" so the pinned JWT
 # timestamps validate deterministically under DST.
-axess-clock = { path = "../../axess-clock", version = "=0.18.0", features = ["testing"] }
+axess-clock = { path = "../../axess-clock", version = "=0.19.0", features = ["testing", "allow-testing-in-release"] }
 base64 = { version = "0.23.1", default-features = false, features = ["std"] }
 jsonwebtoken = { version = "11.1.0", features = ["aws_lc_rs"] }
 # `pkcs5` matches the workspace pin. The `pkcs1` *module* (used to

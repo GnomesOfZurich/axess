@@ -255,3 +255,28 @@ fn issuer_deserialization_refuses_a_custom_label_naming_a_built_in() {
     let wire = r#"{"kind":"custom","label":"jwt_svid"}"#;
     assert!(serde_json::from_str::<Issuer>(wire).is_err());
 }
+
+/// Every label that can be held is a label the constructor accepts: the
+/// refused ones never become an issuer, and an accepted one survives a
+/// round trip.
+#[test]
+fn issuer_custom_label_always_valid() {
+    for bad in [
+        "oauth".to_string(),
+        "cli".to_string(),
+        "jwt_svid".to_string(),
+        "mtls".to_string(),
+        String::new(),
+        "A-B".to_string(),
+        "a\nb".to_string(),
+        "a".repeat(33),
+    ] {
+        assert!(Issuer::custom(&bad).is_err(), "{bad:?}");
+    }
+    for good in ["github_actions", "a", "k8s_prod", &"a".repeat(32)] {
+        let issuer = Issuer::custom(good).unwrap();
+        assert_eq!(issuer.as_str(), good);
+        let json = serde_json::to_string(&issuer).unwrap();
+        assert_eq!(serde_json::from_str::<Issuer>(&json).unwrap(), issuer);
+    }
+}

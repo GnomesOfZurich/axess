@@ -17,7 +17,8 @@ use axess_core::authn::{
     types::{EntityState, User},
 };
 use axess_core::testing::mock_authn::{MockFactorStore, MockIdentityStore};
-use axess_core::{BreachCheckOutage, BreachedPasswordList, TracingCapture};
+use axess_core::{BreachCheckOutage, BreachedPasswordList};
+use axess_testing::mock_tracing::TracingCapture;
 use chrono::Utc;
 use common::{test_tenant, tid, uid};
 use std::sync::Arc;

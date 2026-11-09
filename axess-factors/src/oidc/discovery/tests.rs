@@ -2,6 +2,7 @@
 //! 200-LoC inline-test rule in AGENTS.md.
 
 use super::*;
+use crate::egress::EgressPolicy;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -42,7 +43,7 @@ async fn document_fetch_parses_well_known() {
         .await;
 
     let client = openidconnect::reqwest::Client::new();
-    let doc = DiscoveryDocument::fetch(&server.uri(), &client)
+    let doc = DiscoveryDocument::fetch_screened(&server.uri(), &client, EgressPolicy::unscreened())
         .await
         .expect("fetch ok");
 
@@ -68,7 +69,7 @@ async fn document_fetch_rejects_missing_jwks_uri() {
         .await;
 
     let client = openidconnect::reqwest::Client::new();
-    let err = DiscoveryDocument::fetch(&server.uri(), &client)
+    let err = DiscoveryDocument::fetch_screened(&server.uri(), &client, EgressPolicy::unscreened())
         .await
         .expect_err("missing jwks_uri must reject");
     assert!(
@@ -140,7 +141,7 @@ async fn document_fetch_rejects_issuer_mismatch() {
         .mount(&server)
         .await;
     let client = openidconnect::reqwest::Client::new();
-    let err = DiscoveryDocument::fetch(&server.uri(), &client)
+    let err = DiscoveryDocument::fetch_screened(&server.uri(), &client, EgressPolicy::unscreened())
         .await
         .expect_err("mismatched issuer must reject");
     assert!(
@@ -163,7 +164,7 @@ async fn document_fetch_rejects_plain_http_jwks_uri() {
         .mount(&server)
         .await;
     let client = openidconnect::reqwest::Client::new();
-    let err = DiscoveryDocument::fetch(&server.uri(), &client)
+    let err = DiscoveryDocument::fetch_screened(&server.uri(), &client, EgressPolicy::unscreened())
         .await
         .expect_err("http jwks_uri must reject");
     assert!(
@@ -185,7 +186,7 @@ async fn document_fetch_rejects_error_status() {
         .mount(&server)
         .await;
     let client = openidconnect::reqwest::Client::new();
-    let err = DiscoveryDocument::fetch(&server.uri(), &client)
+    let err = DiscoveryDocument::fetch_screened(&server.uri(), &client, EgressPolicy::unscreened())
         .await
         .expect_err("a 500 must reject");
     assert!(
@@ -212,7 +213,7 @@ async fn discovery_fetch_chains_jwks() {
         .await;
 
     let client = openidconnect::reqwest::Client::new();
-    let discovery = Discovery::fetch(&server.uri(), &client)
+    let discovery = Discovery::fetch_screened(&server.uri(), &client, EgressPolicy::unscreened())
         .await
         .expect("discovery ok");
 
@@ -235,7 +236,7 @@ async fn a_discovery_body_over_the_cap_is_refused() {
         .await;
     let client = openidconnect::reqwest::Client::new();
 
-    let err = DiscoveryDocument::fetch(&server.uri(), &client)
+    let err = DiscoveryDocument::fetch_screened(&server.uri(), &client, EgressPolicy::unscreened())
         .await
         .expect_err("oversized body");
 
@@ -262,11 +263,66 @@ async fn document_fetch_compares_the_issuer_exactly() {
         .mount(&server)
         .await;
     let client = openidconnect::reqwest::Client::new();
-    let err = DiscoveryDocument::fetch(&server.uri(), &client)
+    let err = DiscoveryDocument::fetch_screened(&server.uri(), &client, EgressPolicy::unscreened())
         .await
         .expect_err("a different issuer string must reject");
     assert!(
         matches!(err, OidcError::InvalidIssuer(_)),
         "expected InvalidIssuer, got {err:?}"
     );
+}
+
+fn short_client() -> openidconnect::reqwest::Client {
+    openidconnect::reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(1))
+        .build()
+        .expect("client")
+}
+
+fn refused_as(err: &OidcError, setting: &str, range: &str) -> bool {
+    matches!(err, OidcError::EgressRefused { setting: s, range: r } if s == setting && r == range)
+}
+
+/// The simple entry point follows the documented default: a private issuer is
+/// refused by name, with no connection made.
+#[tokio::test]
+async fn document_fetch_refuses_a_private_issuer_by_default() {
+    let err = DiscoveryDocument::fetch("https://10.0.0.5", &short_client())
+        .await
+        .expect_err("a private issuer is refused");
+
+    assert!(refused_as(&err, "issuer URL", "private"), "{err:?}");
+}
+
+#[tokio::test]
+async fn discovery_fetch_refuses_a_metadata_issuer_by_default() {
+    let err = Discovery::fetch("https://169.254.169.254", &short_client())
+        .await
+        .err()
+        .expect("a metadata issuer is refused");
+
+    assert!(refused_as(&err, "issuer URL", "metadata"), "{err:?}");
+}
+
+/// The key set's address is screened before it is fetched, under the policy
+/// the caller chose.
+#[tokio::test]
+async fn discovery_fetch_screened_refuses_a_private_jwks_uri() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/.well-known/openid-configuration"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(discovery_json(&server.uri(), "https://10.0.0.5/jwks")),
+        )
+        .mount(&server)
+        .await;
+    let policy = EgressPolicy::screened_allowing_loopback_http();
+
+    let err = Discovery::fetch_screened(&server.uri(), &short_client(), policy)
+        .await
+        .err()
+        .expect("a private jwks_uri is refused");
+
+    assert!(refused_as(&err, "jwks_uri", "private"), "{err:?}");
 }

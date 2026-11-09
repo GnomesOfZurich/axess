@@ -22,7 +22,7 @@ Axess is a session-based multi-factor authentication and Cedar Policy authorizat
 
 ```toml
 [dependencies]
-axess = { version = "0.18.0", features = ["sqlite", "authz", "testing"] }
+axess = { version = "0.19.0", features = ["sqlite", "authz", "testing"] }
 axum = "0.8"
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
 tokio = { version = "1", features = ["full"] }
@@ -51,6 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `FactorStore` impl. See `examples/sqlite/src/models/backend.rs`
     // and `docs/identity/store.md`.
     let backend = InMemoryBackend::new()
+        .with_default_tenant("default", "Default tenant")
         .with_user_password("alice", "default", "Gnomes2+");
     // One registry for the service (it records every login) and the session
     // layer (it ends a revoked session on every route). Use the Valkey
@@ -188,7 +189,7 @@ For the complete docs index, see [`docs/README.md`](docs/README.md).
 
 ```toml
 [dependencies]
-axess = { version = "0.18.0", features = ["sqlite", "authz"] }
+axess = { version = "0.19.0", features = ["sqlite", "authz"] }
 ```
 
 To track the development branch instead of a release:

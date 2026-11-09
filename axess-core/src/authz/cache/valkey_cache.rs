@@ -11,11 +11,17 @@ use cedar_policy::{Entities, EntityUid};
 use fred::prelude::*;
 use tracing::warn;
 
+use self::index_ops::drain_index;
 use super::generation::Generations;
 use crate::authz::error::AuthzError;
 use crate::authz::provider::RequestEntityProvider;
 use crate::health::{HealthCheck, HealthStatus};
 use crate::session::AuthSession;
+
+pub(crate) mod index_ops;
+
+#[cfg(test)]
+mod index_tests;
 
 const DEFAULT_PREFIX: &str = "axess";
 const DEFAULT_TTL_SECS: u64 = 60;
@@ -65,10 +71,12 @@ const DEFAULT_TTL_SECS: u64 = 60;
 /// Beside each entry the cache writes, for every entity UID in the entity
 /// set and for the resource, a Valkey SET `{prefix}:authz-entities-uid:{uid}`
 /// holding the entry's key, with the same TTL as the entry.
-/// [`invalidate_resource`](Self::invalidate_resource) reads that SET and
-/// deletes the entries it names, so it also drops the entries built under a
-/// parent (a folder, group or role) whose UID is in their entity sets. An
-/// entry whose index could not be written is not stored.
+/// [`invalidate_resource`](Self::invalidate_resource) takes the members out
+/// of that SET and deletes the entries they name, so it also drops the
+/// entries built under a parent (a folder, group or role) whose UID is in
+/// their entity sets. A member another pod adds while it runs stays in the
+/// SET until a later read takes it. An entry whose index could not be
+/// written is not stored.
 ///
 /// # Caching contract
 ///
@@ -319,11 +327,7 @@ where
     ) -> Result<(), fred::error::Error> {
         self.generations.bump_resource(resource);
         let index = self.index_key(resource);
-        let members: Vec<String> = self.client.smembers(&index).await?;
-        for chunk in members.chunks(256) {
-            let _: () = self.client.del(chunk.to_vec()).await?;
-        }
-        let _: () = self.client.del(&index).await?;
+        drain_index(&self.client, &index).await?;
         let pattern = format!(
             "{}:authz-entities:*|{}|*",
             self.prefix,

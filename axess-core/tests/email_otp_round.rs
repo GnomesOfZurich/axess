@@ -135,6 +135,65 @@ async fn a_lost_second_swap_is_retried_against_the_claim_that_is_still_ours() {
     assert!(stored(&factors).await.pending_hash.is_some());
 }
 
+/// A write another request makes to the claimed row between this request's
+/// claim and its store.
+fn changed(
+    write: impl Fn(&mut EmailOtpConfig) + Send + Sync + 'static,
+) -> impl Fn(&FactorConfig) -> FactorConfig + Send + Sync + 'static {
+    move |config| match config {
+        FactorConfig::EmailOtp(cfg) => {
+            let mut cfg = cfg.clone();
+            write(&mut cfg);
+            FactorConfig::EmailOtp(cfg)
+        }
+        other => other.clone(),
+    }
+}
+
+#[tokio::test]
+async fn a_retry_after_a_lost_swap_keeps_a_concurrent_attempt_count() {
+    let (svc, factors, _clock) = world(base());
+    let session = test_session();
+    svc.begin_login("alice", "default", &session).await.unwrap();
+    factors.arm_cas_failures_after(1, 1);
+    factors.arm_concurrent_write_on_lost_swap(changed(|cfg| cfg.attempt_count = 3));
+
+    let issued = svc.prepare_factor(&session).await.unwrap();
+
+    assert!(
+        matches!(issued, PrepareOutcome::SendOtp { .. }),
+        "{issued:?}"
+    );
+    let row = stored(&factors).await;
+    assert!(row.pending_hash.is_some());
+    assert_eq!(
+        row.attempt_count, 3,
+        "the retry wrote a stale snapshot over a concurrent change"
+    );
+}
+
+#[tokio::test]
+async fn a_retry_after_a_concurrent_address_change_delivers_nothing() {
+    let (svc, factors, _clock) = world(base());
+    let session = test_session();
+    svc.begin_login("alice", "default", &session).await.unwrap();
+    factors.arm_cas_failures_after(1, 1);
+    factors.arm_concurrent_write_on_lost_swap(changed(|cfg| cfg.email = "new@example.com".into()));
+
+    let result = svc.prepare_factor(&session).await;
+
+    assert!(
+        result.is_err(),
+        "a code for the old address must not be delivered: {result:?}"
+    );
+    let row = stored(&factors).await;
+    assert_eq!(&*row.email, "new@example.com", "the change stands");
+    assert!(
+        row.pending_hash.is_none(),
+        "no code is held for the new address"
+    );
+}
+
 #[tokio::test]
 async fn an_unfinished_claim_is_a_short_lease_not_the_full_ttl() {
     let (svc, factors, clock) = world(base());

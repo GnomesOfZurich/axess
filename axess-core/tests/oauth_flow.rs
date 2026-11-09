@@ -1,23 +1,21 @@
 //! OAuth begin/finish ceremony: CSRF guard, expiry cap, MockOAuthProvider surface.
 
-#![cfg(feature = "testing-oauth")]
+#![cfg(all(feature = "testing", feature = "oauth"))]
 
 mod common;
 
 use axess_core::authn::AuditContext;
+use axess_core::testing::oauth_provider::{oauth_discover_provider, oauth_setup_provider};
 use axess_core::{
     authn::service::AuthnService,
     testing::{
         MockClock,
         mock_authn::{MockFactorStore, MockIdentityStore},
-        oauth_wiremock::{
-            oauth_discover_provider, oauth_generate_rsa_keypair, oauth_mount_oidc_endpoints,
-            oauth_setup_provider,
-        },
         test_session,
     },
 };
 use axess_factors::oauth::{OAuthLoginOptions, OAuthProviderConfig};
+use axess_testing::oauth_wiremock::{oauth_generate_rsa_keypair, oauth_mount_oidc_endpoints};
 use common::test_tenant;
 use wiremock::MockServer;
 
@@ -29,7 +27,7 @@ async fn oauth_csrf_mismatch_rejected() {
     let server = MockServer::start().await;
     let (_, jwk, _) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &jwk).await;
-    let provider: OAuthProviderConfig = oauth_setup_provider(&server).await;
+    let provider: OAuthProviderConfig = oauth_setup_provider(&server.uri()).await;
 
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
     let authn = AuthnService::builder(identity, MockFactorStore::new())
@@ -58,7 +56,7 @@ async fn oauth_expired_ceremony_rejected() {
     let server = MockServer::start().await;
     let (_, jwk, _) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &jwk).await;
-    let provider = oauth_setup_provider(&server).await;
+    let provider = oauth_setup_provider(&server.uri()).await;
 
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
     let clock = MockClock::now();
@@ -100,7 +98,7 @@ async fn oauth_ceremony_started_in_the_future_is_expired() {
     let server = MockServer::start().await;
     let (_, jwk, _) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &jwk).await;
-    let provider = oauth_setup_provider(&server).await;
+    let provider = oauth_setup_provider(&server.uri()).await;
 
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
     let clock = MockClock::now();
@@ -149,7 +147,7 @@ async fn oauth_ceremony_capped_at_rfc_600s_even_when_provider_overrides() {
     oauth_mount_oidc_endpoints(&server, &jwk).await;
     // Provider advertises a 30-min ceremony_timeout. The AS would happily
     // honour it; the axess-side cap clamps the *axess* expiry check at 600 s.
-    let provider = oauth_discover_provider(&server)
+    let provider = oauth_discover_provider(&server.uri())
         .await
         .with_ceremony_timeout(std::time::Duration::from_secs(1800))
         .build()

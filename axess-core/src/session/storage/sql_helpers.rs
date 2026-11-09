@@ -23,6 +23,25 @@
 use crate::health::HealthStatus;
 use std::future::Future;
 
+/// Refuse a zero cleanup interval by name.
+///
+/// `tokio::time::interval` panics on a zero period, and from inside the
+/// spawned task that panic is only a finished `JoinHandle` nobody awaits: the
+/// sweep never runs and expired rows pile up. The check runs on the caller's
+/// thread, at startup, where the misconfiguration (a `0` from a config file)
+/// is seen.
+///
+/// # Panics
+///
+/// When `interval` is zero.
+pub(crate) fn require_cleanup_interval(label: &'static str, interval: std::time::Duration) {
+    assert!(
+        !interval.is_zero(),
+        "{label} spawn_cleanup_task: the cleanup interval must be greater than zero; \
+         a zero interval would end the cleanup task on its first tick"
+    );
+}
+
 /// Log a single `cleanup_expired` outcome.
 ///
 /// `label` is the backend tag emitted as part of the message
@@ -74,7 +93,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::mock_tracing::TracingCapture;
+    use axess_testing::mock_tracing::TracingCapture;
 
     #[test]
     fn ok_zero_does_not_log() {

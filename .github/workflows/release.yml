@@ -2,9 +2,8 @@ name: Release
 
 # A release starts from a tag `vX.Y.Z`: tag.yml creates it when the release
 # pull request merges into main and starts this workflow from it, or a
-# maintainer pushes it by hand (the tag ruleset lets only repository admins
-# and tag.yml create one, and nobody move or delete it). Nothing is published
-# until, in order:
+# maintainer pushes it by hand (the tag ruleset lets nobody move or delete
+# one). Nothing is published until, in order:
 #
 #   1. "Verify release tag": the run is for a tag, the tag's commit is on
 #      main or on a release/X.Y.x branch, the tag equals the workspace
@@ -62,8 +61,9 @@ jobs:
           esac
           echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       # A tag on a commit no release branch carries would publish code that
@@ -117,9 +117,89 @@ jobs:
       contents: read
     uses: ./.github/workflows/ci.yml
 
+  # ── Package once, attest those files, publish them ────────────────
+  # The crates are packaged here, from the locked tree, by a job that holds
+  # neither the registry token nor an OIDC permission. The SBOM is generated
+  # in the same job from the same tree, before anything is published, so it
+  # describes what was packaged. No cache is restored: a build that feeds
+  # a signature and an upload starts from the sources and the lockfile.
+  package:
+    name: Package the crates and the SBOM
+    needs: [verify, ci]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+
+      # --locked: the verify build of each package resolves from the
+      # Cargo.lock CI tested. The sums are the record the later jobs check
+      # their own packaging against.
+      - name: Package every published crate
+        run: |
+          set -eu
+          cargo package --workspace --exclude "axess-example-*" --locked
+          cd target/package
+          sha256sum -- *.crate | tee crates.sha256
+
+      - name: Generate the SBOM from the same locked tree
+        run: |
+          set -eu
+          cargo install cargo-cyclonedx@0.5.10 --locked
+          # cargo-cyclonedx has no --locked flag: it reads the dependency
+          # graph through cargo metadata. So the lock is checked to be
+          # complete first (--locked refuses a stale one), and checked again
+          # afterwards to be byte for byte what it was, so the SBOM describes
+          # the lock the crates were packaged from.
+          cargo fetch --locked
+          cp Cargo.lock "$RUNNER_TEMP/Cargo.lock.packaged"
+          cargo cyclonedx --all --format json
+          cmp Cargo.lock "$RUNNER_TEMP/Cargo.lock.packaged"
+          mkdir -p sbom
+          find . -name '*.cdx.json' -not -path './sbom/*' -not -path './target/*' -exec mv {} sbom/ \;
+          ls sbom
+
+      - name: Keep the packaged crates and the SBOM for the later jobs
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-files
+          path: |
+            target/package/*.crate
+            target/package/crates.sha256
+            sbom/*.cdx.json
+          if-no-files-found: error
+
+  # The one job with signing permissions. It runs no build and installs no
+  # tool: it downloads what `package` made and attests exactly those files, so
+  # adopters have a provenance statement for each .crate as well as for the
+  # SBOM, tying them to this workflow run and this commit.
+  attest:
+    name: Attest the packaged crates and the SBOM
+    needs: [verify, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write      # OIDC token for Sigstore keyless signing
+      attestations: write  # GitHub artifact attestations
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-files
+      - name: Attest provenance of the crates and the SBOM
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            target/package/*.crate
+            sbom/*.cdx.json
+
   publish:
     name: Publish to crates.io
-    needs: [verify, ci]
+    needs: [verify, ci, package, attest]
     runs-on: ubuntu-latest
     # The maintainer is the environment's required reviewer, and its deployment
     # policy admits `v*` tags only: the job waits here for that approval.
@@ -132,11 +212,46 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-files
+          path: attested
 
-      # bottom-up dependency order
+      # The advisory database as it stands now, against the Cargo.lock the
+      # crates are about to be published from: CI audited the lock when the
+      # pull request ran, and an advisory can land between that run and the
+      # approval of this deployment. The tool is installed and run in steps
+      # that do not hold the registry token. The ignore list is the one
+      # .cargo/audit.toml carries, so this refuses what CI refuses.
+      - name: Audit the lockfile against the current advisory database
+        run: |
+          cargo install cargo-audit@0.22.2 --locked
+          cargo audit --file Cargo.lock --deny warnings
+
+      # `cargo publish` packages again before it uploads; it cannot upload a
+      # file made elsewhere. So the files it will upload are made here first
+      # and their sums compared with the attested ones, and the job stops by
+      # name if a single byte differs.
+      - name: The crates packaged here are the attested crates
+        run: |
+          set -eu
+          cargo package --workspace --exclude "axess-example-*" --locked
+          (cd target/package && sha256sum -- *.crate) > packaged-here.sha256
+          if ! diff -u attested/target/package/crates.sha256 packaged-here.sha256; then
+            echo "::error::refused: the crates packaged in this job are not the crates that were attested; nothing was published."
+            exit 1
+          fi
+          echo "OK: every crate packaged here matches the attested package."
+
+      # bottom-up dependency order. --locked: the verify build of each crate
+      # resolves from the Cargo.lock CI tested, not from whatever
+      # semver-compatible versions are newest at publish time.
       - name: Publish crates (resumable, rate-limit-aware)
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -146,7 +261,7 @@ jobs:
             attempt=0
             while [ "$attempt" -lt 10 ]; do
               attempt=$((attempt + 1))
-              if out=$(cargo publish -p "$crate" 2>&1); then
+              if out=$(cargo publish --locked -p "$crate" 2>&1); then
                 echo "$out"; return 0
               fi
               echo "$out"
@@ -165,43 +280,31 @@ jobs:
             done
             echo "::error::publishing $crate exhausted retries"; return 1
           }
-          for c in axess-strings axess-clock axess-rng axess-identity axess-events axess-cache axess-factors axess-core axess-macros axess; do
+          for c in axess-strings axess-clock axess-rng axess-testing axess-identity axess-events axess-cache axess-factors axess-core axess-macros axess; do
             publish "$c"
             sleep 30
           done
 
-  # ── Signed release with SBOM ──────────────────────────────────────
+  # ── GitHub release with the attested files ───────────────────────
   release:
-    name: GitHub Release + SBOM
-    needs: [verify, publish]
+    name: GitHub Release
+    needs: [verify, attest, publish]
     runs-on: ubuntu-latest
     permissions:
       contents: write      # create the GitHub release
-      id-token: write      # OIDC token for Sigstore keyless signing
-      attestations: write  # GitHub artifact attestations
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Generate SBOM
-        run: |
-          cargo install cargo-cyclonedx
-          cargo cyclonedx --all --format json
-          # Combine per-crate SBOMs into release artifacts
-          mkdir -p sbom
-          find . -name '*.cdx.json' -not -path './sbom/*' -exec mv {} sbom/ \;
-
-      - name: Attest SBOM provenance
-        uses: actions/attest-build-provenance@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          subject-path: sbom/*.cdx.json
+          name: release-files
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           tag_name: ${{ needs.verify.outputs.tag }}
           generate_release_notes: true
-          files: sbom/*.cdx.json
+          files: |
+            target/package/*.crate
+            sbom/*.cdx.json
 
   # ── release/next follows main after a release from main ──────────
   # After a publish from main, release/next has to start from the released
@@ -221,16 +324,26 @@ jobs:
     permissions:
       contents: write      # move or merge release/next
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 0
           ref: main
 
       - name: Move release/next to main, or merge main into it
         env:
           TAG: ${{ needs.verify.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
+          # The checkout keeps no credential (persist-credentials: false), so
+          # the token reaches git only for the two pushes below, as a header
+          # on that one command and in no file under .git.
+          push() {
+            auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')
+            echo "::add-mask::$auth"
+            git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" push "$@"
+          }
           git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main' \
             '+refs/heads/release/next:refs/remotes/origin/release/next' || {
             echo "::error::release/next does not exist on origin; create it from main: git push origin main:refs/heads/release/next"
@@ -247,7 +360,7 @@ jobs:
             # Behind main, or the same tree as the squashed release: nothing on
             # release/next is lost by moving it. The lease refuses the move if
             # the branch changed since it was read.
-            git push --force-with-lease="refs/heads/release/next:$next" origin "$main:refs/heads/release/next"
+            push --force-with-lease="refs/heads/release/next:$next" origin "$main:refs/heads/release/next"
             echo "OK: release/next moved from $next to main ($main) after ${TAG}."
             exit 0
           fi
@@ -260,5 +373,5 @@ jobs:
             echo "::error::release/next and main conflict after ${TAG}; merge main into release/next by hand (git checkout release/next && git merge main) and push."
             exit 1
           fi
-          git push --force-with-lease="refs/heads/release/next:$next" origin "release/next:refs/heads/release/next"
+          push --force-with-lease="refs/heads/release/next:$next" origin "release/next:refs/heads/release/next"
           echo "OK: main ($main) merged into release/next after ${TAG}."

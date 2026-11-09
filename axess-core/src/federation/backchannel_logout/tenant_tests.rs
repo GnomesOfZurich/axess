@@ -285,10 +285,11 @@ async fn an_issuer_and_client_id_shared_by_two_tenants_is_refused_not_guessed() 
     );
 }
 
-/// A tenant provider that matches a global one's issuer and client id is the
-/// same ambiguity.
+/// A tenant provider that matches a global one's issuer and client id does
+/// not shadow it: the global registration is the operator's, so it decides,
+/// and a record a tenant wrote cannot make its tokens ambiguous.
 #[tokio::test]
-async fn a_tenant_matching_the_global_registration_is_ambiguous_too() {
+async fn a_tenant_matching_the_global_registration_does_not_shadow_it() {
     let registry = MemorySessionRegistry::new();
     let global: Vec<Arc<dyn OAuthProvider>> = vec![Arc::new(
         MockOAuthProvider::new("sso")
@@ -302,15 +303,19 @@ async fn a_tenant_matching_the_global_registration_is_ambiguous_too() {
         Arc::new(SystemClock),
     )
     .expect("handler")
-    .with_tenant_providers(Arc::new(Source {
+    .with_tenant_providers(Arc::new(PartlyBroken {
         providers: vec![offered("acme", ISS_A, "client-x")],
-        fails: false,
+        broken: vec![("beta", "client-x")],
     }));
     let claims = serde_json::json!({ "aud": "client-x" });
-    assert!(matches!(
-        h.entry_for(ISS_A, &claims).await,
-        Err(LogoutProviderError::Ambiguous { global: true, .. })
-    ));
+
+    let entry = h
+        .entry_for(ISS_A, &claims)
+        .await
+        .expect("the global registration decides")
+        .expect("and is found");
+
+    assert_eq!(entry.tenant, None, "the global registration is unscoped");
 }
 
 /// Without any tenant source the handler is what it was: the global map
@@ -687,4 +692,31 @@ async fn a_provider_added_to_the_live_registry_is_found_despite_a_remembered_mis
     );
     assert_eq!(post(&h, t("j2")).await, Ok(StatusCode::OK));
     assert!(!registry.is_valid(&user, &session).await.unwrap());
+}
+
+/// A memory interval an operator set to an extreme value (zero, the largest
+/// duration chrono holds, `Duration::MAX`) is a setting, not a way to abort
+/// the unauthenticated request that reads it.
+#[tokio::test]
+async fn an_extreme_unknown_issuer_memory_never_panics_the_request() {
+    for extreme in axess_testing::durations::extreme_durations() {
+        let h = BackChannelLogoutHandler::for_tenants(
+            Arc::new(Counting(Default::default())),
+            Arc::new(SessionRegistryAdapter(MemorySessionRegistry::new())),
+            SidMap::new(),
+            Arc::new(SystemClock),
+        )
+        .with_unknown_issuer_memory(extreme.value);
+        let t = token(
+            "https://nobody.example",
+            "client-a",
+            serde_json::json!({ "sub": "s", "jti": "extreme" }),
+        );
+        assert_eq!(
+            post(&h, t).await,
+            Err(StatusCode::BAD_REQUEST),
+            "memory of {}",
+            extreme.name
+        );
+    }
 }

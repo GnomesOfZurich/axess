@@ -281,13 +281,44 @@ fn refuse_private_key_material(jwk_value: &serde_json::Value) -> Result<(), OAut
     Ok(())
 }
 
+/// Check the proof's signature with the key its header carries. The header is
+/// already parsed by the caller and the payload is parsed once after this, so
+/// the signature is checked directly over the signing input instead of
+/// handing the whole token to `decode`, which would parse both again.
+fn verify_proof_signature(
+    proof_jwt: &str,
+    parts: &[&str],
+    jwk_value: &serde_json::Value,
+) -> Result<(), OAuthError> {
+    use jsonwebtoken::{Algorithm, DecodingKey};
+
+    let jwk: jsonwebtoken::jwk::Jwk = serde_json::from_value(jwk_value.clone())
+        .map_err(|e| OAuthError::IdTokenValidation(format!("DPoP `jwk` invalid: {e}")))?;
+    let decoding_key = DecodingKey::from_jwk(&jwk)
+        .map_err(|e| OAuthError::IdTokenValidation(format!("DPoP key build: {e}")))?;
+    crate::jwt::ensure_crypto_provider();
+    let signing_input = &proof_jwt[..parts[0].len() + 1 + parts[1].len()];
+    let signature_ok = jsonwebtoken::crypto::verify(
+        parts[2],
+        signing_input.as_bytes(),
+        &decoding_key,
+        Algorithm::ES256,
+    )
+    .map_err(|e| OAuthError::IdTokenValidation(format!("DPoP signature verify: {e}")))?;
+    if !signature_ok {
+        return Err(OAuthError::IdTokenValidation(
+            "DPoP signature verify: signature does not match".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Verify a single DPoP proof. Returns the canonical JWK thumbprint of
 /// the signing key on success.
 pub fn verify_dpop_proof(
     req: DpopVerifyRequest<'_>,
     now: DateTime<Utc>,
 ) -> Result<DpopVerified, OAuthError> {
-    use jsonwebtoken::{Algorithm, DecodingKey};
     use subtle::ConstantTimeEq;
 
     if !(0..=MAX_IAT_SKEW_SECS).contains(&req.max_iat_skew_secs) {
@@ -333,29 +364,11 @@ pub fn verify_dpop_proof(
 
     refuse_private_key_material(jwk_value)?;
 
-    // 2. Build the verifier from the embedded JWK.
-    let jwk: jsonwebtoken::jwk::Jwk = serde_json::from_value(jwk_value.clone())
-        .map_err(|e| OAuthError::IdTokenValidation(format!("DPoP `jwk` invalid: {e}")))?;
-    let decoding_key = DecodingKey::from_jwk(&jwk)
-        .map_err(|e| OAuthError::IdTokenValidation(format!("DPoP key build: {e}")))?;
-    // The header is already parsed above and the payload is parsed once
-    // below, so the signature is checked directly over the signing input
-    // instead of handing the whole token to `decode`, which would parse
-    // both again.
-    crate::jwt::ensure_crypto_provider();
-    let signing_input = &req.proof_jwt[..parts[0].len() + 1 + parts[1].len()];
-    let signature_ok = jsonwebtoken::crypto::verify(
-        parts[2],
-        signing_input.as_bytes(),
-        &decoding_key,
-        Algorithm::ES256,
-    )
-    .map_err(|e| OAuthError::IdTokenValidation(format!("DPoP signature verify: {e}")))?;
-    if !signature_ok {
-        return Err(OAuthError::IdTokenValidation(
-            "DPoP signature verify: signature does not match".to_string(),
-        ));
-    }
+    // 2. The key is the sender's to choose, so it is checked to be what this
+    // verifier signs over (ES256) before a key is built from it.
+    let (x, y) = p256_coordinates(jwk_value)?;
+
+    verify_proof_signature(req.proof_jwt, &parts, jwk_value)?;
     let payload_bytes = URL_SAFE_NO_PAD
         .decode(parts[1])
         .map_err(|e| OAuthError::IdTokenValidation(format!("DPoP payload b64 decode: {e}")))?;
@@ -429,37 +442,55 @@ pub fn verify_dpop_proof(
 
     // 6. RFC 7638 JWK thumbprint of the signing key, returned for the
     //    application's `cnf.jkt` cross-check against the access token.
-    let thumbprint = jwk_thumbprint_es256(jwk_value)?;
+    let thumbprint = jwk_thumbprint_p256(&x, &y);
 
     Ok(DpopVerified { thumbprint })
 }
 
-/// Compute the RFC 7638 JWK thumbprint for an ES256 (P-256) JWK.
-fn jwk_thumbprint_es256(jwk_value: &serde_json::Value) -> Result<String, OAuthError> {
-    let crv = jwk_value
-        .get("crv")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            OAuthError::IdTokenValidation("JWK thumbprint: missing `crv`".to_string())
-        })?;
-    let kty = jwk_value
-        .get("kty")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            OAuthError::IdTokenValidation("JWK thumbprint: missing `kty`".to_string())
-        })?;
-    let x = jwk_value
-        .get("x")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| OAuthError::IdTokenValidation("JWK thumbprint: missing `x`".to_string()))?;
-    let y = jwk_value
-        .get("y")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| OAuthError::IdTokenValidation("JWK thumbprint: missing `y`".to_string()))?;
-    // RFC 7638 §3.2: lex-ordered required members for an EC key are
-    // `crv`, `kty`, `x`, `y`.
-    let canonical = format!(r#"{{"crv":"{crv}","kty":"{kty}","x":"{x}","y":"{y}"}}"#);
-    Ok(URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes())))
+/// The coordinates of an EC P-256 public key given as a JWK: `kty` must be
+/// `EC`, `crv` `P-256`, and `x` and `y` base64url without padding of exactly
+/// 32 bytes each. Anything else is refused naming the member.
+///
+/// The members come back as the unpadded base64url of the bytes they decoded
+/// to, so one key has one spelling (and one thumbprint) however the sender
+/// wrote it.
+fn p256_coordinates(jwk_value: &serde_json::Value) -> Result<(String, String), OAuthError> {
+    let refuse = |member: &str, why: &str| {
+        OAuthError::IdTokenValidation(format!("DPoP `jwk` member `{member}` {why}"))
+    };
+    if jwk_value.get("kty").and_then(|v| v.as_str()) != Some("EC") {
+        return Err(refuse("kty", "must be `EC`"));
+    }
+    if jwk_value.get("crv").and_then(|v| v.as_str()) != Some("P-256") {
+        return Err(refuse("crv", "must be `P-256`"));
+    }
+    let coordinate = |member: &str| -> Result<String, OAuthError> {
+        let text = jwk_value
+            .get(member)
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| refuse(member, "must be a string"))?;
+        let bytes = URL_SAFE_NO_PAD
+            .decode(text)
+            .map_err(|_| refuse(member, "must be base64url without padding"))?;
+        if bytes.len() != 32 {
+            return Err(refuse(member, "must be 32 bytes"));
+        }
+        Ok(URL_SAFE_NO_PAD.encode(bytes))
+    };
+    Ok((coordinate("x")?, coordinate("y")?))
+}
+
+/// The RFC 7638 JWK thumbprint of a P-256 key: the SHA-256 of its required
+/// members, `crv`, `kty`, `x` and `y` in that order, as compact JSON.
+fn jwk_thumbprint_p256(x: &str, y: &str) -> String {
+    let mut members = serde_json::Map::new();
+    members.insert("crv".to_string(), "P-256".into());
+    members.insert("kty".to_string(), "EC".into());
+    members.insert("x".to_string(), x.into());
+    members.insert("y".to_string(), y.into());
+    // A `Map` of strings always serialises; the bytes are what is hashed.
+    let canonical = serde_json::Value::Object(members).to_string();
+    URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes()))
 }
 
 #[cfg(test)]

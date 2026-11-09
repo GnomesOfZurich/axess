@@ -8,6 +8,95 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-11-09
+
+### Security
+
+- A refresh token issued from a session carries the session's authentication time, so redeeming it no longer turns an old login into a fresh one for `max_authenticated_age`, `max_lifetime` and every recency gate, and a session past the family's lifetime gets no token (`issue_refresh_token_from_login`).
+- `login_with_password` answers the guess that locks an account, and a request racing into a lock, as a wrong password, so the password form no longer shows which accounts exist.
+- The per-key guess throttle keeps building while the lockout counter store is down.
+- A cancelled refusal in the OAuth login settles on a task of its own, so the sessions it owed an end to are ended and the displaced `sid` mapping is restored or its session ended.
+- A cancelled back-channel logout no longer leaves its `jti` in flight: the pair is forgotten when the request is dropped while the replay log is taking its outcome.
+- A taken signup identifier rotates the session id as a free one does, so the session cookie no longer shows whether an account exists.
+- `with_lockout_revealed_on_begin` shows a lockout only, not an administrative suspension or its end.
+- The family-compromise handler `cascade_revoke_by_refresh_family_and_tokens` revokes every refresh token bound to the compromised family's devices; `cascade_revoke_by_refresh_family` says it revokes the devices only.
+- The refresh device check reads through `CachedDeviceStore` (`DeviceStore::load_fresh`), so a device revoked on another instance stops the next refresh and not the one after the cache expires.
+- An administrator cannot impersonate themselves, a failed impersonation ends the administrator's anchor entry, and `with_impersonation_max_authn_age` makes `begin_impersonation` require a recent administrator authentication.
+- Invalidating a resource in the Valkey authz cache takes each index member out as it reads it (`SPOP`), so an entry another pod stores meanwhile is no longer left cached and unindexed until its TTL.
+- `require_authz!` resource ids with two or more placeholders refuse a value that holds a character the template uses as a separator, and a template that puts two placeholders next to each other (`{$tenant}{id}`) fails to compile and is refused by `build_uids`, so distinct (tenant, id) pairs can no longer render to one resource id.
+- A stale Valkey revocation-subscriber dispatcher or reconnector no longer drops, quits or wakes the watchers of a newer connection: each acts for its own connection generation only, and closing a connection also stops its dispatcher.
+- The login throttle keys an IPv6 client address on its /64 prefix (an IPv4-mapped address as its IPv4 address), so rotating addresses inside one /64 no longer starts a fresh throttle key for every guess.
+- The login throttle refuses a guess when its delay or retry time is too large to represent (a `max_delay` of `Duration::MAX`) instead of letting it run, and a zero `first_delay` stays no delay however many failures accumulate; the `Retry-After` header saturates instead of wrapping to zero.
+- The Valkey session registry orders `active_sessions` by registration time, kept in a second sorted set that use never moves, so `max_sessions_per_user` evicts the oldest session and not the one least recently used.
+- A cookie name's `__Host-` and `__Secure-` prefixes are matched without regard to case, as browsers do, in `SessionConfig` and in `CsrfConfig`, so `__HOST-sid` or `__HOST-csrf` with `secure(false)` is refused when the config is built.
+- Registering a passkey claims its credential id through the new `FactorStore::claim_fido2_credential` (released by `release_fido2_credential`), so two accounts racing for one id have one winner; a store of your own implements both methods for the guarantee, since the defaults only check the holder.
+- A screened egress client no longer follows `HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY` from the environment, because a proxy resolves the target's name itself and the connect-time address screen never saw it.
+- The SSRF screen judges an IPv6 address that carries an IPv4 address (NAT64, the locally used NAT64 prefix, 6to4, IPv4-compatible) as the IPv4 address it carries, and refuses the IPv4 special-purpose ranges `192.0.0.0/24`, `198.18.0.0/15`, `240.0.0.0/4` and the three documentation ranges (named `private`), so `https://[64:ff9b::a9fe:a9fe]/` no longer reaches a metadata address.
+- `DiscoveryDocument::fetch` and `Discovery::fetch` apply `EgressPolicy::screened()` to the issuer URL and to every URL the document names, `jwks_uri` included, and `Discovery::fetch_screened` takes the policy; the opt-out for an identity provider on the deployment's own network is `EgressPolicy::unscreened()`, passed by name.
+- A signed service request accepted once is refused as a replay under every scheme, because the replay cache keys the request (caller, stamp, method, target, body) rather than the tag, so a dual-signed header can no longer be replayed under the older scheme.
+- `JwtVerifier::with_typ` and `verify_jwt_with_typ` require the JOSE `typ` header of a token (case-insensitive, a leading `application/` dropped), so a key that signs ID tokens, access tokens, logout tokens and DPoP proofs no longer lets one pass for another; the header type is still not read unless it is asked for.
+- `StoredTenantOAuthProviders::upsert` refuses an issuer and client id another tenant or the global registration (`with_global_registration`) already holds, so one tenant can no longer make another's back-channel logout ambiguous and refused.
+- `begin_grant` refuses an authorization endpoint that is not HTTPS (HTTP to a loopback host stays allowed) with `DelegatedError::Transport`, so the client id, PKCE challenge and `state` are not sent in clear to a remote IdP.
+- `SocialProvider::new` refuses a `redirect_uri` that is plain HTTP to a remote host, and `exchange_code` refuses a token response whose `token_type` is not `Bearer` or is missing, so the authorization code is not returned over cleartext and a token bound to another scheme is not sent as a bearer token.
+- An Azure STS error carries the provider's `error`, `error_description` and `correlation_id` (and a non-JSON body) with control characters escaped and the text cut to 512 bytes (128 for the code and the id), so a response cannot forge a log line.
+- `refresh_providers_jwks` reports a provider whose JWKS refresh panicked in its failures, under the provider's name, where it used to drop it and let an empty result stand for success.
+- `LocalIdp::mint` and `mint_with_header` refuse an expired token and one whose `nbf` is after its `exp` after `without_max_ttl()` too, with `IssuanceError::InvalidLifetime`; removing the cap removes only the upper bound on the lifetime.
+- A forwarded entry written as `ip:port`, `[v6]:port` or `[v6]` is read as its address, so a proxy that appends the peer's port no longer ends the `X-Forwarded-For` walk at the proxy's own address, and a trusted proxy whose chain cannot be read is logged as a warning on the `axess::client_ip` target (without the entry).
+- `verify_dpop_proof` refuses a proof key that is not an EC P-256 key with 32-byte `x` and `y` before building a key from it, naming the member (`kty`, `crv`, `x`, `y`), and builds the thumbprint with `serde_json` from the decoded coordinates, so one key has one thumbprint however its JWK is spelled.
+- `SocialProvider::accept_missing_token_type()` is the named opt-in for a provider whose token response omits `token_type`: the missing value is read as `Bearer`, and a present one that is not `Bearer` is still refused.
+- `Issuer::Custom` holds a `CustomLabel`, a newtype with a private field that only `Issuer::custom` builds, so a custom issuer can no longer carry the label of a built-in one (`"oauth"`) or a label the format check refuses; a `compile_fail` doctest pins it.
+- The OAuth example refuses a callback whose `{provider}` path is not the provider the login began with, before any code is redeemed, so per-provider redirect URIs give the mix-up protection they are registered for.
+- The FAPI example creates a local user only for an identity whose IdP verified the e-mail address, and `is_local_issuer` parses the issuer like an HTTP client, so a backslash can no longer make a remote host look local.
+- The minimal example registers the `default` tenant its login names (every login was refused for want of it), and spends one Argon2id check before every early refusal of a login, so an unknown username is no faster to refuse than a known one.
+- The OAuth example takes the stored refresh token out of the session before the IdP is called, so two refreshes that arrive together present it once and the IdP does not revoke the token family on reuse.
+- Every workflow action is pinned to a commit SHA, every checkout drops its credential, every `cargo install` names a version with `--locked`, and CI images are pinned by digest; `scripts/check-workflow-pins.sh` enforces all four in the release preflight.
+- The release packages the crates and the SBOM from one locked tree in a job with no secrets, attests them in a job that builds nothing, audits the lockfile again before upload, and publishes only those byte-identical files with `cargo publish --locked`.
+- `scripts/install-mdbook.sh` checks the mdBook and mdbook-mermaid archives against pinned SHA-256 digests with `sha256sum -c` before extracting them.
+- `axess-core`, `axess-factors`, `axess-rng` and `axess-clock` refuse to compile in a release build (debug assertions off) with the `testing` feature on, unless the build names `allow-testing-in-release`.
+- `scripts/supply-chain.sh` runs `cargo audit`, `cargo deny` with advisories on, unsafe and unused-dependency reports, a duplicate-crypto-crate check and a guard that no published crate or example links `testing`, `memory`, wiremock or tracing-subscriber in a release tree; the release preflight runs it, and `deny.toml` refuses a third version of `p256`, `rsa` or `crypto-bigint`.
+- `wiremock` and the `rsa` crate behind the test fixtures can no longer enter a production dependency graph through a feature flag: the fixtures moved out of `axess-core` into `axess-testing`.
+
+### Changed (breaking)
+
+- `axess_core::testing::mock_tracing`, `axess_core::TracingCapture`, `axess_core::testing::oauth_wiremock` and the `testing-oauth` feature are removed; use the `axess-testing` crate as a dev-dependency, and `axess_core::testing::oauth_provider` for `oauth_discover_provider` and `oauth_setup_provider`, which take the provider's address.
+
+### Added
+
+- `axess_core::profile`: `SecurityProfile::Strict` and `Standard` name one readable, overridable value for each setting a high-assurance deployment tightens, from session lifetimes to the Argon2id cost, and apply each to its configuration type; nothing changes until it is applied.
+- `MockIdentityStore::arm_account_status_failure` and `MockFactorStore::arm_concurrent_write_on_lost_swap` in `axess_core::testing`.
+- `allow-testing-in-release` on `axess`, `axess-core`, `axess-factors`, `axess-rng` and `axess-clock`: the named opt-out for the release-build guard on `testing`.
+- A `Hardening` workflow runs the supply-chain script, ten fuzz targets against the real decoders, Miri over the crates that contain `unsafe`, and a compile-fail test that `axess::testing` is absent without its feature.
+- `AuthnServiceBuilder::with_argon2_cost` (with `Argon2Cost`, `hash_password_with_salt_and_cost` and `password_needs_rehash_for` in `axess-factors`), `with_password_reset_ttl`, `with_max_password_reset_ttl`, `begin_password_reset_with_default_ttl` and `with_impersonation_max_authn_age`, each defaulting to the behaviour the library already had.
+- `DeviceCookieConfig::max_age`, `CachedDeviceStore::ttl` and `JwtVerifier::clock_skew` read back the value their setters write.
+- `axess-testing`, a dev-dependency crate that holds the tracing capture, the OIDC wiremock fixture, tables of extreme durations and IPv6 address forms, and a gate for cancellation tests (`stall`).
+- `scripts/check-test-crate-edges.sh` and `deny-production.toml` fail when `axess-testing` or `wiremock` is reachable from a normal or build edge.
+- `scripts/check-clock-usage.sh` fails on a new wall-clock read outside `axess-clock`.
+- `scripts/check-rsa-sites.sh` fails on a new `rsa` call site outside the reviewed local IdP primitives.
+- Design pages for the remaining dependency tasks: RSA verify-only, one JOSE verification core, one RustCrypto major, one stored-data format, and regex replaced by hand-written validators.
+
+### Fixed
+
+- A password reset works in a tenant whose timed suspension has run out.
+- A discoverable passkey login that fails at a gate clears its ceremony state from the session.
+- An email code retry after a lost swap keeps a concurrent change to the row and refuses a row whose address or limits changed, instead of writing a stale copy over it.
+- An extreme signup verification TTL, unknown-issuer memory or refresh-token TTL clamps instead of panicking.
+- `begin_login` is documented as identifier-first: it tells a caller whether an account exists, and `login_with_password` is the form that does not.
+- `spawn_cleanup_task` of the SQLite, Postgres and MySQL session stores refuses a zero interval by name when it is called, instead of ending the task silently on its first tick.
+- `InMemoryBackend::with_user_password` no longer overwrites a user of the same tenant whose id a fallback id coincides with.
+- The sqlite example gives each sensitive form its own rate-limit bucket instead of one shared by clones of a single limiter, sends a login that needs a further factor to that factor's page instead of the dashboard, and escapes every message it renders into a page.
+- The tag workflow created no tag after a merge into `main` (its existence test read an absent tag as present), and the mutation summary's self-test printed its refusal lines as error annotations on a passing step.
+
+### Changed
+
+- The minimal, sqlite, OAuth and FAPI examples set their own session limits to 15 minutes idle and 10 hours in all through named constants; the library defaults are unchanged.
+- `axess-core` asks tokio for `macros`, `rt`, `sync` and `time` instead of `full` and `rt-multi-thread`.
+- `axess-core` takes `sqlx` without default features (`runtime-tokio` and `derive` only).
+- `chrono` is taken without default features across the workspace; `clock` stays on through `axess-clock`, and a lint rejects a new wall-clock read outside it.
+- `axess-core` takes `fred` without `transactions`, `replicas` and `i-cluster`.
+- The dev-dependency `reqwest` of `axess-core` uses rustls instead of the default TLS stack, so `native-tls` and `openssl-sys` leave the lockfile.
+- The publishing runbook enables auto-merge for the release pull request and describes the tag ruleset as immutability only, with the organisation-app route to restricted creation.
+- The per-change mutation sweep runs on pull requests into `release/next` and `release/X.Y.x`, where a change arrives on its own, and no longer on the release pull request into `main`, which carries the whole release the weekly sweep covers.
+
 ## [0.18.0] - 2026-11-07
 
 ### Changed (breaking)

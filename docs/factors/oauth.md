@@ -334,12 +334,18 @@ verifying tenant's: the login path records the tenant beside each `sid`
 mapping and subject record, and a token verified by tenant A's provider
 neither finds nor ends tenant B's session, though both are for the same `sub`
 under the shared issuer. A token verified by a global provider ends the
-subject's sessions in every tenant, as the provider is shared. When two providers (two tenants, or a
-tenant and a global provider) share both the issuer and the client id, the
-token cannot be attributed, and the handler refuses it with
+subject's sessions in every tenant, as the provider is shared. When two
+tenants' providers share both the issuer and the client id, the token cannot
+be attributed, and the handler refuses it with
 `LogoutProviderError::Ambiguous` and ends nothing; give each tenant its own
-client registration. A tenant source that fails answers 503, so the IdP
-retries.
+client registration. `StoredTenantOAuthProviders::upsert` refuses to register
+the second one (`OAuthError::Config`, "already registered by another
+tenant"), so a tenant administrator cannot create the ambiguity for another
+tenant; name the pairs the global registration holds with
+`with_global_registration(issuer, client_id)` so a tenant cannot take those
+either. A tenant provider that matches a global one never shadows it: the
+global provider decides the token, and the tenant's is ignored and logged. A
+tenant source that fails answers 503, so the IdP retries.
 
 ## Back-channel logout across instances
 

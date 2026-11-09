@@ -76,7 +76,10 @@ cap the concurrency of every signed route (a `tower` `ConcurrencyLimitLayer`
 outside the layer), since N concurrent requests can hold N times the limit. It refuses a signature whose timestamp is
 more than `SignedRequests::tolerance` (five minutes by default) from
 its clock in either direction, and one it has already accepted within
-that window.
+that window. What is remembered is the request (the caller, the stamp, the
+method, the target and the body), not the signature it arrived with, so a
+request accepted under one scheme is refused when it comes again under another
+(`v3` stripped to `v2`, `v1` sent as `v2`).
 
 The replay memory is per process. Behind several instances, a request
 replayed to a different instance inside the window is not caught.

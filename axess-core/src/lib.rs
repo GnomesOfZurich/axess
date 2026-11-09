@@ -65,6 +65,22 @@
 //! Internal features (used by the library, not intended for direct use):
 //! `accept_client_id`.
 
+// The `testing` feature compiles deterministic clocks and random sources and
+// constructors that skip key checks. A release build that links it ships
+// those in a production binary, and cargo feature unification lets any one
+// dependent switch it on for the whole build, so the build refuses by name.
+// `allow-testing-in-release` is the named opt-out for a build that means it.
+#[cfg(all(
+    feature = "testing",
+    not(debug_assertions),
+    not(feature = "allow-testing-in-release")
+))]
+compile_error!(
+    "the `testing` feature of axess-core is enabled in a release build; it ships test doubles in a \
+     production binary. Remove the feature from the release build, or enable \
+     `allow-testing-in-release` to keep it on purpose."
+);
+
 // ── Session layer ──────────────────────────────────────────────────────────────
 
 /// Custom tower session layer with HMAC-signed cookies and typed session data.
@@ -229,7 +245,8 @@ pub use device::{
     NoopDeviceResolver, OwnerClaim, PiiToken, PresentedDevice, ProvenDevice, REDACTED_PLACEHOLDER,
     RedactedResolver, ResolvedDevice, SessionDevice, SessionTenant, SessionUser, SweepConfig,
     SweepConfigBuilder, SweepConfigError, SweepCounts, TenantPepperResolver, TrustTransition,
-    cascade_revoke_by_refresh_family, cascade_revoke_devices,
+    cascade_revoke_by_refresh_family, cascade_revoke_by_refresh_family_and_tokens,
+    cascade_revoke_devices,
 };
 
 #[cfg(feature = "device")]
@@ -332,7 +349,12 @@ pub mod testing;
 /// Identifier / e-mail / URL validation helpers.
 pub mod validation;
 
+/// The strict security profile: named values for the settings a
+/// high-assurance deployment tightens, and their application.
+pub mod profile;
+
 pub(crate) mod length_prefix;
+pub(crate) mod lifetime;
 
 pub(crate) mod locked;
 
@@ -363,9 +385,6 @@ pub use metrics::{
     MetricSinks, NoopMetrics, ProviderCategory, ProviderRegistryMetrics, RequestGuardMetrics,
     RotationMetrics, SessionMetrics,
 };
-
-#[cfg(any(test, feature = "testing"))]
-pub use testing::mock_tracing::TracingCapture;
 
 #[cfg(any(test, feature = "testing"))]
 pub use testing::{

@@ -1,9 +1,9 @@
 //! Callback and UserInfo checks that need only the mock provider: the RFC 9207
 //! `iss` parameter and the UserInfo `sub` binding.
 //!
-//! Run with: `cargo test -p axess-core --features testing-oauth --test oauth_callback_checks`
+//! Run with: `cargo test -p axess-core --features testing,oauth --test oauth_callback_checks`
 
-#![cfg(feature = "testing-oauth")]
+#![cfg(all(feature = "testing", feature = "oauth"))]
 
 mod common;
 

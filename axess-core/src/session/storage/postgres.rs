@@ -40,7 +40,7 @@
 use crate::session::storage::session_codec::{
     DEFAULT_MAX_PAYLOAD_BYTES, Decoded, SessionCodec, SqlStoreError, expires_at,
 };
-use crate::session::storage::sql_helpers::log_cleanup_outcome;
+use crate::session::storage::sql_helpers::{log_cleanup_outcome, require_cleanup_interval};
 use crate::session::{
     data::SessionData,
     id::SessionId,
@@ -235,6 +235,10 @@ impl PostgresSessionStore {
     /// decided by the injected [`Clock`]; the pacing of the sweeps is the
     /// Tokio timer's.
     ///
+    /// # Panics
+    ///
+    /// When `interval` is zero: the value is refused here, at startup, by name.
+    ///
     /// Errors from `cleanup_expired` are logged at `warn` and swallowed;
     /// the loop keeps running so a single transient DB blip does not
     /// silently halt cleanup forever.
@@ -245,6 +249,7 @@ impl PostgresSessionStore {
     /// let _cleanup = store.spawn_cleanup_task(std::time::Duration::from_secs(3600));
     /// ```
     pub fn spawn_cleanup_task(&self, interval: Duration) -> tokio::task::JoinHandle<()> {
+        require_cleanup_interval("postgres", interval);
         let store = self.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
@@ -639,7 +644,7 @@ mod postgres_tests {
     use super::*;
     use crate::session::data::SessionData;
     use crate::session::id::SessionId;
-    use crate::testing::mock_tracing::TracingCapture;
+    use axess_testing::mock_tracing::TracingCapture;
     use sqlx::postgres::PgPoolOptions;
 
     fn unreachable_pool() -> PgPool {

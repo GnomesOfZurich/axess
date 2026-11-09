@@ -28,6 +28,11 @@ rustdoc-args = ["--cfg", "docsrs"]
 # enabling this feature get the mock in their dev-deps without forcing
 # every production consumer of the trait to compile the test surface.
 testing = []
+# The named opt-out for the release-build guard: with `testing` on and
+# debug assertions off the crate refuses to compile, because the feature
+# ships test doubles in a production binary. Enable this only for a build
+# that means it (a benchmark, a release-mode test run).
+allow-testing-in-release = []
 
 [dependencies]
-chrono = { workspace = true, features = ["serde"] }
+chrono = { workspace = true, features = ["clock", "serde"] }

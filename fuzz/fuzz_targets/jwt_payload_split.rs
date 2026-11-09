@@ -1,35 +1,69 @@
-// Fuzz the back-channel-logout JWT splitter. The pre-validation
-// path splits the compact-serialised JWT on `.`, base64url-decodes the
-// payload, and feeds the result to `serde_json`. None of those steps
-// have intrinsic bounds beyond what the compact-serialisation grammar
-// implies, so any malformed input has to be rejected without panicking.
+// Fuzz the real token-payload decoders that run before any signature check:
+// `axess_factors::oidc::logout_token::{decode_jwt_payload, decode_id_token_payload}`
+// for the public back-channel-logout endpoint and the login path, and
+// `axess_factors::jwt::claims::decode_jwt_payload` for bearer tokens.
 //
-// `decode_jwt_payload` itself is `pub(super)`, so the fuzz target
-// re-implements the same shape against the public crates the function
-// composes (`base64`, `serde_json`). A divergence between this target
-// and the live function would surface as a missed bug; treat both
-// the live fn and this target as the contract under test.
+// The target calls the library functions, not a copy of their steps, and holds
+// them to an independent statement of the contract: a token is accepted only
+// when it is within its size cap, has exactly three dot-separated segments and
+// carries a payload segment that is URL-safe base64 of a JSON document; the
+// document returned is that JSON; and the logout cap is never looser than the
+// ID-token cap.
 
 #![no_main]
 
+use axess_factors::jwt::claims::{self, MAX_JWT_BYTES};
+use axess_factors::oidc::logout_token::{
+    MAX_ID_TOKEN_BYTES, MAX_LOGOUT_TOKEN_BYTES, decode_id_token_payload, decode_jwt_payload,
+};
 use base64::Engine as _;
 use libfuzzer_sys::fuzz_target;
 
-fuzz_target!(|data: &[u8]| {
-    let Ok(s) = std::str::from_utf8(data) else {
-        return;
-    };
-    // Compact JWT: header.payload.signature; split on the first two
-    // `.` and decode the payload exactly as `decode_jwt_payload` does.
-    let mut parts = s.splitn(3, '.');
-    let _header = parts.next();
-    let Some(payload) = parts.next() else {
-        return;
-    };
-    let _signature = parts.next();
+/// What the contract says the payload is, written without the library's code.
+fn expected(token: &str, cap: usize) -> Option<serde_json::Value> {
+    if token.len() > cap {
+        return None;
+    }
+    let mut segments = token.split('.');
+    let (_header, payload, _signature) = (segments.next()?, segments.next()?, segments.next()?);
+    if segments.next().is_some() {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
 
-    let Ok(decoded) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload) else {
+fuzz_target!(|data: &[u8]| {
+    let Ok(token) = std::str::from_utf8(data) else {
         return;
     };
-    let _ = serde_json::from_slice::<serde_json::Value>(&decoded);
+
+    let logout = decode_jwt_payload(token);
+    assert_eq!(
+        logout.ok(),
+        expected(token, MAX_LOGOUT_TOKEN_BYTES),
+        "logout decoder"
+    );
+
+    let id = decode_id_token_payload(token);
+    assert_eq!(
+        id.ok(),
+        expected(token, MAX_ID_TOKEN_BYTES),
+        "ID token decoder"
+    );
+
+    let bearer = claims::decode_jwt_payload(token);
+    assert_eq!(
+        bearer.ok(),
+        expected(token, MAX_JWT_BYTES),
+        "bearer decoder"
+    );
+
+    // A token the stricter cap accepts, the looser cap accepts with the same
+    // payload.
+    if let Ok(strict) = decode_jwt_payload(token) {
+        assert_eq!(decode_id_token_payload(token).ok(), Some(strict));
+    }
 });

@@ -1,6 +1,6 @@
 [package]
 name = "axess-example-sqlite"
-version = "0.18.0"
+version = "0.19.0"
 edition = "2024"
 rust-version.workspace = true
 publish = false
@@ -15,7 +15,7 @@ categories = ["web-programming"]
 [dependencies]
 # `sqlite` opts the storage backend in; `device` (used by `--bin device`) is
 # in axess's default features.
-axess = { path = "../../axess", version = "=0.18.0", features = ["sqlite", "memory"] }
+axess = { path = "../../axess", version = "=0.19.0", features = ["sqlite", "memory"] }
 base64 = { version = "0.23.1", default-features = false, features = ["std"] }
 axum = { version = "0.8.9", features = ["macros", "form"] }
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }

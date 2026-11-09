@@ -147,8 +147,10 @@ where
     /// (another request bumping `attempt_count`, say) loses it although the
     /// claim is still ours. A lost swap therefore reloads the row and, when
     /// it is still this request's claim (no hash, the lease's expiry), swaps
-    /// again against what is there now, a few times. Only a row that is no
-    /// longer this claim is a real loss. Returns `Ok(false)` for that, with
+    /// again against what is there now, a few times, writing only this
+    /// request's pending hash and expiry onto the row as it is now. Only a
+    /// row that is no longer this claim, or whose address or limits changed
+    /// under it, is a real loss. Returns `Ok(false)` for that, with
     /// nothing delivered; the claim is released first when it is still ours
     /// to release.
     async fn store_issued_otp(
@@ -157,15 +159,18 @@ where
         claimed: &FactorConfig,
         final_cfg: &FactorConfig,
     ) -> Result<bool, AuthnError<I::Error>> {
-        let FactorConfig::EmailOtp(claimed_cfg) = claimed else {
+        let (FactorConfig::EmailOtp(claimed_cfg), FactorConfig::EmailOtp(issued_cfg)) =
+            (claimed, final_cfg)
+        else {
             return Ok(false);
         };
         let mut expected = claimed.clone();
+        let mut write = final_cfg.clone();
         for _ in 0..STORE_ATTEMPTS {
             match self
                 .inner
                 .factors
-                .compare_and_save_factor(user_scope, &expected, final_cfg.clone())
+                .compare_and_save_factor(user_scope, &expected, write.clone())
                 .await
             {
                 Ok(true) => return Ok(true),
@@ -186,7 +191,24 @@ where
                     if now_cfg.pending_hash.is_none()
                         && now_cfg.pending_until == claimed_cfg.pending_until =>
                 {
-                    expected = FactorConfig::EmailOtp(now_cfg);
+                    let current = FactorConfig::EmailOtp(now_cfg.clone());
+                    // Still this request's claim, but a concurrent write may
+                    // have changed what the code is for: the address or the
+                    // limits it was drawn under. The code was drawn and is
+                    // about to be sent for the claimed row, so a changed
+                    // row is a real loss; the claim is ours to release.
+                    if !same_but_for_attempts(&now_cfg, claimed_cfg) {
+                        self.release_otp_claim(user_scope, &current).await;
+                        return Ok(false);
+                    }
+                    // Keep the rest of the row as it is now (a concurrent
+                    // `attempt_count` bump, say) and add only this request's
+                    // pending hash and expiry.
+                    let mut next = now_cfg;
+                    next.pending_hash = issued_cfg.pending_hash.clone();
+                    next.pending_until = issued_cfg.pending_until;
+                    expected = current;
+                    write = FactorConfig::EmailOtp(next);
                 }
                 _ => return Ok(false),
             }
@@ -244,4 +266,17 @@ where
             tracing::warn!(error = %e, "could not release an email OTP claim; it lapses at its expiry");
         }
     }
+}
+
+/// Whether two rows of one email OTP factor agree on everything a code is
+/// drawn for: the address, its length, lifetime and attempt limit. The
+/// failure count is left out; it moves with every wrong guess.
+fn same_but_for_attempts(
+    a: &crate::authn::factor::EmailOtpConfig,
+    b: &crate::authn::factor::EmailOtpConfig,
+) -> bool {
+    a.email == b.email
+        && a.code_length == b.code_length
+        && a.ttl_secs == b.ttl_secs
+        && a.max_attempts == b.max_attempts
 }

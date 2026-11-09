@@ -444,6 +444,66 @@ impl FactorStore for OurBackend {
         }
         Ok(None)
     }
+
+    /// Claim the id in `fido2_credential_claims`, whose primary key is
+    /// `(tenant_id, credential_id)`: one conditional insert, so of two
+    /// registrations racing for one id exactly one inserts. A passkey stored
+    /// before the table existed holds its id too, which the holder lookup
+    /// finds first.
+    async fn claim_fido2_credential(
+        &self,
+        tenant_id: &TenantId,
+        user_id: &UserId,
+        credential_id: &[u8],
+    ) -> Result<bool, Self::Error> {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        if self
+            .fido2_credential_holder(tenant_id, credential_id)
+            .await?
+            .is_some_and(|holder| &holder != user_id)
+        {
+            return Ok(false);
+        }
+        let encoded = URL_SAFE_NO_PAD.encode(credential_id);
+        sqlx::query(
+            "INSERT OR IGNORE INTO fido2_credential_claims (tenant_id, credential_id, user_id)
+             VALUES (?1, ?2, ?3)",
+        )
+        .bind(tenant_id.to_string())
+        .bind(&encoded)
+        .bind(user_id.to_string())
+        .execute(self.pool())
+        .await?;
+        let holder: String = sqlx::query_scalar(
+            "SELECT user_id FROM fido2_credential_claims
+              WHERE tenant_id = ?1 AND credential_id = ?2",
+        )
+        .bind(tenant_id.to_string())
+        .bind(&encoded)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(holder == user_id.to_string())
+    }
+
+    /// Delete the user's own claim on the id; another user's claim stays.
+    async fn release_fido2_credential(
+        &self,
+        tenant_id: &TenantId,
+        user_id: &UserId,
+        credential_id: &[u8],
+    ) -> Result<(), Self::Error> {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        sqlx::query(
+            "DELETE FROM fido2_credential_claims
+              WHERE tenant_id = ?1 AND credential_id = ?2 AND user_id = ?3",
+        )
+        .bind(tenant_id.to_string())
+        .bind(URL_SAFE_NO_PAD.encode(credential_id))
+        .bind(user_id.to_string())
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
 }
 
 /// Whether any `cred_id` member anywhere in `value` equals `encoded`.

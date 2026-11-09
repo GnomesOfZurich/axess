@@ -13,7 +13,7 @@ use axess_core::middleware::service_secret::{
     SIGNATURE_HEADER, ServiceCaller, ServiceSecret, ServiceSecretLayer, ServiceSecrets,
     SignedRequests,
 };
-use axess_core::testing::mock_tracing::TracingCapture;
+use axess_testing::mock_tracing::TracingCapture;
 use axum::body::Body;
 use axum::http::{HeaderMap, Method, Request, StatusCode};
 use axum::{Router, routing::post};

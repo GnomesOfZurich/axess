@@ -142,12 +142,13 @@ where
     ///
     /// A credential id the user already holds is refused with
     /// [`AuthnError::NoFlow`] and nothing is stored. So is an id another user
-    /// of the same tenant holds, found through
-    /// [`FactorStore::fido2_credential_holder`];
+    /// of the same tenant holds, refused through
+    /// [`FactorStore::claim_fido2_credential`];
     /// that refusal also leaves a failed `FactorSetup` audit row. A store
-    /// that does not implement the lookup admits the id (its default answers
-    /// "nobody"), and an application on such a store keeps its own index.
-    /// A failed lookup fails the registration.
+    /// that keeps the default claim only checks the holder, so two
+    /// registrations racing for one id can both pass; implement
+    /// [`FactorStore::claim_fido2_credential`] atomically for the guarantee.
+    /// A failed claim fails the registration.
     #[tracing::instrument(skip(self, user, response, session))]
     pub async fn finish_fido2_registration(
         &self,
@@ -229,26 +230,7 @@ where
         // resolved `DeviceId`.
         let cred_id = key.cred_id().clone();
 
-        // A credential id another user of the tenant holds is refused: one
-        // authenticator credential belongs to one account. A failed lookup
-        // is an error, never "nobody holds it".
-        let holder = self
-            .inner
-            .factors
-            .fido2_credential_holder(&user.tenant_id, cred_id.as_slice())
-            .await
-            .map_err(AuthnError::Store)?;
-        if holder.is_some_and(|holder| holder != user.id) {
-            self.emit_audit(
-                AuthEventBuilder::failure(AuthEventType::FactorSetup)
-                    .attributed_to(&user.id, &user.tenant_id)
-                    .with_factor(FactorKind::Fido2)
-                    .with_session(session.session_id().await)
-                    .with_error(AuthFailureReason::from("credential_held_by_another_user")),
-            )
-            .await?;
-            return Err(AuthnError::NoFlow);
-        }
+        self.claim_credential_id(user, session, &cred_id).await?;
 
         let user_scope = AuthnScope::User {
             tenant_id: user.tenant_id,
@@ -270,10 +252,16 @@ where
                 ));
                 Some(())
             })
-            .await?;
+            .await;
+        // A write that failed stored nothing: the claim taken above is given
+        // back. A credential id already registered to this user (`Ok(None)`)
+        // keeps its claim, which is theirs.
+        if added.is_err() {
+            self.release_credential_id(user, &cred_id).await?;
+        }
         // `None` is a credential id that is already registered: nothing was
         // stored, so no device binding and no `FactorSetup` audit.
-        if added.is_none() {
+        if added?.is_none() {
             return Err(AuthnError::NoFlow);
         }
 
@@ -298,5 +286,49 @@ where
         .await?;
 
         Ok(())
+    }
+
+    /// Claim `cred_id` for `user` through the store's atomic step (see
+    /// [`FactorStore::claim_fido2_credential`]), so two accounts racing to
+    /// register one id cannot both pass. An id another user of the tenant
+    /// holds is refused with [`AuthnError::NoFlow`] and a failed `FactorSetup`
+    /// audit row; a failed claim is an error, never "nobody holds it".
+    async fn claim_credential_id(
+        &self,
+        user: &crate::authn::types::User,
+        session: &AuthSession,
+        cred_id: &webauthn_rs::prelude::CredentialID,
+    ) -> Result<(), AuthnError<I::Error>> {
+        let claimed = self
+            .inner
+            .factors
+            .claim_fido2_credential(&user.tenant_id, &user.id, cred_id.as_slice())
+            .await
+            .map_err(AuthnError::Store)?;
+        if claimed {
+            return Ok(());
+        }
+        self.emit_audit(
+            AuthEventBuilder::failure(AuthEventType::FactorSetup)
+                .attributed_to(&user.id, &user.tenant_id)
+                .with_factor(FactorKind::Fido2)
+                .with_session(session.session_id().await)
+                .with_error(AuthFailureReason::from("credential_held_by_another_user")),
+        )
+        .await?;
+        Err(AuthnError::NoFlow)
+    }
+
+    /// Give back the claim `user` took on `cred_id`.
+    async fn release_credential_id(
+        &self,
+        user: &crate::authn::types::User,
+        cred_id: &webauthn_rs::prelude::CredentialID,
+    ) -> Result<(), AuthnError<I::Error>> {
+        self.inner
+            .factors
+            .release_fido2_credential(&user.tenant_id, &user.id, cred_id.as_slice())
+            .await
+            .map_err(AuthnError::Store)
     }
 }

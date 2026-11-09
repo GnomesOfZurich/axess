@@ -113,6 +113,14 @@ step "Inline test block sizes" "$AXESS_DIR/scripts/check-inline-tests.sh"
 # numbers only go down.
 step "File and function sizes" "$AXESS_DIR/scripts/check-file-sizes.sh"
 
+# Production code reads the wall clock only through axess-clock, against a
+# baseline of the reads that predate the gate.
+step "Wall-clock reads outside axess-clock" "$AXESS_DIR/scripts/check-clock-usage.sh"
+
+# The deny.toml ignore for the rsa advisory is sound only while its uses stay
+# in the reviewed files.
+step "rsa call sites" "$AXESS_DIR/scripts/check-rsa-sites.sh"
+
 # Sub-second too, and the only gate that reads Markdown. `check-doc-links.sh`
 # runs rustdoc and sees Rust intra-doc links; nothing saw the READMEs, which
 # is how a crates.io front page came to link at a chapter that had moved.
@@ -122,6 +130,11 @@ step "Markdown links resolve" "$AXESS_DIR/scripts/check-markdown-links.sh"
 # preserved the result: a later documentation sweep reintroduced 101 of them
 # across nineteen files with every gate green.
 step "Prose style" "$AXESS_DIR/scripts/check-prose-style.sh"
+
+# Also sub-second. The release and publish jobs run third-party actions while
+# holding the registry token and the OIDC permissions, and an action pinned to
+# a tag or a branch runs whatever its owner points the name at on the day.
+step "Workflow actions pinned to commits" "$AXESS_DIR/scripts/check-workflow-pins.sh"
 
 
 # Mirrors the `Ban #[non_exhaustive]` CI job: see the docstring on that job
@@ -222,18 +235,27 @@ step "Public docs build (rustdoc links)" "$AXESS_DIR/scripts/check-doc-links.sh"
 # check a promise is before publishing it.
 step "MSRV build + lib tests" "$AXESS_DIR/scripts/check-msrv.sh"
 
-# `cargo deny` covers bans / licenses / sources policy; `cargo audit` covers
-# the RUSTSEC advisory database (CVSS 4.0 handling that cargo-deny 0.18.x
-# doesn't do yet, per the note on the CI Security Audit job). Both gate the
-# release: a deny hit or an unpatched advisory blocks the tag.
-# The two advisory ignore lists must name the same ids: cargo-deny and
-# cargo-audit read different files, and a drift between them means one gate
-# accepts an advisory the other fails.
-advisory_ids() { grep -oE '^[[:space:]]*"RUSTSEC-[0-9]{4}-[0-9]{4}"' "$1" | tr -d ' "' | sort -u; }
-step "Advisory ignore lists agree (deny.toml vs .cargo/audit.toml)" \
-    diff <(advisory_ids "$AXESS_DIR/deny.toml") <(advisory_ids "$AXESS_DIR/.cargo/audit.toml")
-step "Supply-chain policy (cargo deny)" cargo deny --manifest-path "$AXESS_DIR/Cargo.toml" check licenses sources bans
-step "Security advisories (cargo audit)" cargo audit --file "$AXESS_DIR/Cargo.lock" --deny warnings
+# One script for the supply chain: `cargo audit` over the lockfile (warnings
+# denied), `cargo deny` for licenses, sources, bans and advisories (the
+# advisory ignore lists in deny.toml and .cargo/audit.toml must name the same
+# ids, because the two tools read different files), the unsafe and
+# unused-dependency reports, the duplicate crypto crates, and the guard that a
+# default-feature release build links no `testing`, `memory`, wiremock or
+# tracing-subscriber. A deny hit, an unpatched advisory or a test feature in a
+# release tree blocks the tag. Needs cargo-audit and cargo-deny >= 0.19;
+# cargo-geiger and cargo-machete report when installed (STRICT=1 makes them
+# fatal). scripts/supply-chain.sh says what each step reads.
+step "Supply chain (audit, deny, duplicates, release-build features)" "$AXESS_DIR/scripts/supply-chain.sh"
+
+# The test-only crate and wiremock may reach a production graph from no normal or
+# build edge; deny-production.toml bans them and the edge script reads cargo metadata.
+step "Test-only crates stay out of production graphs" bash -c 'cd "$0" && cargo deny --config deny-production.toml check bans && scripts/check-test-crate-edges.sh' "$AXESS_DIR"
+
+# `axess::testing` must not exist without the feature. The compile-fail test
+# is compiled out under `--all-features`, which the workspace test step uses,
+# so it runs here with the default features.
+step "axess::testing unreachable without the feature" \
+    cargo test --manifest-path "$AXESS_DIR/Cargo.toml" -p axess --test testing_unreachable
 
 # Against the last release tag below HEAD, the baseline CI's "SemVer Checks"
 # job uses; the script says why a pass is a floor and what an "unsupported
@@ -245,7 +267,7 @@ step "Leaf crate publish dry-runs" bash -c '
   cd "$0"
   shift
   publish_args=("$@")
-  for c in axess-strings axess-clock axess-rng; do
+  for c in axess-strings axess-clock axess-rng axess-testing; do
     cargo publish --dry-run -p "$c" ${publish_args[@]+"${publish_args[@]}"}
   done
 ' "$AXESS_DIR" bash ${PACKAGE_ARGS[@]+"${PACKAGE_ARGS[@]}"}
@@ -276,7 +298,7 @@ if [ "$WITH_FUZZ" = true ]; then
     fi
     cd "$0/fuzz"
     cargo +nightly fuzz build
-    for target in session_data_msgpack session_data_json jwt_payload_split pkce_verifier_predicate; do
+    for target in session_data_msgpack session_data_json jwt_payload_split pkce_verifier_predicate client_ip_forwarded; do
       cargo +nightly fuzz run "$target" -- -max_total_time=30
     done
   ' "$AXESS_DIR"

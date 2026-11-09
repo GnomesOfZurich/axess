@@ -100,6 +100,16 @@ openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt 
 
 The example's tests check that the development key and the realm's registered key are one pair.
 
+## Session limits
+
+The library's defaults are a session that lives 24 hours idle and 7 days in
+all. This example sets its own, 15 minutes idle (`STRICT_IDLE_TTL`) and 10
+hours in all (`STRICT_MAX_SESSION_AGE`), the values the security review
+recommends for a bank: a session left open on a shared machine, or a stolen
+cookie, is useful for far less time. The two constants are the whole change;
+raise them for a product that wants longer sessions, and copy them if yours
+should be strict. The library defaults are unchanged.
+
 ## Rate limiting and housekeeping
 
 `/auth/login` pushes an authorization request to the IdP and opens a session, so the example limits it to ten requests a minute per client address (`axess::RateLimitLayer` keyed on the address `client_ip::layer` resolves) and prunes expired sessions and unfinished logins from the store every five minutes. The limit counts per process: a deployment with several replicas must also rate-limit `/auth/login` at the edge (the TLS terminator or gateway).

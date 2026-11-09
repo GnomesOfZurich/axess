@@ -323,11 +323,27 @@ impl SharedSubscriber {
         }
     }
 
-    /// The connection ended: tell every watcher, and forget the connection
-    /// so the next watcher opens a new one.
-    fn dispatch_closed(&self) {
-        let dead = self.lock().connection.take();
+    /// Whether a newer connection than `generation` has been subscribed. A
+    /// dispatcher or reconnector of an older one that reports late must leave
+    /// the newer connection and its watchers alone.
+    fn is_replaced(&self, generation: u64) -> bool {
+        self.lock().generation > generation
+    }
+
+    /// The connection of `generation` ended: tell every watcher, and forget
+    /// the connection so the next watcher opens a new one. A call from a
+    /// connection that has been replaced since does nothing: the connection
+    /// now held is alive, and its watchers have not lost anything.
+    fn dispatch_closed(&self, generation: u64) {
+        let dead = {
+            let mut state = self.lock();
+            if state.generation > generation {
+                return;
+            }
+            state.connection.take()
+        };
         if let Some(connection) = dead {
+            connection.dispatcher.abort();
             connection.reconnector.abort();
             quit_in_background(connection.client);
         }
@@ -387,18 +403,17 @@ impl SharedSubscriber {
             self.connection_lost();
         }
 
-        match self.open(base, prefix).await {
+        // Setup is serialised by `connecting`, so no other join takes this
+        // number meanwhile.
+        let generation = self.lock().generation + 1;
+        match self.open(base, prefix, generation).await {
             Some(connection) => {
-                let generation = {
+                {
                     let mut state = self.lock();
-                    state.generation += 1;
+                    state.generation = generation;
                     state.backoff = Backoff::default();
-                    state.generation
-                };
-                self.lock().connection = Some(Connection {
-                    generation,
-                    ..connection
-                });
+                    state.connection = Some(connection);
+                }
                 self.finish_reconnect();
                 Some(Watch { _hold: hold, slot })
             }
@@ -422,7 +437,12 @@ impl SharedSubscriber {
     }
 
     /// Open a subscriber connection and subscribe it, each step bounded.
-    async fn open(self: &Arc<Self>, base: &Client, prefix: &str) -> Option<Connection> {
+    async fn open(
+        self: &Arc<Self>,
+        base: &Client,
+        prefix: &str,
+        generation: u64,
+    ) -> Option<Connection> {
         let subscriber = base.clone_new();
         let mut pending = QuitOnDrop(Some(subscriber.clone()));
         tokio::time::timeout(SETUP_TIMEOUT, subscriber.init())
@@ -440,19 +460,20 @@ impl SharedSubscriber {
             .await
             .ok()?
             .ok()?;
-        let dispatcher = tokio::spawn(dispatch(messages, Arc::downgrade(self)));
+        let dispatcher = tokio::spawn(dispatch(messages, Arc::downgrade(self), generation));
         let reconnector = tokio::spawn(resubscribe_on_reconnect(
             reconnects,
             subscriber.clone(),
             patterns,
             Arc::downgrade(self),
+            generation,
         ));
         pending.0 = None;
         Some(Connection {
             client: subscriber,
             dispatcher,
             reconnector,
-            generation: 0,
+            generation,
         })
     }
 
@@ -476,10 +497,12 @@ impl SharedSubscriber {
     }
 }
 
-/// Route the connection's messages until it ends or the subscriber is gone.
+/// Route the messages of the connection of `generation` until it ends or the
+/// subscriber is gone.
 async fn dispatch(
     mut messages: tokio::sync::broadcast::Receiver<Message>,
     shared: Weak<SharedSubscriber>,
+    generation: u64,
 ) {
     use tokio::sync::broadcast::error::RecvError;
     loop {
@@ -491,7 +514,7 @@ async fn dispatch(
             Ok(message) => shared.dispatch_message(&message.channel),
             Err(RecvError::Lagged(_)) => shared.dispatch_lag(),
             Err(RecvError::Closed) => {
-                shared.dispatch_closed();
+                shared.dispatch_closed(generation);
                 return;
             }
         }
@@ -504,12 +527,15 @@ async fn dispatch(
 /// treated as a loss: the watchers are told, the patterns are subscribed
 /// again (a new connection has none), and the watchers recheck the registry.
 /// When the patterns cannot be subscribed the connection is given up, so the
-/// next join opens a replacement.
+/// next join opens a replacement. It acts for the connection of `generation`
+/// only: once that has been replaced, a reconnect it reports is not news to
+/// the watchers of the newer connection.
 async fn resubscribe_on_reconnect(
     mut reconnects: tokio::sync::broadcast::Receiver<Server>,
     client: Client,
     patterns: Vec<String>,
     shared: Weak<SharedSubscriber>,
+    generation: u64,
 ) {
     use tokio::sync::broadcast::error::RecvError;
     loop {
@@ -520,13 +546,16 @@ async fn resubscribe_on_reconnect(
         let Some(shared) = shared.upgrade() else {
             return;
         };
+        if shared.is_replaced(generation) {
+            return;
+        }
         shared.connection_lost();
         let subscribed =
             tokio::time::timeout(SETUP_TIMEOUT, client.psubscribe(patterns.clone())).await;
         if matches!(subscribed, Ok(Ok(()))) {
             shared.finish_reconnect();
         } else {
-            shared.dispatch_closed();
+            shared.dispatch_closed(generation);
             return;
         }
     }

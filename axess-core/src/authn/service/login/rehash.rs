@@ -56,7 +56,11 @@ where
             tenant_id: *tenant_id,
             user_id: *user_id,
         };
-        if resolved_from != &user_scope || !axess_factors::password_needs_rehash(cfg.hash.as_ref())
+        if resolved_from != &user_scope
+            || !axess_factors::password_needs_rehash_for(
+                cfg.hash.as_ref(),
+                self.inner.hardening.argon2_cost,
+            )
         {
             return;
         }
@@ -65,10 +69,13 @@ where
         let salt = axess_factors::generate_password_salt(&self.inner.rng);
         let plaintext: &str = password.as_ref();
         let candidate = zeroize::Zeroizing::new(plaintext.to_owned());
+        let cost = self.inner.hardening.argon2_cost;
         let hash = match self
             .inner
             .kdf
-            .run(move || axess_factors::hash_password_with_salt(candidate.as_bytes(), &salt))
+            .run(move || {
+                axess_factors::hash_password_with_salt_and_cost(candidate.as_bytes(), &salt, cost)
+            })
             .await
         {
             Ok(hash) => hash,

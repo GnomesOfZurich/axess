@@ -646,6 +646,59 @@ pub trait FactorStore: Send + Sync + 'static {
         let _ = (tenant_id, credential_id);
         async { Ok(None) }
     }
+
+    /// Claim the passkey credential id `credential_id` for `user_id` within
+    /// `tenant_id`, and say whether the claim holds: `Ok(true)` when the id
+    /// is now (or already was) claimed by this user, `Ok(false)` when
+    /// another user of the tenant holds it.
+    ///
+    /// `finish_fido2_registration` claims before it stores the passkey, so
+    /// two accounts racing to register one credential id cannot both pass:
+    /// the holder lookup and the per-user compare-and-swap write touch
+    /// different rows, and only a claim the store makes atomically (a unique
+    /// index on `(tenant_id, credential_id)`, written with a single
+    /// conditional insert) closes the window between them. Claiming for the
+    /// same user twice is `Ok(true)`.
+    ///
+    /// **The default is not atomic.** It answers from
+    /// [`fido2_credential_holder`](Self::fido2_credential_holder) and writes
+    /// nothing, so two registrations that both look before either stores
+    /// still both succeed. Implement this method, with
+    /// [`release_fido2_credential`](Self::release_fido2_credential), to get
+    /// the guarantee. The in-tree stores (the mock store and the SQLite
+    /// example) do.
+    ///
+    /// An `Err` is not read as a claim: the registration fails.
+    fn claim_fido2_credential(
+        &self,
+        tenant_id: &TenantId,
+        user_id: &UserId,
+        credential_id: &[u8],
+    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
+        async move {
+            let holder = self
+                .fido2_credential_holder(tenant_id, credential_id)
+                .await?;
+            Ok(holder.is_none_or(|holder| &holder == user_id))
+        }
+    }
+
+    /// Release the claim `user_id` holds on `credential_id` in `tenant_id`,
+    /// taken by [`claim_fido2_credential`](Self::claim_fido2_credential).
+    ///
+    /// Called when the passkey is deleted and when a registration that
+    /// claimed the id did not store it, so the id can be registered again.
+    /// Releasing a claim the user does not hold changes nothing. The default
+    /// does nothing, matching the default claim, which writes nothing.
+    fn release_fido2_credential(
+        &self,
+        tenant_id: &TenantId,
+        user_id: &UserId,
+        credential_id: &[u8],
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+        let _ = (tenant_id, user_id, credential_id);
+        async { Ok(()) }
+    }
 }
 
 // ── AuthMethod ────────────────────────────────────────────────────────────────

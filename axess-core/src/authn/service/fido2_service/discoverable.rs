@@ -112,6 +112,26 @@ where
         credentials: &[crate::authn::factor::Fido2Credential],
         session: &AuthSession,
     ) -> Result<FactorOutcome, AuthnError<I::Error>> {
+        let result = self
+            .finish_discoverable_login_gated(assertion, user, credentials, session)
+            .await;
+        // Whichever way the call ended, including a store error at one of
+        // the gates, no ceremony state is left to a later request.
+        if result.is_err() {
+            self.clear_discoverable_ceremony(session).await;
+        }
+        result
+    }
+
+    /// The body of [`finish_discoverable_login`](Self::finish_discoverable_login):
+    /// the gates, then the assertion.
+    async fn finish_discoverable_login_gated(
+        &self,
+        assertion: &webauthn_rs::prelude::PublicKeyCredential,
+        user: &crate::authn::types::User,
+        credentials: &[crate::authn::factor::Fido2Credential],
+        session: &AuthSession,
+    ) -> Result<FactorOutcome, AuthnError<I::Error>> {
         let fido2 = self.inner.fido2.load_full();
         let webauthn = match &fido2 {
             Some(w) => w,

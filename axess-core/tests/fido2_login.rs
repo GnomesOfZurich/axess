@@ -1028,3 +1028,32 @@ async fn the_ceremony_tenant_is_cleared_on_the_expiry_exit() {
         "the ceremony tenant is cleared with the ceremony: {left:?}"
     );
 }
+
+/// A store error at one of the gates before the assertion is verified ends
+/// the call, and the ceremony it began is gone from the session whichever way
+/// it ended: a retry starts a new ceremony, it does not finish the old one.
+#[tokio::test]
+async fn a_store_error_at_a_gate_clears_the_discoverable_ceremony() {
+    let f = fixture(true);
+    let session = test_session();
+    let list = begin_discoverable(&f, &session).await;
+    assert!(
+        session.get_custom("axess.fido2.disc_state").await.is_some(),
+        "the ceremony is under way"
+    );
+    f.identity.arm_account_status_failure();
+
+    let result = f
+        .service
+        .finish_discoverable_login(&assertion(), &test_user("u1", "alice"), &list, &session)
+        .await;
+
+    assert!(matches!(result, Err(AuthnError::Store(_))), "{result:?}");
+    assert!(
+        session
+            .get_custom("axess.fido2.disc_state")
+            .await
+            .is_none_or(|v| v.is_null()),
+        "the ceremony state outlived a failed call"
+    );
+}

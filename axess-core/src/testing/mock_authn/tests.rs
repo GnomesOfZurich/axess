@@ -380,3 +380,59 @@ mod throttle {
         );
     }
 }
+
+/// Two users claiming one credential id at the same time: exactly one claim
+/// holds, whichever runs first, and a release lets the other have it.
+#[cfg(feature = "fido2")]
+#[tokio::test]
+async fn racing_claims_of_one_credential_id_have_one_winner() {
+    use crate::authn::store::FactorStore;
+    let store = MockFactorStore::new();
+    let tenant = axess_identity::testing::tenant("t1");
+    let (a, b) = (
+        axess_identity::testing::user("a"),
+        axess_identity::testing::user("b"),
+    );
+    let (first, second) = tokio::join!(
+        store.claim_fido2_credential(&tenant, &a, b"cred"),
+        store.claim_fido2_credential(&tenant, &b, b"cred"),
+    );
+    let (first, second) = (first.unwrap(), second.unwrap());
+    assert!(first != second, "both or neither claimed: {first} {second}");
+    let (winner, loser) = if first { (a, b) } else { (b, a) };
+    assert!(
+        store
+            .claim_fido2_credential(&tenant, &winner, b"cred")
+            .await
+            .unwrap()
+    );
+    store
+        .release_fido2_credential(&tenant, &loser, b"cred")
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .claim_fido2_credential(&tenant, &loser, b"cred")
+            .await
+            .unwrap(),
+        "a release by a user that does not hold the claim changed it"
+    );
+    store
+        .release_fido2_credential(&tenant, &winner, b"cred")
+        .await
+        .unwrap();
+    assert!(
+        store
+            .claim_fido2_credential(&tenant, &loser, b"cred")
+            .await
+            .unwrap()
+    );
+    let other_tenant = axess_identity::testing::tenant("t2");
+    assert!(
+        store
+            .claim_fido2_credential(&other_tenant, &winner, b"cred")
+            .await
+            .unwrap(),
+        "the id is held per tenant"
+    );
+}

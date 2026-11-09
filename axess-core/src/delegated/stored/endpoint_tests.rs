@@ -85,3 +85,46 @@ async fn the_default_session_client_does_not_follow_a_redirect() {
         .with_clock(Arc::new(MockClock::at(t0())));
     assert!(session.get_access_token().await.is_err());
 }
+
+fn provider_with_authorization_endpoint(authorization_endpoint: &str) -> DelegatedProvider {
+    DelegatedProvider::new(
+        "p",
+        Url::parse(authorization_endpoint).unwrap(),
+        Url::parse("https://idp.example/token").unwrap(),
+        "client",
+        "secret",
+        Url::parse("https://gnomes.local/callback").unwrap(),
+    )
+}
+
+/// The browser is sent to the authorization endpoint with the client id, the
+/// PKCE challenge and the `state` in the URL: a plain-HTTP remote endpoint
+/// would carry them in clear.
+#[test]
+fn a_plain_http_remote_authorization_endpoint_is_refused_by_begin_grant() {
+    let provider = provider_with_authorization_endpoint("http://192.0.2.1:9/authorize");
+
+    let refused = begin_grant(&provider, &[], &MockRng::new(1));
+
+    assert!(
+        matches!(&refused, Err(DelegatedError::Transport(m)) if m.contains("must be https")),
+        "{:?}",
+        refused.map(|(url, _)| url.scheme().to_owned())
+    );
+}
+
+#[test]
+fn a_loopback_or_https_authorization_endpoint_is_accepted_by_begin_grant() {
+    for endpoint in [
+        "http://127.0.0.1:8080/authorize",
+        "http://localhost:8080/authorize",
+        "http://[::1]:8080/authorize",
+        "https://idp.example/authorize",
+    ] {
+        let provider = provider_with_authorization_endpoint(endpoint);
+        assert!(
+            begin_grant(&provider, &[], &MockRng::new(1)).is_ok(),
+            "{endpoint}"
+        );
+    }
+}

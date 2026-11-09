@@ -1,14 +1,13 @@
 # cargo-deny configuration: CRA supply chain policy
 # https://embarkstudios.github.io/cargo-deny/
 #
-# Run: cargo deny check licenses sources bans
-# CI:  cargo deny check licenses sources bans
+# Run: cargo deny check
+# CI:  scripts/supply-chain.sh (licenses, sources, bans and advisories)
 #
-# `cargo deny check advisories` currently fails on cargo-deny 0.18.x because
-# the upstream RustSec advisory database contains CVSS 4.0 entries that the
-# crate's parser does not yet accept (parse error on libcrux-poly1305 et al.,
-# even though those crates are not in our dependency tree). Re-enable the
-# `advisories` check once cargo-deny ships CVSS 4.0 support.
+# `cargo deny check advisories` needs cargo-deny 0.19 or later: 0.18.x stops on
+# the CVSS 4.0 entries the RustSec database now holds. scripts/supply-chain.sh
+# runs it with 0.20.2, and says so by name if an older cargo-deny cannot parse
+# the database, instead of passing.
 
 [graph]
 all-features = true
@@ -41,6 +40,23 @@ ignore = [
     #
     # Resolution: wait for rsa crate maintainers to release a fix.
     "RUSTSEC-2023-0071",
+
+    # libsqlite3-sys 0.37.0: bundled SQLite before 3.54.0 can return
+    # uninitialised page-cache memory when it opens a database together with
+    # a `-wal` file of a different page size (RUSTSEC-2026-0459,
+    # CVE-2026-119375). Severity 6.8 (medium). Fixed in 0.39.0, which no
+    # sqlx release accepts yet: sqlx-sqlite 0.9.0 requires < 0.38.0.
+    #
+    # Reachability: only a process that opens a database file, with its
+    # `-wal`, that a less trusted party could have written. The SQLite
+    # session and identity stores open the database the application
+    # configures for itself; a deployment that lets another party place
+    # that file is exposed. A build that links the system SQLite (3.54.0 or
+    # later) instead of the bundled source is not affected.
+    #
+    # Resolution: move to the sqlx release that accepts libsqlite3-sys 0.39,
+    # and drop this entry in the same commit.
+    "RUSTSEC-2026-0459",
 
     # crypto-bigint 0.5.5: timing variability in operations meant to be
     # constant-time (RUSTSEC-2026-0387). Patched only in 0.7.6.
@@ -90,6 +106,17 @@ wildcards = "deny"
 # (they are `publish = false` and never resolved from a registry). Allow
 # wildcards on path entries only; published crates still need a version pin.
 allow-wildcard-paths = true
+
+# A third copy of a curve, RSA or big-integer stack fails the gate by name.
+# Two lines of each coexist today (p256 0.13 beside 0.14, rsa 0.9 beside
+# 0.10.0-rc, crypto-bigint 0.5 beside 0.7), each pair accepted below by the
+# skip-tree entry of the crate that pulls the newer line; any further version
+# is a new copy to audit and is refused.
+deny = [
+    { crate = "p256", deny-multiple-versions = true, reason = "two copies of the curve stack already double the audit surface; a third is refused" },
+    { crate = "rsa", deny-multiple-versions = true, reason = "rsa carries the Marvin advisory on its 0.9 line; every further copy is another place to track it" },
+    { crate = "crypto-bigint", deny-multiple-versions = true, reason = "the constant-time big-integer core under the curve and RSA crates; a further copy is refused" },
+]
 
 # Known-accepted transitive duplicate roots. Each entry documents why the
 # upstream cannot yet consolidate; see the workspace-preamble comment on

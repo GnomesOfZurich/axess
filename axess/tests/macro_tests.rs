@@ -474,7 +474,7 @@ mod authz_tests {
             .layer(Extension(policy_store()))
             .layer(Extension(provider()))
             .layer(session_layer());
-        let capture = axess_core::testing::mock_tracing::TracingCapture::install();
+        let capture = axess_testing::mock_tracing::TracingCapture::install();
         let (status, _) = call_protected(app, "/docs/doc-1").await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         let decisions: Vec<_> = capture

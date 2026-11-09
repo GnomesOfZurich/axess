@@ -52,4 +52,21 @@ if ! git rev-parse --verify --quiet "${baseline}^{commit}" >/dev/null; then
 fi
 
 echo "Semver baseline: $baseline ($(git rev-parse --short "${baseline}^{commit}"))"
-cargo semver-checks check-release --workspace --baseline-rev "$baseline"
+
+# A crate that did not exist at the baseline has no semver to keep; it is
+# named and skipped, and the published crates the baseline holds are checked.
+pkgs=()
+while IFS=$'\t' read -r name dir; do
+  rel="${dir#"$AXESS_DIR"/}"
+  if git cat-file -e "${baseline}:${rel}/Cargo.toml" 2>/dev/null; then
+    pkgs+=(-p "$name")
+  else
+    echo "note: $name is new since $baseline and has no semver baseline; skipped"
+  fi
+done < <(cargo metadata --no-deps --format-version 1 \
+  | jq -r '.packages[] | select(.publish == null or (.publish | length) > 0) | [.name, (.manifest_path | rtrimstr("/Cargo.toml"))] | @tsv')
+if [ ${#pkgs[@]} -eq 0 ]; then
+  echo "ERROR: no published crate to check against $baseline." >&2
+  exit 1
+fi
+cargo semver-checks check-release "${pkgs[@]}" --baseline-rev "$baseline"

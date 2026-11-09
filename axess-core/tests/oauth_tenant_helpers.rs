@@ -7,9 +7,9 @@
 //! provider `sso`. Each IdP records the requests it receives, so every
 //! assertion is about which IdP was reached.
 //!
-//! Run with: `cargo test -p axess-core --features testing-oauth,jwt-aws-lc --test oauth_tenant_helpers`
+//! Run with: `cargo test -p axess-core --features testing,oauth,jwt-aws-lc --test oauth_tenant_helpers`
 
-#![cfg(feature = "testing-oauth")]
+#![cfg(all(feature = "testing", feature = "oauth"))]
 
 use axess_core::authn::AuditContext;
 use axess_core::authn::ids::TenantId;
@@ -23,11 +23,11 @@ use axess_core::session::extractor::AuthSession;
 use axess_core::session::store::{MemorySessionRegistry, SessionRegistry, SessionRegistryAdapter};
 use axess_core::testing::{
     mock_authn::{MockFactorStore, MockIdentityStore},
-    oauth_wiremock::{oauth_discovery_document, oauth_generate_rsa_keypair},
     test_session,
 };
 use axess_factors::FactorSecret;
 use axess_factors::oauth::{OAuthClaims, OAuthError, OAuthLoginOptions};
+use axess_testing::oauth_wiremock::{oauth_discovery_document, oauth_generate_rsa_keypair};
 use axum::extract::{Form, State};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde_json::{Value, json};

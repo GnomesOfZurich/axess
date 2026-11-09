@@ -292,7 +292,7 @@ The shipped security surface, grouped by area. Caveats live in the Notes column.
 | `AuthFlowMetrics`, `FactorMetrics`, `SessionMetrics`, `RotationMetrics`, `ProviderRegistryMetrics`, `RequestGuardMetrics`, `AuthzCacheMetrics`, `AuditMetrics` | One trait per concern, counters with no-op defaults, wired by `MetricSinks`. |
 | `AuditArchiver` + `AuditRetentionPolicy` | Hot / cold tiering with two-stage retention (90d / 7d defaults, the cold sink owns its own expiry). `FilesystemAuditArchiver` reference impl behind `audit-archive-fs`. |
 | `AuthnAnalyticsSink` + `RichAuthnEvent` | Denormalised analytics path parallel to the regulatory `AuthEvent`. serde + rkyv derives for Apache Iggy / ClickHouse / DuckDB / Snowflake. |
-| `TracingCapture` | Test subscriber for asserting on emitted `tracing` events. |
+| `axess_testing::mock_tracing::TracingCapture` | Test subscriber for asserting on emitted `tracing` events, in the dev-dependency crate `axess-testing`. |
 
 ## PII classification
 

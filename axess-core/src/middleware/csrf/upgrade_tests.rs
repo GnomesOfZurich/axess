@@ -190,6 +190,24 @@ fn a_secure_prefix_without_secure_is_refused() {
 }
 
 #[test]
+#[should_panic(expected = "requires `secure = true`")]
+fn a_host_prefix_in_another_case_without_secure_is_refused() {
+    let config = CsrfConfig::new([3u8; 32])
+        .cookie_name("__HOST-csrf")
+        .secure(false);
+    let _ = CsrfLayer::new(config);
+}
+
+#[test]
+#[should_panic(expected = "requires `secure = true`")]
+fn a_secure_prefix_in_another_case_without_secure_is_refused() {
+    let config = CsrfConfig::new([3u8; 32])
+        .cookie_name("__secure-csrf")
+        .secure(false);
+    let _ = CsrfLayer::new(config);
+}
+
+#[test]
 fn prefixed_names_with_secure_and_plain_names_are_accepted() {
     let _ = CsrfLayer::new(CsrfConfig::new([3u8; 32]).cookie_name("__Host-csrf"));
     let _ = CsrfLayer::new(CsrfConfig::new([3u8; 32]).cookie_name("__Secure-csrf"));

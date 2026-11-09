@@ -2,7 +2,7 @@
 //! missing peer address, an authenticated caller without the keyed header.
 
 use super::*;
-use crate::testing::mock_tracing::TracingCapture;
+use axess_testing::mock_tracing::TracingCapture;
 use tracing::Level;
 
 fn peer_request(ip: [u8; 4]) -> Request<Body> {

@@ -166,6 +166,7 @@ where
             }
         };
         let salt = axess_factors::generate_password_salt(&self.inner.rng);
+        let cost = self.inner.hardening.argon2_cost;
         let candidate = zeroize::Zeroizing::new(new_password.to_owned());
         let outcome = self
             .inner
@@ -177,7 +178,9 @@ where
                         reused = true;
                     }
                 }
-                (!reused).then(|| axess_factors::hash_password_with_salt(candidate.as_str(), &salt))
+                (!reused).then(|| {
+                    axess_factors::hash_password_with_salt_and_cost(candidate.as_str(), &salt, cost)
+                })
             })
             .await?;
         Ok(outcome)

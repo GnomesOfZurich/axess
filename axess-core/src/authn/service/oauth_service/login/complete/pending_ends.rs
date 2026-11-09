@@ -42,6 +42,12 @@ use crate::federation::sid_map::{DisplacedSid, SidKey};
 use crate::federation::sid_store::SidStore;
 use crate::session::store::{SessionRegistryHandle, note_revocation};
 use std::sync::Arc;
+use std::time::Duration;
+
+/// How long a refused login waits for the `sid` store to put the displaced
+/// mapping back before it ends that session instead: a store that hangs must
+/// not leave a live session that no `sid` logout can reach.
+const RESTORE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Sessions owed an end by one login. See the [module docs](self).
 pub(super) struct PendingEnds {
@@ -53,6 +59,9 @@ pub(super) struct PendingEnds {
     /// The mapping this login displaced, and the issuer it was under: ended
     /// only if the login stands, put back if it is refused.
     displaced: Option<(SidKey, DisplacedSid)>,
+    /// How long a refused login waits for the store to put the displaced
+    /// mapping back before it ends that session instead.
+    restore_timeout: Duration,
     settled: bool,
 }
 
@@ -68,8 +77,17 @@ impl PendingEnds {
             sid_map,
             aged: Vec::new(),
             displaced: None,
+            restore_timeout: RESTORE_TIMEOUT,
             settled: false,
         }
+    }
+
+    /// Wait `timeout` instead of [`RESTORE_TIMEOUT`] for the store to take
+    /// the displaced mapping back of a refused login.
+    #[cfg(test)]
+    pub(super) fn restore_timeout(mut self, timeout: Duration) -> Self {
+        self.restore_timeout = timeout;
+        self
     }
 
     /// Owe the end of a session the TTL prune took out of the map.
@@ -94,30 +112,24 @@ impl PendingEnds {
 
     /// The login was refused: put the displaced mapping back and end only the
     /// sessions that aged out.
+    ///
+    /// The restore and the ends run on a spawned task, handed everything
+    /// that is owed before the first await: a caller cancelled while the
+    /// restore is on the wire (a networked store's round trip) leaves the
+    /// task running, so neither the aged-out sessions nor the displaced
+    /// mapping is lost.
     pub(super) async fn refuse(mut self) {
         self.settled = true;
-        if let Some((key, displaced)) = self.displaced.take() {
-            let session = displaced.session;
-            if self
-                .sid_map
-                .restore_if_vacant(key.clone(), displaced)
-                .await
-                .unwrap_or(false)
-            {
-                tracing::debug!(
-                    iss = %key.0,
-                    "sid_map: put back the mapping a refused login had displaced"
-                );
-            } else {
-                tracing::debug!(
-                    iss = %key.0,
-                    session = %session,
-                    "sid_map: the displaced mapping was not put back (key taken or session ended)"
-                );
-            }
+        let task = tokio::spawn(settle_refused(
+            self.registry.clone(),
+            self.sid_map.clone(),
+            std::mem::take(&mut self.aged),
+            self.displaced.take(),
+            self.restore_timeout,
+        ));
+        if let Err(e) = task.await {
+            tracing::error!(error = %e, "settling a refused login's owed sessions failed");
         }
-        let owed = std::mem::take(&mut self.aged);
-        self.end(owed).await;
     }
 
     /// End `sessions` on a spawned task and wait for it. The task is not tied
@@ -165,6 +177,60 @@ impl Drop for PendingEnds {
             ),
         }
     }
+}
+
+/// What a refused login owes: put the displaced mapping back, and end the
+/// aged-out sessions.
+///
+/// The two run side by side, so a store that hangs on the restore does not
+/// hold up the ends. A restore the store failed, or did not finish within
+/// `timeout`, leaves the displaced session live with no mapping, out of reach
+/// of every `sid` logout, so that session ends with the aged-out ones.
+async fn settle_refused(
+    registry: Option<Arc<dyn SessionRegistryHandle>>,
+    sid_map: Arc<dyn SidStore>,
+    aged: Vec<SubjectSession>,
+    displaced: Option<(SidKey, DisplacedSid)>,
+    timeout: Duration,
+) {
+    let end = |sessions: Vec<SubjectSession>| {
+        let (registry, sid_map) = (registry.clone(), sid_map.clone());
+        async move {
+            if let Some(registry) = registry
+                && !sessions.is_empty()
+            {
+                end_sessions(registry, sid_map, sessions).await;
+            }
+        }
+    };
+    let restore = async {
+        let Some((key, displaced)) = displaced else {
+            return;
+        };
+        let (user, session) = (displaced.user, displaced.session);
+        let attempt =
+            tokio::time::timeout(timeout, sid_map.restore_if_vacant(key.clone(), displaced)).await;
+        match attempt {
+            Ok(Ok(true)) => tracing::debug!(
+                iss = %key.0,
+                "sid_map: put back the mapping a refused login had displaced"
+            ),
+            Ok(Ok(false)) => tracing::debug!(
+                iss = %key.0,
+                session = %session,
+                "sid_map: the displaced mapping was not put back (key taken or session ended)"
+            ),
+            Ok(Err(_)) | Err(_) => {
+                tracing::warn!(
+                    iss = %key.0,
+                    session = %session,
+                    "sid_map: the displaced mapping could not be put back; ending its session"
+                );
+                end(vec![(key.0, user, session)]).await;
+            }
+        }
+    };
+    tokio::join!(end(aged), restore);
 }
 
 /// End each session in the registry, concurrently within the bound, and forget

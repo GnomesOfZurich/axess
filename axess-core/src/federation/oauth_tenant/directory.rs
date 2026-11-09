@@ -65,6 +65,12 @@ pub struct StoredTenantOAuthProviders<S> {
     clock: Arc<dyn Clock>,
     rng: Arc<dyn SecureRng>,
     egress: EgressPolicy,
+    /// The `(issuer, client id)` pairs the global registration holds, which
+    /// no tenant may register.
+    global: Vec<(String, String)>,
+    /// Held across the check that a pair is free and the write that takes it,
+    /// so two registrations in this process cannot both pass.
+    registering: tokio::sync::Mutex<()>,
     built: Mutex<HashMap<(TenantId, String), Built>>,
     /// Bumped by `upsert`, `remove` and the invalidations; see
     /// [`TenantOAuthProviders::generation`].
@@ -98,6 +104,8 @@ impl<S: TenantOAuthProviderStore> StoredTenantOAuthProviders<S> {
             clock: Arc::new(axess_clock::SystemClock),
             rng: Arc::new(axess_rng::SystemRng),
             egress: EgressPolicy::screened(),
+            global: Vec::new(),
+            registering: tokio::sync::Mutex::new(()),
             built: Mutex::new(HashMap::new()),
             generation: std::sync::atomic::AtomicU64::new(0),
         }
@@ -127,6 +135,22 @@ impl<S: TenantOAuthProviderStore> StoredTenantOAuthProviders<S> {
         self
     }
 
+    /// Name an `(issuer, client id)` pair the global registration holds, so
+    /// [`upsert`](Self::upsert) refuses a tenant record that takes it. Call it
+    /// once per global provider: a tenant that registered the same pair would
+    /// make every back-channel logout token addressed to that client
+    /// ambiguous. (The logout route decides for the global registration
+    /// whatever a record says; this refuses the record at the door.)
+    #[must_use]
+    pub fn with_global_registration(
+        mut self,
+        issuer: impl Into<String>,
+        client_id: impl Into<String>,
+    ) -> Self {
+        self.global.push((issuer.into(), client_id.into()));
+        self
+    }
+
     /// The underlying store, for listing and reading records.
     pub fn store(&self) -> &S {
         &self.store
@@ -138,9 +162,17 @@ impl<S: TenantOAuthProviderStore> StoredTenantOAuthProviders<S> {
     ///
     /// # Errors
     ///
-    /// [`OAuthError::Config`] when the record is incomplete or its issuer URL
-    /// is one the egress policy refuses, [`OAuthError::Store`] when the credential cannot be sealed or the
+    /// [`OAuthError::Config`] when the record is incomplete, its issuer URL is
+    /// one the egress policy refuses, or its issuer and client id are already
+    /// registered by another tenant or by the global registration
+    /// ([`with_global_registration`](Self::with_global_registration)): the
+    /// refusal names which, never the other tenant or the issuer.
+    /// [`OAuthError::Store`] when the credential cannot be sealed or the
     /// store fails.
+    ///
+    /// Registrations in one process are serialised, so two of them cannot both
+    /// take a free pair. Two processes sharing a store can: a store that must
+    /// close that window needs a unique index over issuer and client id.
     pub async fn upsert(
         &self,
         mut record: TenantOAuthProviderRecord,
@@ -153,6 +185,8 @@ impl<S: TenantOAuthProviderStore> StoredTenantOAuthProviders<S> {
         self.egress
             .check_url(&record.issuer, "issuer URL")
             .map_err(|e| OAuthError::Config(e.to_string()))?;
+        let _registering = self.registering.lock().await;
+        self.refuse_a_held_pair(&record).await?;
         if let Some(cipher) = &self.cipher {
             record
                 .seal(cipher)
@@ -161,6 +195,42 @@ impl<S: TenantOAuthProviderStore> StoredTenantOAuthProviders<S> {
         let stored = self.store.put(record).await.map_err(store_error);
         self.bump();
         stored
+    }
+
+    /// Refuse a record whose issuer and client id another tenant, or the
+    /// global registration, already holds. A record that does not build counts
+    /// as holding its pair: the logout route counts it too.
+    async fn refuse_a_held_pair(
+        &self,
+        record: &TenantOAuthProviderRecord,
+    ) -> Result<(), OAuthError> {
+        if self
+            .global
+            .iter()
+            .any(|(issuer, client_id)| *issuer == record.issuer && *client_id == record.client_id)
+        {
+            return Err(OAuthError::Config(
+                "tenant provider refused: its issuer and client id are already registered by \
+                 the global provider"
+                    .to_string(),
+            ));
+        }
+        let held = self
+            .store
+            .list_by_issuer(&record.issuer)
+            .await
+            .map_err(store_error)?;
+        if held
+            .iter()
+            .any(|other| other.tenant_id != record.tenant_id && other.client_id == record.client_id)
+        {
+            return Err(OAuthError::Config(
+                "tenant provider refused: its issuer and client id are already registered by \
+                 another tenant"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Remove a record and the provider held for it; `true` when there was a

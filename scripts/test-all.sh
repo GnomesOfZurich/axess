@@ -201,7 +201,7 @@ bg_step "Ban #[non_exhaustive]" false bash -c '
       -e "#\[non_exhaustive\]" \
       -e "#\[ *non_exhaustive *\]" \
       axess axess-cache axess-clock axess-core axess-events axess-factors \
-      axess-identity axess-macros axess-rng axess-strings examples \
+      axess-identity axess-macros axess-rng axess-strings axess-testing examples \
       | grep -v ":[[:space:]]*//" || true)
   if [ -n "$hits" ]; then
     echo "$hits"

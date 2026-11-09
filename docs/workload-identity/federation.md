@@ -261,6 +261,21 @@ The allowlist also restricts the run and fails closed: the token's `ref` or
 `event_name` one you listed with `event`. A token without the claim, or an
 allowlist with nothing listed, admits nothing.
 
+### Requiring a token type
+
+`JwtVerifier::with_typ("at+jwt")` makes the verifier refuse a token whose JOSE
+`typ` header is not that type (compared without case, with a leading
+`application/` dropped), or has none, before it looks at the signature.
+It is off by default: without it the header type is not read, so an ID
+token, a logout token and a DPoP proof that one key signed verify as whatever
+the caller expects, provided `iss` and `aud` match. Set it wherever an issuer
+signs more than one kind of token with one key. The values: `at+jwt` for an
+access token (RFC 9068), `logout+jwt` for a logout token, `dpop+jwt` for a DPoP
+proof, `oauth-authz-req+jwt` for a signed authorization request (FAPI 2.0
+message signing) and `token-introspection+jwt` for a signed introspection
+response. `verify_jwt_with_typ` is the same check for code that calls the
+primitive directly.
+
 ### Other issuers (Okta, Azure AD, Auth0, …)
 
 Write your own recipe. For any new IdP:

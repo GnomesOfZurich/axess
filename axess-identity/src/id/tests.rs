@@ -187,6 +187,10 @@ fn mint_v4_default_is_dst_reproducible_under_override() {
 /// Catches both Encode (TEXT-shaped output) and Decode (TEXT input
 /// to `try_new` parsing) regressions in one go.
 #[cfg(feature = "sqlx")]
+#[cfg_attr(
+    miri,
+    ignore = "the tokio runtime starts an I/O driver, which Miri does not support"
+)]
 #[tokio::test]
 async fn sqlx_text_column_roundtrip() {
     use sqlx::sqlite::SqlitePoolOptions;

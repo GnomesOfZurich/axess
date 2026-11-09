@@ -164,12 +164,15 @@ where
             .await?;
             // Hidden conflicts (the default) answer as a free identifier
             // does, so the response is not a way to learn who has an account.
-            // Nothing is created and the session stays as it was; the
-            // application reads that from the session (no user) where the
-            // caller cannot.
+            // Nothing is created and the session holds no user; the
+            // application reads that from the session where the caller
+            // cannot. The session id rotates all the same: a free
+            // identifier rotates it (and so sets the cookie and writes the
+            // store), and a response that did not would tell the two apart.
             if self.inner.reveal_signup_conflicts {
                 return Ok(SignupOutcome::AlreadyExists);
             }
+            session.regenerate().await;
             return Ok(SignupOutcome::Started(None));
         }
 
@@ -359,9 +362,8 @@ where
         let secret =
             Zeroizing::new(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw.as_slice()));
         let now = self.inner.clock.now();
-        let expires_at = now
-            + chrono::Duration::from_std(self.inner.signup_verification_ttl)
-                .unwrap_or(chrono::Duration::MAX / 4);
+        // A TTL past chrono's range clamps; it must not panic the signup.
+        let expires_at = crate::lifetime::expiry_after(now, self.inner.signup_verification_ttl);
         session
             .set_pending_workflow(
                 *user_id,

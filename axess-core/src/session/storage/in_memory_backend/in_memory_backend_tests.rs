@@ -618,3 +618,47 @@ async fn a_fallback_id_never_replaces_a_user_of_another_tenant() {
     }
     assert_eq!(ids.len(), 3, "three users, three ids");
 }
+
+/// A username whose plain id is held by another user of the same tenant,
+/// because that user fell back to it, is a third user: it does not
+/// overwrite the one that holds the id, password included.
+#[tokio::test]
+async fn a_literal_username_never_replaces_a_fallback_user_of_the_same_tenant() {
+    let backend = InMemoryBackend::new()
+        .with_default_tenant("Y", "Y")
+        .with_default_tenant("b", "b")
+        .with_user_password("a", "Y", "Gnomes2+")
+        // Falls back to the id of "a@b", the plain id of the next user.
+        .with_user_password("a", "b", "Pw1+aaaa")
+        .with_user_password("a@b", "b", "Pw2+bbbb");
+    let tenant = |name: &str| axess_identity::testing::tenant(name);
+
+    let in_y = backend.find_user("a", &tenant("Y")).await.unwrap().unwrap();
+    let fallback = backend.find_user("a", &tenant("b")).await.unwrap().unwrap();
+    let literal = backend
+        .find_user("a@b", &tenant("b"))
+        .await
+        .unwrap()
+        .unwrap();
+    let ids: std::collections::HashSet<_> = [in_y.id, fallback.id, literal.id].into();
+    assert_eq!(ids.len(), 3, "three users, three ids");
+    assert_eq!(fallback.identifier.as_ref(), "a");
+    assert_eq!(literal.identifier.as_ref(), "a@b");
+
+    // Each of the two has a password factor of its own.
+    for user in [&fallback, &literal] {
+        let scope = AuthnScope::User {
+            tenant_id: tenant("b"),
+            user_id: user.id,
+        };
+        assert!(
+            backend
+                .load_factor(&scope, FactorKind::Password)
+                .await
+                .unwrap()
+                .is_some(),
+            "{} has no password factor",
+            user.identifier
+        );
+    }
+}

@@ -66,7 +66,7 @@ mod entity_cache;
 pub use entity_cache::EntityCache;
 
 #[cfg(feature = "valkey-cache")]
-mod valkey_cache;
+pub(crate) mod valkey_cache;
 
 #[cfg(feature = "valkey-cache")]
 pub use valkey_cache::ValkeyEntityCache;

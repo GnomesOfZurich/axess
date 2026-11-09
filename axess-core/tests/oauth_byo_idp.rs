@@ -13,9 +13,9 @@
 //! started with `examples/fapi/keycloak/fapi-realm.json`. The tests replace
 //! the recorded host with the wiremock server's, and nothing else.
 //!
-//! Run with: `cargo test -p axess-core --features testing-oauth,jwt-aws-lc,sqlite --test oauth_byo_idp`
+//! Run with: `cargo test -p axess-core --features testing,oauth,jwt-aws-lc,sqlite --test oauth_byo_idp`
 
-#![cfg(feature = "testing-oauth")]
+#![cfg(all(feature = "testing", feature = "oauth"))]
 
 use axess_core::authn::AuditContext;
 use axess_core::authn::factor_secret::{FactorSecretCipher, FactorSecretError};
@@ -27,7 +27,6 @@ use axess_core::federation::oauth_tenant::{
 };
 use axess_core::testing::{
     mock_authn::{MockFactorStore, MockIdentityStore},
-    oauth_wiremock::{oauth_discovery_document, oauth_generate_rsa_keypair},
     test_session,
 };
 use axess_factors::FactorSecret;
@@ -36,6 +35,7 @@ use axess_factors::oauth::{
     FapiConfig, OAuthClaims, OAuthError, OAuthLoginOptions, OAuthProvider, OAuthProviderBuilder,
     OAuthProviderConfig,
 };
+use axess_testing::oauth_wiremock::{oauth_discovery_document, oauth_generate_rsa_keypair};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde_json::{Value, json};

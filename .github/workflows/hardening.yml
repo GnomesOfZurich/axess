@@ -1,0 +1,141 @@
+name: Hardening
+
+# Supply-chain, fuzz and Miri checks that run beside ci.yml and release no
+# secret: the workflow reads the repository and nothing else. Three jobs:
+#
+#   supply-chain  scripts/supply-chain.sh (audit, deny with advisories,
+#                 unsafe and unused-dependency reports, duplicate crypto
+#                 crates, the release-build feature guard) and the workflow
+#                 pin check;
+#   fuzz          every cargo-fuzz target for a bounded time, crash inputs
+#                 uploaded;
+#   miri          the crates that contain `unsafe`, under strict provenance.
+#
+# It runs on pull requests, nightly (advisories change without commits) and
+# on demand. Every action is pinned to a commit and every tool to a version;
+# scripts/check-workflow-pins.sh refuses anything else.
+on:
+  pull_request:
+    branches: [main, release/next, 'release/*.x']
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+# Least privilege: read the repository, nothing else. No job widens it.
+permissions:
+  contents: read
+
+concurrency:
+  group: hardening-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  supply-chain:
+    name: Supply chain
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Install the supply-chain tools (exact versions, --locked)
+        run: |
+          cargo install --locked cargo-audit@0.22.2 cargo-deny@0.20.2 cargo-geiger@0.14.0 cargo-machete@0.9.2
+      - name: Actions pinned to commits, images to digests
+        run: scripts/check-workflow-pins.sh
+      - name: Run scripts/supply-chain.sh
+        run: scripts/supply-chain.sh
+      # `axess::testing` does not exist in a build without the feature. The
+      # test builds a small crate against `axess` with default features and
+      # expects the compiler to refuse the path, so it must run with no
+      # features: `--all-features` would switch the module on.
+      - name: axess::testing is unreachable without the feature
+        run: cargo test -p axess --test testing_unreachable
+
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - session_data_msgpack
+          - session_data_json
+          - jwt_payload_split
+          - pkce_verifier_predicate
+          - client_ip_forwarded
+          - egress_reserved_embedded_v4
+          - service_secret_replay_any_scheme
+          - throttle_math_props
+          - cookie_config_prefix
+          - cedar_uid_injective
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: fuzz
+      - name: Install cargo-fuzz
+        run: cargo +nightly install --locked cargo-fuzz@0.13.2
+      - name: Run ${{ matrix.target }} for 120 s
+        working-directory: fuzz
+        run: cargo +nightly fuzz run "${{ matrix.target }}" -- -max_total_time=120 -rss_limit_mb=2048
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-crashes-${{ matrix.target }}
+          path: fuzz/artifacts/
+          retention-days: 14
+
+  miri:
+    name: Miri (${{ matrix.crate }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # The crates with `unsafe`: axess-strings (repr.rs, lib.rs),
+        # axess-identity (lib.rs) and axess-cache (lib.rs, lru.rs).
+        crate: [axess-strings, axess-identity, axess-cache]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: nightly
+          components: miri, rust-src
+      - name: Miri setup
+        run: cargo +nightly miri setup
+      - name: cargo miri test -p ${{ matrix.crate }}
+        env:
+          # Strict provenance and the symbolic alignment check catch more
+          # undefined behaviour in the small-string and LRU pointer code. A
+          # test that does I/O or depends on real time carries
+          # `#[cfg_attr(miri, ignore)]`; proptest runs at a small size.
+          # Miri isolates the test from the host, so proptest may not read the
+          # working directory to persist failures: persistence is switched off
+          # and both proptest settings are forwarded into the interpreter.
+          MIRIFLAGS: >-
+            -Zmiri-strict-provenance -Zmiri-symbolic-alignment-check
+            -Zmiri-env-forward=PROPTEST_CASES
+            -Zmiri-env-forward=PROPTEST_DISABLE_FAILURE_PERSISTENCE
+          PROPTEST_CASES: "16"
+          PROPTEST_DISABLE_FAILURE_PERSISTENCE: "true"
+        # Default features only: --all-features would pull the database and
+        # archive codecs, whose FFI and I/O Miri cannot run.
+        run: cargo +nightly miri test -p ${{ matrix.crate }}

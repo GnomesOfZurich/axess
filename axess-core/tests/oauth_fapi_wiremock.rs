@@ -3,15 +3,14 @@
 //! calls bound to the same key, JARM, the ID-token algorithm allow-list, and
 //! client authentication by `private_key_jwt` or mTLS, never a client secret.
 //!
-//! Run with: `cargo test -p axess-core --features testing-oauth --test oauth_fapi_wiremock`
+//! Run with: `cargo test -p axess-core --features testing,oauth --test oauth_fapi_wiremock`
 
-#![cfg(feature = "testing-oauth")]
+#![cfg(all(feature = "testing", feature = "oauth"))]
 
 use axess_core::authn::AuditContext;
 use axess_core::authn::service::{AuthnService, RequestAuthnService};
 use axess_core::testing::{
     mock_authn::{MockFactorStore, MockIdentityStore},
-    oauth_wiremock::{oauth_discovery_document, oauth_generate_rsa_keypair},
     test_session,
 };
 use axess_factors::client_assertion::{CLIENT_ASSERTION_TYPE_JWT_BEARER, ClientAssertionSigner};
@@ -19,6 +18,7 @@ use axess_factors::oauth::{
     DpopKey, FapiConfig, OAuthClaims, OAuthError, OAuthLoginOptions, OAuthProviderBuilder,
     OAuthProviderConfig, SenderConstraint,
 };
+use axess_testing::oauth_wiremock::{oauth_discovery_document, oauth_generate_rsa_keypair};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde_json::{Value, json};

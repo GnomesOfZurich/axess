@@ -135,3 +135,96 @@ fn the_lockout_policy_throttles_by_default_and_without_throttle_is_the_named_opt
         "the lock is untouched by the opt-out"
     );
 }
+
+fn addr6(text: &str) -> IpAddr {
+    text.parse().expect("an IPv6 literal")
+}
+
+fn subject_of(throttle: &Throttle, address: IpAddr) -> ThrottleSubject {
+    throttle.subject(&TenantId::system(), &UserId::system(), Some(address))
+}
+
+#[test]
+fn an_ipv6_subject_is_keyed_on_its_64_prefix() {
+    use axess_testing::ipv6_forms::IPV6_FORMS;
+    let throttle = Throttle::default();
+    let form = |name: &str| {
+        let found = IPV6_FORMS.iter().find(|f| f.name == name).expect("a row");
+        addr6(found.address)
+    };
+    let (first, second, next) = (
+        form("same /64, first"),
+        form("same /64, second"),
+        form("next /64"),
+    );
+    assert_eq!(
+        subject_of(&throttle, first),
+        subject_of(&throttle, second),
+        "failures inside one /64 must build up under one key"
+    );
+    assert_ne!(
+        subject_of(&throttle, first),
+        subject_of(&throttle, next),
+        "another /64 is another guesser"
+    );
+    assert_eq!(
+        subject_of(&throttle, addr(7)).address,
+        Some(addr(7)),
+        "an IPv4 address is kept as it is"
+    );
+}
+
+#[test]
+fn an_ipv4_mapped_address_is_the_ipv4_address_it_carries() {
+    use axess_testing::ipv6_forms::IPV6_FORMS;
+    let throttle = Throttle::default();
+    for form in IPV6_FORMS.iter().filter(|f| f.embedded_v4.is_some()) {
+        let carried: IpAddr = form.embedded_v4.expect("filtered").parse().expect("IPv4");
+        assert_eq!(
+            subject_of(&throttle, addr6(form.address)),
+            subject_of(&throttle, carried),
+            "{}",
+            form.name
+        );
+    }
+}
+
+#[test]
+fn a_huge_max_delay_refuses_the_guess_and_never_waits_less_as_failures_grow() {
+    let table = axess_testing::durations::extreme_durations();
+    for first in &table {
+        for max in &table {
+            let throttle = Throttle {
+                first_delay: first.value,
+                max_delay: max.value,
+                ..Throttle::default()
+            };
+            let mut previous = Duration::ZERO;
+            for failures in [1, 2, 3, 40, 100, u32::MAX] {
+                let delay = throttle.delay_after(failures);
+                assert!(delay <= max.value, "{} / {}", first.name, max.name);
+                assert!(delay >= previous, "{} / {}", first.name, max.name);
+                previous = delay;
+                let waiting = throttle.retry_after(Some(&state(failures, 0)), at(0));
+                if !first.value.is_zero() && !max.value.is_zero() {
+                    assert!(
+                        matches!(waiting, Some(wait) if !wait.is_zero()),
+                        "throttle fails open: first {} / max {} at {failures} failures gave {waiting:?}",
+                        first.name,
+                        max.name
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_zero_first_delay_stays_zero_past_the_doubling_width() {
+    let throttle = Throttle {
+        first_delay: Duration::ZERO,
+        ..Throttle::default()
+    };
+    assert_eq!(throttle.delay_after(40), Duration::ZERO);
+    assert_eq!(throttle.retry_after(Some(&state(40, 0)), at(0)), None);
+}

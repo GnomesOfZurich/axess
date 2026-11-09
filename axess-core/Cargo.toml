@@ -39,7 +39,12 @@ axum = { workspace = true, default-features = false, features = ["original-uri",
 base64 = { workspace = true }
 cedar-policy = { version = "4.14.1", optional = true }
 chrono = { workspace = true, features = ["serde"] }
-fred = { version = "10.1.0", features = ["transactions", "subscriber-client", "i-std", "i-cluster", "i-scripts", "blocking-encoding", "replicas"], optional = true }
+# Only what the Valkey code calls: the standard command families (`i-std`),
+# `EVAL` (`i-scripts`) and the pub/sub client of the policy reload
+# (`subscriber-client`). No transactions, replica routing or cluster commands.
+# `blocking-encoding` stays: it keeps large-frame encoding off the runtime
+# thread, and it is what enables tokio's `rt-multi-thread` for a Valkey build.
+fred = { version = "10.1.0", default-features = false, features = ["i-std", "i-scripts", "subscriber-client", "blocking-encoding"], optional = true }
 hmac = { workspace = true }
 # No backend here either: see axess-factors' note. The adopter picks with
 # `jwt-aws-lc` or `jwt-rust-crypto`, which this crate passes through.
@@ -73,19 +78,22 @@ rustls-pki-types = { version = "1.15.1", optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-sqlx = { version = "0.9.0", features = ["runtime-tokio"], optional = true }
+# No default features: `any`, `migrate` and `json` are unused here, and the
+# default `macros` pulls the `sqlx-macros` proc-macro (which can open a
+# database at build time). `derive` is the one macro surface used
+# (`FromRow`). The backend and TLS choice stay with the features below and
+# the adopter.
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "derive"], optional = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["full", "macros", "rt-multi-thread"] }
+# Listed per use: `sync` (channels, `Semaphore`), `time` (timeouts, intervals),
+# `rt` (`spawn`, `spawn_blocking`, `Handle::try_current`) and `macros`
+# (`select!`, `join!`). No `full` and no `rt-multi-thread`: a library does not
+# choose the runtime flavour, the application does.
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tower = { version = "0.5.3", features = ["util"] }
 cookie = { version = "0.18.2", features = ["percent-encode"] }
 tracing = { workspace = true }
-# A library depends on the facade (`tracing`) and leaves the subscriber,
-# the implementation, to the binary: installing one is the application's
-# decision, and two libraries that both install one conflict. Needed only
-# by `testing::mock_tracing`, so it rides the `testing` feature; in-crate
-# tests and doc-tests get it from dev-dependencies.
-tracing-subscriber = { workspace = true, optional = true }
 url = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde"] }
 # `danger-allow-state-serialisation` is required to store a
@@ -93,11 +101,6 @@ uuid = { workspace = true, features = ["v4", "serde"] }
 # keep that state SERVER-SIDE only (never in a cookie or any field the
 # client can read or return), because it is the ceremony's trust anchor.
 webauthn-rs = { version = "0.6.2", features = ["danger-allow-state-serialisation", "conditional-ui"], optional = true }
-# Adopter test-fixture surface: `axess_core::testing::oauth_wiremock` stands
-# up an OIDC IdP against `wiremock` so adopters can exercise their OAuth flow
-# without provisioning Keycloak/Auth0 for unit tests. Opt-in via the
-# `testing-oauth` feature.
-wiremock = { version = "0.6.5", optional = true }
 x509-parser = { workspace = true, optional = true }
 zeroize = { workspace = true }
 
@@ -105,18 +108,23 @@ zeroize = { workspace = true }
 # Foundation crates' `testing` features are gated; tests pull them via
 # dev-deps overrides so `cargo test` sees `axess_clock::testing::MockClock`
 # etc. without forcing production builds to compile the mocks.
-axess-clock = { workspace = true, features = ["testing"] }
-axess-factors = { workspace = true, features = ["testing"] }
+axess-clock = { workspace = true, features = ["testing", "allow-testing-in-release"] }
+axess-factors = { workspace = true, features = ["testing", "allow-testing-in-release"] }
 axess-identity = { workspace = true, features = ["testing"] }
-axess-rng = { workspace = true, features = ["testing"] }
+axess-rng = { workspace = true, features = ["testing", "allow-testing-in-release"] }
+# The tracing capture and the OIDC identity-provider fixture: a dev-dependency
+# only, so `wiremock` and its `rsa` are reachable from no production edge.
+axess-testing = { workspace = true }
 base32 = { workspace = true }
 criterion = { workspace = true, features = ["async_tokio"] }
 http-body-util = "0.1.5"
 proptest = { workspace = true }
 # rcgen mints X509-SVID certs with SPIFFE URIs in SAN for mTLS resolver tests.
 rcgen = "0.14.10"
-# Match the production `outbound-oauth` reqwest pin.
-reqwest = { version = "0.12.28", features = ["cookies"] }
+# Match the production `outbound-oauth` reqwest pin: rustls only, so
+# `native-tls` and `openssl-sys` stay out of the lockfile. `json` is the live
+# Keycloak test's response decoding.
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "cookies", "json"] }
 # rmp-serde is normally feature-gated (sqlite/postgres/valkey); pull into
 # dev-deps so the wire-format proptest suite runs independently of storage.
 rmp-serde = "1.3.1"
@@ -128,17 +136,19 @@ serial_test = "4.0.1"
 sha1 = { workspace = true }
 # `tls-rustls-aws-lc-rs`: MySQL 8 signs in with `caching_sha2_password`, which
 # needs TLS (or an RSA exchange); the live MySQL tests connect over TLS.
-sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite", "postgres", "tls-rustls-aws-lc-rs"] }
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "derive", "sqlite", "postgres", "tls-rustls-aws-lc-rs"] }
 subtle = { workspace = true }
 # Test directories that are removed on drop, also when an assertion fails.
 tempfile = "3.27.0"
 # Satisfies `#[cfg(test)] mod tests` in authz/audit.rs and the doc-test
-# examples, which need a subscriber without the `testing` feature on.
+# examples. A library leaves the subscriber to the binary: installing one is
+# the application's decision, and two libraries that both install one
+# conflict.
 tracing-subscriber = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
 tokio-test = { workspace = true }
-# In-crate `#[cfg(test)]` mods build wiremock fixtures directly; an optional
-# regular-dep entry of the same crate (under `testing-oauth`) re-exposes
-# wiremock to adopters via `axess_core::testing::oauth_wiremock`.
+# In-crate `#[cfg(test)]` mods and the integration tests build wiremock
+# fixtures directly. Not a regular dependency under any feature.
 wiremock = "0.6.5"
 
 [[bench]]
@@ -167,13 +177,16 @@ testing = [
     "axess-clock/testing",
     "axess-rng/testing",
     "axess-identity/testing",
-    "dep:tracing-subscriber",
 ]
-# Adopter-facing test helpers that stand up an OIDC IdP against `wiremock`,
-# mounting `/.well-known/openid-configuration` and `/jwks` so tests can
-# exercise the full discovery + token-exchange flow without external
-# infrastructure. Pulls `wiremock` + `rsa` in addition to `testing` + `oauth`.
-testing-oauth = ["testing", "oauth", "dep:wiremock", "dep:rsa"]
+# The named opt-out for the release-build guard: with `testing` on and
+# debug assertions off the crate refuses to compile, because the feature
+# ships test doubles in a production binary. Enable this only for a build
+# that means it (a benchmark, a release-mode test run).
+allow-testing-in-release = [
+    "axess-clock/allow-testing-in-release",
+    "axess-rng/allow-testing-in-release",
+    "axess-factors/allow-testing-in-release",
+]
 
 # HTTP middleware
 accept-client-id = []

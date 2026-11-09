@@ -377,6 +377,9 @@ where
                     "record_failed_attempt errored; lockout counter not updated; \
                      monitor counter-store health"
                 );
+                // The throttle fails on its own terms: its delay keeps
+                // building for this key while the lockout counter is down.
+                self.record_throttled_guess(user_id, tenant_id).await;
                 session.record_attempt_at(self.inner.clock.now()).await;
                 self.record_factor_failure_audit(user_id, tenant_id, current_kind, session)
                     .await;

@@ -133,9 +133,10 @@ impl InMemoryBackend {
     ///
     /// The user's id is derived from `username`
     /// (`axess_identity::testing::user(username)`), so registering the same
-    /// username in the same tenant again replaces the user. A username
-    /// already registered in another tenant gets an id derived from
-    /// `"{username}@{tenant_id}"` instead, so the two stay separate users.
+    /// username in the same tenant again replaces the user. A username whose
+    /// id is held by another user, of another tenant or of this one under a
+    /// different username, gets an id derived from `"{username}@{tenant_id}"`
+    /// instead, so the two stay separate users.
     pub fn with_user_password(
         mut self,
         username: impl Into<Arc<str>>,
@@ -152,10 +153,16 @@ impl InMemoryBackend {
         // from the username and tenant together, unless another tenant holds
         // that too (a literal username such as `a@b` can); then the same
         // pair length-prefixed, which no username can imitate.
+        // An id is free when no user holds it, or when the user holding it is
+        // this very username in this very tenant (registering it again
+        // replaces it). A different username of the same tenant that
+        // derived the same id is another user and keeps its id.
         let free = |id: &UserId| {
             self.identity
-                .tenant_of(id)
-                .is_none_or(|held| held == tenant_id)
+                .holder_of(id)
+                .is_none_or(|(held_tenant, held_name)| {
+                    held_tenant == tenant_id && held_name == username
+                })
         };
         let user_id = [
             username.to_string(),

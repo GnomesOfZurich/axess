@@ -718,3 +718,94 @@ async fn a_missing_issuer_pin_refuses_unless_waived() {
         .with_issuer("https://any.example.com");
     pinned.verify::<serde_json::Value>(&token).await.unwrap();
 }
+
+// ── The JOSE `typ` header ─────────────────────────────────────────────────
+
+/// A token signed with `typ` as its header type (`None`: no `typ`).
+fn sign_typed(claims: &serde_json::Value, kid: &str, der: &[u8], typ: Option<&str>) -> String {
+    crate::jwt::ensure_crypto_provider();
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some(kid.to_string());
+    header.typ = typ.map(str::to_string);
+    encode(&header, claims, &EncodingKey::from_rsa_der(der)).expect("JWT encode")
+}
+
+fn typed_claims() -> serde_json::Value {
+    serde_json::json!({
+        "iss": "https://idp.example.com",
+        "sub": "workload-42",
+        "aud": "my-svc",
+        "exp": now_secs() + 3600,
+    })
+}
+
+fn pinned(jwks: JwkSet) -> JwtVerifier {
+    JwtVerifier::new(handle(jwks))
+        .with_issuer("https://idp.example.com")
+        .with_audience("my-svc")
+}
+
+/// With a type required, the header type must be that one: compared without
+/// regard to case, and with a leading `application/` dropped (RFC 7515
+/// section 4.1.9), on both sides.
+#[tokio::test]
+async fn a_required_typ_accepts_the_same_media_type_however_it_is_written() {
+    let (der, jwks, kid) = rsa_keypair();
+    for expected in ["at+jwt", "application/at+jwt", "AT+JWT"] {
+        let verifier = pinned(jwks.clone()).with_typ(expected);
+        for sent in [
+            "at+jwt",
+            "AT+JWT",
+            "application/at+jwt",
+            "Application/AT+jwt",
+        ] {
+            let token = sign_typed(&typed_claims(), &kid, &der, Some(sent));
+            verifier
+                .verify::<serde_json::Value>(&token)
+                .await
+                .unwrap_or_else(|e| panic!("{sent} against {expected}: {e}"));
+        }
+    }
+}
+
+/// A token of another kind from the same issuer and key is refused: an ID
+/// token, a logout token and a DPoP proof are not access tokens, and a token
+/// with no `typ` is not one that says it is.
+#[tokio::test]
+async fn a_required_typ_refuses_every_other_type_and_a_missing_one() {
+    let (der, jwks, kid) = rsa_keypair();
+    let verifier = pinned(jwks).with_typ("at+jwt");
+    for sent in [
+        Some("JWT"),
+        Some("logout+jwt"),
+        Some("dpop+jwt"),
+        Some("application/jwt"),
+        Some("at+jwt+extra"),
+        Some(""),
+        None,
+    ] {
+        let token = sign_typed(&typed_claims(), &kid, &der, sent);
+        let err = verifier
+            .verify::<serde_json::Value>(&token)
+            .await
+            .expect_err("a token of another type is refused");
+        assert!(
+            matches!(&err, JwtError::VerificationFailed(m) if m.contains("typ")),
+            "{sent:?}: {err}"
+        );
+    }
+}
+
+/// Without `with_typ` the header type is not looked at, as before.
+#[tokio::test]
+async fn without_a_required_typ_any_type_is_accepted() {
+    let (der, jwks, kid) = rsa_keypair();
+    let verifier = pinned(jwks);
+    for sent in [Some("JWT"), Some("logout+jwt"), None] {
+        let token = sign_typed(&typed_claims(), &kid, &der, sent);
+        verifier
+            .verify::<serde_json::Value>(&token)
+            .await
+            .unwrap_or_else(|e| panic!("{sent:?}: {e}"));
+    }
+}

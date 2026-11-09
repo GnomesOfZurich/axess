@@ -145,6 +145,23 @@ jobs. Only Release Version differs: it runs with `--allow-unreleased`,
 so the version's heading may still say `unreleased`, or the version may
 not be known yet and only `## [Unreleased]` exists.
 
+### The hardening workflow
+
+[`hardening.yml`](../../.github/workflows/hardening.yml) runs beside CI on
+every pull request into those branches and nightly, with `contents: read`
+and nothing else. It runs `scripts/check-workflow-pins.sh` (every action
+pinned to a commit with its release in a comment, every image to a digest,
+every checkout without a stored credential), `scripts/supply-chain.sh`
+(audit, deny with advisories, unsafe and unused-dependency reports, one
+version of each crypto crate, no `testing`, `memory`, wiremock or
+tracing-subscriber in a release tree), the compile-fail test that
+`axess::testing` is absent without its feature, every fuzz target for 120
+seconds, and Miri over the crates that contain `unsafe`. Five fuzz targets
+encode defects under repair and may fail without failing the run; the
+workflow file names each and the date its allowance ends. The workflow is
+not yet among the required checks; add it to the ruleset when it has
+been green for a week.
+
 ### The release workflow
 
 A tag `vX.Y.Z` starts
@@ -163,15 +180,29 @@ the same workflow. In order:
    not `v` plus the workspace version or whose version has no dated
    changelog section.
 2. **CI** runs the whole of `ci.yml` on the tagged commit.
-3. **Publish to crates.io** waits for the maintainer's approval in the
-   `crates-io` environment, then publishes the crates in dependency
-   order with the organisation secret `CARGO_REGISTRY_TOKEN`, which only
-   a job in that environment reaches. Moving to crates.io trusted
+3. **Package the crates and the SBOM** runs `cargo package --workspace
+   --locked` from the tagged tree, records the SHA-256 of every `.crate`
+   and generates the CycloneDX SBOM from the same tree with a
+   version-pinned `cargo-cyclonedx --locked`. It holds no secret and no
+   OIDC permission, and restores no cache.
+4. **Attest the packaged crates and the SBOM** is the one job with
+   signing permissions. It runs no build: it downloads the files the
+   previous job made and attests the build provenance of each `.crate`
+   and of the SBOM with Sigstore keyless signing, so adopters can tie a
+   crate to this workflow run and this commit.
+5. **Publish to crates.io** waits for the maintainer's approval in the
+   `crates-io` environment. It runs `cargo audit` against the lockfile as
+   the advisory database stands then, packages the workspace again and
+   refuses, by name, unless the sums equal the attested ones (`cargo
+   publish` packages before it uploads and cannot upload a file made
+   elsewhere, so equality of bytes is the proof the upload is the
+   attested file), then publishes in dependency order with `cargo publish
+   --locked` and the organisation secret `CARGO_REGISTRY_TOKEN`, which
+   only a job in that environment reaches. Moving to crates.io trusted
    publishing (settings step 5) removes that stored token.
-4. **GitHub Release + SBOM** generates the CycloneDX SBOM, attests its
-   provenance with Sigstore keyless signing, and creates the GitHub
-   release with generated notes.
-5. **Level release/next with main** runs only for a tag on `main`:
+6. **GitHub Release** creates the release with generated notes and the
+   attested `.crate` files and SBOM as assets.
+7. **Level release/next with main** runs only for a tag on `main`:
    when `release/next` is behind `main` or carries the same tree as the
    squashed release, the branch is moved to the released commit; when
    work landed on it since the release pull request was opened, `main`
@@ -201,14 +232,16 @@ order:
 1. `axess-strings` (no axess deps)
 2. `axess-clock` (no axess deps)
 3. `axess-rng` (no axess deps)
-4. `axess-identity` (no axess deps)
-5. `axess-cache` (depends on `axess-clock`)
-6. `axess-events` (depends on `axess-identity`)
-7. `axess-factors` (depends on `axess-identity`, `axess-clock`,
+4. `axess-testing` (no axess deps; a dev-dependency for adopters, so no
+   published crate depends on it)
+5. `axess-identity` (no axess deps)
+6. `axess-cache` (depends on `axess-clock`)
+7. `axess-events` (depends on `axess-identity`)
+8. `axess-factors` (depends on `axess-identity`, `axess-clock`,
    `axess-rng`)
-8. `axess-macros` (no axess deps; procedural macros stand alone)
-9. `axess-core` (depends on everything in the previous tier)
-10. `axess` (the facade, depends on `axess-core` and
+9. `axess-macros` (no axess deps; procedural macros stand alone)
+10. `axess-core` (depends on everything in the previous tier)
+11. `axess` (the facade, depends on `axess-core` and
     `axess-factors` and `axess-macros`)
 
 The release workflow publishes in this order; the maintainer should
@@ -266,7 +299,7 @@ on the published version. The shape:
 mkdir /tmp/axess-smoke
 cd /tmp/axess-smoke
 cargo new --name axess-smoke .
-echo 'axess = "0.18"' >> Cargo.toml
+echo 'axess = "0.19"' >> Cargo.toml
 cargo build
 ```
 
@@ -385,15 +418,18 @@ organisation owners can create release tags; accounts with write
 access can merge pull requests. The GitHub Actions app, which
 reports every check below, has integration id 15368.
 
-### 1. Merge settings: squash only
+### 1. Merge settings: squash only, auto-merge allowed
 
 UI: Settings, General, Pull Requests: tick "Allow squash merging" with
 the default commit message "Pull request title and description";
-untick "Allow merge commits" and "Allow rebase merging".
+untick "Allow merge commits" and "Allow rebase merging"; tick "Allow
+auto-merge", so that `gh pr merge --squash --auto` can arm the release
+pull request to merge by itself when its required checks pass.
 
 ```bash
 gh api -X PATCH repos/GnomesOfZurich/axess \
   -F allow_squash_merge=true -F allow_merge_commit=false -F allow_rebase_merge=false \
+  -F allow_auto_merge=true \
   -f squash_merge_commit_title=PR_TITLE -f squash_merge_commit_message=PR_BODY
 ```
 
@@ -486,36 +522,31 @@ editing `ci.yml` itself, since a pull request runs the workflow as the
 pull request has it. Read a release pull request's changes under
 `.github/` before merging.
 
-### 3. Tag rulesets: only the maintainer and `tag.yml` create `v*`, nobody moves or deletes one
+### 3. Tag ruleset: nobody moves or deletes a `v*` tag
 
-Two rulesets, because a bypass actor bypasses every rule of its
-ruleset: creation names two bypasses (repository admins, and GitHub
-Actions so that `tag.yml` can create the tag after a merge into
-`main`), immutability names none.
+One ruleset, with no bypass actor, makes a release tag immutable:
+nobody updates, deletes or force-pushes one, `tag.yml` included.
 
-UI: Settings, Rules, Rulesets, New ruleset, New tag ruleset. First:
-name "release tags: created by admins"; Active; Bypass list: Add
-bypass, Repository admin, Always allow, then Add bypass, GitHub
-Actions (under Apps), Always allow; Target tags: Include by pattern,
-`v*`; Rules: tick "Restrict creations". Second: name "release tags:
-immutable"; Active; Bypass list empty; the same target; Rules: tick
-"Restrict updates", "Restrict deletions" and "Block force pushes".
+Creating a tag is not restricted. `tag.yml` creates the tag with the
+workflow token after a merge into `main`, and GitHub refuses the GitHub
+Actions app as a bypass actor on a repository ruleset ("must be part of
+the ruleset source or owner organization"), so a creation rule would
+only ever refuse the workflow. What a stray tag can do is bounded
+elsewhere: `release.yml` refuses a tag that is not on `main` or a
+`release/X.Y.x` branch or that disagrees with the workspace version and
+its dated changelog section, and publishes nothing without the
+maintainer's approval in the `crates-io` environment. To restrict
+creation again, register a GitHub App owned by the organisation, mint
+its installation token in `tag.yml` (`actions/create-github-app-token`)
+and name the app as the creation rule's bypass actor; a tag pushed with
+that token also starts `release.yml` by itself.
+
+UI: Settings, Rules, Rulesets, New ruleset, New tag ruleset: name
+"release tags: immutable"; Active; Bypass list empty; Target tags:
+Include by pattern, `v*`; Rules: tick "Restrict updates", "Restrict
+deletions" and "Block force pushes".
 
 ```bash
-gh api -X POST repos/GnomesOfZurich/axess/rulesets --input - <<'JSON'
-{
-  "name": "release tags: created by admins",
-  "target": "tag",
-  "enforcement": "active",
-  "bypass_actors": [
-    { "actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always" },
-    { "actor_id": 15368, "actor_type": "Integration", "bypass_mode": "always" }
-  ],
-  "conditions": { "ref_name": { "include": ["refs/tags/v*"], "exclude": [] } },
-  "rules": [ { "type": "creation" } ]
-}
-JSON
-
 gh api -X POST repos/GnomesOfZurich/axess/rulesets --input - <<'JSON'
 {
   "name": "release tags: immutable",
@@ -580,8 +611,9 @@ permission `id-token: write`, its token passed as
 
 Trusted publishing needs each crate configured on crates.io, by an
 owner of the crate, and only for a crate that already exists there
-(all ten do). For each of `axess-strings`, `axess-clock`, `axess-rng`,
-`axess-identity`, `axess-events`, `axess-cache`, `axess-factors`,
+(all ten do; `axess-testing` needs its first release by token before it
+can be configured). For each of `axess-strings`, `axess-clock`, `axess-rng`,
+`axess-testing`, `axess-identity`, `axess-events`, `axess-cache`, `axess-factors`,
 `axess-core`, `axess-macros` and `axess`:
 
 UI: https://crates.io/crates/CRATE/settings, Trusted Publishing, Add,

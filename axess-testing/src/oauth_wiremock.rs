@@ -1,32 +1,28 @@
-//! OIDC test fixture against `wiremock`: mounts a discovery document, a JWKS
-//! endpoint, and gives the caller everything needed to drive an
-//! [`OAuthProviderConfig`](axess_factors::oauth::OAuthProviderConfig) end-to-end without external infrastructure.
+//! OIDC test fixture against `wiremock`: a discovery document, a JWKS
+//! endpoint, and an RSA key pair, everything a test needs to stand up an
+//! in-process identity provider without external infrastructure.
 //!
 //! Adopters writing integration tests for code that depends on
-//! [`AuthnService::begin_oauth_login`](crate::authn::service::AuthnService)
-//! / `finish_oauth_login` / `complete_oauth_login` can spin up an
-//! in-process IdP that returns canned responses, exercise the real OIDC
-//! discovery + PKCE + state machinery, and assert on the result without
-//! touching Keycloak / Auth0 / Cognito.
-//!
-//! Gated behind the `testing-oauth` feature (pulls in `wiremock` + `rsa`).
+//! `AuthnService::begin_oauth_login`, `finish_oauth_login` or
+//! `complete_oauth_login` start a `wiremock` server, mount the endpoints
+//! here, and point a provider at the server's address, exercising the real
+//! OIDC discovery, PKCE and state machinery without Keycloak, Auth0 or
+//! Cognito. `axess_core::testing` (feature `testing`, with `oauth`) builds
+//! the provider from the server's address.
 //!
 //! ## Typical usage
 //!
 //! ```ignore
-//! use axess_core::testing::oauth_wiremock::{
-//!     oauth_generate_rsa_keypair, oauth_mount_oidc_endpoints, oauth_setup_provider,
+//! use axess_testing::oauth_wiremock::{
+//!     oauth_generate_rsa_keypair, oauth_mount_oidc_endpoints,
 //! };
 //! use wiremock::MockServer;
 //!
 //! let server = MockServer::start().await;
 //! let (_private_der, jwk, _kid) = oauth_generate_rsa_keypair();
 //! oauth_mount_oidc_endpoints(&server, &jwk).await;
-//! let provider = oauth_setup_provider(&server).await;
-//! // ... drive begin_oauth_login(&provider, ...) against the wiremock IdP ...
+//! // ... point a provider at server.uri() and drive begin_oauth_login ...
 //! ```
-
-use axess_factors::oauth::{OAuthProviderBuilder, OAuthProviderConfig};
 
 /// Build an OIDC discovery document for the given issuer. The shape covers
 /// the discovery fields axess actually reads; it is not a complete
@@ -99,29 +95,4 @@ pub async fn oauth_mount_oidc_endpoints(server: &wiremock::MockServer, jwk: &ser
         )
         .mount(server)
         .await;
-}
-
-/// Run OIDC discovery against the given wiremock server and return the
-/// builder of a provider pointed at it, for a test that adds settings
-/// before [`build`](OAuthProviderBuilder::build). Uses stable test values for
-/// the client id (`"test-client-id"`), secret (`"test-secret"`), and
-/// redirect URI (`"http://localhost:3000/callback"`).
-pub async fn oauth_discover_provider(server: &wiremock::MockServer) -> OAuthProviderBuilder {
-    OAuthProviderConfig::discover(
-        "test",
-        &server.uri(),
-        "test-client-id",
-        "test-secret",
-        "http://localhost:3000/callback",
-    )
-    .await
-    .expect("OIDC discovery should succeed")
-}
-
-/// [`oauth_discover_provider`], built with no further settings.
-pub async fn oauth_setup_provider(server: &wiremock::MockServer) -> OAuthProviderConfig {
-    oauth_discover_provider(server)
-        .await
-        .build()
-        .expect("a provider with no settings builds")
 }

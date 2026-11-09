@@ -178,6 +178,27 @@ where
                 )
                 .await);
         }
+        // How recently the administrator authenticated, when the service was
+        // built to ask. Stale authentication is refused before the target is
+        // read, so the answer does not depend on which ids exist.
+        if let Some(limit) = self.inner.hardening.impersonation_max_authn_age {
+            let age = self
+                .inner
+                .clock
+                .now()
+                .signed_duration_since(admin_snapshot.authn_time);
+            let limit = chrono::Duration::from_std(limit).unwrap_or(chrono::Duration::MAX);
+            if age > limit {
+                return Err(self
+                    .refuse_impersonation(
+                        admin_user_id,
+                        None,
+                        AuthFailureReason::AuthnTooOld,
+                        AuthnError::NoFlow,
+                    )
+                    .await);
+            }
+        }
         // The target is the store's, not the caller's record of it: a
         // `User` struct is whatever the caller built, and its `tenant_id`
         // is what the tenant rail compares. Reloaded by id; the tenant
@@ -211,6 +232,19 @@ where
                 .refuse_impersonation(admin_user_id, None, AuthFailureReason::UnknownTarget, error)
                 .await);
         };
+        // An administrator impersonating themselves changes nobody's
+        // identity, and would put an impersonation marker on their own
+        // account and a row in the trail saying it happened.
+        if target.id == *admin_user_id {
+            return Err(self
+                .refuse_impersonation(
+                    admin_user_id,
+                    Some(&target),
+                    AuthFailureReason::from("self_impersonation"),
+                    AuthnError::NoFlow,
+                )
+                .await);
+        }
         if let Some(expected) = expected_tenant
             && (&target.tenant_id != expected || admin_snapshot.tenant_id != *expected)
         {
@@ -398,6 +432,8 @@ where
                     target_user_id = %target_user.id,
                     "begin_impersonation register failed; clearing session and refusing"
                 );
+                self.release_impersonation_anchor(session, admin_user_id, &target_user.id)
+                    .await;
                 session.clear().await;
                 return Err(self
                     .refuse_impersonation(
@@ -423,6 +459,8 @@ where
             )
             .await
         {
+            self.release_impersonation_anchor(session, admin_user_id, &target_user.id)
+                .await;
             self.end_session_after_audit_failure(&target_user.id, session)
                 .await;
             return Err(e);
@@ -435,6 +473,26 @@ where
         );
 
         Ok(())
+    }
+
+    /// End the entry an impersonation registered under the administrator, for
+    /// an impersonation that did not stand. Read from the session before it
+    /// is cleared; without it the entry would stay in the registry, counted
+    /// against the administrator's sessions, until they are all revoked.
+    async fn release_impersonation_anchor(
+        &self,
+        session: &AuthSession,
+        admin_user_id: &crate::authn::ids::UserId,
+        target_id: &crate::authn::ids::UserId,
+    ) {
+        let (Some(reg), Some(imp)) = (&self.inner.registry, session.impersonation().await) else {
+            return;
+        };
+        note_revocation(
+            reg.invalidate_session(admin_user_id, &imp.registry_anchor(target_id))
+                .await,
+            "ending the anchor of a failed impersonation",
+        );
     }
 
     /// End an impersonation: the session and its registry entry are

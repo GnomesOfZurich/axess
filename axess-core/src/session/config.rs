@@ -197,7 +197,7 @@ impl SessionConfig {
             name.bytes().all(is_cookie_token_byte),
             "SessionConfig: cookie name `{name}` contains characters that are not valid in a cookie name"
         );
-        if name.starts_with("__Host-") {
+        if has_prefix_ignoring_case(name, "__Host-") {
             assert!(
                 self.secure,
                 "SessionConfig: cookie name `{name}` requires `secure = true`"
@@ -206,7 +206,7 @@ impl SessionConfig {
                 self.path.as_ref() == "/",
                 "SessionConfig: cookie name `{name}` requires `path = \"/\"`"
             );
-        } else if name.starts_with("__Secure-") {
+        } else if has_prefix_ignoring_case(name, "__Secure-") {
             assert!(
                 self.secure,
                 "SessionConfig: cookie name `{name}` requires `secure = true`"
@@ -229,6 +229,15 @@ impl SessionConfig {
             "SessionConfig: `SameSite=None` requires `secure = true` (browsers reject the cookie otherwise)"
         );
     }
+}
+
+/// Whether `name` starts with `prefix`, ignoring ASCII case: browsers read the
+/// `__Host-` and `__Secure-` cookie-name prefixes case-insensitively
+/// (RFC 6265bis), so `__HOST-sid` is held to the rules of `__Host-`.
+pub(crate) fn has_prefix_ignoring_case(name: &str, prefix: &str) -> bool {
+    name.as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
 }
 
 /// Whether `path` can be written as a cookie `Path` attribute as given: it
@@ -481,6 +490,48 @@ mod tests {
             .same_site(SameSite::None)
             .secure(false)
             .build();
+    }
+
+    /// Browsers match the prefixes without regard to case, so a name in
+    /// another case is held to the same rules.
+    #[test]
+    #[should_panic(expected = "requires `secure = true`")]
+    fn a_host_prefix_in_another_case_needs_secure() {
+        let _ = SessionConfig::builder()
+            .cookie_name("__HOST-sid")
+            .secure(false)
+            .build();
+    }
+
+    #[test]
+    #[should_panic(expected = "requires `secure = true`")]
+    fn a_secure_prefix_in_another_case_needs_secure() {
+        let _ = SessionConfig::builder()
+            .cookie_name("__SECURE-sid")
+            .secure(false)
+            .build();
+    }
+
+    #[test]
+    #[should_panic(expected = "requires `path = \"/\"`")]
+    fn a_host_prefix_in_another_case_needs_the_root_path() {
+        let _ = SessionConfig::builder()
+            .cookie_name("__host-sid")
+            .path("/app")
+            .build();
+    }
+
+    #[test]
+    fn a_prefixed_name_in_any_case_is_accepted_when_its_rules_hold() {
+        let c = SessionConfig::builder().cookie_name("__hOsT-sid").build();
+        assert_eq!(c.cookie_name(), "__hOsT-sid");
+    }
+
+    #[test]
+    fn the_prefix_match_is_by_bytes_and_never_splits_a_character() {
+        assert!(!has_prefix_ignoring_case("__Hos\u{e9}-x", "__Host-"));
+        assert!(!has_prefix_ignoring_case("__H", "__Host-"));
+        assert!(has_prefix_ignoring_case("__HOST-x", "__Host-"));
     }
 
     #[test]

@@ -1,13 +1,14 @@
 //! Valkey-backed [`SessionRegistry`] implementation.
 //!
 //! See the [module-level docs](super) for the registry data-type
-//! rationale (Redis sorted set keyed on `register`-time millis for FIFO
+//! rationale (Redis sorted sets keyed on `register`-time millis for FIFO
 //! eviction ordering) and the pub/sub revocation channel layout.
 
 use super::internal::{
     DEFAULT_PREFIX, ValkeyStoreError, Watch, after_check, after_degraded_poll, degraded_poll_delay,
-    log_session_id, registry_cutoff_ms, registry_key, registry_key_ttl_secs, registry_member_live,
-    registry_member_ttl_ms, revocation_session_channel, revocation_user_channel,
+    log_session_id, oldest_first, registered_at_key, registry_cutoff_ms, registry_key,
+    registry_key_ttl_secs, registry_member_live, registry_member_ttl_ms,
+    revocation_session_channel, revocation_user_channel,
 };
 use super::subscriber::{Event, SharedSubscriber};
 use crate::session::{id::SessionId, store::SessionRegistry};
@@ -215,6 +216,27 @@ impl ValkeySessionRegistry {
         })
     }
 
+    /// Remove the registration times of sessions that are no longer live, so
+    /// the registration set does not outgrow the registry set.
+    async fn drop_orphan_registrations(
+        &self,
+        registered_key: &str,
+        live: &[(String, f64)],
+    ) -> Result<(), ValkeyStoreError> {
+        let held: Vec<String> = self
+            .client
+            .zrange(registered_key, 0_i64, -1_i64, None, false, None, false)
+            .await?;
+        let gone: Vec<String> = held
+            .into_iter()
+            .filter(|m| !live.iter().any(|(live_member, _)| live_member == m))
+            .collect();
+        if !gone.is_empty() {
+            self.client.zrem::<(), _, _>(registered_key, gone).await?;
+        }
+        Ok(())
+    }
+
     /// One draw from the injected random source.
     fn draw(&self) -> u64 {
         let mut bytes = [0u8; 4];
@@ -246,14 +268,22 @@ impl SessionRegistry for ValkeySessionRegistry {
         // entries). `now_ms` is the server's clock unless one is injected,
         // and a `MockClock` gives deterministic ordering.
         let score = now_ms as f64;
+        let registered_key = registered_at_key(&self.prefix, user_id.to_string().as_str());
         let pipeline = self.client.pipeline();
         pipeline
             .zremrangebyscore::<(), _, _, _>(&key, expired_min(), expired_max(cutoff))
             .await?;
         pipeline
-            .zadd::<(), _, _>(&key, None, None, false, false, (score, sid_str))
+            .zadd::<(), _, _>(&key, None, None, false, false, (score, sid_str.clone()))
             .await?;
         pipeline.expire::<(), _>(&key, ttl_secs, None).await?;
+        // The registration time, which use never moves: the eviction order.
+        pipeline
+            .zadd::<(), _, _>(&registered_key, None, None, false, false, (score, sid_str))
+            .await?;
+        pipeline
+            .expire::<(), _>(&registered_key, ttl_secs, None)
+            .await?;
         pipeline.all::<()>().await?;
 
         debug!(
@@ -312,6 +342,15 @@ impl SessionRegistry for ValkeySessionRegistry {
                 pipeline
                     .expire::<(), _>(&key, registry_key_ttl_secs(self.ttl), None)
                     .await?;
+                // The registration set lives as long as the registry set, so
+                // an active session keeps its place in the order.
+                pipeline
+                    .expire::<(), _>(
+                        &registered_at_key(&self.prefix, user_id.to_string().as_str()),
+                        registry_key_ttl_secs(self.ttl),
+                        None,
+                    )
+                    .await?;
                 pipeline.all::<()>().await?;
             }
         }
@@ -324,6 +363,12 @@ impl SessionRegistry for ValkeySessionRegistry {
     ) -> Result<(), Self::Error> {
         let key = registry_key(&self.prefix, user_id.to_string().as_str());
         self.client.del::<(), _>(&key).await?;
+        self.client
+            .del::<(), _>(registered_at_key(
+                &self.prefix,
+                user_id.to_string().as_str(),
+            ))
+            .await?;
 
         // Publish on the user-level revocation channel so any watcher
         // subscribed to *any* of this user's sessions wakes up.
@@ -345,6 +390,12 @@ impl SessionRegistry for ValkeySessionRegistry {
         let key = registry_key(&self.prefix, user_id.to_string().as_str());
         let sid_str = session_id.to_string();
         self.client.zrem::<(), _, _>(&key, &sid_str).await?;
+        self.client
+            .zrem::<(), _, _>(
+                registered_at_key(&self.prefix, user_id.to_string().as_str()),
+                &sid_str,
+            )
+            .await?;
 
         // Publish on the session-level channel for any watcher of this
         // specific session.
@@ -363,24 +414,36 @@ impl SessionRegistry for ValkeySessionRegistry {
         &self,
         user_id: &crate::authn::ids::UserId,
     ) -> Result<Vec<SessionId>, Self::Error> {
-        // ZRANGE 0 -1 returns all members ordered ascending by
-        // score, i.e. oldest registration first: matches the trait
-        // contract that `max_sessions_per_user` enforcement at
-        // `account/mod.rs::complete_factor_step` relies on for
-        // FIFO eviction. Previously this fell through to the trait
-        // default `Ok(vec![])`, silently disabling the limit for every
-        // Valkey-backed deployment.
+        // The trait promises oldest registration first, which
+        // `max_sessions_per_user` enforcement relies on for FIFO eviction.
+        // The live members come from the registry set; their order comes
+        // from the registration set, because a used session's score there
+        // has moved forward.
         let key = registry_key(&self.prefix, user_id.to_string().as_str());
         let now_ms = self.now_ms().await?;
         let cutoff = registry_cutoff_ms(now_ms, registry_member_ttl_ms(self.ttl));
         self.client
             .zremrangebyscore::<(), _, _, _>(&key, expired_min(), expired_max(cutoff))
             .await?;
-        let members: Vec<String> = self
+        let live: Vec<(String, f64)> = self
             .client
-            .zrangebyscore(&key, live_min(cutoff), live_max(), false, None)
+            .zrangebyscore(&key, live_min(cutoff), live_max(), true, None)
             .await?;
-        Ok(members.into_iter().filter_map(|s| s.parse().ok()).collect())
+        // The score says when a session was last used, so it is not the
+        // order: the oldest registration is, read from its own set.
+        let registered_key = registered_at_key(&self.prefix, user_id.to_string().as_str());
+        let registered: Vec<Option<f64>> = if live.is_empty() {
+            Vec::new()
+        } else {
+            let members: Vec<&str> = live.iter().map(|(m, _)| m.as_str()).collect();
+            self.client.zmscore(&registered_key, members).await?
+        };
+        self.drop_orphan_registrations(&registered_key, &live)
+            .await?;
+        Ok(oldest_first(live, &registered)
+            .into_iter()
+            .filter_map(|s| s.parse().ok())
+            .collect())
     }
 
     async fn watch_revocation(&self, user_id: &crate::authn::ids::UserId, session_id: &SessionId) {

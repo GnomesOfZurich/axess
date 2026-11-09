@@ -96,6 +96,7 @@ proptest! {
     /// from `LruCache::put`'s contract; randomising the op stream
     /// pins it against accidental violations introduced by future
     /// changes.
+    #[cfg_attr(miri, ignore = "hundreds of randomised sequences are too slow to interpret; the unit tests cover the cache under Miri")]
     #[test]
     fn cache_size_never_exceeds_capacity(
         capacity in 1usize..=32,
@@ -120,6 +121,7 @@ proptest! {
     ///
     /// The expiry instant is exclusive: at exactly
     /// `expires_at_micros == now_micros` the entry is already gone.
+    #[cfg_attr(miri, ignore = "hundreds of randomised sequences are too slow to interpret; the unit tests cover the cache under Miri")]
     #[test]
     fn ttl_boundary_get_within_returns_some_after_returns_none(
         capacity in 4usize..=32,
@@ -154,6 +156,7 @@ proptest! {
     /// call against accidental introduction of side effects (e.g.
     /// double-counting in the invalidations counter, decrementing
     /// len(), etc.).
+    #[cfg_attr(miri, ignore = "hundreds of randomised sequences are too slow to interpret; the unit tests cover the cache under Miri")]
     #[test]
     fn invalidate_is_idempotent(
         capacity in 4usize..=32,
@@ -180,6 +183,7 @@ proptest! {
     /// Property 4: when a key is inserted multiple times, `get`
     /// returns the value from the most recent insert. Pins
     /// "last write wins" semantics across arbitrary insert sequences.
+    #[cfg_attr(miri, ignore = "hundreds of randomised sequences are too slow to interpret; the unit tests cover the cache under Miri")]
     #[test]
     fn insert_overwrite_returns_latest_value(
         capacity in 4usize..=32,

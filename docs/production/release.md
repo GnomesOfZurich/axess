@@ -101,10 +101,12 @@ cargo clippy --workspace --all-features --all-targets -- -D warnings
 cargo test --workspace --all-features
 cargo test --workspace --all-features -- --ignored   # Valkey, PostgreSQL, MySQL
 cargo doc --no-deps --all-features -p axess -p axess-core
-cargo deny check licenses sources bans
+./scripts/check-workflow-pins.sh        # actions pinned to commits, images to digests
+./scripts/supply-chain.sh               # audit, deny with advisories, duplicates, release-build features
+cargo test -p axess --test testing_unreachable   # axess::testing absent without the feature
 cargo semver-checks check-release --workspace
 # Leaf crates can dry-run end-to-end:
-for c in axess-strings axess-clock axess-rng; do
+for c in axess-strings axess-clock axess-rng axess-testing; do
   cargo publish --dry-run -p "$c"
 done
 # For non-leaf crates, `cargo publish --dry-run` fails before first publish

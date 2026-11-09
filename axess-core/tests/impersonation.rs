@@ -869,3 +869,120 @@ async fn the_administrators_stored_tenant_gates_impersonation_not_the_sessions()
     assert!(matches!(res, Err(AuthnError::NotActive(_))), "{res:?}");
     assert_eq!(session.impersonator().await, None);
 }
+
+/// A registry that takes the administrator's entry but refuses the target's
+/// session, and records what it took and what it was asked to end.
+#[derive(Clone)]
+struct AnchorOnlyRegistry {
+    admin: axess_core::authn::UserId,
+    taken: std::sync::Arc<
+        std::sync::Mutex<
+            Vec<(
+                axess_core::authn::UserId,
+                axess_core::session::id::SessionId,
+            )>,
+        >,
+    >,
+    ended: std::sync::Arc<
+        std::sync::Mutex<
+            Vec<(
+                axess_core::authn::UserId,
+                axess_core::session::id::SessionId,
+            )>,
+        >,
+    >,
+}
+
+impl axess_core::session::store::SessionRegistry for AnchorOnlyRegistry {
+    type Error = std::io::Error;
+    async fn register(
+        &self,
+        user: &axess_core::authn::UserId,
+        sid: &axess_core::session::id::SessionId,
+    ) -> Result<(), Self::Error> {
+        if *user == self.admin {
+            self.taken.lock().unwrap().push((*user, *sid));
+            Ok(())
+        } else {
+            Err(std::io::Error::other("registry unreachable"))
+        }
+    }
+    async fn is_valid(
+        &self,
+        _: &axess_core::authn::UserId,
+        _: &axess_core::session::id::SessionId,
+    ) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
+    async fn invalidate_user(&self, _: &axess_core::authn::UserId) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    async fn invalidate_session(
+        &self,
+        user: &axess_core::authn::UserId,
+        sid: &axess_core::session::id::SessionId,
+    ) -> Result<(), Self::Error> {
+        self.ended.lock().unwrap().push((*user, *sid));
+        Ok(())
+    }
+    async fn active_sessions(
+        &self,
+        _: &axess_core::authn::UserId,
+    ) -> Result<Vec<axess_core::session::id::SessionId>, Self::Error> {
+        Ok(vec![])
+    }
+}
+
+/// An impersonation that fails after the administrator's anchor entry was
+/// registered ends that entry too: nothing of it is left to count against
+/// the administrator's sessions.
+#[tokio::test]
+async fn a_failed_impersonation_leaves_no_anchor_under_the_administrator() {
+    let admin = test_user("admin", "ops").id;
+    let registry = AnchorOnlyRegistry {
+        admin,
+        taken: Default::default(),
+        ended: Default::default(),
+    };
+    let r = rig_with(|b| b.with_registry(registry.clone()));
+    let session = test_session();
+    session
+        .set_authenticated(r.admin.id, r.admin.tenant_id, r.clock.now())
+        .await;
+
+    let res = r
+        .svc
+        .begin_impersonation(&r.admin, &r.target, &session)
+        .await;
+
+    assert!(matches!(res, Err(AuthnError::NoFlow)), "{res:?}");
+    let taken = registry.taken.lock().unwrap().clone();
+    let ended = registry.ended.lock().unwrap().clone();
+    assert_eq!(taken.len(), 1, "the anchor was registered: {taken:?}");
+    assert!(
+        ended.contains(&taken[0]),
+        "the anchor {taken:?} outlived the failed impersonation: {ended:?}"
+    );
+}
+
+/// An administrator cannot impersonate themselves: the session would carry an
+/// impersonation marker on their own account, and the audit trail an
+/// impersonation that never changed who acts.
+#[tokio::test]
+async fn an_administrator_cannot_impersonate_themselves() {
+    let r = rig();
+    let session = test_session();
+    session
+        .set_authenticated(r.admin.id, r.admin.tenant_id, r.clock.now())
+        .await;
+
+    let res = r
+        .svc
+        .begin_impersonation(&r.admin, &r.admin, &session)
+        .await;
+
+    assert!(matches!(res, Err(AuthnError::NoFlow)), "{res:?}");
+    assert!(session.impersonator().await.is_none());
+    assert_eq!(session.user_id().await, Some(r.admin.id));
+    assert_eq!(refusals(&r.identity, "self_impersonation").len(), 1);
+}

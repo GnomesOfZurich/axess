@@ -50,6 +50,9 @@ ROOT = pathlib.Path(".")
 # *type* had no way through the gate at all and the only recourse was
 # ALLOW, which would have been a false claim about provenance.
 REMOVED = {
+    # 0.19.0: the `testing-oauth` feature of axess-core is gone, its fixtures
+    # live in the `axess-testing` crate; the "0.18.0 to 0.19.0" section names it.
+    "testing-oauth",
     # 0.18.0: `Fido2Credential::passkey` is `Fido2Credential::key`; the
     # "0.17.0 to 0.18.0" section and the assurance page name the old field.
     "Fido2Credential::passkey",

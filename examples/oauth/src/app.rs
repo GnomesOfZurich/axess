@@ -27,6 +27,12 @@ use axum::{
 use jsonwebtoken::Algorithm;
 use serde::Deserialize;
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Session limits tighter than the library's defaults (24 hours idle, 7 days
+/// in all), as a bank would set them; the README says why.
+const STRICT_IDLE_TTL: Duration = Duration::from_secs(15 * 60);
+const STRICT_MAX_SESSION_AGE: Duration = Duration::from_secs(10 * 60 * 60);
 
 /// The authentication service the example runs.
 pub type Service = AuthnService<MockIdentityStore, MockFactorStore>;
@@ -47,6 +53,9 @@ const SESSION_NONCE: &str = "example.nonce";
 /// tokens work with this key and no other, so it is kept as carefully as the
 /// refresh token beside it, and restored by whichever process refreshes.
 const SESSION_DPOP_KEY: &str = "example.dpop_key";
+/// Session key for the provider the login began with. The callback's path
+/// names a provider too, and the two must agree before the code is redeemed.
+const SESSION_LOGIN_PROVIDER: &str = "example.login_provider";
 
 /// The session spelling of a DPoP key: its seed, in hex.
 fn dpop_key_to_text(key: &DpopKey) -> String {
@@ -336,6 +345,8 @@ pub async fn build(config: Config) -> Result<App, BuildError> {
         signing_key,
         Arc::new(SessionRegistryAdapter(registry)),
     )
+    .with_ttl(STRICT_IDLE_TTL)
+    .with_max_session_age(Some(STRICT_MAX_SESSION_AGE))
     .with_secure(config.secure_cookies);
 
     // The application's own origin: what a browser sends as `Origin` from this
@@ -464,7 +475,15 @@ async fn login(
         )
         .await
     {
-        Ok((auth_url, _csrf)) => Redirect::temporary(auth_url.as_str()).into_response(),
+        Ok((auth_url, _csrf)) => {
+            session
+                .set_custom(
+                    SESSION_LOGIN_PROVIDER,
+                    serde_json::Value::String(provider.clone()),
+                )
+                .await;
+            Redirect::temporary(auth_url.as_str()).into_response()
+        }
         Err(e) => {
             tracing::error!(error = %e, "begin_oauth_login failed");
             page(
@@ -485,8 +504,12 @@ struct CallbackParams {
     iss: Option<String>,
 }
 
-/// Finish the login in three steps, each of which can refuse:
+/// Finish the login in four steps, each of which can refuse:
 ///
+/// 0. The provider in the callback's path must be the one the login began
+///    with. Each provider has its own redirect URI, so an answer that comes
+///    back on another one is a mix-up and is refused before any code is
+///    redeemed.
 /// 1. `finish_oauth_login_with_iss` checks the callback and the ID token and
 ///    returns the claims, and binds them to this session (the claim lock).
 ///    The userinfo endpoint, if there is one, is asked for the same subject.
@@ -499,11 +522,26 @@ struct CallbackParams {
 // ANCHOR: callback
 async fn callback(
     State(state): State<AppState>,
-    Path(_provider): Path<String>,
+    Path(provider): Path<String>,
     Query(params): Query<CallbackParams>,
     session: AuthSession,
     audit: AuditContext,
 ) -> Response {
+    let began_with = session
+        .get_custom(SESSION_LOGIN_PROVIDER)
+        .await
+        .and_then(|v| v.as_str().map(str::to_owned));
+    if began_with.as_deref() != Some(provider.as_str()) {
+        tracing::error!(
+            path_provider = %provider,
+            "the callback's provider is not the one the login began with"
+        );
+        return page(
+            StatusCode::BAD_REQUEST,
+            "Login failed",
+            "The provider's answer could not be accepted.",
+        );
+    }
     let authn = state.authn.with_audit_context(audit);
     let claims = match authn
         .finish_oauth_login_with_iss(&params.code, &params.state, params.iss.as_deref(), &session)
@@ -700,15 +738,28 @@ async fn refresh(
                 .and_then(|v| v.as_str().map(str::to_owned))
         }
     };
-    let (Some(provider), Some(token), Some(subject)) = (
-        text(SESSION_PROVIDER).await,
-        text(SESSION_REFRESH_TOKEN).await,
-        text(SESSION_SUBJECT).await,
-    ) else {
+    let (Some(provider), Some(subject)) =
+        (text(SESSION_PROVIDER).await, text(SESSION_SUBJECT).await)
+    else {
         return page(
             StatusCode::CONFLICT,
             "No refresh token",
             "The provider issued no refresh token for this session.",
+        );
+    };
+    // The token is taken out of the session, not read: of two refreshes that
+    // arrive together exactly one gets it, so the IdP never sees a refresh
+    // token twice (a rotating IdP treats that as theft and revokes the whole
+    // family). The other answers 409 and the browser may retry.
+    let Some(token) = session
+        .take_custom(SESSION_REFRESH_TOKEN)
+        .await
+        .and_then(|v| v.as_str().map(str::to_owned))
+    else {
+        return page(
+            StatusCode::CONFLICT,
+            "No refresh token",
+            "No refresh token is available: none was issued, or a refresh is already under way.",
         );
     };
     let nonce = text(SESSION_NONCE).await;
@@ -730,6 +781,10 @@ async fn refresh(
         Ok(outcome) => outcome,
         Err(e) => {
             tracing::error!(error = %e, "refresh_oauth_token failed");
+            // Nothing was accepted, so the session keeps the token it had.
+            session
+                .set_custom(SESSION_REFRESH_TOKEN, serde_json::Value::String(token))
+                .await;
             return page(
                 StatusCode::BAD_GATEWAY,
                 "Refresh failed",

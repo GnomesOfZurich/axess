@@ -58,6 +58,7 @@ use serde::Deserialize;
 use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
+use super::log_safe;
 use crate::authn::factor::ZeroizedString;
 
 /// Time allowed for one token request from send to last response byte,
@@ -370,19 +371,33 @@ struct AzureErrorBody {
     correlation_id: Option<String>,
 }
 
+/// The longest `error_description` kept in an error: the text is the
+/// provider's, and the error ends up in logs.
+const MAX_DESCRIPTION_BYTES: usize = 512;
+/// The longest `error` code or correlation id kept in an error.
+const MAX_CODE_BYTES: usize = 128;
+
 fn parse_azure_error(http_status: u16, body: &str) -> AzureFicError {
     match serde_json::from_str::<AzureErrorBody>(body) {
         Ok(parsed) => AzureFicError::AzureError {
             http_status,
-            error: parsed.error,
-            error_description: parsed.error_description.unwrap_or_default(),
+            error: log_safe(&parsed.error, MAX_CODE_BYTES),
+            error_description: log_safe(
+                &parsed.error_description.unwrap_or_default(),
+                MAX_DESCRIPTION_BYTES,
+            ),
             error_codes: parsed.error_codes,
-            correlation_id: parsed.correlation_id,
+            correlation_id: parsed
+                .correlation_id
+                .map(|id| log_safe(&id, MAX_CODE_BYTES)),
         },
         Err(_) => AzureFicError::AzureError {
             http_status,
             error: "unknown".to_string(),
-            error_description: format!("non-JSON error body: {body}"),
+            error_description: log_safe(
+                &format!("non-JSON error body: {body}"),
+                MAX_DESCRIPTION_BYTES,
+            ),
             error_codes: Vec::new(),
             correlation_id: None,
         },

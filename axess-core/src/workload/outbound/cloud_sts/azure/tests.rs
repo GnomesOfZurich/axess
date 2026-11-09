@@ -305,3 +305,92 @@ fn a_client_that_cannot_be_built_is_an_error_not_a_default_client() {
         "the default build still succeeds"
     );
 }
+
+// ── What the identity provider says reaches a log line ────────────────────
+
+const FORGED_LINE: &str = "level=INFO msg=\"login ok\" user=admin";
+
+/// An error through the adapter, from a server that answers `status` with
+/// `body`.
+async fn error_for(status: u16, body: Vec<u8>, content_type: &str) -> AzureFicError {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/tenant-guid/oauth2/v2.0/token"))
+        .respond_with(ResponseTemplate::new(status).set_body_raw(body, content_type))
+        .mount(&server)
+        .await;
+    AzureFicClient::new("tenant-guid", "app-id")
+        .expect("client")
+        .with_token_endpoint(endpoint(&server))
+        .acquire_token(&AzureFicRequest::new("token"))
+        .await
+        .expect_err("an error status propagates")
+}
+
+/// The text of an error that is meant for a log line: one line, no control
+/// character, and short.
+fn assert_log_safe(text: &str, what: &str, max_bytes: usize) {
+    assert!(
+        !text.contains('\n') && !text.contains('\r'),
+        "{what} has a line break: {text:?}"
+    );
+    assert!(
+        !text.chars().any(char::is_control),
+        "{what} has a control character: {text:?}"
+    );
+    assert!(text.len() <= max_bytes, "{what} is {} bytes", text.len());
+}
+
+#[tokio::test]
+async fn a_non_json_error_body_is_sanitized_in_error_description() {
+    let mut body = format!("Bad Gateway\r\n{FORGED_LINE}\x1b[2J").into_bytes();
+    body.extend(std::iter::repeat_n(b'A', 10_000));
+
+    let err = error_for(502, body, "text/plain").await;
+
+    let AzureFicError::AzureError {
+        error_description, ..
+    } = &err
+    else {
+        panic!("expected AzureError, got {err:?}");
+    };
+    assert_log_safe(error_description, "error_description", 512);
+    assert_log_safe(&err.to_string(), "the Display text", 768);
+    assert!(
+        error_description.contains("Bad Gateway"),
+        "{error_description}"
+    );
+}
+
+#[tokio::test]
+async fn a_json_error_description_with_control_characters_is_sanitized() {
+    let body = json!({
+        "error": "invalid_client\n",
+        "error_description": format!("x\r\n{FORGED_LINE}\x1b[2J{}", "B".repeat(600)),
+        "correlation_id": "id\r\nforged",
+    })
+    .to_string()
+    .into_bytes();
+
+    let err = error_for(400, body, "application/json").await;
+
+    let AzureFicError::AzureError {
+        error,
+        error_description,
+        correlation_id,
+        ..
+    } = &err
+    else {
+        panic!("expected AzureError, got {err:?}");
+    };
+    assert_log_safe(error, "error", 128);
+    assert_log_safe(error_description, "error_description", 512);
+    assert_log_safe(
+        correlation_id.as_deref().unwrap_or_default(),
+        "correlation_id",
+        128,
+    );
+    assert_log_safe(&err.to_string(), "the Display text", 768);
+    assert!(error.contains("invalid_client"), "{error}");
+    assert!(error_description.starts_with('x'), "{error_description}");
+}

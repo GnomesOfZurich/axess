@@ -56,10 +56,13 @@
 //! [`for_tenants`](BackChannelLogoutHandler::for_tenants) when every provider
 //! is a tenant's). A token carries only an issuer, so the handler asks the
 //! source for every tenant provider of that issuer, and the one whose client
-//! id the token's `aud` names verifies it. When more than one provider (two
-//! tenants, or a tenant and the global registration) has that issuer and
-//! client id the token cannot be attributed to one of them, and the handler
-//! refuses it with [`LogoutProviderError::Ambiguous`] instead of choosing.
+//! id the token's `aud` names verifies it. When two tenants' providers have
+//! that issuer and client id the token cannot be attributed to one of them,
+//! and the handler refuses it with [`LogoutProviderError::Ambiguous`] instead
+//! of choosing. The global registration is the operator's and wins: a tenant
+//! provider with its issuer and client id is ignored (and logged), never a
+//! reason to refuse the token. The tenant directory refuses to register such a
+//! provider in the first place.
 //! A tenant's provider that cannot be built (its credential does not open,
 //! its discovery fails) does not stop the other tenants of its issuer: a
 //! token addressed to it alone is refused as retryable
@@ -188,12 +191,14 @@ struct ActingOn {
 
 impl ActingOn {
     async fn finish(mut self, acted: bool) {
-        self.done = true;
+        // `done` follows the await it guards: a request cancelled while the
+        // log is taking the outcome still has its pair forgotten by `Drop`.
         let result = if acted {
             self.log.settle(&self.issuer, &self.jti).await
         } else {
             self.log.forget(&self.issuer, &self.jti).await
         };
+        self.done = true;
         if let Err(e) = result {
             tracing::warn!(
                 iss = %loggable(&self.issuer),
@@ -390,7 +395,9 @@ impl BackChannelLogoutHandler {
     #[must_use]
     pub fn with_unknown_issuer_memory(mut self, ttl: std::time::Duration) -> Self {
         self.unknown_issuers = Arc::new(unknown_issuers::UnknownIssuers::new(
-            chrono::Duration::from_std(ttl).unwrap_or(chrono::Duration::zero()),
+            // A TTL past chrono's range remembers for as long as chrono can
+            // count, not for no time at all.
+            chrono::Duration::from_std(ttl).unwrap_or(chrono::Duration::MAX),
         ));
         self
     }

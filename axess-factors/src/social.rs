@@ -274,6 +274,7 @@ where
     redirect_uri: String,
     scopes: Vec<String>,
     use_pkce: bool,
+    missing_token_type_is_bearer: bool,
     claim_mapper: F,
     http: reqwest::Client,
     // Routes through the axess RNG abstraction so DST tests can pin
@@ -301,18 +302,21 @@ where
     /// The token and userinfo endpoints receive the client secret, the
     /// code, the PKCE verifier and the access token, and the user is sent to
     /// the authorization endpoint, so all three must be HTTPS (plain HTTP
-    /// only to `localhost`, `127.0.0.1` or `[::1]`). They are checked here,
+    /// only to `localhost`, `127.0.0.1` or `[::1]`); so must the
+    /// `redirect_uri`, which the authorization code is returned to. They are
+    /// checked here,
     /// once: the provider's fields do not change after construction.
     ///
     /// # Errors
     ///
-    /// [`SocialError::Config`] naming the endpoint that is not HTTPS or
-    /// loopback HTTP, without echoing its URL; [`SocialError::ClientBuild`]
+    /// [`SocialError::Config`] naming the endpoint or the `redirect_uri` that is not
+    /// HTTPS or loopback HTTP, without echoing its URL; [`SocialError::ClientBuild`]
     /// when the HTTP client cannot be built.
     pub fn new(config: SocialProviderConfig, claim_mapper: F) -> Result<Self, SocialError> {
         require_secure_endpoint(&config.authorization_endpoint, "authorization_endpoint")?;
         require_secure_endpoint(&config.token_endpoint, "token_endpoint")?;
         require_secure_endpoint(&config.userinfo_endpoint, "userinfo_endpoint")?;
+        require_secure_endpoint(&config.redirect_uri, "redirect_uri")?;
         let http = build_http_client(|builder| builder)?;
         Ok(Self {
             name: Arc::from(config.name.as_str()),
@@ -324,6 +328,7 @@ where
             redirect_uri: config.redirect_uri,
             scopes: config.scopes,
             use_pkce: true,
+            missing_token_type_is_bearer: false,
             claim_mapper,
             http,
             rng: Arc::new(SystemRng),
@@ -336,6 +341,23 @@ where
     /// it even when not required.
     pub fn without_pkce(mut self) -> Self {
         self.use_pkce = false;
+        self
+    }
+
+    /// Accept a token response that has no `token_type` and read it as
+    /// `Bearer`.
+    ///
+    /// By default a response without `token_type` is refused
+    /// ([`SocialError::InvalidResponse`]): RFC 6749 section 5.1 requires the
+    /// field, and the token is sent on as a bearer token. A few providers
+    /// leave it out (LinkedIn's token endpoint is the usual example; check
+    /// the provider's own documentation, since this changes between
+    /// versions), and every login against one fails without this call. It
+    /// only supplies the missing value: a `token_type` that is present and is
+    /// not `Bearer` (any case), such as `mac` or `DPoP`, is still refused.
+    #[must_use]
+    pub fn accept_missing_token_type(mut self) -> Self {
+        self.missing_token_type_is_bearer = true;
         self
     }
 
@@ -458,7 +480,10 @@ where
     /// Sends the standard RFC 6749 §4.1.3 token request to the
     /// provider's token endpoint. Returns the access token only, as a
     /// [`ZeroizedString`] that is zeroed when dropped and derefs to `str`;
-    /// social providers do not issue ID tokens.
+    /// social providers do not issue ID tokens. The response's `token_type`
+    /// must be `Bearer` (any case): another scheme, or none, is
+    /// [`SocialError::InvalidResponse`] (a missing one is read as `Bearer` after
+    /// [`accept_missing_token_type`](Self::accept_missing_token_type)).
     pub async fn exchange_code(
         &self,
         expected_state: &str,
@@ -507,12 +532,27 @@ where
         #[derive(Deserialize)]
         struct TokenResponse {
             access_token: ZeroizedString,
+            #[serde(default)]
+            token_type: Option<String>,
         }
         let body: TokenResponse = serde_json::from_slice(&bytes).map_err(|e| {
             SocialError::InvalidResponse(format!(
                 "token endpoint did not return JSON access_token: {e}"
             ))
         })?;
+        // The token is sent to the userinfo endpoint as a bearer token. One
+        // issued under another scheme (`DPoP`, `mac`) is bound to something
+        // this client does not hold, and `token_type` is required by RFC 6749
+        // section 5.1: a response without it is refused, not assumed.
+        let bearer = match body.token_type.as_deref() {
+            Some(scheme) => scheme.eq_ignore_ascii_case("bearer"),
+            None => self.missing_token_type_is_bearer,
+        };
+        if !bearer {
+            return Err(SocialError::InvalidResponse(
+                "token endpoint token_type is missing or is not Bearer".to_string(),
+            ));
+        }
         Ok(body.access_token)
     }
 

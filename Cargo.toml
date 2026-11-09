@@ -10,6 +10,7 @@ members = [
     "axess-macros",
     "axess-rng",
     "axess-strings",
+    "axess-testing",
     "examples/*",
 ]
 # `default-members` is what `cargo test`, `cargo build`, `cargo clippy` etc.
@@ -27,6 +28,7 @@ default-members = [
     "axess-macros",
     "axess-rng",
     "axess-strings",
+    "axess-testing",
 ]
 resolver = "3"
 
@@ -35,7 +37,7 @@ resolver = "3"
 # Per-crate fields (`name`, `description`, `keywords`, `categories`, `exclude`)
 # stay local because they genuinely differ.
 [workspace.package]
-version = "0.18.0"
+version = "0.19.0"
 edition = "2024"
 rust-version = "1.95.0"
 authors = ["Gnomes"]
@@ -75,15 +77,16 @@ homepage = "https://github.com/GnomesOfZurich/axess"
 # override unless the workspace entry has it too. Members that want the
 # defaults restate them via `features = [...]`. The other entries leave
 # defaults enabled so the common case stays terse.
-axess-cache    = { path = "axess-cache",    version = "=0.18.0" }
-axess-clock    = { path = "axess-clock",    version = "=0.18.0" }
-axess-core     = { path = "axess-core",     version = "=0.18.0", default-features = false }
-axess-events   = { path = "axess-events",   version = "=0.18.0" }
-axess-factors  = { path = "axess-factors",  version = "=0.18.0" }
-axess-identity = { path = "axess-identity", version = "=0.18.0", default-features = false }
-axess-macros   = { path = "axess-macros",   version = "=0.18.0" }
-axess-rng      = { path = "axess-rng",      version = "=0.18.0" }
-axess-strings  = { path = "axess-strings",  version = "=0.18.0", default-features = false }
+axess-cache    = { path = "axess-cache",    version = "=0.19.0" }
+axess-clock    = { path = "axess-clock",    version = "=0.19.0" }
+axess-core     = { path = "axess-core",     version = "=0.19.0", default-features = false }
+axess-events   = { path = "axess-events",   version = "=0.19.0" }
+axess-factors  = { path = "axess-factors",  version = "=0.19.0" }
+axess-identity = { path = "axess-identity", version = "=0.19.0", default-features = false }
+axess-macros   = { path = "axess-macros",   version = "=0.19.0" }
+axess-rng      = { path = "axess-rng",      version = "=0.19.0" }
+axess-strings  = { path = "axess-strings",  version = "=0.19.0", default-features = false }
+axess-testing  = { path = "axess-testing",  version = "=0.19.0" }
 
 # RustCrypto family + x509-parser; see preamble above.
 aes-gcm = "0.11.1"
@@ -108,7 +111,12 @@ base32 = "0.5.1"
 # defaults still compiles the SIMD engines in: hyper-util (through reqwest,
 # so `oauth` and the other HTTP features) and crypto-glue (`fido2`) do.
 base64 = { version = "0.23.1", default-features = false, features = ["std"] }
-chrono = "0.4.45"
+# No default features: `clock` (the wall clock, `iana-time-zone`), `wasmbind`
+# and `oldtime` are not wanted everywhere. `clock` is enabled by axess-clock
+# alone, the one crate allowed to read the wall clock
+# (`scripts/check-clock-usage.sh`), and so is present wherever a crate that
+# injects a `Clock` is.
+chrono = { version = "0.4.45", default-features = false, features = ["std", "serde"] }
 # Benchmark-only in this workspace (axess-strings compares ShortString
 # against it). Pinned to the version nomos uses so the comparison is
 # against the code the org actually links, not a nearby release.

@@ -422,3 +422,57 @@ async fn login_is_rate_limited_per_client() {
     let status = send(&app, "GET", "/", &[]).await;
     assert_eq!(status, axum::http::StatusCode::OK);
 }
+
+/// An address the IdP did not verify, or did not say anything about, creates
+/// no user, even inside the allowed domain; a verified one still does.
+#[tokio::test]
+async fn an_unverified_email_is_not_provisioned() {
+    let state = test_state();
+    let mut unverified = claims("sub-unverified", "alice@bank.example.com");
+    unverified.email_verified = Some(false);
+    let mut silent = claims("sub-silent", "alice@bank.example.com");
+    silent.email_verified = None;
+    for (sub, c) in [("sub-unverified", &unverified), ("sub-silent", &silent)] {
+        assert!(local_user(&state, c).await.is_err(), "{sub}");
+        let identifier = format!("https://idp.example#{sub}");
+        assert!(
+            state
+                .identity
+                .find_user(&identifier, &state.tenant)
+                .await
+                .expect("lookup")
+                .is_none(),
+            "{sub} left a user behind"
+        );
+    }
+    let verified = claims("sub-verified", "alice@bank.example.com");
+    assert!(local_user(&state, &verified).await.is_ok());
+}
+
+/// The development key signs only for an issuer whose host, as an HTTP client
+/// parses it, is local. A backslash, which a client reads as a slash, a
+/// `user@` prefix and a look-alike host do not make a remote host local.
+#[test]
+fn only_a_local_host_is_a_local_issuer() {
+    for local in [
+        "http://localhost:8080/realms/fapi",
+        "http://LOCALHOST/realms/fapi",
+        "https://127.0.0.1:8443/",
+        "http://localhost",
+    ] {
+        assert!(is_local_issuer(local), "{local}");
+    }
+    for remote in [
+        "http://evil.example\\@localhost",
+        "http://evil.example\\@127.0.0.1/",
+        "http://localhost@evil.example/",
+        "http://localhost.evil.example/",
+        "http://evil.example/localhost",
+        "http://evil.example/?x=@localhost",
+        "ftp://localhost/",
+        "localhost",
+        "",
+    ] {
+        assert!(!is_local_issuer(remote), "{remote}");
+    }
+}

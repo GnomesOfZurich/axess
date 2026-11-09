@@ -184,6 +184,9 @@ pub const fn assert_resource_type_is_literal(template: &str) {
 /// `a = "x/y", b = "z"` and `a = "x", b = "y/z"`. Session-derived
 /// placeholders (`{$tenant}`, `{$user}`) are not counted, because their
 /// values come from the authenticated session and not from the request.
+///
+/// Two placeholders of any kind with nothing between them (`{$tenant}{id}`)
+/// are refused as well: the values cannot be told apart in the result.
 pub const fn assert_one_path_placeholder(template: &str) {
     let bytes = template.as_bytes();
     let start = match type_id_separator(template) {
@@ -196,6 +199,10 @@ pub const fn assert_one_path_placeholder(template: &str) {
         if bytes[i] == b'{' && !(i + 1 < bytes.len() && bytes[i + 1] == b'$') {
             count += 1;
         }
+        assert!(
+            !(bytes[i] == b'}' && i + 1 < bytes.len() && bytes[i + 1] == b'{'),
+            "require_authz! resource id must put a literal separator between two placeholders; `}}{{` cannot be split back into its values"
+        );
         i += 1;
     }
     assert!(
@@ -268,6 +275,11 @@ pub fn build_uids(
             "resource template `{resource_template}` names path parameter `{name}`, which the route does not have"
         ))));
     }
+    if let Some(reason) = ambiguous_id(id_template, params) {
+        return Err(InvalidUid::resource(AuthzError::InvalidEntityUid(format!(
+            "resource template `{resource_template}` {reason}"
+        ))));
+    }
     let resource_id = interpolate_path_params(id_template, params);
     let principal = make_entity_uid(namespace, "User", user_id).map_err(|error| InvalidUid {
         reason: "invalid_principal",
@@ -280,6 +292,49 @@ pub fn build_uids(
     let resource =
         make_entity_uid(namespace, resource_type, &resource_id).map_err(InvalidUid::resource)?;
     Ok((principal, action, resource))
+}
+
+/// Why an id built from `id_template` and `params` could be read back as a
+/// different set of values, or `None` when it cannot.
+///
+/// An id with two or more placeholders is the literal text of the template
+/// with each value in between. It reads back as one set of values only if
+/// no two placeholders touch and no value holds a character that the
+/// template's literal text uses as a separator: then a value ends exactly
+/// where a separator character begins. Without that, tenant `t1` with id
+/// `a/b` and tenant `t1/a` with id `b` both give `t1/a/b` under
+/// `{$tenant}/{id}`. An id with one placeholder has fixed text around its
+/// value and needs no check.
+fn ambiguous_id(id_template: &str, params: &HashMap<String, String>) -> Option<String> {
+    let mut names: Vec<&str> = Vec::new();
+    let mut separators = String::new();
+    let mut rest = id_template;
+    let mut touching = false;
+    while let Some(open) = rest.find('{') {
+        separators.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let close = after.find('}')?;
+        names.push(&after[..close]);
+        rest = &after[close + 1..];
+        touching |= rest.starts_with('{');
+    }
+    separators.push_str(rest);
+    if names.len() < 2 {
+        return None;
+    }
+    if touching {
+        return Some(
+            "puts two placeholders next to each other; put a literal separator between them"
+                .to_string(),
+        );
+    }
+    names.iter().find_map(|name| {
+        let value = params.get(*name)?;
+        value
+            .chars()
+            .any(|c| separators.contains(c))
+            .then(|| format!("cannot take the value of `{name}`: it holds a separator character of the template, so the id could be read as other values"))
+    })
 }
 
 /// The first `{name}` placeholder in `template` with no matching key, if any.

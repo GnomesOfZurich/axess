@@ -31,9 +31,12 @@ jobs:
     name: Format Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
           components: rustfmt
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -52,7 +55,9 @@ jobs:
     name: "Ban #[non_exhaustive]"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Reject any non_exhaustive in first-party crates
         run: |
           set -eu
@@ -80,7 +85,9 @@ jobs:
     name: Ban cargo-mutants markers
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Reject committed cargo-mutants mutation markers
         run: |
           set -eu
@@ -94,7 +101,7 @@ jobs:
           # cargo-mutants injects it (lowercase, tilde-bracketed).
           if grep -RIn --include='*.rs' \
               -e '~ changed by cargo-mutants ~' \
-              axess axess-core axess-factors axess-macros axess-cache axess-clock axess-rng axess-events axess-identity axess-strings examples; then
+              axess axess-core axess-factors axess-macros axess-cache axess-clock axess-rng axess-events axess-identity axess-strings axess-testing examples; then
             echo "::error::cargo-mutants mutation marker found in committed source."
             echo "A local cargo-mutants run left a stub body (e.g. \`() /* ~ changed by cargo-mutants ~ */\`)"
             echo "in the source. Revert the file to its real implementation before merging."
@@ -116,9 +123,13 @@ jobs:
     name: Lockfile Drift
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Verify Cargo.lock is up-to-date and unchanged
         run: |
           set -eu
@@ -144,12 +155,14 @@ jobs:
     name: Detect orphan .rs files
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Verify every src/*.rs is reachable from its crate root
         run: |
           set -eu
           errors=0
-          crates="axess axess-core axess-factors axess-macros axess-cache axess-clock axess-rng axess-events axess-identity axess-strings"
+          crates="axess axess-core axess-factors axess-macros axess-cache axess-clock axess-rng axess-events axess-identity axess-strings axess-testing"
           for crate_root in $crates; do
             src="$crate_root/src"
             [ -d "$src" ] || continue
@@ -188,11 +201,14 @@ jobs:
     name: Clippy Lints
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Run Clippy
         run: cargo clippy --workspace --all-features --all-targets -- -D warnings
 
@@ -205,9 +221,13 @@ jobs:
     name: Rustdoc (-D warnings)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # Was `-p axess -p axess-core`: two crates of eighteen, which is how 29
       # unresolved intra-doc links accumulated elsewhere in the workspace. The
       # script covers every member and proves it rendered each one, since
@@ -252,11 +272,17 @@ jobs:
     name: Source Rules
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Inline test block sizes
         run: ./scripts/check-inline-tests.sh
       - name: File and function sizes
         run: ./scripts/check-file-sizes.sh
+      - name: Wall-clock reads outside axess-clock
+        run: ./scripts/check-clock-usage.sh
+      - name: rsa call sites
+        run: ./scripts/check-rsa-sites.sh
 
   # The book, built and tested with the mdBook the docs workflow publishes
   # with (both install through scripts/install-mdbook.sh). The docs workflow
@@ -267,9 +293,13 @@ jobs:
     name: Book
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Install mdBook + mdbook-mermaid
         run: ./scripts/install-mdbook.sh
       - name: Install mermaid assets
@@ -287,10 +317,14 @@ jobs:
     runs-on: ubuntu-latest
     
     services:
+      # Every service image below is pinned by the digest of its multi-arch
+      # index (read from the registry on 2026-11-08), with the tag kept for the
+      # reader: the tag says what was meant, the digest is what runs. Moving a
+      # pin is a deliberate edit that reads the new digest from the registry.
       # Valkey (Redis-compatible). Service name and redis-cli are standard;
       # Valkey maintains full wire-protocol compatibility with Redis.
       redis:
-        image: valkey/valkey:latest
+        image: valkey/valkey:latest@sha256:3add1a336a920ea54770a001ab6feb3da5fceea96a40373a3a2cd469b815f0b7
         ports:
           - 6379:6379
         options: >-
@@ -300,7 +334,7 @@ jobs:
           --health-retries 5
 
       postgres:
-        image: postgres:latest
+        image: postgres:latest@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42
         ports:
           - 5432:5432
         env:
@@ -312,7 +346,7 @@ jobs:
           --health-retries 5
 
       mysql:
-        image: mysql:8
+        image: mysql:8@sha256:a81d043930e51745522bd5c430961cf8286f0a23f0a9a2a6e0108f7ea71b0902
         ports:
           - 3306:3306
         env:
@@ -325,11 +359,15 @@ jobs:
           --health-retries 10
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       # Keycloak with the FAPI example's realm, for the private_key_jwt login
       # test (axess-core/tests/oauth_keycloak_live.rs). Started as a step, not
@@ -341,7 +379,7 @@ jobs:
             -e KC_BOOTSTRAP_ADMIN_USERNAME=admin -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
             -e KC_HTTP_ENABLED=true -e KC_HOSTNAME_STRICT=false \
             -v "$PWD/examples/fapi/keycloak/fapi-realm.json:/opt/keycloak/data/import/fapi-realm.json:ro" \
-            quay.io/keycloak/keycloak:26.0 start-dev --import-realm
+            quay.io/keycloak/keycloak:26.0@sha256:09a381c715ab0b111835b70f2905955274843a219c6f27efb348e4d9f4086858 start-dev --import-realm
 
       # Every test not marked ignored: unit, integration and doc tests, the
       # release preflight's "Workspace tests" step. This used to be `--lib`
@@ -391,7 +429,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       cockroach:
-        image: cockroachdb/cockroach:latest
+        image: cockroachdb/cockroach:latest@sha256:9f9172a9c03771263bd8af89dbb76d490d5cd6d8c6029a23de5b3456f01cb9ff
         ports:
           - 26257:26257
           - 8080:8080
@@ -408,9 +446,13 @@ jobs:
         env:
           COCKROACH_ARGS: "start-single-node --insecure"
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # Cockroach defaults to user `root` with no password on `--insecure`
       # mode. We point the existing postgres integration suite at port
       # 26257: same `POSTGRES_URL` env var consumed by the tests, just
@@ -430,7 +472,9 @@ jobs:
     name: MSRV
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - id: msrv
         name: Read rust-version from Cargo.toml
         run: |
@@ -438,10 +482,10 @@ jobs:
             | grep -m1 '^rust-version' | sed 's/.*"\(.*\)".*/\1/')
           test -n "$version" || { echo "could not read rust-version" >&2; exit 1; }
           echo "version=$version" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # Same script maintainers run locally, so the two cannot drift.
       - name: Build and test on the declared MSRV
         run: ./scripts/check-msrv.sh
@@ -454,11 +498,15 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Build all targets
         run: cargo build --workspace --all-features --all-targets
@@ -518,9 +566,13 @@ jobs:
           - profile: delegated-only
             flags: --no-default-features --features delegated,jwt-rust-crypto
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # `cargo check --lib` rather than `cargo build`: faster (skips
       # link), and matches what catches the missing-cfg-gate class of
       # bugs locally. `--lib` keeps the check scoped to library targets
@@ -564,9 +616,13 @@ jobs:
           - oauth,jwt-rust-crypto
           - outbound-oauth,jwt-rust-crypto
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Check axess-factors (${{ matrix.features }} alone)
         run: cargo check -p axess-factors --lib --no-default-features --features ${{ matrix.features }}
 
@@ -575,11 +631,15 @@ jobs:
     name: Examples
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
       
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       
       - name: Build all examples
         run: |
@@ -595,13 +655,17 @@ jobs:
     name: Fuzz Smoke
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: fuzz
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: cargo install cargo-fuzz@0.13.2 --locked
       - name: Build fuzz targets
         working-directory: fuzz
         run: cargo +nightly fuzz build
@@ -616,7 +680,7 @@ jobs:
           done
       - name: Upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fuzz-crashes
           path: fuzz/artifacts/
@@ -627,17 +691,21 @@ jobs:
     name: Benchmarks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Run benchmarks
         run: cargo bench -p axess-core --all-features -- --output-format bencher | tee bench-output.txt
 
       - name: Upload benchmark results
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: bench-results
           path: bench-output.txt
@@ -653,16 +721,20 @@ jobs:
     name: Publish Dry-Run
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # `cargo publish --dry-run` for leaf crates: a true end-to-end check
       # including the registry-resolution step. Catches the long tail of
       # crates.io packaging issues that `cargo package` alone misses.
       - name: Dry-run publish leaf crates (no internal deps)
         run: |
           set -eu
-          for c in axess-strings axess-clock axess-rng; do
+          for c in axess-strings axess-clock axess-rng axess-testing; do
             echo "::group::dry-run $c"
             cargo publish --dry-run -p "$c"
             echo "::endgroup::"
@@ -698,15 +770,18 @@ jobs:
     steps:
       # The whole history and its tags: the baseline is the last release
       # tag below HEAD, built from git rather than fetched from crates.io.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
       # `cache-bin: "true"` (default in v2, pinned explicitly here) keeps
       # ~/.cargo/bin/cargo-semver-checks across runs, so the install step
       # below is a no-op on warm cache. The first run under `shared-key:
       # semver` pays a full cold-cache tax; every run after is fast.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: semver
           cache-bin: "true"
@@ -716,7 +791,7 @@ jobs:
       - name: Install cargo-semver-checks
         run: |
           command -v cargo-semver-checks >/dev/null \
-            || cargo install cargo-semver-checks --locked
+            || cargo install cargo-semver-checks@0.51.0 --locked
       # The script the release preflight runs. It refuses when no release
       # tag is below HEAD instead of skipping, as the registry baseline did.
       - name: SemVer checks against the last release tag
@@ -727,10 +802,14 @@ jobs:
     name: Security Audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
       - name: Install audit tools
-        run: cargo install cargo-audit@0.22.2 cargo-deny@0.18.3 --locked cargo-cyclonedx
+        run: cargo install cargo-audit@0.22.2 cargo-deny@0.20.2 cargo-cyclonedx@0.5.10 --locked
       # cargo-deny and cargo-audit read different ignore files; a drift
       # between them means one gate accepts an advisory the other fails.
       - name: Advisory ignore lists agree (deny.toml vs .cargo/audit.toml)
@@ -739,12 +818,17 @@ jobs:
           diff <(advisory_ids deny.toml) <(advisory_ids .cargo/audit.toml)
       - name: Run security audit
         run: cargo audit --deny warnings
-      # Keep advisories on cargo-audit until cargo-deny 0.18.x handles CVSS 4.0.
-      - name: Run cargo-deny (bans + licenses + sources)
-        run: cargo deny check bans licenses sources
+      # cargo-deny 0.20 reads the CVSS 4.0 entries in the RustSec database,
+      # which 0.18 stopped on, so advisories run here beside cargo audit.
+      - name: Run cargo-deny (advisories + bans + licenses + sources)
+        run: cargo deny check advisories bans licenses sources
+      - name: Test-only crates stay out of production graphs
+        run: |
+          cargo deny --config deny-production.toml check bans
+          scripts/check-test-crate-edges.sh
       - name: Generate SBOM (CycloneDX)
         run: cargo cyclonedx --all --format json
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sbom
           path: "**/*.cdx.json"
@@ -757,7 +841,7 @@ jobs:
     services:
       # Valkey (Redis-compatible); see note in Integration Tests job above.
       redis:
-        image: valkey/valkey:latest
+        image: valkey/valkey:latest@sha256:3add1a336a920ea54770a001ab6feb3da5fceea96a40373a3a2cd469b815f0b7
         ports:
           - 6379:6379
         options: >-
@@ -767,7 +851,7 @@ jobs:
           --health-retries 5
 
       postgres:
-        image: postgres:latest
+        image: postgres:latest@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42
         ports:
           - 5432:5432
         env:
@@ -779,17 +863,20 @@ jobs:
           --health-retries 5
 
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
           components: llvm-tools-preview
       # Instrumented builds use a different profile than the clippy/test
       # cache, so scope this cache separately: sharing the default key
       # thrashed both caches.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: coverage
-      - run: cargo install cargo-llvm-cov
+      - run: cargo install cargo-llvm-cov@0.9.1 --locked
       # Run the instrumented test suite ONCE, then render summary + HTML
       # from the same profile data. The old version invoked
       # `cargo llvm-cov` twice (`--summary-only`, then `--html`), each
@@ -819,7 +906,7 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload coverage report
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage-report
           path: coverage-html/
@@ -850,7 +937,9 @@ jobs:
     name: Badges in sync
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Regenerate derived badges
         run: ./scripts/update-badges.sh
       - name: Fail if badge drift
@@ -872,7 +961,9 @@ jobs:
     name: Release Version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # The main ruleset can require a pull request but not where it comes
       # from; this refuses one into main from anything but a release branch.
       - name: A pull request into main comes from a release branch
@@ -944,7 +1035,9 @@ jobs:
       - badges
       - release_version
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Every job in ci.yml is a need of this one
         run: ./scripts/check-ci-gate.sh
       - name: Every need passed
