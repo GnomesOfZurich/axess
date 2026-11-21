@@ -1,10 +1,12 @@
-//! Claim-lock + session-registry mutation coverage on `complete_oauth_login`.
+//! The claim lock and the session-registry step of `complete_oauth_login`, branch by branch.
 
 #![cfg(all(feature = "oauth", feature = "testing"))]
 
-mod common;
+use axess_core::testing::fixtures as common;
 
 use axess_core::authn::AuditContext;
+use axess_core::authn::service::OAuthCallbackRoute;
+use axess_core::testing::registry_double::{RegistryDouble, RegistryOp, Step};
 use axess_core::{
     authn::service::AuthnService,
     testing::{
@@ -17,21 +19,20 @@ use common::test_tenant;
 
 // These tests exercise `complete_oauth_login` directly, bypassing the HTTP
 // ceremony, so they can drive `verify_oauth_claim_lock` and
-// `register_oauth_session_or_clear` along every branch that cargo-mutants
-// found uncovered.
+// `register_oauth_session_or_clear` along every branch.
 
-/// Compute the claim-binding lock exactly as `compute_claim_lock` in
-/// `login.rs` does: SHA-256(provider ":" subject ":" session_id_bytes)
-/// URL-safe base64.
+/// Compute the claim-binding lock exactly as `compute_claim_lock` does:
+/// SHA-256 over the provider, the subject and the session key's 32 bytes,
+/// each behind its length, as URL-safe base64.
 async fn test_claim_lock(
     provider: &str,
     subject: &str,
     session: &axess_core::AuthSession,
 ) -> String {
     use sha2::{Digest, Sha256};
-    let sid = session.session_id().await;
+    let key = session.session_key().await;
     let mut hasher = Sha256::new();
-    for field in [provider.as_bytes(), subject.as_bytes(), sid.as_bytes()] {
+    for field in [provider.as_bytes(), subject.as_bytes(), key.as_bytes()] {
         hasher.update((field.len() as u64).to_be_bytes());
         hasher.update(field);
     }
@@ -60,79 +61,37 @@ fn test_claims(provider: &str, subject: &str) -> axess_factors::oauth::OAuthClai
 
 /// A `SessionRegistry` whose `register` always errors. Used to exercise
 /// the register-failure branch in `register_oauth_session_or_clear`.
-#[derive(Clone)]
-struct FailingRegistry;
-
-#[derive(Debug)]
-struct FailRegisterError;
-
-impl std::fmt::Display for FailRegisterError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "injected register failure")
-    }
-}
-
-impl std::error::Error for FailRegisterError {}
-
-impl axess_core::SessionRegistry for FailingRegistry {
-    type Error = FailRegisterError;
-
-    async fn register(
-        &self,
-        user_id: &axess_core::UserId,
-        session_id: &axess_core::SessionId,
-    ) -> Result<(), FailRegisterError> {
-        tracing::trace!(%user_id, %session_id, "FailingRegistry: register stub");
-        Err(FailRegisterError)
-    }
-
-    async fn is_valid(
-        &self,
-        user_id: &axess_core::UserId,
-        session_id: &axess_core::SessionId,
-    ) -> Result<bool, FailRegisterError> {
-        tracing::trace!(%user_id, %session_id, "FailingRegistry: is_valid stub");
-        Ok(false)
-    }
-
-    async fn invalidate_user(&self, user_id: &axess_core::UserId) -> Result<(), FailRegisterError> {
-        tracing::trace!(%user_id, "FailingRegistry: invalidate_user stub");
-        Ok(())
-    }
-
-    async fn invalidate_session(
-        &self,
-        user_id: &axess_core::UserId,
-        session_id: &axess_core::SessionId,
-    ) -> Result<(), FailRegisterError> {
-        tracing::trace!(%user_id, %session_id, "FailingRegistry: invalidate_session stub");
-        Ok(())
-    }
-
-    async fn active_sessions(
-        &self,
-        user_id: &axess_core::UserId,
-    ) -> Result<Vec<axess_core::SessionId>, FailRegisterError> {
-        tracing::trace!(%user_id, "FailingRegistry: active_sessions stub returns empty");
-        Ok(Vec::new())
-    }
+fn failing_registry(clock: &axess_clock::testing::MockClock) -> RegistryDouble {
+    let inner =
+        axess_core::MemorySessionRegistry::new().with_clock(std::sync::Arc::new(clock.clone()));
+    RegistryDouble::over(inner).before(|call, _| async move {
+        match call.op() {
+            RegistryOp::Register => Step::Fail("injected register failure"),
+            _ => Step::Forward,
+        }
+    })
 }
 
 /// `complete_oauth_login` with no claim-lock stashed must
 /// return `Err(AuthnError::NoFlow)`. Catches the mutation
-/// `verify_oauth_claim_lock -> Ok(())` (line 438): the mutant succeeds even
+/// `verify_oauth_claim_lock -> Ok(())`: the mutant succeeds even
 /// though the session carries no lock; the real function refuses.
 #[tokio::test]
 async fn no_claim_lock_stashed_returns_no_flow() {
+    let clock = common::test_clock();
     use axess_core::authn::error::AuthnError;
     use axess_factors::oauth::MockOAuthProvider;
 
-    let mock = MockOAuthProvider::new("idp").with_user("sub1", "u@e.com", vec![], vec![]);
+    let mock = MockOAuthProvider::new("idp")
+        .with_clock(std::sync::Arc::new(clock.clone()))
+        .with_user("sub1", "u@e.com", vec![], vec![]);
     let user = common::test_user("u1", "user1");
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(user.clone());
     let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_oauth_provider(mock)
         .build()
         .with_audit_context(AuditContext::default());
@@ -149,19 +108,24 @@ async fn no_claim_lock_stashed_returns_no_flow() {
 
 /// stashing a WRONG claim-lock must also return
 /// `Err(AuthnError::NoFlow)`. Catches the mutation
-/// `ct_eq -> true` (line 446): the mutant accepts any stashed string as
+/// `ct_eq -> true`: the mutant accepts any stashed string as
 /// matching; the real function constant-time-compares and rejects a mismatch.
 #[tokio::test]
 async fn wrong_claim_lock_returns_no_flow() {
+    let clock = common::test_clock();
     use axess_core::authn::error::AuthnError;
     use axess_factors::oauth::MockOAuthProvider;
 
-    let mock = MockOAuthProvider::new("idp2").with_user("sub2", "u@e.com", vec![], vec![]);
+    let mock = MockOAuthProvider::new("idp2")
+        .with_clock(std::sync::Arc::new(clock.clone()))
+        .with_user("sub2", "u@e.com", vec![], vec![]);
     let user = common::test_user("u1", "user1");
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(user.clone());
     let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_oauth_provider(mock)
         .build()
         .with_audit_context(AuditContext::default());
@@ -184,21 +148,26 @@ async fn wrong_claim_lock_returns_no_flow() {
 
 /// when the session registry rejects `register`, the session
 /// must be cleared and `Err(AuthnError::NoFlow)` returned. Catches the
-/// mutation `register_oauth_session_or_clear -> Ok(())` (line 512): the
+/// mutation `register_oauth_session_or_clear -> Ok(())`: the
 /// mutant succeeds silently; the real function propagates the registry error.
 #[tokio::test]
 async fn register_failure_returns_no_flow() {
+    let clock = common::test_clock();
     use axess_core::authn::error::AuthnError;
     use axess_factors::oauth::MockOAuthProvider;
 
-    let mock = MockOAuthProvider::new("idp3").with_user("sub3", "u@e.com", vec![], vec![]);
+    let mock = MockOAuthProvider::new("idp3")
+        .with_clock(std::sync::Arc::new(clock.clone()))
+        .with_user("sub3", "u@e.com", vec![], vec![]);
     let user = common::test_user("u1", "user1");
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(user.clone());
     let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_oauth_provider(mock)
-        .with_registry(FailingRegistry)
+        .with_registry(failing_registry(&clock))
         .build()
         .with_audit_context(AuditContext::default());
 
@@ -218,23 +187,28 @@ async fn register_failure_returns_no_flow() {
 
 /// with a working registry and an active user,
 /// `complete_oauth_login` must return `Ok(())`. Catches two mutations:
-/// `delete !` (line 516): the mutant enters the error block on a
+/// `delete !`: the mutant enters the error block on a
 ///   *successful* register, returning `Err(NoFlow)`; the real code proceeds.
-/// `!status.allows_login() -> true` (line 539): the mutant rejects active
+/// `!status.allows_login() -> true`: the mutant rejects active
 ///   users as locked; the real function passes them through.
 #[tokio::test]
 async fn active_user_with_working_registry_returns_ok() {
+    let clock = common::test_clock();
     use axess_core::MemorySessionRegistry;
     use axess_factors::oauth::MockOAuthProvider;
 
-    let mock = MockOAuthProvider::new("idp4").with_user("sub4", "u@e.com", vec![], vec![]);
+    let mock = MockOAuthProvider::new("idp4")
+        .with_clock(std::sync::Arc::new(clock.clone()))
+        .with_user("sub4", "u@e.com", vec![], vec![]);
     let user = common::test_user("u1", "user1");
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(user.clone());
     let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_oauth_provider(mock)
-        .with_registry(MemorySessionRegistry::new())
+        .with_registry(MemorySessionRegistry::new().with_clock(std::sync::Arc::new(clock.clone())))
         .build()
         .with_audit_context(AuditContext::default());
 
@@ -255,20 +229,22 @@ async fn active_user_with_working_registry_returns_ok() {
 /// when the account is suspended after registry registration,
 /// the session must be cleared and `Err(AuthnError::Locked)` returned.
 /// Catches two mutations:
-/// `register_oauth_session_or_clear -> Ok(())` (line 512): the mutant skips
+/// `register_oauth_session_or_clear -> Ok(())`: the mutant skips
 ///   the status check entirely.
-/// `!status.allows_login() -> false` (line 539): the mutant never enters the
+/// `!status.allows_login() -> false`: the mutant never enters the
 ///   locked branch, silently authenticating a suspended account.
 #[tokio::test]
 async fn suspended_user_post_register_returns_locked() {
+    let clock = common::test_clock();
     use axess_core::MemorySessionRegistry;
     use axess_core::authn::error::AuthnError;
     use axess_core::authn::types::{EntityState, StatusDetail};
     use axess_factors::oauth::MockOAuthProvider;
-    use chrono::Utc;
 
-    let mock = MockOAuthProvider::new("idp5").with_user("sub5", "u@e.com", vec![], vec![]);
-    let now = Utc::now();
+    let mock = MockOAuthProvider::new("idp5")
+        .with_clock(std::sync::Arc::new(clock.clone()))
+        .with_user("sub5", "u@e.com", vec![], vec![]);
+    let now = common::start();
     let suspended_user = axess_core::authn::types::User {
         status: EntityState::Suspended(StatusDetail::administrative(
             std::sync::Arc::from("account under review"),
@@ -277,11 +253,13 @@ async fn suspended_user_post_register_returns_locked() {
         ..common::test_user("u1", "user1")
     };
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(suspended_user.clone());
     let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_oauth_provider(mock)
-        .with_registry(MemorySessionRegistry::new())
+        .with_registry(MemorySessionRegistry::new().with_clock(std::sync::Arc::new(clock.clone())))
         .build()
         .with_audit_context(AuditContext::default());
 
@@ -303,7 +281,7 @@ async fn suspended_user_post_register_returns_locked() {
 
 /// `verify_provider_issuer_matches` must refuse with `CsrfMismatch`
 /// when the stored provider issuer differs from the current provider's issuer.
-/// Catches the mutation `verify_provider_issuer_matches -> Ok(())` (line 796):
+/// Catches the mutation `verify_provider_issuer_matches -> Ok(())`:
 /// the mutant skips the check entirely, allowing a mismatched issuer to
 /// proceed to token exchange.
 ///
@@ -313,13 +291,18 @@ async fn suspended_user_post_register_returns_locked() {
 /// `exchange_code` and returns `Ok(claims)`.
 #[tokio::test]
 async fn verify_provider_issuer_mismatch_returns_csrf_mismatch() {
+    let clock = common::test_clock();
     use axess_factors::oauth::{MockOAuthProvider, OAuthError};
 
     // MockOAuthProvider::new("name") sets issuer = "https://name.example.com".
-    let mock =
-        MockOAuthProvider::new("idp-issuer-check").with_user("sub", "u@e.com", vec![], vec![]);
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
+    let mock = MockOAuthProvider::new("idp-issuer-check")
+        .with_clock(std::sync::Arc::new(clock.clone()))
+        .with_user("sub", "u@e.com", vec![], vec![]);
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
     let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_oauth_provider(mock)
         .build()
         .with_audit_context(AuditContext::default());
@@ -356,7 +339,7 @@ async fn verify_provider_issuer_mismatch_returns_csrf_mismatch() {
     session
         .set_custom(
             "axess.oauth.started",
-            serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+            serde_json::Value::String(common::start().to_rfc3339_numeric_offset()),
         )
         .await;
     // Attacker-controlled issuer; does NOT match provider's real issuer.
@@ -367,7 +350,15 @@ async fn verify_provider_issuer_mismatch_returns_csrf_mismatch() {
         )
         .await;
 
-    let result = authn.finish_oauth_login("any-code", csrf, &session).await;
+    let result = authn
+        .finish_oauth_login(
+            OAuthCallbackRoute::global("idp-issuer-check"),
+            "any-code",
+            csrf,
+            None,
+            &session,
+        )
+        .await;
     assert!(
         matches!(result, Err(OAuthError::CsrfMismatch)),
         "tampered provider_issuer must return CsrfMismatch, got {result:?}"

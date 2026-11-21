@@ -10,38 +10,64 @@
 //! When an encryption key is provided via [`ValkeySessionStore::encrypted`],
 //! session data is AES-256-GCM encrypted before storage, bound to the row it
 //! lives in. A stored value is `marker || salt || ciphertext`: a four-byte
-//! format marker (`AXS\x01` with the top bit of its last byte set, which
+//! format marker (`AXS\x02` with the top bit of its last byte set, which
 //! says the key is derived per record), a random 16-byte salt, and the
 //! AES-GCM ciphertext under a key derived from the configured key, the salt
-//! and the session id. The additional authenticated data is
-//! `axess.session.v1 || 0x00 || session id`; the id is not stored in the
-//! value but supplied again on read, so a value copied under another session
-//! id (or restored from a backup into a different row) fails authentication
+//! and the session's key. The additional authenticated data is
+//! `axess.session.v2 || 0x00 || session key`; the key is not stored in the
+//! value but supplied again on read, so a value copied under another session's
+//! key (or restored from a backup into a different row) fails authentication
 //! and reads as a decryption failure.
 //!
-//! Values written before row binding carry no marker and no binding: they
-//! open under any session id, so an attacker who can write to the store could
-//! move one between rows. [`LegacyBlobs`](crate::session::crypto::LegacyBlobs)
-//! decides what happens to them. The default, `Reject`, refuses them (the
-//! user signs in again). `AcceptUntil(instant)` reads them until the instant
-//! and refuses them afterwards; until then an unbound value can be moved
-//! between rows undetected, and a read leaves it as it is (the session's next
-//! save writes the bound form). `Accept` reads them with no end date. Set the
-//! policy with [`ValkeySessionStore::with_legacy_blobs`].
+//! A value is read in that form and in no other. One written by an earlier
+//! release (bound to the session id, or with no binding at all) is refused:
+//! sessions stored before this format are not carried over, and their users
+//! sign in again. No [`LegacyBlobs`](crate::session::crypto::LegacyBlobs)
+//! policy applies to a session.
 //!
 //! Key rotation is supported: pass both the current key and the previous key.
 //! On load, the store tries the current key first; if decryption fails, it
-//! retries with the previous key. A save always uses the current key, so a
-//! row is re-sealed under it when it is next written; a row that is only read
-//! stays under the previous key until it expires.
+//! retries with the previous key. A save always uses the current key, and a
+//! load that opened a row under the previous key writes it back under the
+//! current one (only while the stored bytes are still the ones it read), so
+//! rows move to the new key as they are read or written.
 //!
 //! # Key layout
 //!
 //! | Key pattern | Type | Purpose |
 //! |---|---|---|
-//! | `{prefix}:sess:{session_id}` | String (msgpack bytes or encrypted) | Session data |
-//! | `{prefix}:reg:{user_id}` | Sorted set (member = session ID, score = `register` instant, moved forward by use, in epoch ms) | Session registry: liveness |
-//! | `{prefix}:reg-at:{user_id}` | Sorted set (member = session ID, score = `register` instant in epoch ms, never moved) | Session registry: eviction order |
+//! | `<prefix>:sess:<session_key>` | String (msgpack bytes or encrypted) | Session data, named by the 64 hexadecimal characters of the session's key (a digest of its id, never the id) |
+//! | `<prefix>:reg:{<user_id>}` | Sorted set (member = the session's key, score = `register` instant, moved forward by use, in epoch ms) | Session registry: liveness |
+//! | `<prefix>:reg-at:{<user_id>}` | Sorted set (member = the session's key, score = `register` instant in epoch ms, never moved) | Session registry: eviction order |
+//! | `<prefix>:fwd:{<user_id>}` | Hash (field = a key the session was moved away from, value = the key it is under now) | Session registry: the records of the user's moves |
+//! | `<prefix>:fwd-at:{<user_id>}` | Sorted set (member = a field of the hash beside it, score = its place in the order of the user's moves) | Session registry: which record a move gives up at the bound |
+//!
+//! Angle brackets stand for the prefix, the session's key and the
+//! hyphenated user id; a registry member is the 64 characters of a session's
+//! key, as are the fields and values of the records of moves and the last
+//! part of the channel `<prefix>:revoked-session:<key>` that the registry
+//! publishes when it ends one session, so neither a member, a record, a
+//! key name nor a channel holds a value a cookie could carry. The
+//! braces around the user id are literal: a hash
+//! tag. A cluster hashes such a key by the user id alone, so one user's
+//! four registry keys share a cluster slot and the registry's scripts (the
+//! move of a session, the ending by key, the cut-off of a user's other
+//! sessions, the orphan sweep) run as single scripts on any cluster, with
+//! no hash tag in the prefix. A prefix that closes a tag of its own (`{axess}`) puts every
+//! user in that tag's one slot instead. A prefix that opens a brace it does
+//! not close (`a{b`) would split a user's keys, and the registry refuses it
+//! when it is built and at every call. Keys the registry wrote before the
+//! user id was a hash tag are named without braces; nothing reads them, and
+//! they expire with their own TTL.
+//!
+//! The registry is built only on a server that runs its scripts:
+//! [`ValkeySessionRegistry::new`] and
+//! [`ValkeySessionRegistry::with_options`] send a script that reads and
+//! writes nothing over a user's keys and refuse to start with
+//! [`ValkeyStoreError::ScriptsRefused`] when the server refuses it. The
+//! session store's rotation of a session the request did not load is a
+//! two-key script that runs as one step on a cluster only with a hash tag
+//! in the store's prefix, and takes a sequenced form otherwise.
 //!
 //! # Registry data type
 //!
@@ -82,22 +108,40 @@
 //!     client.clone(), current_key, old_key,
 //! );
 //!
-//! let registry = ValkeySessionRegistry::new(client);
+//! // The registry checks, on the connected client, that the server runs its
+//! // scripts, and refuses to start otherwise.
+//! let registry = ValkeySessionRegistry::new(client).await?;
 //! let session_layer = SessionLayer::new(
 //!     store,
 //!     signing_key,
 //!     std::sync::Arc::new(SessionRegistryAdapter(registry)),
+//!     authn.session_end_audit(),
 //! );
 //! ```
 
 mod encryption;
 mod internal;
 mod registry;
+mod registry_keys;
 mod store;
 mod subscriber;
 
 #[cfg(test)]
+mod cluster_tests;
+#[cfg(test)]
+mod fallback_tests;
+#[cfg(test)]
+mod layout_tests;
+#[cfg(test)]
+mod member_tests;
+#[cfg(test)]
+mod move_tests;
+#[cfg(test)]
 mod registry_tests;
+#[cfg(test)]
+mod sequenced_tests;
+#[cfg(test)]
+mod stored_form_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -105,9 +149,11 @@ mod ttl_tests;
 #[cfg(test)]
 mod watch_tests;
 
-/// The live tests that open a subscriber connection run one at a time: the
-/// watch tests count the server's pub/sub connections, and a watcher another
-/// test opens or closes meanwhile would be counted with theirs.
+/// The live tests that open a subscriber connection run one at a time. The
+/// watch tests count and kill only the connection that carries their own
+/// registry's name, so no other client's pub/sub connection moves a count;
+/// taking turns keeps each test's wait for its connection clear of the
+/// connections the others open and kill.
 #[cfg(test)]
 static SUBSCRIBER_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 

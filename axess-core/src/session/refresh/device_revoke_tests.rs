@@ -81,6 +81,7 @@ async fn revoking_a_device_revokes_its_tokens_and_only_its_tokens() {
     assert_eq!(device.trust_level, DeviceTrustLevel::Revoked);
     let outcome = Refresh::any_tenant(&laptop, |_| async { true })
         .device_info(Some("ua-laptop"))
+        .without_device_check()
         .run(&refresh, &test_config(), &rng, now())
         .await;
     assert!(
@@ -89,6 +90,7 @@ async fn revoking_a_device_revokes_its_tokens_and_only_its_tokens() {
     );
     let ok = Refresh::any_tenant(&phone, |_| async { true })
         .device_info(Some("ua-phone"))
+        .without_device_check()
         .run(&refresh, &test_config(), &rng, now())
         .await;
     assert!(ok.is_ok(), "another device's token still refreshes");
@@ -114,6 +116,7 @@ async fn the_device_check_refuses_a_token_whose_device_is_revoked() {
 
     // The plain refresh does not look at the device.
     let plain = Refresh::any_tenant(&token, |_| async { true })
+        .without_device_check()
         .run(&refresh, &test_config(), &rng, now())
         .await;
     assert!(plain.is_ok(), "set_trust_level alone does not stop it");
@@ -221,10 +224,12 @@ async fn a_compromised_family_revokes_its_devices_through_the_decorator() {
 
     // v1 rotates to v2; presenting v1 again is reuse.
     Refresh::any_tenant(&v1, |_| async { true })
+        .without_device_check()
         .run(&refresh, &test_config(), &rng, now())
         .await
         .unwrap();
     let reuse = Refresh::any_tenant(&v1, |_| async { true })
+        .without_device_check()
         .run(&refresh, &test_config(), &rng, now())
         .await;
     assert!(matches!(reuse, Err(RefreshError::Revoked)));
@@ -382,6 +387,7 @@ async fn reuse_of_a_token_of_a_revoked_device_is_not_theft() {
     assert_eq!(row.revoked_at, Some(now()), "and when");
 
     let reuse = Refresh::any_tenant(&plaintext, |_| async { true })
+        .without_device_check()
         .run(&refresh, &test_config(), &rng, now())
         .await;
     assert!(matches!(reuse, Err(RefreshError::Revoked)), "{reuse:?}");
@@ -467,6 +473,7 @@ async fn the_cascade_helper_revokes_devices_and_their_tokens() {
         assert_eq!(device.trust_level, DeviceTrustLevel::Revoked);
         let outcome = Refresh::any_tenant(token, |_| async { true })
             .device_info(Some(info))
+            .without_device_check()
             .run(&refresh, &test_config(), &rng, now())
             .await;
         assert!(matches!(outcome, Err(RefreshError::Revoked)));

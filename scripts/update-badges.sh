@@ -6,7 +6,7 @@
 #
 #   - version.svg → workspace [workspace.package].version (root Cargo.toml)
 #   - license.svg → workspace [workspace.package].license (root Cargo.toml,
-#                   formatted "X / Y" to match the Gnomes badge convention)
+#                   formatted "X / Y", as the licence badge shows it)
 #
 # Status ("alpha", "beta", etc.) is an editorial choice: change it by
 # regenerating status.svg via generate-badge.sh directly.
@@ -38,8 +38,8 @@ section=$(awk '
   flag                     { print }
 ' Cargo.toml)
 
-version=$(printf '%s\n' "$section" | grep -m1 '^version = ' | sed -E 's/version = "([^"]+)"/\1/')
-license=$(printf '%s\n' "$section" | grep -m1 '^license = ' | sed -E 's/license = "([^"]+)"/\1/' | sed 's| OR | / |g')
+version=$(grep '^version = ' <<<"$section" | sed -n 1p | sed -E 's/version = "([^"]+)"/\1/')
+license=$(grep '^license = ' <<<"$section" | sed -n 1p | sed -E 's/license = "([^"]+)"/\1/' | sed 's| OR | / |g')
 
 if [ -z "$version" ] || [ -z "$license" ]; then
   echo "Could not parse version/license from [workspace.package] in Cargo.toml" >&2

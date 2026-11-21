@@ -5,7 +5,9 @@
 //! the chapter's block directly.
 
 // ANCHOR: wiring
-use axess::authn::{AuditContext, AuthnService, FactorCredential, FactorOutcome, LoginOutcome};
+use axess::authn::{
+    AuditContext, AuthnService, FactorCredential, FactorOutcome, LoginOutcome, RequestAuthnService,
+};
 use axess::{
     AuthSession, InMemoryBackend, MemorySessionRegistry, MemorySessionStore, SecureRng,
     SessionLayer, SystemRng,
@@ -26,7 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Backend -- one type implements both IdentityStore and FactorStore.
     let backend = InMemoryBackend::new()
         .with_default_tenant("default", "Default tenant")
-        .with_user_password("alice", "default", "Gnomes2+");
+        .with_user_password("alice", "default", "Sample2+");
 
     // 2. Session store + 3. signing key.
     // `MemorySessionStore` is unbounded and per process: it is for demos.
@@ -52,10 +54,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 5. SessionLayer threads the session through each request.
     // A short idle lifetime and a cap on the whole session, so abandoned
     // sessions do not pile up and a stolen cookie does not last.
-    let session_layer = SessionLayer::new(session_store.clone(), signing_key, registry.handle())
-        .with_ttl(STRICT_IDLE_TTL)
-        .with_max_session_age(Some(STRICT_MAX_SESSION_AGE))
-        .with_secure(secure_cookies()); // see "Cookie security" below.
+    // The service's sink writes an audit row for each session the layer
+    // ends by itself (one past the age cap, one the registry dropped).
+    let session_layer = SessionLayer::new(
+        session_store.clone(),
+        signing_key,
+        registry.handle(),
+        service.session_end_audit(),
+    )
+    .with_ttl(STRICT_IDLE_TTL)
+    .with_max_session_age(Some(STRICT_MAX_SESSION_AGE))
+    .with_secure(secure_cookies()); // see "Cookie security" below.
 
     // Drop expired sessions every few minutes; nothing else removes them
     // from the in-memory store.
@@ -76,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_state(service)
         .layer(session_layer);
 
-    // 5. Resolve the client address once, outside everything that reads
+    // 6. Resolve the client address once, outside everything that reads
     //    one. Without this the audit rows say `ip_source = 'unknown'` and
     //    a tenant IP policy cannot be satisfied. `loopback_only` is the
     //    right set for a dev server bound to 127.0.0.1; a deployment
@@ -131,9 +140,29 @@ async fn login(
     //    `verify_factor` do not exist on the shared service.
     let service = service.with_audit_context(audit);
 
+    let answer = attempt(&service, &form, &session).await;
+
+    // 3. A refused attempt ends the login it began. A wrong password for a
+    //    real account leaves that account's login open in the session,
+    //    where an unknown username leaves the session untouched: the
+    //    session, and the cookie set for a changed one, would say which
+    //    usernames exist. Clearing on every refusal leaves the same fresh
+    //    guest session either way. `login_with_password` does this too.
+    if answer.status() != StatusCode::OK {
+        session.clear().await;
+    }
+    answer
+}
+
+/// Steps 1 and 2 of a login: begin it, then verify the password.
+async fn attempt(
+    service: &RequestAuthnService<InMemoryBackend, InMemoryBackend>,
+    form: &LoginForm,
+    session: &AuthSession,
+) -> axum::response::Response {
     // 1. Begin the login. Transitions Guest -> Authenticating.
     match service
-        .begin_login(&form.username, "default", &session)
+        .begin_login(&form.username, "default", session)
         .await
     {
         // The identifier resolved and the first factor is known. For a
@@ -175,7 +204,7 @@ async fn login(
             // `Password` holds a `ZeroizedString`, which wipes itself on
             // drop. `.into()` from a `String` is the conversion.
             &FactorCredential::Password(form.password.clone().into()),
-            &session,
+            session,
         )
         .await
     {
@@ -189,19 +218,20 @@ async fn login(
             (StatusCode::UNAUTHORIZED, "invalid credentials").into_response()
         }
         Ok(FactorOutcome::Locked { until }) => locked_reply(until),
-        // Guesses from this address are slowed down: the same answer as a
-        // wrong password, with `Retry-After` for a client that reads it.
-        Ok(FactorOutcome::Throttled { retry_after }) => (
-            StatusCode::TOO_MANY_REQUESTS,
-            [(
-                axum::http::header::RETRY_AFTER,
-                retry_after.as_secs().max(1).to_string(),
-            )],
-            "invalid credentials",
-        )
-            .into_response(),
+        // Guesses from this address are slowed down. Only an account that
+        // exists can be throttled, so a `429` with `Retry-After` would say
+        // which usernames exist: the answer is the one a wrong password
+        // gets, at the cost of the one password check the throttle skipped,
+        // and the delay is logged on the server. `login_with_password` does
+        // the same in one call.
+        Ok(FactorOutcome::Throttled { retry_after }) => {
+            eprintln!("login refused, guesses throttled for {retry_after:?}");
+            service.burn_password_check(&form.password).await.ok();
+            (StatusCode::UNAUTHORIZED, "invalid credentials").into_response()
+        }
         Err(e) => {
             eprintln!("verify_factor failed: {e}");
+            service.burn_password_check(&form.password).await.ok();
             (StatusCode::UNAUTHORIZED, "invalid credentials").into_response()
         }
     }
@@ -227,92 +257,4 @@ fn secure_cookies() -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The service, with a counted executor for its password checks.
-    fn counted_service() -> (
-        Arc<AuthnService<InMemoryBackend, InMemoryBackend>>,
-        Arc<axess::blocking::KdfExecutor>,
-    ) {
-        let kdf = Arc::new(axess::blocking::KdfExecutor::inline());
-        let backend = InMemoryBackend::new()
-            .with_default_tenant("default", "Default tenant")
-            .with_user_password("alice", "default", "Gnomes2+");
-        let service = AuthnService::builder_from_backend(backend)
-            .with_kdf_executor(kdf.clone())
-            .build();
-        (Arc::new(service), kdf)
-    }
-
-    /// Refuse a wrong password for `username` and return the status.
-    async fn refuse(
-        service: &Arc<AuthnService<InMemoryBackend, InMemoryBackend>>,
-        username: &str,
-    ) -> StatusCode {
-        let form = LoginForm {
-            username: username.to_string(),
-            password: "not the password".to_string(),
-        };
-        login(
-            axess_core::testing::test_session(),
-            State(service.clone()),
-            AuditContext::default(),
-            Json(form),
-        )
-        .await
-        .into_response()
-        .status()
-    }
-
-    /// An unknown username costs exactly one password check, as a known one
-    /// does, so the two cannot be told apart by how long the check takes.
-    #[tokio::test]
-    async fn an_unknown_user_costs_one_password_check_like_a_known_one() {
-        let (service, kdf) = counted_service();
-
-        let before = kdf.jobs_started();
-        assert_eq!(refuse(&service, "alice").await, StatusCode::UNAUTHORIZED);
-        let known = kdf.jobs_started() - before;
-
-        let before = kdf.jobs_started();
-        assert_eq!(refuse(&service, "mallory").await, StatusCode::UNAUTHORIZED);
-        let unknown = kdf.jobs_started() - before;
-
-        assert_eq!(known, 1, "a known user's refusal");
-        assert_eq!(unknown, known, "an unknown user's refusal");
-    }
-
-    /// The same property as wall-clock time: the fastest unknown refusal is
-    /// not far below the fastest known one. Timing depends on the machine,
-    /// so this runs only on request (`cargo test -- --ignored`).
-    #[tokio::test]
-    #[ignore = "wall-clock comparison; the counting test is the gate"]
-    async fn an_unknown_user_takes_about_as_long_as_a_known_one() {
-        let (service, _) = counted_service();
-        refuse(&service, "nobody").await;
-        let fastest = |name: &'static str| {
-            let service = service.clone();
-            async move {
-                let mut best = Duration::MAX;
-                for _ in 0..3 {
-                    let started = std::time::Instant::now();
-                    refuse(&service, name).await;
-                    best = best.min(started.elapsed());
-                }
-                best
-            }
-        };
-        let known = fastest("alice").await;
-        let unknown = fastest("mallory").await;
-        assert!(unknown * 2 >= known, "unknown {unknown:?}, known {known:?}");
-    }
-
-    #[tokio::test]
-    async fn a_locked_account_gets_the_wrong_password_answer() {
-        let reply = locked_reply(Some("tomorrow"));
-        assert_eq!(reply.status(), StatusCode::UNAUTHORIZED);
-        let body = axum::body::to_bytes(reply.into_body(), 1024).await.unwrap();
-        assert_eq!(&body[..], b"invalid credentials");
-    }
-}
+mod tests;

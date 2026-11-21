@@ -1,9 +1,10 @@
 //! The sliding-window counter.
 
 use super::*;
+use axess_clock::testing::Shift;
 
-fn millis(t: DateTime<Utc>, ms: i64) -> DateTime<Utc> {
-    t + chrono::Duration::milliseconds(ms)
+fn millis(t: Timestamp, ms: i64) -> Timestamp {
+    t.plus(axess_clock::SignedDuration::milliseconds(ms))
 }
 
 fn allowed(a: Acquire) -> bool {
@@ -11,8 +12,8 @@ fn allowed(a: Acquire) -> bool {
 }
 
 /// The boundary burst: one request at the start and four at the end of a
-/// 60 s window used to be followed by five more in the first instant of the
-/// next window. Now the second burst is refused until the first has aged out.
+/// 60 s window are not followed by five more in the first instant of the
+/// next window. The second burst is refused until the first has aged out.
 #[test]
 fn a_burst_across_the_window_boundary_is_not_doubled() {
     let store = test_store(5, Duration::from_secs(60));

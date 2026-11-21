@@ -7,12 +7,12 @@ use crate::authn::factor::FactorStep;
 use crate::authn::ids::{TenantId, UserId};
 use crate::session::{
     data::{AdvanceOutcome, AuthState, Impersonation, SessionData, WorkflowState},
-    id::SessionId,
+    id::SessionKey,
     layer::SessionHandle,
 };
+use axess_clock::Timestamp;
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
-use chrono::{DateTime, Utc};
 use std::sync::Arc;
 
 /// Axum request extractor providing typed, mutable session access.
@@ -35,8 +35,13 @@ use std::sync::Arc;
 /// use axess_core::authn::ids::{TenantId, UserId};
 /// use axess_core::session::extractor::AuthSession;
 ///
-/// async fn handler(session: AuthSession, user: UserId, tenant: TenantId) {
-///     session.set_authenticated(user, tenant, chrono::Utc::now()).await;
+/// async fn handler(
+///     session: AuthSession,
+///     user: UserId,
+///     tenant: TenantId,
+///     now: axess_clock::Timestamp,
+/// ) {
+///     session.set_authenticated(user, tenant, now).await;
 /// }
 /// ```
 #[derive(Clone)]
@@ -50,10 +55,16 @@ pub struct AuthSnapshot {
     pub user_id: UserId,
     /// Tenant the user belongs to.
     pub tenant_id: TenantId,
-    /// Stable session identifier for this snapshot.
-    pub session_id: SessionId,
-    /// Wall-clock time at which authentication completed.
-    pub authn_time: DateTime<Utc>,
+    /// The key of the session: the name its store row, its registry entry
+    /// and its audit records carry. The session's id, the value its cookie
+    /// carries, is held by the session layer alone.
+    pub session_key: SessionKey,
+    /// When the person last proved presence: the login, or the latest
+    /// step-up. What recency checks read.
+    pub authn_time: Timestamp,
+    /// When the login that created the session completed: what the
+    /// absolute age cap counts from. A step-up does not move it.
+    pub signed_in_at: Timestamp,
     /// The administrator acting in the user's name, and since when; `None`
     /// for the user's own session. See [`AuthSession::impersonation`].
     pub impersonation: Option<Impersonation>,
@@ -71,7 +82,7 @@ impl AuthSession {
     ///
     /// **Prefer [`snapshot`](Self::snapshot)** when the handler needs more
     /// than one identity field; a single `snapshot().await` acquires the
-    /// read lock once and returns `user_id` + `tenant_id` + `session_id` +
+    /// read lock once and returns `user_id` + `tenant_id` + `session_key` +
     /// `authn_time` together.
     #[doc(hidden)]
     pub async fn user_id(&self) -> Option<UserId> {
@@ -132,9 +143,11 @@ impl AuthSession {
     /// `with_impersonated_credential_changes_allowed`, and every audit row a
     /// request under impersonation writes names the administrator as
     /// actor. Check it before anything else an administrator should not do
-    /// in a user's name. The session's authentication time is the
-    /// administrator's, not a fresh login's. [`impersonation`](Self::impersonation)
-    /// also says since when.
+    /// in a user's name. The session's authentication time and its login
+    /// time are the administrator's, not a fresh login's, and so is its
+    /// device: the browser is the administrator's, and nothing about it is
+    /// recorded for the user. [`impersonation`](Self::impersonation) also
+    /// says since when.
     pub async fn impersonator(&self) -> Option<UserId> {
         self.impersonation().await.map(|i| i.admin)
     }
@@ -158,7 +171,7 @@ impl AuthSession {
     /// Mark the authenticated session as `admin`'s impersonation begun at
     /// `since`. Returns `false`, changing nothing, when the session is not
     /// authenticated.
-    pub(crate) async fn set_impersonator(&self, admin: UserId, since: DateTime<Utc>) -> bool {
+    pub(crate) async fn set_impersonator(&self, admin: UserId, since: Timestamp) -> bool {
         let mut guard = self.0.0.write().await;
         let marked = guard.data.auth_state.set_impersonator(admin, since);
         if marked {
@@ -167,7 +180,21 @@ impl AuthSession {
         marked
     }
 
-    /// Clone the current authentication state enum (cheap; fields are `Arc<str>`).
+    /// Keep `at` as the login time of the authenticated session (see
+    /// `AuthState::keep_signed_in_at`). Returns `false`, changing nothing,
+    /// when the session is not authenticated.
+    pub(crate) async fn keep_signed_in_at(&self, at: Timestamp) -> bool {
+        let mut guard = self.0.0.write().await;
+        let kept = guard.data.auth_state.keep_signed_in_at(at);
+        if kept {
+            guard.modified = true;
+        }
+        kept
+    }
+
+    /// Clone the current authentication state enum. The ids in it are
+    /// `Copy` and the method name is an `Arc<str>`; a login in flight also
+    /// clones its lists of remaining and completed factors.
     pub async fn auth_state(&self) -> AuthState {
         self.0.0.read().await.data.auth_state.clone()
     }
@@ -204,57 +231,68 @@ impl AuthSession {
         }
     }
 
-    /// Return the session ID.
+    /// The key this session is stored, registered and recorded under, and
+    /// the one name of the session a handler can read: the session's id,
+    /// the value its cookie carries, never leaves the session layer.
     ///
-    /// Reading the id marks the session as needed beyond this request, so a
-    /// cookieless request that keys something on the id still gets a stored
+    /// Reading the key marks the session as needed beyond this request, so
+    /// a cookieless request that keys something on it still gets a stored
     /// session and a cookie.
-    pub async fn session_id(&self) -> SessionId {
+    pub async fn session_key(&self) -> SessionKey {
         let mut guard = self.0.0.write().await;
         guard.needs_persist = true;
-        guard.id
+        *guard.session.key()
     }
 
-    /// Read the session id without marking the session as needed beyond
-    /// this request. For observers (audit context, logging) that record the
-    /// id but key nothing durable on it: calling
-    /// [`session_id`](Self::session_id) there would make every cookieless
+    /// The key without the mark, for observers (the audit context) that
+    /// record the session but key nothing durable on it: calling
+    /// [`session_key`](Self::session_key) there would make every cookieless
     /// request that merely passes through them store a session.
-    pub(crate) async fn peek_session_id(&self) -> SessionId {
-        self.0.0.read().await.id
+    pub(crate) async fn peek_session_key(&self) -> SessionKey {
+        *self.0.0.read().await.session.key()
     }
 
     /// Return the resolved [`crate::authn::ids::DeviceId`] for this session, if the device
-    /// subsystem populated it. `None` when the `device` feature is
-    /// disabled, when the resolver did not run for this request, or when
-    /// the request did not match a known device.
+    /// subsystem populated it and it holds for the person at the session's
+    /// browser. `None` when the `device` feature is disabled, when the
+    /// resolver did not run for this request, when the request did not
+    /// match a known device, and for the rest of a request in which another
+    /// person signed in on a signed-in session: the device was resolved for
+    /// the first person. [`data`](Self::data) shows the raw field.
     ///
     /// Single-acquisition read; cheap when the device subsystem is in
     /// use because `DeviceId` is a 16-byte `Copy` UUID newtype.
     pub async fn device_id(&self) -> Option<crate::authn::ids::DeviceId> {
-        self.0.0.read().await.data.device_id
+        self.0.0.read().await.device_in_force()
     }
 
-    /// The session's device when the client proved it holds it, `None`
-    /// otherwise (no device, or one a resolver found by fingerprint alone).
-    ///
-    /// The only reading of the session's device that a lockout exemption
-    /// accepts: the per-account lockout lets an account's own device through
-    /// only as a [`ProvenDevice`](crate::device::ProvenDevice), which the
-    /// session layer records when the device resolver reports one (the
-    /// library's [`LifecycleDeviceResolver`](crate::device::LifecycleDeviceResolver)
-    /// does, on the secret token of the device cookie).
-    #[cfg(feature = "device")]
-    pub async fn proven_device(&self) -> Option<crate::device::ProvenDevice> {
+    /// Whether this request runs as a session bound to a device key and
+    /// proved that key: the session's
+    /// [`key_binding`](crate::session::SessionData::key_binding) names the
+    /// tenant, the device and the key, and the session layer verified a
+    /// proof by exactly that key on this request (a proof cookie, or a
+    /// request proof), whether or not the request also presented the
+    /// device's token. Only a binding in force counts
+    /// ([`SessionData::key_binding_in_force`]): `false` from the moment
+    /// another person signs in or a new login begins on the session, in the
+    /// same request. `false` for a session that is not bound, and for a
+    /// bound one served without a proof, which happens only under
+    /// [`KeyBindingPolicy::Off`](crate::device_key::KeyBindingPolicy). On
+    /// the request that registers a key it is still `false`: the binding is
+    /// made by that request, and proven from the next. What a Cedar policy
+    /// reads through
+    /// [`StandardRequestContext::with_key_bound`](crate::authz::StandardRequestContext::with_key_bound).
+    pub async fn key_bound(&self) -> bool {
         let inner = self.0.0.read().await;
-        if inner.data.device_proven {
-            inner.data.device_id.map(crate::device::ProvenDevice::new)
-        } else {
-            None
-        }
+        let data = &inner.data;
+        data.key_binding_in_force().is_some() && data.key_proven
     }
 
-    /// Return a clone of the full session data.
+    /// Return a clone of the full session data: the row as the request
+    /// holds it, before the judgements the readers above make. A key
+    /// binding or a device that does not hold for the person at the browser
+    /// still shows here until the row is written; ask
+    /// [`key_bound`](Self::key_bound) and [`device_id`](Self::device_id).
     pub async fn data(&self) -> SessionData {
         self.0.0.read().await.data.clone()
     }
@@ -262,8 +300,8 @@ impl AuthSession {
     /// Invoke `f` against a borrow of the current [`AuthState`]
     /// without cloning. Use this when the caller only needs to read a
     /// few fields. Avoids the full `AuthState::clone()` that
-    /// [`auth_state`](Self::auth_state) performs (which clones every
-    /// `Arc<str>` plus the workflow state). For `AuthState::Authenticated`
+    /// [`auth_state`](Self::auth_state) performs (which clones the method
+    /// name, the factor lists and the workflow state). For `AuthState::Authenticated`
     /// in particular this halves the per-request lock-held work in
     /// authenticated handlers that just need the user id.
     ///
@@ -280,7 +318,8 @@ impl AuthSession {
     /// Invoke `f` against a borrow of the full [`SessionData`]
     /// without cloning. Useful when reading several fields together,
     /// where `data()` would copy more than necessary. Same lock-held
-    /// caveat as [`with_auth_state`](Self::with_auth_state).
+    /// caveat as [`with_auth_state`](Self::with_auth_state). The data is the
+    /// raw row, as [`data`](Self::data) says.
     pub async fn with_data<F, T>(&self, f: F) -> T
     where
         F: FnOnce(&SessionData) -> T,
@@ -292,7 +331,7 @@ impl AuthSession {
     /// Read all the common identity fields under a *single*
     /// read-lock acquisition. The previous pattern of calling
     /// `is_authenticated()` then `user_id()` then `tenant_id()` then
-    /// `session_id()` from a typical authenticated handler took four
+    /// `session_key()` from a typical authenticated handler took four
     /// `RwLock` reads per request: most contention-free, but each is a
     /// cross-await synchronization point. `snapshot()` collapses them
     /// into one acquisition.
@@ -305,13 +344,15 @@ impl AuthSession {
                 user_id,
                 tenant_id,
                 authn_time,
+                signed_in_at,
                 impersonator,
                 ..
             } => Some(AuthSnapshot {
                 user_id: *user_id,
                 tenant_id: *tenant_id,
-                session_id: guard.id,
+                session_key: *guard.session.key(),
                 authn_time: *authn_time,
+                signed_in_at: *signed_in_at,
                 impersonation: *impersonator,
             }),
             _ => None,
@@ -323,8 +364,8 @@ impl AuthSession {
     /// Mark the session as fully authenticated.
     ///
     /// Cycles the session id eagerly so handler code that subsequently calls
-    /// `session.session_id().await` (e.g. to register against a
-    /// `SessionRegistry`) reads the post-rotation id, the same id the
+    /// `session.session_key().await` (e.g. to register against a
+    /// `SessionRegistry`) reads the post-rotation key, the key of the id the
     /// cookie will carry on the next request.
     ///
     /// Clears the custom data the session held before the login, so state an
@@ -337,7 +378,7 @@ impl AuthSession {
         &self,
         user_id: UserId,
         tenant_id: TenantId,
-        authn_time: DateTime<Utc>,
+        authn_time: Timestamp,
     ) {
         self.set_authenticated_keeping(user_id, tenant_id, authn_time, None, &[])
             .await;
@@ -350,7 +391,7 @@ impl AuthSession {
         &self,
         user_id: UserId,
         tenant_id: TenantId,
-        authn_time: DateTime<Utc>,
+        authn_time: Timestamp,
         proof: Option<crate::authn::assurance::FactorAssurance>,
         preserved: &[String],
     ) {
@@ -447,8 +488,8 @@ impl AuthSession {
 
     /// Record a failed attempt at the given time (for UI display / rate-limit feedback).
     ///
-    /// Callers should supply `clock.now()` rather than `Utc::now()` so that
-    /// deterministic simulation tests control the timestamp.
+    /// Callers should supply `clock.now()` rather than a read of the system
+    /// clock so that deterministic simulation tests control the timestamp.
     ///
     /// **This does not enforce lockout**; lockout is based exclusively on the
     /// DB counter returned by `IdentityStore::record_failed_attempt`.
@@ -462,7 +503,7 @@ impl AuthSession {
     /// cross-request "attempts remaining" UX should read the
     /// authoritative counter via `IdentityStore::account_status` /
     /// `record_failed_attempt`'s return value, not session state.
-    pub(crate) async fn record_attempt_at(&self, now: DateTime<Utc>) {
+    pub(crate) async fn record_attempt_at(&self, now: Timestamp) {
         let mut guard = self.0.0.write().await;
         // Pure state mutation lives on AuthState.
         // Intentionally do NOT set `guard.modified = true`.
@@ -472,7 +513,7 @@ impl AuthSession {
     /// Return `(user_id, tenant_id)` if the session is fully authenticated, `None` otherwise.
     ///
     /// **Prefer [`snapshot`](Self::snapshot)**; it returns the full
-    /// identity bundle (`user_id` + `tenant_id` + `session_id` +
+    /// identity bundle (`user_id` + `tenant_id` + `session_key` +
     /// `authn_time`) under one lock acquisition. `authenticated_ids` is
     /// retained for the narrow case where the caller really only wants
     /// the pair.
@@ -546,23 +587,25 @@ impl AuthSession {
     /// Cycle the session ID immediately.
     ///
     /// Mints a new id, swaps it in, and stashes the old id for the layer to
-    /// `store.cycle` on the way out. Idempotent within a single request;
-    /// calling twice still rotates only once.
+    /// `store.cycle` on the way out. A second call in the same request
+    /// mints another id, and the response still makes one move in the
+    /// store, from the id the request arrived with to the last one minted.
     ///
     /// Call at any **privilege boundary**; i.e. any change to the
     /// session's authentication context, scope, or subject identity.
-    /// Login (`RequestAuthnService::verify_factor` completing a factor chain
-    /// with `FactorOutcome::Authenticated`) and OAuth callback finish
-    /// are cycled inside the library; every other boundary listed below
+    /// The library cycles the id itself at every state transition of the
+    /// session (the start of a login, each completed factor chain, which
+    /// is how a login and a step-up through `verify_factor` end, a
+    /// workflow step, `clear`), at the OAuth callback finish, and when an
+    /// impersonation begins and ends. Every other boundary listed below
     /// is the app's call. Canonical list (OWASP ASVS V3, OWASP Session
     /// Management Cheat Sheet, NIST SP 800-63B AAL transitions):
     ///
     /// - MFA factor added (TOTP, WebAuthn, recovery codes, …)
     /// - MFA factor removed or disabled (AAL drops)
     /// - Password / primary-credential change
-    /// - Step-up to a higher assurance level
+    /// - Step-up to a higher assurance level by a path of your own
     /// - Account-recovery flow completion
-    /// - Impersonation start / stop
     /// - Role grant / revoke or scope change
     /// - Tenant switch in a multi-tenant deployment
     ///
@@ -572,8 +615,10 @@ impl AuthSession {
     ///
     /// On credential changes (password change, recovery completion)
     /// consider also revoking sibling sessions via
-    /// [`SessionRegistry::invalidate_user`](crate::session::store::SessionRegistry::invalidate_user);
-    /// that is a strictly
+    /// [`RequestAuthnService::invalidate_other_sessions`](crate::authn::RequestAuthnService::invalidate_other_sessions),
+    /// which keeps the caller's session, or
+    /// [`SessionRegistry::invalidate_user`](crate::session::store::SessionRegistry::invalidate_user),
+    /// which ends it with the rest; either is a strictly
     /// stronger statement than rotation and cuts off other devices
     /// still holding a stale credential-derived cookie.
     ///
@@ -621,7 +666,8 @@ impl AuthSession {
     /// Run `f` against a mutable borrow of the custom-bag JSON
     /// object under a single write-lock acquisition. Returns the value
     /// produced by `f`. Marks the session modified if `f` actually
-    /// mutated the bag (judged by JSON-byte-length comparison).
+    /// mutated the bag (the bag is compared with a copy taken before `f`
+    /// ran).
     ///
     /// Use this in place of a series of `remove_custom`/`set_custom`
     /// calls when several edits must appear atomic to a concurrent
@@ -711,15 +757,9 @@ where
 {
     type Rejection = SessionMissing;
 
-    // `_state: &S` is the single documented carve-out from the workspace's
-    // "no `_`-prefixed names" rule. `FromRequestParts<S>` is axum's trait,
-    // so the parameter shape is fixed; `S` is unconstrained (only `Send +
-    // Sync` auto-traits) so no method can be called on it, no `tracing` use
-    // is possible, and `drop(state)` triggers `drop_ref` on the `&S` borrow.
-    // Renaming to `_state` is the language-idiomatic way to express "trait
-    // requires this; this impl genuinely cannot use it" without resorting
-    // to `#[allow(unused_variables)]` or `core::hint::black_box`.
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+    // The trait fixes the state parameter and this extractor reads none of
+    // it, so it is taken as `_`.
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
         parts
             .extensions
             .get::<SessionHandle>()
@@ -729,5 +769,8 @@ where
     }
 }
 
+#[cfg(feature = "device")]
+mod device;
+mod registered;
 #[cfg(test)]
 mod tests;

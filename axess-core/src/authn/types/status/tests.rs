@@ -3,12 +3,13 @@
 
 use super::*;
 use crate::authn::types::EntityState;
+use axess_clock::testing::Shift;
 
 const SINCE: &str = "2026-06-01T12:00:00Z";
 
 #[test]
 fn constructors_state_their_cause_and_no_end() {
-    let now = chrono::Utc::now();
+    let now = axess_clock::testing::MockClock::reference_time();
     let cases = [
         (
             StatusDetail::administrative("fraud review", now),
@@ -36,9 +37,15 @@ fn constructors_state_their_cause_and_no_end() {
         assert_eq!(detail.since, now);
         assert_eq!(detail.until, None, "{cause:?}");
     }
-    let timed = StatusDetail::administrative("review", now)
-        .with_until(Some(now + chrono::Duration::hours(1)));
-    assert_eq!(timed.until, Some(now + chrono::Duration::hours(1)));
+    let timed = StatusDetail::administrative("review", now).with_until(Some(
+        axess_clock::Until::At(now.plus(axess_clock::SignedDuration::hours(1))),
+    ));
+    assert_eq!(
+        timed.until,
+        Some(axess_clock::Until::At(
+            now.plus(axess_clock::SignedDuration::hours(1))
+        ))
+    );
     assert_eq!(timed.cause, StatusCause::Administrative);
 }
 
@@ -64,7 +71,7 @@ fn a_row_written_without_a_cause_reads_as_unspecified() {
 
 #[test]
 fn every_cause_round_trips_through_serde() {
-    let now = chrono::Utc::now();
+    let now = axess_clock::testing::MockClock::reference_time();
     for cause in [
         StatusCause::Administrative,
         StatusCause::Verification,
@@ -77,7 +84,7 @@ fn every_cause_round_trips_through_serde() {
             cause: cause.clone(),
             reason: "r".into(),
             since: now,
-            until: Some(now),
+            until: Some(axess_clock::Until::At(now)),
         };
         let json = serde_json::to_string(&detail).expect("serialise");
         let back: StatusDetail = serde_json::from_str(&json).expect("deserialise");
@@ -89,7 +96,7 @@ fn every_cause_round_trips_through_serde() {
 /// value sees the same answer the type gives.
 #[test]
 fn a_written_row_carries_its_cause() {
-    let now = chrono::Utc::now();
+    let now = axess_clock::testing::MockClock::reference_time();
     let value =
         serde_json::to_value(StatusDetail::lockout("too many attempts", now)).expect("serialise");
     assert_eq!(value["cause"], serde_json::json!("Lockout"));

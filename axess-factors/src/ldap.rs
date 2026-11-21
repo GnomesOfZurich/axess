@@ -42,6 +42,20 @@ use std::time::Duration;
 
 // ── Error ────────────────────────────────────────────────────────────────────
 
+/// The most bytes of the directory's own text an error carries: a
+/// diagnostic message, or a client error that quotes one.
+const DIRECTORY_TEXT_LOG_BYTES: usize = 256;
+
+/// Text the directory wrote, as an error carries it: every character
+/// [`escapes`](crate::log_text::escapes) names (control characters, the line
+/// and paragraph separators, bidirectional controls, zero-width characters,
+/// the byte order mark, the Hangul fillers) escaped, and the whole cut at
+/// [`DIRECTORY_TEXT_LOG_BYTES`]. A directory is a remote party, and callers
+/// log these errors.
+fn directory_text(text: &str) -> String {
+    crate::log_text::log_safe(text, DIRECTORY_TEXT_LOG_BYTES)
+}
+
 /// Errors returned by the LDAP provider during connect, bind, or search operations.
 #[derive(Debug, thiserror::Error)]
 pub enum LdapError {
@@ -58,7 +72,11 @@ pub enum LdapError {
     /// `unwillingToPerform` (53), `operationsError` (1), or any other code
     /// outside the credential set listed on
     /// [`LdapProvider::verify_bind`]. `text` is the directory's diagnostic
-    /// message, which may name the server; log it, do not show it. The
+    /// message, which may name the server; log it, do not show it. It is
+    /// carried with every character [`escapes`](crate::log_text::escapes)
+    /// names (control characters, the line and paragraph separators,
+    /// bidirectional controls, zero-width characters, the byte order mark,
+    /// the Hangul fillers) escaped and cut at 256 bytes. The
     /// orchestrator answers an external-service error and counts no failed
     /// attempt, where `InvalidCredentials` feeds the lockout.
     #[error("LDAP directory could not perform the bind: rc={rc} {text}")]
@@ -128,7 +146,7 @@ pub trait LdapProvider: Send + Sync + 'static {
     /// settings, without sending a credential.
     ///
     /// Consulted before a running service swaps this provider in
-    /// (`AuthnService::reload_ldap`). The default refuses: a provider that
+    /// (`RequestAuthnService::reload_ldap_as`). The default refuses: a provider that
     /// cannot say whether its directory answers is not swapped in unchecked,
     /// so override it to connect (and unbind) or to return `Ok(())` where a
     /// check is not meaningful. Nothing on the login path calls it.
@@ -337,9 +355,9 @@ impl LdapProviderConfig {
                 vec![search.group_attr.as_str()],
             )
             .await
-            .map_err(|e| LdapError::Search(e.to_string()))?
+            .map_err(|e| LdapError::Search(directory_text(&e.to_string())))?
             .success()
-            .map_err(|e| LdapError::Search(e.to_string()))?;
+            .map_err(|e| LdapError::Search(directory_text(&e.to_string())))?;
 
         let groups = results
             .into_iter()
@@ -387,7 +405,7 @@ impl LdapProvider for LdapProviderConfig {
             )
             .await
             .map_err(|_| LdapError::Timeout)?
-            .map_err(|e| LdapError::Connection(e.to_string()))?;
+            .map_err(|e| LdapError::Connection(directory_text(&e.to_string())))?;
 
             // `ldap3` hands back a connection future that must be polled for
             // the `Ldap` handle to make progress, so it needs a task of its
@@ -402,7 +420,7 @@ impl LdapProvider for LdapProviderConfig {
                 tokio::time::timeout(self.connection_timeout, ldap.simple_bind(bind_dn, password))
                     .await
                     .map_err(|_| LdapError::Timeout)?
-                    .map_err(|e| LdapError::Connection(e.to_string()))?;
+                    .map_err(|e| LdapError::Connection(directory_text(&e.to_string())))?;
 
             if result.rc != 0 {
                 let _ = ldap.unbind().await;
@@ -411,7 +429,7 @@ impl LdapProvider for LdapProviderConfig {
                 }
                 return Err(LdapError::Directory {
                     rc: result.rc,
-                    text: result.text,
+                    text: directory_text(&result.text),
                 });
             }
 
@@ -456,7 +474,7 @@ impl LdapProvider for LdapProviderConfig {
             )
             .await
             .map_err(|_| LdapError::Timeout)?
-            .map_err(|e| LdapError::Connection(e.to_string()))?;
+            .map_err(|e| LdapError::Connection(directory_text(&e.to_string())))?;
             tokio::spawn(async move { conn.drive().await });
             let _ = ldap.unbind().await;
             Ok(())
@@ -515,7 +533,7 @@ impl MockLdapProvider {
 impl LdapProvider for MockLdapProvider {
     fn verify_bind<'a>(
         &'a self,
-        identifier: &'a str,
+        _: &'a str,
         bind_dn: &'a str,
         password: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<LdapBindResult, LdapError>> + Send + 'a>> {
@@ -525,15 +543,10 @@ impl LdapProvider for MockLdapProvider {
             if password.is_empty() {
                 return Err(LdapError::InvalidCredentials);
             }
-            let user = self.users.get(bind_dn).ok_or_else(|| {
-                tracing::debug!(
-                    target: "axess::testing::mock_ldap",
-                    identifier,
-                    bind_dn,
-                    "MockLdapProvider rejected: bind_dn not registered",
-                );
-                LdapError::InvalidCredentials
-            })?;
+            let user = self
+                .users
+                .get(bind_dn)
+                .ok_or(LdapError::InvalidCredentials)?;
 
             // Constant-time comparison even in test code; good practice and
             // prevents timing side-channels in development/staging environments

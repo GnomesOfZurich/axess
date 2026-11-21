@@ -6,6 +6,7 @@
 use super::test_support::{fixture_tenant, fixture_user, now, store, test_config};
 use super::*;
 use crate::testing::mock_random::MockRng;
+use axess_clock::testing::Shift;
 
 /// Pins the `expires_at = issued_at + ttl` invariant on freshly issued
 /// tokens. `expired_token_rejected` does not pin this: a `+`-to-`-`
@@ -37,16 +38,16 @@ async fn issued_token_expires_after_issuance() {
     .unwrap();
 
     assert!(
-        record.expires_at > record.issued_at,
-        "expires_at ({}) must be after issued_at ({}); a sign-flip in \
+        record.expires_at > axess_clock::Until::At(record.issued_at),
+        "expires_at ({:?}) must be after issued_at ({}); a sign-flip in \
          build_refresh_token would invert this and silently produce \
          tokens that are dead on arrival",
         record.expires_at,
         record.issued_at,
     );
     assert_eq!(
-        record.expires_at - record.issued_at,
-        config.ttl,
+        record.expires_at.at().unwrap().since(record.issued_at),
+        SignedDuration::try_from(config.ttl).unwrap(),
         "expires_at - issued_at must equal the configured ttl exactly; \
          this pins the additive shape against an offset / multiplier \
          drift mutation"
@@ -83,6 +84,7 @@ async fn issue_and_refresh_roundtrip() {
 
     // Use the plaintext to refresh; should produce a new session.
     let (session, new_token) = Refresh::any_tenant(&plaintext, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, ts)
         .await
         .unwrap();
@@ -100,7 +102,7 @@ async fn issue_and_refresh_roundtrip() {
 async fn expired_token_rejected() {
     let store = store();
     let config = RefreshTokenConfig {
-        ttl: Duration::seconds(1),
+        ttl: std::time::Duration::from_secs(1),
         ..test_config()
     };
     let rng = MockRng::new(99);
@@ -123,8 +125,9 @@ async fn expired_token_rejected() {
     .unwrap();
 
     // Advance time past expiry.
-    let future = ts + Duration::seconds(2);
+    let future = ts.plus(SignedDuration::seconds(2));
     let result = Refresh::any_tenant(&plaintext, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, future)
         .await;
 
@@ -163,6 +166,7 @@ async fn revoked_token_rejected() {
         .unwrap();
 
     let result = Refresh::any_tenant(&plaintext, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, ts)
         .await;
     assert!(matches!(result, Err(RefreshError::Revoked)));
@@ -196,6 +200,7 @@ async fn rotation_invalidates_old_token() {
 
     // First refresh: v1 is consumed, v2 is issued.
     let (_, new_token) = Refresh::any_tenant(&plaintext_v1, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, ts)
         .await
         .unwrap();
@@ -203,6 +208,7 @@ async fn rotation_invalidates_old_token() {
 
     // v1 should now be revoked.
     let result = Refresh::any_tenant(&plaintext_v1, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, ts)
         .await;
     assert!(matches!(result, Err(RefreshError::Revoked)));
@@ -210,6 +216,7 @@ async fn rotation_invalidates_old_token() {
     // v1 reuse triggered family revocation; v2 is also revoked (correct
     // security behavior: token theft detected → entire family invalidated).
     let result = Refresh::any_tenant(&plaintext_v2, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, ts)
         .await;
     assert!(matches!(result, Err(RefreshError::Revoked)));
@@ -239,7 +246,7 @@ async fn hash_token_pepper_branch_covered() {
         seed: u64,
         user: &UserId,
         tenant: &TenantId,
-        ts: DateTime<Utc>,
+        ts: Timestamp,
     ) -> String {
         let store = store();
         let config = RefreshTokenConfig {
@@ -247,7 +254,7 @@ async fn hash_token_pepper_branch_covered() {
             ..test_config()
         };
         let rng = MockRng::new(seed);
-        let (_plaintext, record) = issue_refresh_token(
+        let (_, record) = issue_refresh_token(
             IssueRequest {
                 user_id: user,
                 tenant_id: tenant,
@@ -266,8 +273,22 @@ async fn hash_token_pepper_branch_covered() {
     }
 
     let h_none = hash_with(None, SEED, &user, &tenant, ts).await;
-    let h_pepper_a = hash_with(Some(b"pepper-a".to_vec()), SEED, &user, &tenant, ts).await;
-    let h_pepper_b = hash_with(Some(b"pepper-b".to_vec()), SEED, &user, &tenant, ts).await;
+    let h_pepper_a = hash_with(
+        Some(b"pepper a, thirty-two bytes long.".to_vec()),
+        SEED,
+        &user,
+        &tenant,
+        ts,
+    )
+    .await;
+    let h_pepper_b = hash_with(
+        Some(b"pepper b, thirty-two bytes long.".to_vec()),
+        SEED,
+        &user,
+        &tenant,
+        ts,
+    )
+    .await;
 
     // (1) An empty pepper is refused by the config check (see
     // `config_tests`), so it never reaches a hash.
@@ -336,6 +357,7 @@ async fn replayed_rotated_token_revokes_entire_family() {
 
     // Step 1 (cont.): Alice's browser rotates v1 → v2.
     let (_, alice_rotation) = Refresh::any_tenant(&alice_v1, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, ts)
         .await
         .unwrap();
@@ -343,6 +365,7 @@ async fn replayed_rotated_token_revokes_entire_family() {
 
     // Step 2 + 3: Eve replays the rotated-out v1. Must fail.
     let eve_replay = Refresh::any_tenant(&alice_v1, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, ts)
         .await;
     assert!(
@@ -354,6 +377,7 @@ async fn replayed_rotated_token_revokes_entire_family() {
     // is now revoked. This is the contract that distinguishes axess
     // from naive "revoke just the replayed token" implementations.
     let alice_followup = Refresh::any_tenant(&alice_v2, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, ts)
         .await;
     assert!(
@@ -376,8 +400,8 @@ async fn max_per_user_enforced() {
     // Issue 3 tokens with max_per_user = 2.
     // Use increasing timestamps so `active_tokens` ordering is deterministic.
     let t1 = ts;
-    let t2 = ts + Duration::seconds(1);
-    let t3 = ts + Duration::seconds(2);
+    let t2 = ts.plus(SignedDuration::seconds(1));
+    let t3 = ts.plus(SignedDuration::seconds(2));
 
     let (pt1, _) = issue_refresh_token(
         IssueRequest {
@@ -394,7 +418,7 @@ async fn max_per_user_enforced() {
     )
     .await
     .unwrap();
-    let (_pt2, _) = issue_refresh_token(
+    let (_, _) = issue_refresh_token(
         IssueRequest {
             user_id: &fixture_user(),
             tenant_id: &fixture_tenant(),
@@ -409,7 +433,7 @@ async fn max_per_user_enforced() {
     )
     .await
     .unwrap();
-    let (_pt3, _) = issue_refresh_token(
+    let (_, _) = issue_refresh_token(
         IssueRequest {
             user_id: &fixture_user(),
             tenant_id: &fixture_tenant(),
@@ -427,6 +451,7 @@ async fn max_per_user_enforced() {
 
     // The first token should have been auto-revoked.
     let result = Refresh::any_tenant(&pt1, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, ts)
         .await;
     assert!(matches!(result, Err(RefreshError::Revoked)));
@@ -481,9 +506,11 @@ async fn revoke_user_tokens_clears_all() {
     store.revoke_user_tokens(&fixture_user()).await.unwrap();
 
     let result1 = Refresh::any_tenant(&pt1, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, ts)
         .await;
     let result2 = Refresh::any_tenant(&pt2, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, ts)
         .await;
 
@@ -523,6 +550,7 @@ async fn device_binding_mismatch_rejected() {
     // Refresh from a different device.
     let result = Refresh::any_tenant(&plaintext, |_| async { true })
         .device_info(Some("Android/15"))
+        .without_device_check()
         .run(&store, &config, &rng, ts)
         .await;
     assert!(matches!(result, Err(RefreshError::DeviceMismatch)));
@@ -530,6 +558,7 @@ async fn device_binding_mismatch_rejected() {
     // Correct device works.
     let (session, _) = Refresh::any_tenant(&plaintext, |_| async { true })
         .device_info(Some("iPhone/16"))
+        .without_device_check()
         .run(&store, &config, &rng, ts)
         .await
         .unwrap();

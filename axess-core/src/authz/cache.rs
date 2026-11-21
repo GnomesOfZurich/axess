@@ -73,3 +73,5 @@ pub use valkey_cache::ValkeyEntityCache;
 
 #[cfg(test)]
 mod shared_entities;
+#[cfg(test)]
+mod test_support;

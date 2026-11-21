@@ -9,7 +9,7 @@
 // replayed as `t=..,v2=..` is accepted once.
 #![no_main]
 
-use axess_clock::Clock;
+use axess_clock::{Clock, Timestamp};
 use axess_core::middleware::service_secret::{
     SIGNATURE_HEADER, ServiceSecret, ServiceSecretLayer, ServiceSecrets, SignedRequests,
 };
@@ -19,7 +19,6 @@ use axum::{
     http::{HeaderMap, Method, Request, StatusCode},
     routing::post,
 };
-use chrono::{DateTime, Utc};
 use libfuzzer_sys::fuzz_target;
 use std::sync::{Arc, LazyLock};
 use tower::ServiceExt as _;
@@ -28,9 +27,9 @@ const SECRET: &str = "relay-secret-0123456789abcdef0123456789";
 const AUDIENCE: &str = "billing";
 const EPOCH: i64 = 1_790_000_000;
 
-struct Fixed(DateTime<Utc>);
+struct Fixed(Timestamp);
 impl Clock for Fixed {
-    fn now(&self) -> DateTime<Utc> {
+    fn now(&self) -> Timestamp {
         self.0
     }
 }
@@ -47,13 +46,13 @@ fn app() -> Router {
     let secrets: ServiceSecrets = [ServiceSecret::new("relay", SECRET).expect("long enough")]
         .into_iter()
         .collect();
-    let until = DateTime::from_timestamp(EPOCH + 1000, 0).expect("ts");
+    let until = Timestamp::from_unix_seconds(EPOCH + 1000).expect("ts");
     let config = SignedRequests::default()
         .audience(AUDIENCE)
         .accept_v2_until(until)
         .accept_unaddressed_until(until)
         .clock(Arc::new(Fixed(
-            DateTime::from_timestamp(EPOCH, 0).expect("ts"),
+            Timestamp::from_unix_seconds(EPOCH).expect("ts"),
         )));
     Router::new()
         .route("/hook", post(|| async { "ok" }))

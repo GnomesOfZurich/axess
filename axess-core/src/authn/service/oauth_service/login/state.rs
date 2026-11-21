@@ -6,10 +6,11 @@
 //! and checks expiry, complete checks the tenant). They live here so the
 //! per-step modules can stay focused on their own happy path.
 
+use super::super::scoped::Scope;
 use crate::authn::service::{AuthnService, RequestAuthnService};
 use crate::authn::{
     event::{AuthEventBuilder, AuthEventType, AuthFailureReason},
-    factor::FactorKind,
+    factor::{FactorKind, FederatedProvider},
     store::{FactorStore, IdentityStore},
 };
 use crate::session::extractor::AuthSession;
@@ -49,6 +50,21 @@ where
         recorded
     }
 
+    /// The kind a row of the ceremony bound by `binding` records for
+    /// `provider_name`: the tenant's provider's when the binding says the
+    /// provider comes from the tenant, the global registration's otherwise.
+    pub(super) async fn ceremony_provider_kind(
+        &self,
+        binding: Option<CeremonyTenant>,
+        provider_name: &str,
+    ) -> FederatedProvider {
+        let scope = match binding {
+            Some(binding) => Scope::ceremony(binding, provider_name),
+            None => Scope::global(),
+        };
+        self.scoped_provider_kind(&scope, provider_name).await
+    }
+
     /// Record an OAuth failure audit event.
     pub(super) async fn record_oauth_failure(
         &self,
@@ -61,13 +77,17 @@ where
         // error field carry the diagnostic information.
         let user_id = session.pending_user_id().await;
         let tenant_id = session.pending_tenant_id().await;
+        // The ceremony's provider decides the kind: a binding that does not
+        // read names no provider, and the row records the name as it is.
+        let kind = match ceremony_tenant(session).await {
+            Ok(binding) => self.ceremony_provider_kind(binding, provider_name).await,
+            Err(UnreadableBinding) => FederatedProvider::Custom(provider_name.into()),
+        };
 
         self.emit_audit(
             AuthEventBuilder::failure(AuthEventType::LoginAttempt)
                 .maybe_attributed_to(user_id.as_ref(), tenant_id.as_ref())
-                .with_factor(FactorKind::Federated(
-                    crate::authn::factor::FederatedProvider::Custom(provider_name.into()),
-                ))
+                .with_factor(FactorKind::Federated(kind))
                 .with_error(reason),
         )
         .await
@@ -109,22 +129,22 @@ where
         let Some(ts) = started.as_str() else {
             return true;
         };
-        let Ok(started_at) = chrono::DateTime::parse_from_rfc3339(ts) else {
+        let Ok(started_at) = axess_clock::Timestamp::parse_rfc3339(ts) else {
             return true;
         };
         let timeout = configured.min(RFC_6749_AUTH_CODE_MAX);
         if configured > RFC_6749_AUTH_CODE_MAX {
             tracing::warn!(
-                provider = %provider_name,
+                provider = %super::super::logged_provider_name(provider_name),
                 configured_secs = configured.as_secs(),
                 cap_secs = RFC_6749_AUTH_CODE_MAX.as_secs(),
                 "provider ceremony_timeout exceeds RFC 6749 §4.1.2 RECOMMENDED 600s; capped"
             );
         }
-        let elapsed = self.inner.clock.now() - started_at.with_timezone(&chrono::Utc);
+        let elapsed = self.inner.clock.now().since(started_at);
         // A start in the future (a negative elapsed time) is no start the
         // ceremony can have had: expired.
-        elapsed.to_std().map_or(true, |elapsed| elapsed > timeout)
+        std::time::Duration::try_from(elapsed).map_or(true, |elapsed| elapsed > timeout)
     }
 
     /// Clear all OAuth ceremony state from the session.

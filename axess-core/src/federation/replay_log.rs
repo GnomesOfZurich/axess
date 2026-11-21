@@ -15,7 +15,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use chrono::{DateTime, Utc};
+use axess_clock::Timestamp;
 
 /// A [`LogoutReplayLog`] call in flight.
 pub type ReplayFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ReplayLogError>> + Send + 'a>>;
@@ -54,7 +54,7 @@ pub trait LogoutReplayLog: Send + Sync + 'static {
         &'a self,
         issuer: &'a str,
         jti: &'a str,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> ReplayFuture<'a, Recorded>;
 
     /// The action on the pair's token ended: its pair is a replay from now on.

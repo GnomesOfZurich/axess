@@ -3,18 +3,15 @@
 #![cfg(test)]
 
 use crate::{CacheStats, ClockTtlCache};
-use axess_clock::Clock;
 use axess_clock::testing::MockClock;
-use chrono::{TimeZone, Utc};
+use axess_clock::{Clock, SignedDuration};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 fn fixed_clock() -> Arc<MockClock> {
-    Arc::new(MockClock::at(
-        Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
-    ))
+    Arc::new(MockClock::at_reference())
 }
 
 fn cache(capacity: usize, ttl_secs: u64, clock: Arc<MockClock>) -> ClockTtlCache<String, u32> {
@@ -722,9 +719,13 @@ fn entry_is_expired_at_exactly_insert_plus_ttl() {
     let clk = fixed_clock();
     let c = cache(8, 60, clk.clone());
     c.insert("k".into(), 1);
-    clk.advance(chrono::Duration::seconds(60) - chrono::Duration::microseconds(1));
+    clk.advance(
+        SignedDuration::seconds(60)
+            .checked_sub(SignedDuration::microseconds(1))
+            .unwrap(),
+    );
     assert_eq!(c.get(&"k".into()), Some(1), "one microsecond before expiry");
-    clk.advance(chrono::Duration::microseconds(1));
+    clk.advance(SignedDuration::microseconds(1));
     assert_eq!(c.get(&"k".into()), None, "expiry instant is exclusive");
 }
 
@@ -768,15 +769,14 @@ async fn joiner_succeeds_and_is_cached_after_leader_fetch_fails() {
                 .await
         })
     };
-    // Let the joiner reach the cell before the leader fails. Bounded, so a
-    // counter that never moves fails the test instead of hanging it.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    // Let the joiner reach the cell before the leader fails. Bounded (ten
+    // thousand naps of a millisecond), so a counter that never moves fails
+    // the test instead of hanging it.
+    let mut naps = 0u32;
     while c.stats().single_flight_joins == 0 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the joiner never reached the in-flight cell"
-        );
-        tokio::task::yield_now().await;
+        assert!(naps < 10_000, "the joiner never reached the in-flight cell");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        naps += 1;
     }
     release.notify_one();
 

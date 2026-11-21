@@ -10,7 +10,7 @@
 //! once.
 
 use crate::session::data::SessionData;
-use crate::session::id::SessionId;
+use crate::session::id::SessionKey;
 use crate::session::store::{ConditionalUpdate, CycleOutcome, SessionStore};
 use std::future::Future;
 use std::time::Duration;
@@ -48,17 +48,17 @@ pub(crate) trait CasRow: Sync {
     /// The store's error.
     type Error;
 
-    /// The live row under `id`: the revision decoded from it, and what a
+    /// The live row under `key`: the revision decoded from it, and what a
     /// conditional write compares; `None` for no live row.
     fn read(
         &self,
-        id: &SessionId,
+        key: &SessionKey,
     ) -> impl Future<Output = Result<Option<(u64, Self::Seen)>, Self::Error>> + Send;
 
     /// Remove the row while it still holds `seen`.
     fn delete_if(
         &self,
-        id: &SessionId,
+        key: &SessionKey,
         seen: &Self::Seen,
     ) -> impl Future<Output = Result<CasWrite, Self::Error>> + Send;
 
@@ -66,7 +66,7 @@ pub(crate) trait CasRow: Sync {
     /// holds `seen`. `ttl` is never zero.
     fn replace_if(
         &self,
-        id: &SessionId,
+        key: &SessionKey,
         seen: &Self::Seen,
         data: &SessionData,
         ttl: Duration,
@@ -84,25 +84,25 @@ pub(crate) trait CasRow: Sync {
 /// session reported gone (the trait's "Zero TTL" section).
 pub(crate) async fn cas_by_revision<R: CasRow>(
     row: &R,
-    id: &SessionId,
+    key: &SessionKey,
     expected_revision: u64,
     data: &SessionData,
     ttl: Duration,
 ) -> Result<ConditionalUpdate, R::Error> {
     for _ in 0..CAS_ATTEMPTS {
-        let Some((revision, seen)) = row.read(id).await? else {
+        let Some((revision, seen)) = row.read(key).await? else {
             return Ok(ConditionalUpdate::Gone);
         };
         if revision != expected_revision {
             return Ok(ConditionalUpdate::Conflict);
         }
         let written = if ttl.is_zero() {
-            match row.delete_if(id, &seen).await? {
+            match row.delete_if(key, &seen).await? {
                 CasWrite::Done => CasWrite::Gone,
                 other => other,
             }
         } else {
-            row.replace_if(id, &seen, data, ttl).await?
+            row.replace_if(key, &seen, data, ttl).await?
         };
         match written {
             CasWrite::Done => return Ok(ConditionalUpdate::Written),
@@ -120,13 +120,15 @@ pub(crate) async fn cas_by_revision<R: CasRow>(
 /// expected revision, so a write that landed between the caller's read and
 /// the removal makes the removal miss and the answer
 /// [`CycleOutcome::Conflict`]; whoever removes the row owns the rotation, as
-/// the delete decides in `cycle`. The new row is written after the removal.
+/// the delete decides in `cycle`. The new row is written after the removal,
+/// sealed for the new key: a row is never renamed in place, because a blob
+/// sealed for one key does not authenticate under another.
 /// A failure between the two leaves neither row, which the layer treats as
 /// the failed rotation it fails closed on.
 pub(crate) async fn cycle_by_revision<S>(
     store: &S,
-    old_id: &SessionId,
-    new_id: &SessionId,
+    old: &SessionKey,
+    new: &SessionKey,
     data: &SessionData,
     ttl: Duration,
     require_old: bool,
@@ -138,25 +140,23 @@ where
     if ttl.is_zero() {
         // Nothing is stored for a zero ttl: both rows go, and the revision
         // only decides whether this caller still owned the row.
-        if let Some((revision, _)) = CasRow::read(store, old_id).await?
+        if let Some((revision, _)) = CasRow::read(store, old).await?
             && revision != expected_revision
         {
             return Ok(CycleOutcome::Conflict);
         }
-        return store.cycle(old_id, new_id, data, ttl, require_old).await;
+        return store.cycle(old, new, data, ttl, require_old).await;
     }
     for _ in 0..CAS_ATTEMPTS {
-        let step = match CasRow::read(store, old_id).await? {
+        let step = match CasRow::read(store, old).await? {
             None => CasWrite::Gone,
             Some((revision, _)) if revision != expected_revision => {
                 return Ok(CycleOutcome::Conflict);
             }
-            Some((_, seen)) if old_id == new_id => {
-                store.replace_if(new_id, &seen, data, ttl).await?
-            }
-            Some((_, seen)) => match store.delete_if(old_id, &seen).await? {
+            Some((_, seen)) if old == new => store.replace_if(new, &seen, data, ttl).await?,
+            Some((_, seen)) => match store.delete_if(old, &seen).await? {
                 CasWrite::Done => {
-                    store.save(new_id, data, ttl).await?;
+                    store.save(new, data, ttl).await?;
                     return Ok(CycleOutcome::Rotated);
                 }
                 other => other,
@@ -167,13 +167,13 @@ where
             CasWrite::Missed => {}
             CasWrite::Gone if require_old => return Ok(CycleOutcome::SessionGone),
             CasWrite::Gone => {
-                // A login on a guest whose id was never stored: no old row
+                // A login on a guest whose session was never stored: no old row
                 // to remove (an expired remnant of it goes too), and the new
                 // row is always written.
-                if old_id != new_id {
-                    store.delete(old_id).await?;
+                if old != new {
+                    store.delete(old).await?;
                 }
-                store.save(new_id, data, ttl).await?;
+                store.save(new, data, ttl).await?;
                 return Ok(CycleOutcome::Rotated);
             }
         }

@@ -3,7 +3,7 @@
 //! semantics, missing-provider returns `NoFlow`, and `DefaultFido2Provider`
 //! stores ceremony state in the session on begin.
 
-mod common;
+use axess_core::testing::fixtures as common;
 
 use axess_core::authn::AuditContext;
 use axess_core::{
@@ -47,11 +47,14 @@ fn mock_provider_returns_errors_for_all_ceremonies() {
 /// because the mock's start_registration fails.
 #[tokio::test]
 async fn service_begin_registration_with_mock_returns_error() {
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_default_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new();
     let service = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
         .with_fido2(MockFido2Provider::new())
         .build()
         .with_audit_context(AuditContext::default());
@@ -68,11 +71,16 @@ async fn service_begin_registration_with_mock_returns_error() {
 /// returns NoFlow.
 #[tokio::test]
 async fn service_begin_registration_without_provider_returns_no_flow() {
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_default_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new();
-    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
+    let service = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
+        .build()
+        .with_audit_context(AuditContext::default());
 
     let session = session_for(&test_user("u1", "alice")).await;
     let result = service
@@ -85,11 +93,16 @@ async fn service_begin_registration_without_provider_returns_no_flow() {
 /// Service without FIDO2 provider: begin_discoverable_login returns NoFlow.
 #[tokio::test]
 async fn service_discoverable_login_without_provider_returns_no_flow() {
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_default_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new();
-    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
+    let service = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
+        .build()
+        .with_audit_context(AuditContext::default());
 
     let session = test_session();
     let result = service.begin_discoverable_login(&session).await;
@@ -101,6 +114,7 @@ async fn service_discoverable_login_without_provider_returns_no_flow() {
 /// state in the session.
 #[tokio::test]
 async fn real_provider_begin_registration_stores_ceremony_state() {
+    let clock = common::test_clock();
     let rp_origin = Url::parse("https://localhost:8443").unwrap();
     let webauthn = WebauthnBuilder::new("localhost", &rp_origin)
         .unwrap()
@@ -109,10 +123,12 @@ async fn real_provider_begin_registration_stores_ceremony_state() {
     let provider = DefaultFido2Provider::new(webauthn);
 
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_default_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new();
     let service = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
         .with_fido2(provider)
         .build()
         .with_audit_context(AuditContext::default());
@@ -160,6 +176,7 @@ async fn real_provider_begin_registration_stores_ceremony_state() {
 /// produces a challenge when credentials exist.
 #[tokio::test]
 async fn real_provider_begin_discoverable_authentication() {
+    let clock = common::test_clock();
     let rp_origin = Url::parse("https://localhost:8443").unwrap();
     let webauthn = WebauthnBuilder::new("localhost", &rp_origin)
         .unwrap()
@@ -168,10 +185,12 @@ async fn real_provider_begin_discoverable_authentication() {
     let provider = DefaultFido2Provider::new(webauthn);
 
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_default_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new();
     let service = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
         .with_fido2(provider)
         .build()
         .with_audit_context(AuditContext::default());
@@ -197,6 +216,7 @@ async fn real_provider_begin_discoverable_authentication() {
 /// ceremony state exists (simulating an out-of-order call).
 #[tokio::test]
 async fn finish_registration_without_begin_returns_error() {
+    let clock = common::test_clock();
     let rp_origin = Url::parse("https://localhost:8443").unwrap();
     let webauthn = WebauthnBuilder::new("localhost", &rp_origin)
         .unwrap()
@@ -205,10 +225,12 @@ async fn finish_registration_without_begin_returns_error() {
     let provider = DefaultFido2Provider::new(webauthn);
 
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_default_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new();
     let service = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
         .with_fido2(provider)
         .build()
         .with_audit_context(AuditContext::default());

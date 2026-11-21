@@ -4,12 +4,15 @@
 //! forgets the session breaks the follow-up request, so the write is the
 //! price of the binding, not an accident.
 
-#![cfg(feature = "memory")]
+#![cfg(all(feature = "memory", feature = "testing"))]
 
+use axess_core::testing::fixtures as common;
+
+use axess_clock::testing::MockClock;
 use axess_core::middleware::csrf::{CsrfConfig, CsrfLayer, CsrfToken};
 use axess_core::session::{
     data::SessionData,
-    id::SessionId,
+    id::SessionKey,
     layer::SessionLayer,
     store::{CycleOutcome, MemorySessionStore, SessionStore},
 };
@@ -32,31 +35,31 @@ impl SessionStore for ForgetfulStore {
         &self,
         _: &axess_core::authn::ids::UserId,
         _: usize,
-    ) -> Result<Vec<(SessionId, SessionData)>, Self::Error> {
+    ) -> Result<Vec<(SessionKey, SessionData)>, Self::Error> {
         Ok(Vec::new())
     }
 
-    async fn load(&self, _id: &SessionId) -> Result<Option<SessionData>, Self::Error> {
+    async fn load(&self, _: &SessionKey) -> Result<Option<SessionData>, Self::Error> {
         Ok(None)
     }
-    async fn save(&self, _: &SessionId, _: &SessionData, _: Duration) -> Result<(), Self::Error> {
+    async fn save(&self, _: &SessionKey, _: &SessionData, _: Duration) -> Result<(), Self::Error> {
         Ok(())
     }
     async fn update(
         &self,
-        _: &SessionId,
+        _: &SessionKey,
         _: &SessionData,
         _: Duration,
     ) -> Result<bool, Self::Error> {
         Ok(false)
     }
-    async fn delete(&self, _id: &SessionId) -> Result<(), Self::Error> {
+    async fn delete(&self, _: &SessionKey) -> Result<(), Self::Error> {
         Ok(())
     }
     async fn cycle(
         &self,
-        _: &SessionId,
-        _: &SessionId,
+        _: &SessionKey,
+        _: &SessionKey,
         _: &SessionData,
         _: Duration,
         _: bool,
@@ -65,12 +68,12 @@ impl SessionStore for ForgetfulStore {
     }
     async fn update_if_revision(
         &self,
-        id: &SessionId,
+        key: &SessionKey,
         expected_revision: u64,
         data: &SessionData,
         ttl: Duration,
     ) -> Result<axess_core::session::store::ConditionalUpdate, Self::Error> {
-        let _ = (id, expected_revision, data, ttl);
+        let _ = (key, expected_revision, data, ttl);
         Ok(axess_core::session::store::ConditionalUpdate::Gone)
     }
     async fn prune_expired(&self) -> Result<u64, Self::Error> {
@@ -78,7 +81,7 @@ impl SessionStore for ForgetfulStore {
     }
 }
 
-fn router<S: SessionStore>(store: S) -> Router {
+fn router<S: SessionStore>(clock: &MockClock, store: S) -> Router {
     Router::new()
         .route(
             "/form",
@@ -91,7 +94,7 @@ fn router<S: SessionStore>(store: S) -> Router {
         )
         .layer(CsrfLayer::new(CsrfConfig::new([42u8; 32])))
         .layer(
-            SessionLayer::new(store, axess_core::testing::test_key(42), axess_core::MemorySessionRegistry::new().handle())
+            SessionLayer::new(store, axess_core::testing::test_key(42), axess_core::MemorySessionRegistry::new().with_clock(std::sync::Arc::new(clock.clone())).handle(), std::sync::Arc::new(axess_core::session::UnrecordedSessionEnds)).with_clock(clock.clone())
                 .with_ttl(Duration::from_secs(3600))
                 .with_secure(false),
         )
@@ -99,8 +102,8 @@ fn router<S: SessionStore>(store: S) -> Router {
 
 /// GET the form, then POST it back with the cookies and the token, the way a
 /// browser would; returns the POST's status.
-async fn get_then_post<S: SessionStore>(store: S) -> StatusCode {
-    let app = router(store);
+async fn get_then_post<S: SessionStore>(clock: &MockClock, store: S) -> StatusCode {
+    let app = router(clock, store);
     let first = app
         .clone()
         .oneshot(Request::get("/form").body(Body::empty()).unwrap())
@@ -132,13 +135,22 @@ async fn get_then_post<S: SessionStore>(store: S) -> StatusCode {
 
 #[tokio::test]
 async fn the_follow_up_post_passes_when_the_guest_session_was_persisted() {
+    let clock = common::test_clock();
     assert_eq!(
-        get_then_post(MemorySessionStore::new()).await,
+        get_then_post(
+            &clock,
+            MemorySessionStore::new().with_clock(std::sync::Arc::new(clock.clone()))
+        )
+        .await,
         StatusCode::OK
     );
 }
 
 #[tokio::test]
 async fn the_follow_up_post_is_refused_when_the_guest_session_was_not_kept() {
-    assert_eq!(get_then_post(ForgetfulStore).await, StatusCode::FORBIDDEN);
+    let clock = common::test_clock();
+    assert_eq!(
+        get_then_post(&clock, ForgetfulStore).await,
+        StatusCode::FORBIDDEN
+    );
 }

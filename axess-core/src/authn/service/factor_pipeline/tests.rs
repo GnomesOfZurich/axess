@@ -1,21 +1,23 @@
 //! Isolated unit tests for the factor-pipeline helpers.
 //!
-//! The pipeline split promised that each extracted helper would be
-//! "independently testable." These tests deliver on that: each
-//! `enforce_account_status`, `persist_fail_with_update`,
+//! Each helper of the pipeline is testable on its own, and these tests
+//! do that: each `enforce_account_status`, `persist_fail_with_update`,
 //! `record_factor_failure`, and `persist_pass_with_update` branch is
 //! exercised directly rather than only through a full `verify_factor`
 //! integration test. A regression in any single branch surfaces here
 //! with a much smaller blast radius than chasing it through the full
 //! login flow.
 //!
-//! `extract_authenticating_state` now lives at
-//! `AuthSession::authenticating_state`; its 3 branches
-//! (Authenticating / Guest / Authenticated) are pinned at the bottom
-//! of this file because the function pairs naturally with the rest of
-//! the pipeline even though it now lives on the session.
+//! `AuthSession::authenticating_state` is a method of the session and
+//! is tested here all the same, because it pairs with the rest of the
+//! pipeline: its 3 branches (Authenticating / Guest / Authenticated)
+//! are pinned in `tests/authenticating_state.rs`.
+//!
+//! This file holds the fixtures every topic shares; the tests sit by topic
+//! in the files under `tests/`.
 
 use super::AccountStatusEnforcement;
+use super::GuessSlot;
 use crate::authn::AuditContext;
 use crate::authn::{
     event::{AuthEvent, AuthEventStatus, AuthEventType},
@@ -32,11 +34,13 @@ use crate::testing::{
     mock_authn::{MockFactorStore, MockIdentityStore},
     test_session,
 };
-use chrono::Utc;
+use axess_clock::Timestamp;
+use axess_clock::testing::MockClock;
+use axess_clock::testing::Shift;
 use std::sync::Arc;
 
-// ── Fixture helpers (local; these compose differently than the
-// `tests/common/` set, so they're kept inline) ──────────────────────────
+// Fixture helpers, shared by every topic. They compose differently than the
+// `tests/common/` set, so they are kept here.
 
 fn uid(v: &str) -> UserId {
     axess_identity::testing::user(v)
@@ -46,8 +50,25 @@ fn tid(v: &str) -> TenantId {
     axess_identity::testing::tenant(v)
 }
 
+/// The instant every service and fixture of these tests stands at: the
+/// services read a `MockClock` frozen there, so a time a test writes and the
+/// time the service compares it with are the same clock's.
+fn start() -> Timestamp {
+    Timestamp::from_utc(2026, 1, 1, 0, 0, 0).expect("a valid instant")
+}
+
+/// A service over `identity` and `factors` on a clock frozen at [`start`].
+fn service_over<F>(identity: MockIdentityStore, factors: F) -> AuthnService<MockIdentityStore, F>
+where
+    F: crate::authn::store::FactorStore<Error = crate::testing::mock_authn::MockStoreError>,
+{
+    AuthnService::builder(identity, factors)
+        .with_clock(MockClock::at(start()))
+        .build()
+}
+
 fn user_with_status(status: EntityState) -> User {
-    let now = Utc::now();
+    let now = start();
     User {
         id: uid("u1"),
         tenant_id: tid("t1"),
@@ -63,7 +84,7 @@ fn user_with_status(status: EntityState) -> User {
 }
 
 fn fixture_tenant() -> Tenant {
-    let now = Utc::now();
+    let now = start();
     Tenant {
         id: tid("t1"),
         identifier: "default".into(),
@@ -87,9 +108,11 @@ fn email_otp_config(attempt_count: u8, max_attempts: u8) -> FactorConfig {
     FactorConfig::EmailOtp(EmailOtpConfig {
         email: "alice@example.com".into(),
         pending_hash: Some(ZeroizedString::new("hash".to_string())),
-        pending_until: Some(Utc::now() + chrono::Duration::minutes(5)),
+        pending_until: Some(axess_clock::Until::At(
+            start().plus(axess_clock::SignedDuration::minutes(5)),
+        )),
         code_length: 6,
-        ttl_secs: 300,
+        ttl: std::time::Duration::from_secs(300),
         max_attempts,
         attempt_count,
     })
@@ -109,8 +132,8 @@ fn hotp_config_with_attempts(counter: u64, attempt_count: u8) -> FactorConfig {
 }
 
 /// Build an `AuthnService` wired against the mock stores with the
-/// supplied user and tenant. `MockClock::now()` keeps timestamps
-/// deterministic so audit-row matching is sharp.
+/// supplied user and tenant, on a clock frozen at [`start`] so timestamps
+/// are deterministic and audit-row matching is sharp.
 fn build_service_with_user(
     user: User,
 ) -> (
@@ -128,8 +151,8 @@ fn build_service_with_user(
     // service runs; `MockIdentityStore` is `Clone` and shares the
     // underlying maps via `Arc`.
     let inspector = identity.clone();
-    let service = AuthnService::new(identity, MockFactorStore::new())
-        .with_audit_context(AuditContext::default());
+    let service =
+        service_over(identity, MockFactorStore::new()).with_audit_context(AuditContext::default());
     (service, inspector)
 }
 
@@ -153,7 +176,7 @@ fn build_service_with_factors(
         });
     let inspector = identity.clone();
     let factor_inspector = factors.clone();
-    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
+    let service = service_over(identity, factors).with_audit_context(AuditContext::default());
     (service, inspector, factor_inspector)
 }
 
@@ -187,826 +210,6 @@ fn locked_events(events: &[AuthEvent]) -> Vec<&AuthEvent> {
         .collect()
 }
 
-// ── enforce_account_status ──────────────────────────────────────────────
-
-#[tokio::test]
-async fn enforce_account_status_returns_ok_for_active() {
-    let user = user_with_status(EntityState::Active);
-    let (service, inspector) = build_service_with_user(user);
-    let session = authenticating_session(vec![FactorKind::Password]).await;
-
-    let result = service
-        .enforce_account_status(&uid("u1"), &tid("t1"), Some(FactorKind::Password), &session)
-        .await
-        .unwrap();
-
-    assert!(matches!(result, AccountStatusEnforcement::Ok));
-    // No audit row for an Active account.
-    assert!(
-        locked_events(&inspector.events()).is_empty(),
-        "Active account must not trigger a `locked` audit row"
-    );
-}
-
-#[tokio::test]
-async fn enforce_account_status_locked_with_until_passes_through_until_and_emits_audit() {
-    // In the future: a suspension whose `until` has passed is over.
-    let until = Utc::now() + chrono::Duration::days(1);
-    let detail = StatusDetail::administrative("policy", Utc::now()).with_until(Some(until));
-    let user = user_with_status(EntityState::Suspended(detail));
-    let (service, inspector) = build_service_with_user(user);
-    let session = authenticating_session(vec![FactorKind::Totp]).await;
-
-    let result = service
-        .enforce_account_status(&uid("u1"), &tid("t1"), Some(FactorKind::Totp), &session)
-        .await
-        .unwrap();
-
-    match result {
-        AccountStatusEnforcement::Locked { until: got_until } => {
-            assert_eq!(got_until, Some(until));
-        }
-        other => panic!("expected Locked, got {other:?}"),
-    }
-
-    // Exactly one `Locked` row, with the next factor kind on it.
-    let all_events = inspector.events();
-    let locked_events = locked_events(&all_events);
-    assert_eq!(
-        locked_events.len(),
-        1,
-        "locked-account attempt must emit exactly one Locked audit row"
-    );
-    // And it must not be recorded as an ordinary failure: the two are
-    // separate outcomes on a dashboard, which is the point of the status.
-    assert!(
-        !all_events.iter().any(|e| matches!(
-            (&e.event_type, &e.event_status),
-            (AuthEventType::FactorVerified, AuthEventStatus::Failure)
-        )),
-        "a lockout must not also appear as a Failure row"
-    );
-    let event = locked_events[0];
-    assert_eq!(event.factor_kind.as_ref(), Some(&FactorKind::Totp));
-    assert_eq!(event.user_id.as_ref(), Some(&uid("u1")));
-}
-
-#[tokio::test]
-async fn enforce_account_status_locked_indefinite_returns_until_none() {
-    let detail = StatusDetail::administrative("indefinite", Utc::now());
-    let user = user_with_status(EntityState::Suspended(detail));
-    let (service, inspector) = build_service_with_user(user);
-    let session = authenticating_session(vec![FactorKind::Password]).await;
-
-    let result = service
-        .enforce_account_status(&uid("u1"), &tid("t1"), Some(FactorKind::Password), &session)
-        .await
-        .unwrap();
-
-    match result {
-        AccountStatusEnforcement::Locked { until, .. } => {
-            assert_eq!(until, None, "indefinite suspension must surface as None")
-        }
-        other => panic!("expected Locked, got {other:?}"),
-    }
-    assert_eq!(locked_events(&inspector.events()).len(), 1);
-}
-
-#[tokio::test]
-async fn enforce_account_status_pending_returns_not_active_without_audit() {
-    let detail = StatusDetail::verification("pending email verification", Utc::now());
-    let user = user_with_status(EntityState::Pending(detail));
-    let (service, inspector) = build_service_with_user(user);
-    let session = authenticating_session(vec![FactorKind::Password]).await;
-
-    let result = service
-        .enforce_account_status(&uid("u1"), &tid("t1"), Some(FactorKind::Password), &session)
-        .await
-        .unwrap();
-
-    assert!(matches!(result, AccountStatusEnforcement::NotActive(_)));
-    // The locked-attempt audit fires only on `Locked` (Suspended).
-    // Pending / Terminated / Archived must not emit one; the SOC
-    // signal is specific to brute-force-after-lockout, not "any
-    // non-active attempt."
-    assert!(
-        locked_events(&inspector.events()).is_empty(),
-        "Pending account must not trigger the `locked` audit"
-    );
-}
-
-#[tokio::test]
-async fn enforce_account_status_no_next_kind_still_emits_audit_without_factor_field() {
-    let detail = StatusDetail::administrative("policy", Utc::now());
-    let user = user_with_status(EntityState::Suspended(detail));
-    let (service, inspector) = build_service_with_user(user);
-    let session = authenticating_session(vec![]).await;
-
-    // `next_kind = None` mirrors `verify_factor`'s behaviour when
-    // `remaining.first()` yields nothing (factor list exhausted but
-    // session somehow still in Authenticating). The audit row still
-    // fires, just without a `factor_kind` attribution.
-    service
-        .enforce_account_status(&uid("u1"), &tid("t1"), None, &session)
-        .await
-        .unwrap();
-
-    let all_events = inspector.events();
-    let events = locked_events(&all_events);
-    assert_eq!(events.len(), 1);
-    assert!(
-        events[0].factor_kind.is_none(),
-        "no next-kind ⇒ no `with_factor` on the audit row"
-    );
-}
-
-// ── persist_fail_with_update ────────────────────────────────────────────
-
-#[tokio::test]
-async fn persist_fail_with_update_initial_empty_does_plain_insert() {
-    // No user-scope row exists. `persist_fail_with_update` must save
-    // the supplied `updated_config` directly; there's nothing to race
-    // with, so no CAS is attempted (path: `applied = true` after the
-    // initial save).
-    let user = user_with_status(EntityState::Active);
-    let updated = email_otp_config(1, 5);
-    let (service, _, factors) = build_service_with_factors(user, MockFactorStore::new());
-
-    service
-        .persist_fail_with_update(&fixture_scope(), FactorKind::EmailOtp, &updated)
-        .await
-        .unwrap();
-
-    let stored = factors
-        .load_factor(&fixture_scope(), FactorKind::EmailOtp)
-        .await
-        .unwrap()
-        .expect("factor must be persisted");
-    let FactorConfig::EmailOtp(cfg) = stored else {
-        panic!("expected EmailOtp")
-    };
-    assert_eq!(cfg.attempt_count, 1);
-}
-
-#[tokio::test]
-async fn persist_fail_with_update_existing_row_uses_cas_and_recomputes() {
-    // A user-scope row already exists. The helper recomputes the
-    // failure update against the *live* value (not the inherited
-    // template) and CAS-saves it. Verifies the invariant that
-    // we don't blindly trust the caller's `updated_config`.
-    let user = user_with_status(EntityState::Active);
-    let factors = MockFactorStore::new().with_factor(fixture_scope(), email_otp_config(2, 5));
-    let (service, _, factors_inspector) = build_service_with_factors(user, factors);
-
-    // Caller's `updated_config` has failed_attempts=1, but the live
-    // row has failed_attempts=2. The helper must recompute against
-    // the live row → result should be 3, not 2.
-    let stale_updated = email_otp_config(1, 5);
-
-    service
-        .persist_fail_with_update(&fixture_scope(), FactorKind::EmailOtp, &stale_updated)
-        .await
-        .unwrap();
-
-    let stored = factors_inspector
-        .load_factor(&fixture_scope(), FactorKind::EmailOtp)
-        .await
-        .unwrap()
-        .expect("factor still present");
-    let FactorConfig::EmailOtp(cfg) = stored else {
-        panic!("expected EmailOtp")
-    };
-    assert_eq!(
-        cfg.attempt_count, 3,
-        "must recompute increment from live (2) → 3, not blindly use caller's updated (1)"
-    );
-}
-
-#[tokio::test]
-async fn persist_fail_with_update_hotp_branch_recomputes_via_apply_hotp_failure() {
-    // Same recompute invariant for HOTP; independent code path in
-    // the helper's match. Without a dedicated test, a regression that
-    // dropped the HOTP arm would only surface through full HOTP
-    // flow tests.
-    let user = user_with_status(EntityState::Active);
-    // Live store: counter=7, attempt_count=2.
-    let factors =
-        MockFactorStore::new().with_factor(fixture_scope(), hotp_config_with_attempts(7, 2));
-    let (service, _, factors_inspector) = build_service_with_factors(user, factors);
-
-    // Stale HOTP config the caller computed; attempt_count=0; the
-    // helper must IGNORE this and recompute from the live (2) → 3.
-    let stale_updated = hotp_config_with_attempts(7, 0);
-
-    service
-        .persist_fail_with_update(&fixture_scope(), FactorKind::Hotp, &stale_updated)
-        .await
-        .unwrap();
-
-    let stored = factors_inspector
-        .load_factor(&fixture_scope(), FactorKind::Hotp)
-        .await
-        .unwrap()
-        .expect("hotp factor persisted");
-    let FactorConfig::Hotp(cfg) = stored else {
-        panic!("expected Hotp")
-    };
-    // apply_hotp_failure below max_attempts: attempt_count += 1.
-    // Live had 2 → must end at 3, NOT 1 (which is what blindly using
-    // the stale `attempt_count=0 → 0+1=1` would yield).
-    assert_eq!(
-        cfg.attempt_count, 3,
-        "HOTP arm: must recompute from live (attempt_count=2 → 3), not blindly use caller's stale (0 → 1)"
-    );
-    // Counter unchanged below max_attempts.
-    assert_eq!(cfg.counter, 7);
-}
-
-#[tokio::test]
-async fn persist_fail_with_update_email_otp_retry_recomputes_after_cas_loss() {
-    // CAS-loss-then-retry path for EmailOtp. The first
-    // `compare_and_save_factor` call is forced to return `Ok(false)`
-    // via `arm_cas_failures(1)`; the helper must then reload the
-    // user-scope row, hit the EmailOtp arm in the retry match
-    // (factor_pipeline.rs:253), recompute `apply_email_otp_failure`,
-    // and CAS-succeed on the second attempt. Kills the "delete match
-    // arm EmailOtp(otp)" mutation: under the mutation the inner
-    // match falls through to `_ => break`, the loop exits with
-    // `applied = false`, and the stored attempt_count never reaches 3.
-    let user = user_with_status(EntityState::Active);
-    let factors = MockFactorStore::new().with_factor(fixture_scope(), email_otp_config(2, 5));
-    let (service, _, factors_inspector) = build_service_with_factors(user, factors);
-
-    // Force one CAS-loss before the function makes any real CAS attempt.
-    factors_inspector.arm_cas_failures(1);
-
-    let stale_updated = email_otp_config(1, 5);
-    service
-        .persist_fail_with_update(&fixture_scope(), FactorKind::EmailOtp, &stale_updated)
-        .await
-        .unwrap();
-
-    let stored = factors_inspector
-        .load_factor(&fixture_scope(), FactorKind::EmailOtp)
-        .await
-        .unwrap()
-        .expect("email otp present after retry");
-    let FactorConfig::EmailOtp(cfg) = stored else {
-        panic!("expected EmailOtp")
-    };
-    assert_eq!(
-        cfg.attempt_count, 3,
-        "retry path must recompute the EmailOtp increment from the reloaded live row (2) → 3"
-    );
-}
-
-#[tokio::test]
-async fn persist_fail_with_update_hotp_retry_recomputes_after_cas_loss() {
-    // CAS-loss-then-retry path for HOTP. Same shape as the EmailOtp
-    // test; kills the "delete match arm Hotp(otp)" mutation at
-    // factor_pipeline.rs:257. Without the arm, the retry loop's inner
-    // match drops through to `_ => break`, `applied` stays false, and
-    // the stored attempt_count never advances.
-    let user = user_with_status(EntityState::Active);
-    let factors =
-        MockFactorStore::new().with_factor(fixture_scope(), hotp_config_with_attempts(7, 2));
-    let (service, _, factors_inspector) = build_service_with_factors(user, factors);
-
-    factors_inspector.arm_cas_failures(1);
-
-    let stale_updated = hotp_config_with_attempts(7, 0);
-    service
-        .persist_fail_with_update(&fixture_scope(), FactorKind::Hotp, &stale_updated)
-        .await
-        .unwrap();
-
-    let stored = factors_inspector
-        .load_factor(&fixture_scope(), FactorKind::Hotp)
-        .await
-        .unwrap()
-        .expect("hotp present after retry");
-    let FactorConfig::Hotp(cfg) = stored else {
-        panic!("expected Hotp")
-    };
-    assert_eq!(
-        cfg.attempt_count, 3,
-        "retry path must recompute the HOTP increment from the reloaded live row (2) → 3"
-    );
-    assert_eq!(cfg.counter, 7);
-}
-
-#[tokio::test]
-async fn persist_fail_with_update_logs_warning_when_retries_exhausted() {
-    // Force every CAS attempt (initial + 8 retries) to lose. The
-    // helper must end with `applied = false` and emit the
-    // "failed to atomically increment failure counter after retries"
-    // warning. Kills the `delete !` mutation on `if !applied { warn!() }`
-    // at factor_pipeline.rs:269; under the mutation the warning is
-    // emitted ONLY on the success path, never on this exhaustion path.
-    use axess_testing::mock_tracing::TracingCapture;
-
-    let capture = TracingCapture::install();
-
-    let user = user_with_status(EntityState::Active);
-    let factors = MockFactorStore::new().with_factor(fixture_scope(), email_otp_config(2, 5));
-    let (service, _, factors_inspector) = build_service_with_factors(user, factors);
-
-    // 9 CAS losses = 1 initial + 8 retries = full exhaustion.
-    factors_inspector.arm_cas_failures(9);
-
-    let stale_updated = email_otp_config(1, 5);
-    service
-        .persist_fail_with_update(&fixture_scope(), FactorKind::EmailOtp, &stale_updated)
-        .await
-        .unwrap();
-
-    let saw_exhaustion_warning = capture.events().iter().any(|ev| {
-        ev.message
-            .contains("failed to atomically increment failure counter after retries")
-    });
-    assert!(
-        saw_exhaustion_warning,
-        "exhausted-retry path must emit the \
-         'failed to atomically increment failure counter after retries' warning"
-    );
-}
-
-/// A factor store that loses one compare-and-save, then reports the row as
-/// absent on the next read while a freshly enrolled config lands in the
-/// store: an admin delete and re-enrolment between two reads.
-#[derive(Clone)]
-struct VanishingRowFactors {
-    inner: MockFactorStore,
-    lose_next_cas: Arc<std::sync::atomic::AtomicBool>,
-    hide_next_load: Arc<std::sync::atomic::AtomicBool>,
-    enrolled: Arc<std::sync::Mutex<Option<FactorConfig>>>,
-    /// Compare-and-saves the wrapped store answered with a loss: writes
-    /// attempted against a prior that was no longer stored.
-    lost_to_the_store: Arc<std::sync::atomic::AtomicUsize>,
-}
-
-impl FactorStore for VanishingRowFactors {
-    type Error = crate::testing::mock_authn::MockStoreError;
-
-    async fn resolve_factor(
-        &self,
-        scope: &AuthnScope,
-        kind: FactorKind,
-    ) -> Result<Option<crate::authn::store::ResolvedFactor>, Self::Error> {
-        self.inner.resolve_factor(scope, kind).await
-    }
-    async fn load_factor(
-        &self,
-        scope: &AuthnScope,
-        kind: FactorKind,
-    ) -> Result<Option<FactorConfig>, Self::Error> {
-        use std::sync::atomic::Ordering;
-        if self.hide_next_load.swap(false, Ordering::SeqCst) {
-            let enrolled = self.enrolled.lock().unwrap().take();
-            if let Some(config) = enrolled {
-                self.inner.save_factor(scope, config).await?;
-            }
-            return Ok(None);
-        }
-        self.inner.load_factor(scope, kind).await
-    }
-    async fn save_factor(&self, scope: &AuthnScope, c: FactorConfig) -> Result<(), Self::Error> {
-        self.inner.save_factor(scope, c).await
-    }
-    async fn compare_and_save_factor(
-        &self,
-        scope: &AuthnScope,
-        prior: &FactorConfig,
-        updated: FactorConfig,
-    ) -> Result<bool, Self::Error> {
-        use std::sync::atomic::Ordering;
-        if self.lose_next_cas.swap(false, Ordering::SeqCst) {
-            self.hide_next_load.store(true, Ordering::SeqCst);
-            return Ok(false);
-        }
-        let swapped = self
-            .inner
-            .compare_and_save_factor(scope, prior, updated)
-            .await?;
-        if !swapped {
-            self.lost_to_the_store.fetch_add(1, Ordering::SeqCst);
-        }
-        Ok(swapped)
-    }
-    async fn insert_factor_if_absent(
-        &self,
-        scope: &AuthnScope,
-        config: FactorConfig,
-    ) -> Result<bool, Self::Error> {
-        self.inner.insert_factor_if_absent(scope, config).await
-    }
-    async fn available_methods(
-        &self,
-        u: &UserId,
-        t: &TenantId,
-    ) -> Result<Vec<crate::authn::store::AuthMethod>, Self::Error> {
-        self.inner.available_methods(u, t).await
-    }
-    async fn save_method(
-        &self,
-        s: &AuthnScope,
-        m: crate::authn::store::AuthMethod,
-    ) -> Result<(), Self::Error> {
-        self.inner.save_method(s, m).await
-    }
-    async fn remove_method(&self, s: &AuthnScope, n: &str) -> Result<(), Self::Error> {
-        self.inner.remove_method(s, n).await
-    }
-    async fn set_method_enabled(
-        &self,
-        s: &AuthnScope,
-        n: &str,
-        e: bool,
-    ) -> Result<bool, Self::Error> {
-        self.inner.set_method_enabled(s, n, e).await
-    }
-}
-
-#[tokio::test]
-async fn persist_fail_with_update_keeps_a_factor_enrolled_after_the_row_vanished() {
-    let inner = MockFactorStore::new().with_factor(fixture_scope(), hotp_config(5));
-    let factors = VanishingRowFactors {
-        inner: inner.clone(),
-        lose_next_cas: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        hide_next_load: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        enrolled: Arc::new(std::sync::Mutex::new(Some(hotp_config(77)))),
-        lost_to_the_store: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-    };
-    let identity = MockIdentityStore::new()
-        .with_tenant(fixture_tenant())
-        .with_user(user_with_status(EntityState::Active));
-    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
-
-    service
-        .persist_fail_with_update(
-            &fixture_scope(),
-            FactorKind::Hotp,
-            &hotp_config_with_attempts(5, 1),
-        )
-        .await
-        .unwrap();
-
-    let stored = inner
-        .load_factor(&fixture_scope(), FactorKind::Hotp)
-        .await
-        .unwrap()
-        .expect("hotp present");
-    assert_eq!(
-        hotp_counter(&stored),
-        77,
-        "the newly enrolled factor must not be overwritten by the stale failure record"
-    );
-}
-
-/// After the row vanished and a factor was enrolled meanwhile, the retry
-/// reloads it before writing: a compare-and-save against the prior it knew
-/// was gone would only lose and spend an attempt.
-#[tokio::test]
-async fn a_failure_record_reloads_before_writing_after_the_row_vanished() {
-    let inner = MockFactorStore::new().with_factor(fixture_scope(), hotp_config(5));
-    let lost = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let factors = VanishingRowFactors {
-        inner: inner.clone(),
-        lose_next_cas: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        hide_next_load: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        enrolled: Arc::new(std::sync::Mutex::new(Some(hotp_config(77)))),
-        lost_to_the_store: lost.clone(),
-    };
-    let identity = MockIdentityStore::new()
-        .with_tenant(fixture_tenant())
-        .with_user(user_with_status(EntityState::Active));
-    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
-
-    service
-        .persist_fail_with_update(
-            &fixture_scope(),
-            FactorKind::Hotp,
-            &hotp_config_with_attempts(5, 1),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(
-        lost.load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "no write may be attempted against a prior known to be stale"
-    );
-}
-
-// ── record_factor_failure ───────────────────────────────────────────────
-
-/// The failed-factor row names the session the attempt came from, as the
-/// locked-attempt row does.
-#[tokio::test]
-async fn the_failed_factor_row_names_its_session() {
-    let user = user_with_status(EntityState::Active);
-    let (service, inspector) = build_service_with_user(user);
-    let session = authenticating_session(vec![FactorKind::Password]).await;
-
-    service
-        .record_factor_failure(&uid("u1"), &tid("t1"), &FactorKind::Password, &session)
-        .await
-        .unwrap();
-
-    let event = inspector
-        .events()
-        .into_iter()
-        .find(|e| {
-            matches!(e.event_type, AuthEventType::FactorVerified)
-                && matches!(e.event_status, AuthEventStatus::Failure)
-        })
-        .expect("failure audit row must be emitted");
-    assert_eq!(event.session_id, Some(session.session_id().await));
-}
-
-#[tokio::test]
-async fn record_factor_failure_below_threshold_returns_invalid_credential() {
-    let user = user_with_status(EntityState::Active);
-    let (service, inspector) = build_service_with_user(user);
-    let session = authenticating_session(vec![FactorKind::Password]).await;
-
-    let outcome = service
-        .record_factor_failure(&uid("u1"), &tid("t1"), &FactorKind::Password, &session)
-        .await
-        .unwrap();
-    assert!(matches!(outcome, FactorOutcome::InvalidCredential));
-
-    // Counter incremented by exactly one.
-    assert_eq!(inspector.failed_attempts_for("u1"), 1);
-
-    // A `FactorVerified Failure` row with the kind attached.
-    let event = inspector
-        .events()
-        .into_iter()
-        .find(|e| {
-            matches!(e.event_type, AuthEventType::FactorVerified)
-                && matches!(e.event_status, AuthEventStatus::Failure)
-        })
-        .expect("failure audit row must be emitted");
-    assert_eq!(event.factor_kind.as_ref(), Some(&FactorKind::Password));
-}
-
-#[tokio::test]
-async fn record_factor_failure_at_threshold_returns_locked() {
-    let user = user_with_status(EntityState::Active);
-    let (service, inspector) = build_service_with_user(user);
-    let session = authenticating_session(vec![FactorKind::Password]).await;
-
-    // Lockout policy in `build_service_with_user` is max_attempts=3.
-    // First two attempts: InvalidCredential. Third: Locked.
-    for _ in 0..2 {
-        let outcome = service
-            .record_factor_failure(&uid("u1"), &tid("t1"), &FactorKind::Password, &session)
-            .await
-            .unwrap();
-        assert!(matches!(outcome, FactorOutcome::InvalidCredential));
-    }
-    let third = service
-        .record_factor_failure(&uid("u1"), &tid("t1"), &FactorKind::Password, &session)
-        .await
-        .unwrap();
-    // At the lockout threshold the helper returns Locked, not
-    // InvalidCredential.
-    // The verdict that *creates* the lockout now carries the
-    // lockout window (`now + policy.duration`); earlier code dropped
-    // the duration even when the policy carried it. The default mock
-    // policy has `duration: Some(15 min)`, so `until` is `Some(_)`.
-    let FactorOutcome::Locked { until } = third else {
-        panic!("expected Locked at threshold, got {third:?}");
-    };
-    let until =
-        until.expect("Locked must carry policy.duration as `until` when the policy has one");
-    // `until` must be in the FUTURE relative to the call site.
-    // Default LockoutPolicy duration is 15 min, so `until` ≈ now + 15min.
-    // The `replace + with -` mutation on `clock.now() + d` would put
-    // `until` 15 min in the *past*; silently leaving the verdict
-    // "locked but expired immediately". Pin the direction.
-    let before = chrono::Utc::now();
-    assert!(
-        until > before,
-        "Locked.until must be in the future (kills `+ → -` on \
-         `clock.now() + policy.duration`); until={until} before={before}"
-    );
-    assert_eq!(inspector.failed_attempts_for("u1"), 3);
-}
-
-#[tokio::test]
-async fn counter_store_outage_fails_closed_by_default() {
-    // `CounterUnavailable::Lock` is the default. A dead counter store must
-    // not hand an attacker an unbounded brute-force window: the attempt
-    // counts as locked even though the counter never moved.
-    let user = user_with_status(EntityState::Active);
-    let (service, inspector) = build_service_with_user(user);
-    let session = authenticating_session(vec![FactorKind::Password]).await;
-
-    inspector.arm_record_failed_attempt_failure();
-
-    let outcome = service
-        .record_factor_failure(&uid("u1"), &tid("t1"), &FactorKind::Password, &session)
-        .await
-        .expect("store errors must not propagate as Err");
-    let until = match outcome {
-        FactorOutcome::Locked { until } => until,
-        other => panic!("outage must fail closed to Locked, got {other:?}"),
-    };
-    // The window comes from the policy, exactly as on the ordinary
-    // threshold path, so a caller cannot tell the two apart.
-    let until = until.expect("policy duration is Some, so until must be Some");
-    assert!(
-        until > chrono::Utc::now(),
-        "Locked.until must be in the future; until={until}"
-    );
-
-    // The counter did not advance, and the audit row is still written,
-    // because audit comes before the increment.
-    assert_eq!(inspector.failed_attempts_for("u1"), 0);
-    assert!(
-        inspector.events().iter().any(|e| {
-            matches!(e.event_type, AuthEventType::FactorVerified)
-                && matches!(e.event_status, AuthEventStatus::Failure)
-        }),
-        "audit row must be emitted BEFORE the counter increment, so a \
-         counter-store outage doesn't suppress the SOC signal"
-    );
-}
-
-#[tokio::test]
-async fn counter_store_outage_fails_open_when_configured() {
-    // `CounterUnavailable::Allow` keeps logins working while the counter is
-    // dead, at the cost of disabling lockout. It must still not propagate
-    // `Err(AuthnError::Store)`: that would leak a distinct timing and error
-    // signature, letting an attacker separate good usernames from bad.
-    let user = user_with_status(EntityState::Active);
-    let identity = MockIdentityStore::new()
-        .with_tenant(fixture_tenant())
-        .with_user(user)
-        .with_lockout_policy(LockoutPolicy {
-            max_attempts: 3,
-            on_counter_unavailable: CounterUnavailable::Allow,
-            ..LockoutPolicy::default()
-        });
-    let inspector = identity.clone();
-    let service = AuthnService::new(identity, MockFactorStore::new())
-        .with_audit_context(AuditContext::default());
-    let session = authenticating_session(vec![FactorKind::Password]).await;
-
-    inspector.arm_record_failed_attempt_failure();
-
-    let outcome = service
-        .record_factor_failure(&uid("u1"), &tid("t1"), &FactorKind::Password, &session)
-        .await
-        .expect("store errors must not propagate as Err");
-    assert!(
-        matches!(outcome, FactorOutcome::InvalidCredential),
-        "Allow must surface the outage as InvalidCredential, not Locked or Err"
-    );
-    assert_eq!(inspector.failed_attempts_for("u1"), 0);
-}
-
-// ── persist_pass_with_update ────────────────────────────────────────────
-
-#[tokio::test]
-async fn persist_pass_with_update_inserts_when_no_user_scope_row() {
-    // First successful verification under an inherited (tenant or
-    // global) template; no user-scope row to CAS against, so the
-    // helper does a plain insert and returns `true`.
-    let user = user_with_status(EntityState::Active);
-    let (service, _, factors) = build_service_with_factors(user, MockFactorStore::new());
-
-    let updated = hotp_config(8); // post-verification counter advance
-    let saved = service
-        .persist_pass_with_update(
-            &fixture_scope(),
-            &hotp_config(7),
-            &AuthnScope::Tenant(tid("t1")),
-            updated,
-        )
-        .await
-        .unwrap();
-
-    assert!(saved, "no prior row ⇒ must save and return true");
-    let stored = factors
-        .load_factor(&fixture_scope(), FactorKind::Hotp)
-        .await
-        .unwrap()
-        .expect("hotp must be saved to user scope");
-    let FactorConfig::Hotp(cfg) = stored else {
-        panic!("expected Hotp")
-    };
-    assert_eq!(cfg.counter, 8);
-}
-
-#[tokio::test]
-async fn persist_pass_with_update_cas_succeeds_when_prior_matches() {
-    // User-scope row already exists and matches what the caller saw
-    // when verifying; CAS swaps cleanly and returns true.
-    let user = user_with_status(EntityState::Active);
-    let factors = MockFactorStore::new().with_factor(fixture_scope(), hotp_config(5));
-    let (service, _, factors_inspector) = build_service_with_factors(user, factors);
-
-    let saved = service
-        .persist_pass_with_update(
-            &fixture_scope(),
-            &hotp_config(5),
-            &fixture_scope(),
-            hotp_config(6),
-        )
-        .await
-        .unwrap();
-    assert!(saved);
-
-    let stored = factors_inspector
-        .load_factor(&fixture_scope(), FactorKind::Hotp)
-        .await
-        .unwrap()
-        .expect("present");
-    let FactorConfig::Hotp(cfg) = stored else {
-        panic!("expected Hotp")
-    };
-    assert_eq!(cfg.counter, 6);
-}
-
-#[tokio::test]
-async fn persist_pass_with_update_cas_loss_returns_false_as_replay_signal() {
-    // CAS-loss path for `persist_pass_with_update`. With
-    // `arm_cas_failures(1)` the first (and only) CAS attempt loses,
-    // so the helper must return `Ok(false)`; the caller in
-    // `verify_factor` reads that as "another writer spent the same
-    // step/counter already" and treats it as a replay.
-    let user = user_with_status(EntityState::Active);
-    let factors = MockFactorStore::new().with_factor(fixture_scope(), hotp_config(5));
-    let (service, _, factors_inspector) = build_service_with_factors(user, factors);
-
-    factors_inspector.arm_cas_failures(1);
-
-    let saved = service
-        .persist_pass_with_update(
-            &fixture_scope(),
-            &hotp_config(5),
-            &fixture_scope(),
-            hotp_config(6),
-        )
-        .await
-        .unwrap();
-    assert!(
-        !saved,
-        "CAS loss must surface as Ok(false) so the caller can flag a replay"
-    );
-}
-
-// ── AuthSession::authenticating_state ──────────────────────────
-
-#[tokio::test]
-async fn authenticating_state_destructures_authenticating_session() {
-    let session = authenticating_session(vec![FactorKind::Password, FactorKind::Totp]).await;
-    let (user_id, tenant_id, remaining) = session
-        .authenticating_state()
-        .await
-        .expect("Authenticating session must produce a triple");
-    assert_eq!(user_id, uid("u1"));
-    assert_eq!(tenant_id, tid("t1"));
-    assert_eq!(
-        remaining,
-        vec![
-            crate::authn::factor::FactorStep::Required(FactorKind::Password),
-            crate::authn::factor::FactorStep::Required(FactorKind::Totp),
-        ]
-    );
-}
-
-#[tokio::test]
-async fn authenticating_state_returns_none_for_guest_session() {
-    let session = test_session(); // Guest by default
-    assert!(
-        session.authenticating_state().await.is_none(),
-        "Guest sessions must not surface a triple; callers map None to AuthnError::NoFlow"
-    );
-}
-
-#[tokio::test]
-async fn authenticating_state_returns_none_for_authenticated_session() {
-    let session = authenticating_session(vec![FactorKind::Password]).await;
-    // Advance through the only remaining factor to flip to Authenticated.
-    session
-        .advance_factor(
-            crate::authn::assurance::FactorAssurance::for_kind(FactorKind::Password, Utc::now()),
-            &[],
-        )
-        .await;
-    assert!(session.is_authenticated().await);
-    assert!(
-        session.authenticating_state().await.is_none(),
-        "Authenticated sessions are no longer mid-flow; must yield None"
-    );
-}
-
-// ── concurrent first use and replay ─────────────────────────────────────
-
 fn hotp_counter(c: &FactorConfig) -> u64 {
     let FactorConfig::Hotp(h) = c else {
         panic!("expected Hotp")
@@ -1014,92 +217,9 @@ fn hotp_counter(c: &FactorConfig) -> u64 {
     h.counter
 }
 
-#[tokio::test]
-async fn parallel_pass_against_user_row_accepts_only_one() {
-    // Two requests verified the same code against the same stored
-    // config (counter 5). The first saves counter 6; the second still
-    // expects the value it verified against and must lose.
-    let user = user_with_status(EntityState::Active);
-    let factors = MockFactorStore::new().with_factor(fixture_scope(), hotp_config(5));
-    let (service, _, _) = build_service_with_factors(user, factors);
-    let verified = hotp_config(5);
-
-    let first = service
-        .persist_pass_with_update(
-            &fixture_scope(),
-            &verified,
-            &fixture_scope(),
-            hotp_config(6),
-        )
-        .await
-        .unwrap();
-    let second = service
-        .persist_pass_with_update(
-            &fixture_scope(),
-            &verified,
-            &fixture_scope(),
-            hotp_config(6),
-        )
-        .await
-        .unwrap();
-    assert!(first);
-    assert!(!second, "the replayed code must be rejected");
-}
-
-#[tokio::test]
-async fn parallel_pass_against_inherited_config_accepts_only_one() {
-    // No user row: both requests verified against the tenant template.
-    let user = user_with_status(EntityState::Active);
-    let (service, _, factors) = build_service_with_factors(user, MockFactorStore::new());
-    let tenant = AuthnScope::Tenant(tid("t1"));
-    let verified = hotp_config(5);
-
-    let first = service
-        .persist_pass_with_update(&fixture_scope(), &verified, &tenant, hotp_config(6))
-        .await
-        .unwrap();
-    let second = service
-        .persist_pass_with_update(&fixture_scope(), &verified, &tenant, hotp_config(6))
-        .await
-        .unwrap();
-    assert!(first);
-    assert!(!second, "the second first-use write must lose");
-    let stored = factors
-        .load_factor(&fixture_scope(), FactorKind::Hotp)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(hotp_counter(&stored), 6);
-}
-
-#[tokio::test]
-async fn parallel_first_failures_are_all_counted() {
-    // A concurrent request already recorded the first failure (count
-    // 1), but this request's read ran before that write landed, so it
-    // sees no row and computed count 1 from the inherited template.
-    // Its failure must still be added: count 2, not 1.
-    let user = user_with_status(EntityState::Active);
-    let factors =
-        MockFactorStore::new().with_factor(fixture_scope(), hotp_config_with_attempts(0, 1));
-    let (service, _, inspector) = build_service_with_factors(user, factors);
-    inspector.arm_blind_loads(1);
-
-    service
-        .persist_fail_with_update(
-            &fixture_scope(),
-            FactorKind::Hotp,
-            &hotp_config_with_attempts(0, 1),
-        )
-        .await
-        .unwrap();
-
-    let stored = inspector
-        .load_factor(&fixture_scope(), FactorKind::Hotp)
-        .await
-        .unwrap()
-        .unwrap();
-    let FactorConfig::Hotp(h) = stored else {
-        panic!("expected Hotp")
-    };
-    assert_eq!(h.attempt_count, 2, "the second failure must not be lost");
-}
+mod account_status;
+mod authenticating_state;
+mod concurrent_use;
+mod persist_fail;
+mod persist_pass;
+mod record_failure;

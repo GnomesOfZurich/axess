@@ -6,7 +6,6 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 documentation = "https://docs.rs/axess-macros"
 readme = "README.md"
 resolver = "3"
@@ -18,6 +17,9 @@ categories = ["web-programming", "authentication"]
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
 
 [dependencies]
 # Mirror axess-core's defaults EXCEPT `authz` (cedar-policy is heavy and

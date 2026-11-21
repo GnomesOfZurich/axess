@@ -23,8 +23,8 @@
 //! behind.
 
 use crate::federation::replay_log::{LogoutReplayLog, ReplayFuture};
-use axess_factors::oidc::logout_token::JTI_RETENTION_SECS;
-use chrono::{DateTime, Utc};
+use axess_clock::Timestamp;
+use axess_factors::oidc::logout_token::JTI_RETENTION;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
@@ -41,12 +41,12 @@ struct State {
     /// partition.
     issuers: HashMap<Arc<str>, HashMap<String, Entry>>,
     /// Arrival order over every issuer, oldest first; one item per entry.
-    order: VecDeque<(DateTime<Utc>, Arc<str>, String)>,
+    order: VecDeque<(Timestamp, Arc<str>, String)>,
 }
 
 /// One recorded pair.
 struct Entry {
-    seen_at: DateTime<Utc>,
+    seen_at: Timestamp,
     /// The token is still being acted on. Cleared when the action ends,
     /// whether it succeeded or not.
     in_flight: bool,
@@ -59,10 +59,15 @@ impl LogoutReplayLog for JtiLog {
         &'a self,
         issuer: &'a str,
         jti: &'a str,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> ReplayFuture<'a, Recorded> {
         Box::pin(async move {
-            let cutoff = now - chrono::Duration::seconds(JTI_RETENTION_SECS);
+            // A reading within the retention of the earliest one has no
+            // record older than it.
+            let cutoff = axess_clock::SignedDuration::try_from(JTI_RETENTION)
+                .ok()
+                .and_then(|retention| now.checked_sub(retention))
+                .unwrap_or(Timestamp::MIN);
             Ok(JtiLog::record(self, issuer, jti, now, cutoff))
         })
     }
@@ -112,8 +117,8 @@ impl JtiLog {
         &self,
         issuer: &str,
         jti: &str,
-        now: DateTime<Utc>,
-        cutoff: DateTime<Utc>,
+        now: Timestamp,
+        cutoff: Timestamp,
     ) -> Recorded {
         let mut state = self.lock();
         state.expire_before(cutoff);
@@ -186,7 +191,7 @@ impl JtiLog {
 impl State {
     /// Pop the items that arrived before `cutoff` off the front, forgetting
     /// the entry each one names.
-    fn expire_before(&mut self, cutoff: DateTime<Utc>) {
+    fn expire_before(&mut self, cutoff: Timestamp) {
         while self.order.front().is_some_and(|(at, _, _)| *at < cutoff) {
             if let Some((_, issuer, jti)) = self.order.pop_front() {
                 self.take(&issuer, &jti);
@@ -196,7 +201,7 @@ impl State {
 
     /// Remove one entry, and its issuer's partition when it was the last;
     /// returns when the entry was seen.
-    fn take(&mut self, issuer: &str, jti: &str) -> Option<DateTime<Utc>> {
+    fn take(&mut self, issuer: &str, jti: &str) -> Option<Timestamp> {
         let seen = self.issuers.get_mut(issuer)?;
         let seen_at = seen.remove(jti)?.seen_at;
         if seen.is_empty() {
@@ -215,8 +220,8 @@ mod tests {
         log: &JtiLog,
         issuer: &str,
         jti: &str,
-        now: DateTime<Utc>,
-        cutoff: DateTime<Utc>,
+        now: Timestamp,
+        cutoff: Timestamp,
     ) -> Recorded {
         let recorded = log.record(issuer, jti, now, cutoff);
         if recorded == Recorded::New {
@@ -225,8 +230,8 @@ mod tests {
         recorded
     }
 
-    fn at(secs: i64) -> DateTime<Utc> {
-        DateTime::from_timestamp(1_700_000_000 + secs, 0).unwrap()
+    fn at(secs: i64) -> Timestamp {
+        Timestamp::from_unix_seconds(1_700_000_000 + secs).unwrap()
     }
 
     #[test]

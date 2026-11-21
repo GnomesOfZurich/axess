@@ -1,7 +1,8 @@
-//! `tests`: extracted from `pii.rs` per the
-//! 200-LoC inline-test rule in AGENTS.md.
+//! `tests`: the unit tests of `pii.rs`, kept beside it per the
+//! 200-line inline-test rule in AGENTS.md.
 
 use super::*;
+use axess_clock::testing::Shift;
 
 fn user(s: &str) -> UserId {
     axess_identity::testing::user(s)
@@ -55,7 +56,7 @@ fn is_well_formed_rejects_malformed() {
 #[tokio::test]
 async fn record_then_resolve_round_trips_value() {
     let store = MemoryDevicePiiStore::new();
-    let now = Utc::now();
+    let now = axess_clock::testing::MockClock::reference_time();
     let token = store
         .record(
             &user("u1"),
@@ -85,7 +86,7 @@ async fn resolve_refuses_cross_tenant_lookup() {
             &tenant("alpha"),
             DevicePiiCategory::IpAddress,
             "203.0.113.42".to_string(),
-            Utc::now(),
+            axess_clock::testing::MockClock::reference_time(),
         )
         .await
         .unwrap();
@@ -110,7 +111,7 @@ async fn resolve_refuses_cross_tenant_lookup() {
 #[tokio::test]
 async fn erase_subject_removes_only_target_subject_mappings() {
     let store = MemoryDevicePiiStore::new();
-    let now = Utc::now();
+    let now = axess_clock::testing::MockClock::reference_time();
     let t = tenant("t1");
 
     // Two mappings for the target user across two categories.
@@ -173,7 +174,7 @@ async fn erase_subject_is_tenant_scoped() {
             &tenant("alpha"),
             DevicePiiCategory::DisplayName,
             "Alice@alpha".into(),
-            Utc::now(),
+            axess_clock::testing::MockClock::reference_time(),
         )
         .await
         .unwrap();
@@ -183,7 +184,7 @@ async fn erase_subject_is_tenant_scoped() {
             &tenant("beta"),
             DevicePiiCategory::DisplayName,
             "Alice@beta".into(),
-            Utc::now(),
+            axess_clock::testing::MockClock::reference_time(),
         )
         .await
         .unwrap();
@@ -219,7 +220,7 @@ async fn erase_subject_is_tenant_scoped() {
 async fn list_for_subject_returns_all_mappings_in_tenant() {
     let store = MemoryDevicePiiStore::new();
     let t = tenant("t1");
-    let now = Utc::now();
+    let now = axess_clock::testing::MockClock::reference_time();
     store
         .record(
             &user("alice"),
@@ -290,7 +291,7 @@ async fn resolver_returns_real_value_when_present() {
             &tenant("t1"),
             DevicePiiCategory::DisplayName,
             "Alice".into(),
-            Utc::now(),
+            axess_clock::testing::MockClock::reference_time(),
         )
         .await
         .unwrap();
@@ -351,7 +352,7 @@ async fn memory_store_len_and_is_empty_track_inserts() {
         tenant_id: axess_identity::testing::tenant("t-pii"),
         category: DevicePiiCategory::IpAddress,
         value: "1.2.3.4".to_string(),
-        created_at: chrono::Utc::now(),
+        created_at: axess_clock::testing::MockClock::reference_time(),
     };
     crate::locked::lock(&store.mappings).insert(token, mapping);
     assert_eq!(store.len(), 1);
@@ -390,7 +391,7 @@ async fn tokens_follow_the_injected_rng() {
                 &tenant("t"),
                 DevicePiiCategory::DisplayName,
                 "v".into(),
-                Utc::now(),
+                axess_clock::testing::MockClock::reference_time(),
             )
             .await
             .unwrap()
@@ -414,9 +415,9 @@ async fn tokens_follow_the_injected_rng() {
 /// map iterates in.
 #[tokio::test]
 async fn list_for_subject_is_ordered_by_creation_time() {
-    use chrono::{Duration, TimeZone};
+    use axess_clock::{SignedDuration, Timestamp};
     let store = MemoryDevicePiiStore::new();
-    let base = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let base = Timestamp::from_utc(2026, 1, 1, 0, 0, 0).unwrap();
     // Recorded newest first so insertion order is the reverse of age.
     for i in (0..40i64).rev() {
         store
@@ -425,7 +426,7 @@ async fn list_for_subject_is_ordered_by_creation_time() {
                 &tenant("t"),
                 DevicePiiCategory::DisplayName,
                 format!("v{i}"),
-                base + Duration::minutes(i),
+                base.plus(SignedDuration::minutes(i32::try_from(i).unwrap())),
             )
             .await
             .unwrap();
@@ -448,7 +449,7 @@ fn mapping_debug_does_not_carry_the_value() {
         tenant_id: tenant("t1"),
         category: DevicePiiCategory::IpAddress,
         value: "203.0.113.77".to_string(),
-        created_at: Utc::now(),
+        created_at: axess_clock::testing::MockClock::reference_time(),
     };
     assert!(!format!("{mapping:?}").contains("203.0.113.77"));
     assert!(!format!("{mapping:#?}").contains("203.0.113.77"));

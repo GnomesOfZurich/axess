@@ -7,7 +7,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use super::*;
 use crate::authn::ids::{TenantId, UserId};
 use crate::authn::types::{EntityState, Tenant, User};
-use crate::session::data::SessionData;
 use crate::session::extractor::AuthSession;
 use crate::session::layer::{SessionHandle, SessionInner};
 use tokio::sync::RwLock;
@@ -62,24 +61,13 @@ impl IdentityLookup for TenantOnly {
 }
 
 async fn session_in(tenant: TenantId) -> AuthSession {
-    let inner = SessionInner {
-        id: crate::session::id::SessionId::new(&axess_rng::SystemRng),
-        data: SessionData::default(),
-        modified: false,
-        needs_persist: false,
-        regenerate: false,
-        pre_cycle_id: None,
-        rng: std::sync::Arc::new(axess_rng::SystemRng),
-        pending_fingerprint: None,
-        max_custom_bytes: 64 * 1024,
-        consume: None,
-    };
+    let inner = SessionInner::detached(std::sync::Arc::new(axess_rng::SystemRng));
     let session = AuthSession(SessionHandle(Arc::new(RwLock::new(inner))));
     session
         .set_authenticated(
             axess_identity::testing::user("u"),
             tenant,
-            chrono::Utc::now(),
+            axess_clock::testing::MockClock::reference_time(),
         )
         .await;
     session
@@ -95,6 +83,7 @@ async fn the_cross_check_reads_only_the_tenant() {
     let validator = SessionValidator {
         registry: None,
         identity: Some(Arc::new(IdentityWrapper(store.clone()))),
+        audit: Arc::new(crate::session::UnrecordedSessionEnds),
     };
 
     assert!(validator.is_valid(&session_in(tenant).await).await);

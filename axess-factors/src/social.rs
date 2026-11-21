@@ -277,6 +277,9 @@ where
     missing_token_type_is_bearer: bool,
     claim_mapper: F,
     http: reqwest::Client,
+    /// The policy the HTTP client is built under and the endpoints were
+    /// checked against.
+    egress: crate::egress::EgressPolicy,
     // Routes through the axess RNG abstraction so DST tests can pin
     // the PKCE verifier by swapping in a `MockRng`. Default: `SystemRng`.
     rng: Arc<dyn SecureRng>,
@@ -307,17 +310,58 @@ where
     /// checked here,
     /// once: the provider's fields do not change after construction.
     ///
+    /// The client and the endpoints are under
+    /// [`EgressPolicy::screened`](crate::egress::EgressPolicy::screened), the
+    /// default: no endpoint on a loopback, private, link-local or metadata
+    /// address, and no proxy from the environment. A provider on the
+    /// deployment's own network, or a mock on loopback, goes through
+    /// [`new_screened`](Self::new_screened) with the policy named.
+    ///
     /// # Errors
     ///
     /// [`SocialError::Config`] naming the endpoint or the `redirect_uri` that is not
     /// HTTPS or loopback HTTP, without echoing its URL; [`SocialError::ClientBuild`]
     /// when the HTTP client cannot be built.
     pub fn new(config: SocialProviderConfig, claim_mapper: F) -> Result<Self, SocialError> {
+        Self::new_screened(
+            config,
+            claim_mapper,
+            crate::egress::EgressPolicy::screened(),
+        )
+    }
+
+    /// [`new`](Self::new) under the egress policy `policy`: the
+    /// authorization, token and userinfo endpoints are checked against it
+    /// here, and the HTTP client is built by it, so under a screened policy
+    /// no request follows a proxy from the environment or reaches a
+    /// loopback, private, link-local or metadata address, a host name that
+    /// resolves to one included.
+    /// [`EgressPolicy::screened_allowing_loopback_http`](crate::egress::EgressPolicy::screened_allowing_loopback_http)
+    /// is the policy for tests against a mock on the loopback interface.
+    ///
+    /// # Errors
+    ///
+    /// As [`new`](Self::new), and [`SocialError::Config`] naming the
+    /// endpoint the policy refuses and why, without its URL.
+    pub fn new_screened(
+        config: SocialProviderConfig,
+        claim_mapper: F,
+        policy: crate::egress::EgressPolicy,
+    ) -> Result<Self, SocialError> {
         require_secure_endpoint(&config.authorization_endpoint, "authorization_endpoint")?;
         require_secure_endpoint(&config.token_endpoint, "token_endpoint")?;
         require_secure_endpoint(&config.userinfo_endpoint, "userinfo_endpoint")?;
         require_secure_endpoint(&config.redirect_uri, "redirect_uri")?;
-        let http = build_http_client(|builder| builder)?;
+        for (url, what) in [
+            (&config.authorization_endpoint, "authorization_endpoint"),
+            (&config.token_endpoint, "token_endpoint"),
+            (&config.userinfo_endpoint, "userinfo_endpoint"),
+        ] {
+            policy
+                .check_url(url, what)
+                .map_err(|e| SocialError::Config(e.to_string()))?;
+        }
+        let http = build_http_client(policy, |settings| settings)?;
         Ok(Self {
             name: Arc::from(config.name.as_str()),
             authorization_endpoint: config.authorization_endpoint,
@@ -331,6 +375,7 @@ where
             missing_token_type_is_bearer: false,
             claim_mapper,
             http,
+            egress: policy,
             rng: Arc::new(SystemRng),
         })
     }
@@ -370,25 +415,30 @@ where
         self
     }
 
-    /// Adjust the `reqwest::ClientBuilder` behind the token-exchange and
-    /// userinfo calls.
+    /// Add settings to the HTTP client behind the token-exchange and
+    /// userinfo calls: a `User-Agent` of your own (some providers reject the
+    /// default `axess-social/<version>`), a trusted root certificate, a
+    /// client certificate, a connect timeout.
     ///
-    /// `adjust` receives a builder that already carries the
-    /// `axess-social/<version>` `User-Agent` and returns it changed: a
-    /// custom User-Agent (some providers reject the default), a TLS
-    /// provider or root store, an outbound HTTP proxy. The library then sets
-    /// the no-redirect policy (SSRF defense) and the 30-second per-operation
-    /// timeout on the result, so nothing `adjust` does can drop them; a
-    /// whole `reqwest::Client` cannot be supplied for the same reason.
+    /// The client is built again under the provider's egress policy, with
+    /// `configure`'s settings before the library's own: the 30-second
+    /// per-operation timeout, the no-redirect rule (SSRF defense) and, under
+    /// a screened policy, no proxy and the address screen on every name the
+    /// client resolves. A
+    /// [`ClientSettings`](crate::egress::ClientSettings) offers nothing that
+    /// could undo them (no redirect policy, no proxy, no fixed answer for a
+    /// host name), and neither a raw `reqwest` builder nor a whole client is
+    /// taken, for that reason.
     ///
     /// # Errors
     ///
-    /// [`SocialError::ClientBuild`] when the adjusted builder cannot build.
-    pub fn with_http_client_builder(
+    /// [`SocialError::ClientBuild`] when the client cannot be built with the
+    /// settings.
+    pub fn with_client_settings(
         mut self,
-        adjust: impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
+        configure: impl FnOnce(crate::egress::ClientSettings) -> crate::egress::ClientSettings,
     ) -> Result<Self, SocialError> {
-        self.http = build_http_client(adjust)?;
+        self.http = build_http_client(self.egress, configure)?;
         Ok(self)
     }
 
@@ -537,7 +587,8 @@ where
         }
         let body: TokenResponse = serde_json::from_slice(&bytes).map_err(|e| {
             SocialError::InvalidResponse(format!(
-                "token endpoint did not return JSON access_token: {e}"
+                "token endpoint did not return JSON access_token: {}",
+                crate::remote_text::parse_error(&e)
             ))
         })?;
         // The token is sent to the userinfo endpoint as a bearer token. One
@@ -571,8 +622,12 @@ where
             crate::http_body::read_limited(&mut resp, crate::http_body::MAX_USERINFO_BODY_BYTES)
                 .await
                 .map_err(|e| SocialError::InvalidResponse(format!("userinfo response: {e}")))?;
-        let raw: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|e| SocialError::InvalidResponse(format!("userinfo is not JSON: {e}")))?;
+        let raw: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+            SocialError::InvalidResponse(format!(
+                "userinfo is not JSON: {}",
+                crate::remote_text::parse_error(&e)
+            ))
+        })?;
 
         (self.claim_mapper)(&raw)
     }
@@ -581,20 +636,21 @@ where
 /// RFC 7636 §4.1: a code verifier is at least 43 characters.
 const MIN_PKCE_VERIFIER_LEN: usize = 43;
 
-/// The HTTP client: the default `User-Agent`, then the adopter's changes,
-/// then no redirects (SSRF defense) and a 30-second per-operation timeout,
-/// which come last so nothing before them can undo them.
+/// The HTTP client: the default `User-Agent`, then the adopter's settings,
+/// then a 30-second per-operation timeout and the egress policy's settings
+/// (no redirects, and under a screened policy no proxy and the address
+/// screen), which come last so nothing before them can undo them.
 fn build_http_client(
-    adjust: impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
+    policy: crate::egress::EgressPolicy,
+    configure: impl FnOnce(crate::egress::ClientSettings) -> crate::egress::ClientSettings,
 ) -> Result<reqwest::Client, SocialError> {
-    adjust(
-        reqwest::ClientBuilder::new()
-            .user_agent(concat!("axess-social/", env!("CARGO_PKG_VERSION"))),
-    )
-    .redirect(reqwest::redirect::Policy::none())
-    .timeout(std::time::Duration::from_secs(30))
-    .build()
-    .map_err(SocialError::ClientBuild)
+    policy
+        .build_client(|settings| {
+            configure(settings.user_agent(concat!("axess-social/", env!("CARGO_PKG_VERSION"))))
+                .timeout(std::time::Duration::from_secs(30))
+        })
+        .map(crate::egress::ScreenedClient::into_inner)
+        .map_err(SocialError::ClientBuild)
 }
 
 /// Minimal `application/x-www-form-urlencoded` encoder for the auth-URL

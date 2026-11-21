@@ -21,7 +21,7 @@
 ///
 /// Three positional string literals, then the session validator:
 ///
-/// 1. **`namespace`**: Cedar namespace, e.g. `"Gnomes"` or `"MyApp"`.
+/// 1. **`namespace`**: Cedar namespace, e.g. `"Acme"` or `"MyApp"`.
 ///    Must match the namespace used in the loaded Cedar policy file.
 /// 2. **`action`**: Cedar action name, e.g. `"ViewLedger"`.
 ///    Combined with namespace into `Namespace::Action::"ActionName"`.
@@ -64,40 +64,42 @@
 /// require_authz!("MyApp", "ViewLedger", "Ledger:{id}", validator = authn.session_validator())
 /// ```
 ///
-/// # Required request extensions
+/// # The installation
 ///
-/// The macro pulls the following from `request.extensions()`. Apps must
-/// install them via tower layers earlier in the middleware chain:
+/// The gate reads one thing from the request: an
+/// `axess_core::authz::AuthzInstallation`, added as a layer outside the
+/// gates. It is built once, where the router is built, from:
 ///
-/// - `Arc<axess_core::authz::PolicyStore>`: the loaded Cedar policies,
-///   typically constructed once at app startup.
-/// - `Arc<dyn axess_core::authz::RequestEntityProvider>`: builds the Cedar
-///   entity set for each request from the session, the principal, the
-///   resource and the action (`entities_for`). Wrap it in the caching
-///   decorators from `axess_core::authz::cache` where entity construction is
-///   costly. The extension must be stored under exactly this type: an
-///   `Arc<MyProvider>` is a different type to the extension map.
+/// - the `Arc<PolicyStore>` holding the loaded Cedar policies;
+/// - an `Arc<dyn RequestEntityProvider>`, which builds the Cedar entity set
+///   for each request from the session, the principal, the resource and the
+///   action (`entities_for`). Wrap it in the caching decorators from
+///   `axess_core::authz::cache` where entity construction is costly;
+/// - an `Arc<dyn RequestContextProvider>` when the policies read `context`,
+///   or `None` when they never do.
 ///
-/// If either extension is missing, the macro returns `500 Internal Server
-/// Error` and logs at `error!` level; this is a configuration bug, not
-/// a per-request error.
+/// `AuthzInstallation::new` refuses a policy store that reads `context`
+/// without a context provider, so that mistake is an error at startup. A
+/// gate that finds no installation in the request answers `500 Internal
+/// Server Error` and logs at `error!` level; this is a configuration bug,
+/// not a per-request error. No other request extension reaches the gate: a
+/// policy store or a provider installed on its own is not read.
 ///
 /// # Request context
 ///
-/// Optionally, `Arc<dyn axess_core::authz::RequestContextProvider>` builds
-/// the Cedar context (`context.mfa_verified` and similar attributes) from the
-/// session and the request head. When the provider returns an error the gate
-/// answers 403. When no provider is installed the gate evaluates with an
-/// empty context: policies that never read `context` are unaffected, and
-/// `PolicyStore` denies every request whose action schema requires a context
-/// attribute (the request is invalid) or in which a policy errors during
-/// evaluation. A policy that guards an optional attribute with
-/// `context has ..` and treats absence as allowed is the one case an empty
-/// context can permit, so declare the attributes policies rely on as
-/// required and install a provider wherever policies reason about the
-/// context. As with
-/// the entity provider, the extension must be stored under exactly the
-/// `Arc<dyn RequestContextProvider>` type.
+/// The installation's context provider builds the Cedar context
+/// (`context.mfa_verified` and similar attributes) from the session and the
+/// request head. When the provider returns an error the gate answers 403.
+/// An installation built without one belongs to a policy store that never
+/// reads `context`, and its gates evaluate with an empty context.
+///
+/// A policy reload can change that after the installation was built: when
+/// the store is reloaded to a set that reads `context` and the installation
+/// holds no provider, the gate answers 500 and logs an error for every
+/// request, because an empty context turns a `forbid` that guards an
+/// optional attribute with `context has ..` into nothing while the `permit`
+/// beside it allows. An application that reloads policies gives the
+/// installation a context provider from the start.
 ///
 /// # Failure responses
 ///
@@ -111,19 +113,24 @@
 /// - **400 Bad Request**: a path parameter is not valid UTF-8 after
 ///   percent-decoding, for an authenticated caller (an anonymous one is
 ///   401 first).
-/// - **500 Internal Server Error**: missing extensions, malformed
-///   namespace/action/resource that can't be parsed as `EntityUid`.
+/// - **500 Internal Server Error**: no installation in the request, a
+///   reloaded policy set that reads `context` on an installation without a
+///   context provider, or a malformed namespace/action/resource that can't
+///   be parsed as `EntityUid`.
 ///
 /// # Examples
 ///
 /// ```ignore
 /// use std::sync::Arc;
-/// use axess_core::authz::{PolicyStore, RequestEntityProvider};
+/// use axess_core::authz::{AuthzInstallation, PolicyStore};
 /// use axess_macros::require_authz;
-/// use axum::{Extension, Router, routing::get};
+/// use axum::{Router, routing::get};
 ///
 /// let store: Arc<PolicyStore> = Arc::new(load_policies()?);
-/// let provider: Arc<dyn RequestEntityProvider> = Arc::new(MyEntityProvider::new(db));
+/// // `None`: these policies never read `context`. A store that does is
+/// // refused here unless a context provider is passed.
+/// let installation =
+///     AuthzInstallation::new(store, Arc::new(MyEntityProvider::new(db)), None)?;
 ///
 /// let app = Router::new()
 ///     // Resource ID extracted from `{id}` path param at runtime:
@@ -136,10 +143,9 @@
 ///            get(list_users).layer(require_authz!(
 ///                "MyApp", "ManageUsers", "Platform:global",
 ///                validator = authn.session_validator())))
-///     // The two extensions every `require_authz!` reads, installed outside
-///     // the gates (layers added last run first):
-///     .layer(Extension(store))
-///     .layer(Extension(provider));
+///     // What every `require_authz!` reads, installed outside the gates
+///     // (layers added last run first):
+///     .layer(installation);
 /// ```
 ///
 /// # Path-param interpolation
@@ -172,7 +178,6 @@ macro_rules! require_authz {
              next: $crate::axum::middleware::Next| {
               let validator = validator.clone();
               async move {
-                use ::std::sync::Arc;
                 use $crate::axum::response::IntoResponse;
 
                 // The entity TYPE comes from the attribute alone: a
@@ -212,37 +217,24 @@ macro_rules! require_authz {
                     };
                 let req = $crate::axum::extract::Request::from_parts(req_parts, req_body);
 
-                // 2. Pull required extensions.
-                let store = match req
+                // 2. The installation: the policies and their providers,
+                //    the one thing the gate reads from the request.
+                let installation = match req
                     .extensions()
-                    .get::<Arc<$crate::__authz::PolicyStore>>()
+                    .get::<$crate::__authz::AuthzInstallation>()
                 {
-                    ::std::option::Option::Some(s) => Arc::clone(s),
+                    ::std::option::Option::Some(i) => i.clone(),
                     ::std::option::Option::None => {
                         $crate::tracing::error!(
                             macro_name = "require_authz!",
                             namespace = $namespace,
                             action = $action,
-                            "missing PolicyStore extension; install Extension(Arc<PolicyStore>) earlier in the middleware chain"
+                            "no AuthzInstallation in the request; build one with AuthzInstallation::new and add it as a layer outside the gates"
                         );
                         return $crate::axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
                     }
                 };
-                let provider = match req
-                    .extensions()
-                    .get::<Arc<dyn $crate::__authz::RequestEntityProvider>>()
-                {
-                    ::std::option::Option::Some(p) => Arc::clone(p),
-                    ::std::option::Option::None => {
-                        $crate::tracing::error!(
-                            macro_name = "require_authz!",
-                            namespace = $namespace,
-                            action = $action,
-                            "missing RequestEntityProvider extension; install Extension(Arc<dyn RequestEntityProvider>) earlier in the middleware chain"
-                        );
-                        return $crate::axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                    }
-                };
+                let store = installation.store();
 
                 // 3. Build EntityUids. Ids are opaque strings, never re-parsed
                 //    from formatted text, so request data cannot inject syntax.
@@ -271,7 +263,8 @@ macro_rules! require_authz {
                 //    The provider receives `&auth_session` so it can read
                 //    tenant_id (and any other session state) when constructing
                 //    principal attributes.
-                let entities = match provider
+                let entities = match installation
+                    .entities()
                     .shared_entities_for(&auth_session, &principal, &resource, &action_uid_parsed)
                     .await
                 {
@@ -294,17 +287,14 @@ macro_rules! require_authz {
                     }
                 };
 
-                // 6. The request context. A provider in the extensions builds
+                // 6. The request context. The installation's provider builds
                 //    it from the session and the request head; an error is a
-                //    denial. Without a provider the gate refuses with a 500
-                //    when the policies read `context`, and decides on an
-                //    empty context when they never do.
+                //    denial. An installation without one decides on an empty
+                //    context, unless a reload has put policies that read
+                //    `context` in force since it was built: then the gate
+                //    refuses with a 500.
                 let (req_parts, req_body) = req.into_parts();
-                let context = match req_parts
-                    .extensions
-                    .get::<Arc<dyn $crate::__authz::RequestContextProvider>>()
-                    .cloned()
-                {
+                let context = match installation.context() {
                     ::std::option::Option::Some(cp) => {
                         match cp.context_for(&auth_session, &req_parts).await {
                             ::std::result::Result::Ok(c) => c,
@@ -328,7 +318,7 @@ macro_rules! require_authz {
                     }
                     ::std::option::Option::None => {
                         if $crate::__macro_support::refuse_without_context_provider(
-                            &store, $action,
+                            store, $action,
                         ) {
                             return $crate::axum::http::StatusCode::INTERNAL_SERVER_ERROR
                                 .into_response();
@@ -342,7 +332,7 @@ macro_rules! require_authz {
                 //    response; a denial a step-up the policies name would
                 //    cure answers `step_up_required` with that step-up.
                 let decision = $crate::__authz::PolicyEvaluator::is_authorized(
-                    &*store,
+                    &**store,
                     &entities,
                     principal.clone(),
                     action_uid_parsed.clone(),
@@ -353,7 +343,7 @@ macro_rules! require_authz {
                     $crate::__authz::AuthzDecision::Allow => next.run(req).await,
                     $crate::__authz::AuthzDecision::Deny => {
                         $crate::__macro_support::refusal(
-                            &*store,
+                            store,
                             &entities,
                             principal,
                             action_uid_parsed,

@@ -19,7 +19,7 @@
 //! use wiremock::MockServer;
 //!
 //! let server = MockServer::start().await;
-//! let (_private_der, jwk, _kid) = oauth_generate_rsa_keypair();
+//! let (_, jwk, _) = oauth_generate_rsa_keypair();
 //! oauth_mount_oidc_endpoints(&server, &jwk).await;
 //! // ... point a provider at server.uri() and drive begin_oauth_login ...
 //! ```
@@ -68,6 +68,22 @@ pub fn oauth_generate_rsa_keypair() -> (Vec<u8>, serde_json::Value, String) {
     });
 
     (private_der, jwk, kid)
+}
+
+/// The PKCS#1 PEM text of a private key [`oauth_generate_rsa_keypair`]
+/// returned as DER: what a stored `private_key_jwt` credential holds.
+pub fn oauth_rsa_private_pem(der: &[u8]) -> String {
+    use base64::Engine as _;
+    let body = base64::engine::general_purpose::STANDARD.encode(der);
+    let lines: Vec<&str> = body
+        .as_bytes()
+        .chunks(64)
+        .filter_map(|c| std::str::from_utf8(c).ok())
+        .collect();
+    format!(
+        "-----BEGIN RSA PRIVATE KEY-----\n{}\n-----END RSA PRIVATE KEY-----\n",
+        lines.join("\n")
+    )
 }
 
 /// Mount OIDC discovery + JWKS on the given wiremock server. After this

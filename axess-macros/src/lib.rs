@@ -41,10 +41,7 @@ pub mod __cedar {
 #[cfg(feature = "authz")]
 #[doc(hidden)]
 pub mod __authz {
-    pub use axess_core::authz::{
-        AuthzDecision, AuthzDenied, PolicyEvaluator, PolicyStore, RequestContextProvider,
-        RequestEntityProvider,
-    };
+    pub use axess_core::authz::{AuthzDecision, AuthzDenied, AuthzInstallation, PolicyEvaluator};
 }
 
 // Internal helpers used by macro expansions.

@@ -3,8 +3,9 @@
 //! of an account that cannot log in, a password reset on one, and an audit
 //! store that is down while a session is being established.
 
-mod common;
+use axess_core::testing::fixtures as common;
 
+use axess_clock::testing::MockClock;
 use axess_core::authn::Actor;
 use axess_core::authn::factor::{FactorCredential, ZeroizedString};
 use axess_core::authn::types::{EntityState, StatusDetail};
@@ -17,35 +18,44 @@ use axess_core::testing::{
     mock_authn::{MockFactorStore, MockIdentityStore},
     test_session,
 };
-use chrono::Utc;
 use common::{
-    password_config, password_method, test_tenant, test_user, test_user_in_tenant, uid, user_scope,
+    password_config, password_method, start, test_clock, test_tenant, test_user,
+    test_user_in_tenant, uid, user_scope,
 };
 use std::time::Duration;
 
-fn service(identity: MockIdentityStore) -> RequestAuthnService<MockIdentityStore, MockFactorStore> {
-    AuthnService::new(identity, MockFactorStore::new()).with_audit_context(AuditContext::default())
+fn service(
+    clock: &MockClock,
+    identity: MockIdentityStore,
+) -> RequestAuthnService<MockIdentityStore, MockFactorStore> {
+    AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build()
+        .with_audit_context(AuditContext::default())
 }
 
 fn suspended_user(id: &str, identifier: &str) -> axess_core::authn::types::User {
     let mut u = test_user_in_tenant(id, identifier, "t1");
-    u.status = EntityState::Suspended(StatusDetail::administrative("hold", Utc::now()));
+    u.status = EntityState::Suspended(StatusDetail::administrative("hold", start()));
     u
 }
 
 #[tokio::test]
 async fn impersonation_refuses_a_suspended_target_and_leaves_the_session_alone() {
+    let clock = test_clock();
     let admin = test_user_in_tenant("admin", "ops", "t1");
     let target = suspended_user("u2", "bob");
     let svc = service(
+        &clock,
         MockIdentityStore::new()
+            .with_clock(clock.clone())
             .with_tenant(test_tenant())
             .with_user(admin.clone())
             .with_user(target.clone()),
     );
     let session = test_session();
     session
-        .set_authenticated(admin.id, admin.tenant_id, Utc::now())
+        .set_authenticated(admin.id, admin.tenant_id, start())
         .await;
     let res = svc
         .begin_impersonation_across_tenants(&admin.id, &target, &session)
@@ -60,17 +70,19 @@ async fn impersonation_refuses_a_suspended_target_and_leaves_the_session_alone()
 
 #[tokio::test]
 async fn impersonation_whose_audit_row_cannot_be_written_leaves_no_session() {
+    let clock = test_clock();
     let admin = test_user_in_tenant("admin", "ops", "t1");
     let target = test_user_in_tenant("u2", "bob", "t1");
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(admin.clone())
         .with_user(target.clone());
     identity.arm_record_event_failure();
-    let svc = service(identity);
+    let svc = service(&clock, identity);
     let session = test_session();
     session
-        .set_authenticated(admin.id, admin.tenant_id, Utc::now())
+        .set_authenticated(admin.id, admin.tenant_id, start())
         .await;
     let res = svc
         .begin_impersonation_across_tenants(&admin.id, &target, &session)
@@ -84,9 +96,12 @@ async fn impersonation_whose_audit_row_cannot_be_written_leaves_no_session() {
 
 #[tokio::test]
 async fn password_reset_is_refused_while_suspended_and_the_token_survives() {
+    let clock = test_clock();
     let user = test_user_in_tenant("u1", "alice", "t1");
     let svc = service(
+        &clock,
         MockIdentityStore::new()
+            .with_clock(clock.clone())
             .with_tenant(test_tenant())
             .with_user(user),
     );
@@ -99,7 +114,7 @@ async fn password_reset_is_refused_while_suspended_and_the_token_survives() {
     svc.suspend_user_across_tenants(
         Actor::System,
         &uid("u1"),
-        StatusDetail::administrative("hold", Utc::now()),
+        StatusDetail::administrative("hold", start()),
     )
     .await
     .unwrap();
@@ -124,26 +139,29 @@ async fn password_reset_is_refused_while_suspended_and_the_token_survives() {
 
 #[tokio::test]
 async fn login_whose_authenticated_row_cannot_be_written_leaves_no_live_session() {
+    let clock = test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new()
-        .with_factor(user_scope(), password_config("Gnomes2+"))
+        .with_factor(user_scope(), password_config("Sample2+"))
         .with_method(&uid("u1"), password_method());
-    let registry = MemorySessionRegistry::new();
+    let registry = MemorySessionRegistry::new().with_clock(std::sync::Arc::new(clock.clone()));
     let svc = AuthnService::builder(identity.clone(), factors)
+        .with_clock(clock.clone())
         .with_registry(registry.clone())
         .build()
         .with_audit_context(AuditContext::default());
 
     let session = test_session();
     svc.begin_login("alice", "default", &session).await.unwrap();
-    let sid = session.session_id().await;
+    let sid = session.session_key().await;
 
     identity.arm_record_event_failure();
     let res = svc
         .verify_factor(
-            &FactorCredential::Password(ZeroizedString::new("Gnomes2+")),
+            &FactorCredential::Password(ZeroizedString::new("Sample2+")),
             &session,
         )
         .await;

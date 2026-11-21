@@ -4,7 +4,7 @@
 
 #![cfg(feature = "testing")]
 
-mod common;
+use axess_core::testing::fixtures as common;
 
 use axess_core::authn::{
     factor::{FactorCredential, ZeroizedString},
@@ -39,13 +39,16 @@ fn recorder() -> Arc<RecordingMetrics> {
 // ── The authentication flow and the factors ─────────────────────────────────
 
 fn service(sinks: MetricSinks) -> AuthnService<MockIdentityStore, MockFactorStore> {
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new()
-        .with_factor(user_scope(), password_config("Gnomes2+"))
+        .with_factor(user_scope(), password_config("Sample2+"))
         .with_method(&uid("u1"), password_method());
     AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
         .with_kdf_executor(Arc::new(KdfExecutor::inline()))
         .with_metrics(sinks)
         .build()
@@ -101,7 +104,7 @@ async fn a_login_and_a_wrong_password_reach_the_flow_and_factor_sinks() {
 async fn a_right_password_is_a_factor_success_and_an_auth_success() {
     let all = recorder();
     let svc = service(MetricSinks::all(all.clone()));
-    login(&svc, "Gnomes2+").await;
+    login(&svc, "Sample2+").await;
     assert_eq!(all.count("factor_attempt"), 1);
     assert_eq!(all.count("factor_success"), 1);
     assert_eq!(all.count("factor_failure"), 0);
@@ -112,9 +115,7 @@ async fn a_right_password_is_a_factor_success_and_an_auth_success() {
 async fn log_in_handler(session: axess_core::session::extractor::AuthSession) -> impl IntoResponse {
     let uid = axess_core::authn::ids::testing::user("user1");
     let tid = axess_core::authn::ids::testing::tenant("tenant1");
-    session
-        .set_authenticated(uid, tid, chrono::Utc::now())
-        .await;
+    session.set_authenticated(uid, tid, common::start()).await;
     "logged in"
 }
 
@@ -162,10 +163,16 @@ fn check(cookie: &str, agent: &str) -> Request<Body> {
 /// session created by the login is counted too.
 #[tokio::test]
 async fn a_replay_from_another_client_is_a_binding_mismatch() {
+    let clock = common::test_clock();
     let sessions = recorder();
     let key = axess_core::testing::test_key(42);
-    let layer = SessionLayer::without_registry_insecure(MemorySessionStore::new(), key)
-        .with_metrics(MetricSinks::noop().with_session(sessions.clone()));
+    let layer = SessionLayer::without_registry_insecure(
+        MemorySessionStore::new().with_clock(std::sync::Arc::new(clock.clone())),
+        key,
+        std::sync::Arc::new(axess_core::session::UnrecordedSessionEnds),
+    )
+    .with_clock(clock.clone())
+    .with_metrics(MetricSinks::noop().with_session(sessions.clone()));
     let app = bound_app(layer);
     let login = send(
         &app,
@@ -194,15 +201,27 @@ async fn a_replay_from_another_client_is_a_binding_mismatch() {
 /// request, and that is counted as a backfill.
 #[tokio::test]
 async fn binding_a_session_that_stored_no_fingerprint_is_counted() {
+    let clock = common::test_clock();
     let sessions = recorder();
-    let store = MemorySessionStore::new();
+    let store = MemorySessionStore::new().with_clock(std::sync::Arc::new(clock.clone()));
     let key = axess_core::testing::test_key(42);
-    let unbound = Router::new()
-        .route("/login", post(log_in_handler))
-        .layer(SessionLayer::without_registry_insecure(store.clone(), key).with_secure(false));
+    let unbound = Router::new().route("/login", post(log_in_handler)).layer(
+        SessionLayer::without_registry_insecure(
+            store.clone(),
+            key,
+            std::sync::Arc::new(axess_core::session::UnrecordedSessionEnds),
+        )
+        .with_clock(clock.clone())
+        .with_secure(false),
+    );
     let bound = bound_app(
-        SessionLayer::without_registry_insecure(store, key)
-            .with_metrics(MetricSinks::noop().with_session(sessions.clone())),
+        SessionLayer::without_registry_insecure(
+            store,
+            key,
+            std::sync::Arc::new(axess_core::session::UnrecordedSessionEnds),
+        )
+        .with_clock(clock.clone())
+        .with_metrics(MetricSinks::noop().with_session(sessions.clone())),
     );
     let cookie = cookie_of(
         &unbound
@@ -224,15 +243,28 @@ async fn binding_a_session_that_stored_no_fingerprint_is_counted() {
 /// first request after the rotation, and that fallback is counted once.
 #[tokio::test]
 async fn a_fingerprint_under_the_previous_signing_key_is_counted_as_a_fallback() {
+    let clock = common::test_clock();
     let rotation = recorder();
-    let store = MemorySessionStore::new();
+    let store = MemorySessionStore::new().with_clock(std::sync::Arc::new(clock.clone()));
     let old = axess_core::testing::test_key(42);
     let new = axess_core::testing::test_key(43);
-    let before = bound_app(SessionLayer::without_registry_insecure(store.clone(), old));
+    let before = bound_app(
+        SessionLayer::without_registry_insecure(
+            store.clone(),
+            old,
+            std::sync::Arc::new(axess_core::session::UnrecordedSessionEnds),
+        )
+        .with_clock(clock.clone()),
+    );
     let after = bound_app(
-        SessionLayer::without_registry_insecure(store, new)
-            .with_previous_signing_key(old)
-            .with_metrics(MetricSinks::noop().with_rotation(rotation.clone())),
+        SessionLayer::without_registry_insecure(
+            store,
+            new,
+            std::sync::Arc::new(axess_core::session::UnrecordedSessionEnds),
+        )
+        .with_clock(clock.clone())
+        .with_previous_signing_key(old)
+        .with_metrics(MetricSinks::noop().with_rotation(rotation.clone())),
     );
     let login = send(
         &before,
@@ -257,9 +289,11 @@ async fn a_fingerprint_under_the_previous_signing_key_is_counted_as_a_fallback()
 /// is counted as allowed.
 #[tokio::test]
 async fn a_rate_limit_rejection_reaches_the_request_guard_sink() {
+    let clock = common::test_clock();
     let guard = recorder();
     let layer = RateLimitLayer::new(
         RateLimitConfig::builder()
+            .clock(clock.clone())
             .max_requests(1)
             .window(Duration::from_secs(60))
             .key(KeyExtractor::Header("x-client".to_string()))
@@ -290,6 +324,7 @@ async fn a_rate_limit_rejection_reaches_the_request_guard_sink() {
 /// reason; a safe request is neither.
 #[tokio::test]
 async fn a_csrf_refusal_reaches_the_request_guard_sink_with_its_reason() {
+    let clock = common::test_clock();
     let guard = recorder();
     let sinks = MetricSinks::noop().with_request_guard(guard.clone());
     let app = Router::new()
@@ -300,9 +335,11 @@ async fn a_csrf_refusal_reaches_the_request_guard_sink_with_its_reason() {
         .layer(CsrfLayer::new(CsrfConfig::new([42u8; 32])).with_metrics(sinks))
         .layer(
             SessionLayer::without_registry_insecure(
-                MemorySessionStore::new(),
+                MemorySessionStore::new().with_clock(std::sync::Arc::new(clock.clone())),
                 axess_core::testing::test_key(42),
+                std::sync::Arc::new(axess_core::session::UnrecordedSessionEnds),
             )
+            .with_clock(clock.clone())
             .with_secure(false),
         );
 
@@ -331,15 +368,20 @@ async fn a_csrf_refusal_reaches_the_request_guard_sink_with_its_reason() {
 #[cfg(feature = "oauth")]
 #[test]
 fn a_duplicate_provider_registration_is_reported_at_build() {
+    let clock = common::test_clock();
     use axess_factors::oauth::MockOAuthProvider;
     let registry = recorder();
     let sinks = MetricSinks::noop().with_provider_registry(registry.clone());
     let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        AuthnService::builder(MockIdentityStore::new(), MockFactorStore::new())
-            .with_oauth_provider(MockOAuthProvider::new("google"))
-            .with_oauth_provider(MockOAuthProvider::new("google"))
-            .with_metrics(sinks)
-            .build()
+        AuthnService::builder(
+            MockIdentityStore::new().with_clock(clock.clone()),
+            MockFactorStore::new(),
+        )
+        .with_clock(clock.clone())
+        .with_oauth_provider(MockOAuthProvider::new("google").with_clock(Arc::new(clock.clone())))
+        .with_oauth_provider(MockOAuthProvider::new("google").with_clock(Arc::new(clock.clone())))
+        .with_metrics(sinks)
+        .build()
     }));
     assert_eq!(registry.count("provider_duplicate_registration"), 1);
     assert_eq!(
@@ -353,13 +395,18 @@ fn a_duplicate_provider_registration_is_reported_at_build() {
 #[cfg(feature = "oauth")]
 #[test]
 fn distinct_providers_report_no_duplicate() {
+    let clock = common::test_clock();
     use axess_factors::oauth::MockOAuthProvider;
     let registry = recorder();
-    let _ = AuthnService::builder(MockIdentityStore::new(), MockFactorStore::new())
-        .with_oauth_provider(MockOAuthProvider::new("google"))
-        .with_oauth_provider(MockOAuthProvider::new("github"))
-        .with_metrics(MetricSinks::noop().with_provider_registry(registry.clone()))
-        .build();
+    let _ = AuthnService::builder(
+        MockIdentityStore::new().with_clock(clock.clone()),
+        MockFactorStore::new(),
+    )
+    .with_clock(clock.clone())
+    .with_oauth_provider(MockOAuthProvider::new("google").with_clock(Arc::new(clock.clone())))
+    .with_oauth_provider(MockOAuthProvider::new("github").with_clock(Arc::new(clock.clone())))
+    .with_metrics(MetricSinks::noop().with_provider_registry(registry.clone()))
+    .build();
     assert_eq!(registry.count("provider_duplicate_registration"), 0);
 }
 

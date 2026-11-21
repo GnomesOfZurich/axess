@@ -1,9 +1,12 @@
 //! A WebSocket upgrade through the session layer carries the Origin check,
 //! so a socket route outside the CSRF layer is covered too.
 
-#![cfg(feature = "memory")]
+#![cfg(all(feature = "memory", feature = "testing"))]
+
+use axess_core::testing::fixtures as common;
 
 use axess_core::session::{layer::SessionLayer, store::MemorySessionStore};
+use axess_testing::mock_tracing::LineCapture;
 use axum::{
     Router,
     body::Body,
@@ -19,10 +22,13 @@ fn app(layer: SessionLayer<MemorySessionStore>) -> Router {
 }
 
 fn layer() -> SessionLayer<MemorySessionStore> {
+    let clock = common::test_clock();
     SessionLayer::without_registry_insecure(
-        MemorySessionStore::new(),
+        MemorySessionStore::new().with_clock(std::sync::Arc::new(clock.clone())),
         axess_core::testing::test_key(1),
+        std::sync::Arc::new(axess_core::session::UnrecordedSessionEnds),
     )
+    .with_clock(clock.clone())
 }
 
 /// An upgrade to `app.example.com` as a browser sends it, with `origin`.
@@ -90,4 +96,33 @@ async fn an_ordinary_request_is_not_origin_checked() {
         .body(Body::empty())
         .unwrap();
     assert_eq!(status(&app, plain).await, StatusCode::OK);
+}
+
+/// A refused upgrade's log line names the route the router matched, never
+/// the path the client sent: a path can carry a credential.
+#[tokio::test]
+async fn a_refused_upgrade_logs_its_route_and_not_its_path() {
+    let printed = LineCapture::install();
+    let app = Router::new()
+        .route("/ws/{token}", get(|| async { "upgraded" }))
+        .layer(layer());
+    let req = Request::get("/ws/marker-7c1e")
+        .header(header::HOST, "app.example.com")
+        .header(header::UPGRADE, "websocket")
+        .header(header::CONNECTION, "Upgrade")
+        .header(header::ORIGIN, "https://evil.example.net")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(status(&app, req).await, StatusCode::FORBIDDEN);
+    let text = printed.text();
+    assert!(
+        !text.contains("marker-7c1e"),
+        "the concrete path reached a line: {text}"
+    );
+    let line = printed
+        .lines()
+        .into_iter()
+        .find(|l| l.contains("WebSocket upgrade refused"))
+        .unwrap_or_else(|| panic!("no refusal line: {text}"));
+    assert!(line.contains("route=/ws/{token}"), "{line}");
 }

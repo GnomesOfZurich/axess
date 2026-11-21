@@ -4,7 +4,7 @@ use super::*;
 async fn mock_accepts_correct_password() {
     let provider = MockLdapProvider::new("uid={user},ou=people,dc=example,dc=com").with_user(
         "alice",
-        "Gnomes2+",
+        "Sample2+",
         vec!["engineers", "admins"],
     );
 
@@ -12,7 +12,7 @@ async fn mock_accepts_correct_password() {
     assert_eq!(dn, "uid=alice,ou=people,dc=example,dc=com");
 
     let result = provider
-        .verify_bind("alice", &dn, "Gnomes2+")
+        .verify_bind("alice", &dn, "Sample2+")
         .await
         .unwrap();
     assert_eq!(result.bind_dn, dn);
@@ -41,14 +41,14 @@ async fn empty_password_is_refused_as_an_unauthenticated_bind() {
 }
 
 /// A directory that accepts the socket and then never answers the bind
-/// ends in `Timeout` after the configured bound; it used to hold the
-/// login open for as long as the peer cared to stay silent.
+/// ends in `Timeout` after the configured bound, and does not hold the
+/// login open for as long as the peer cares to stay silent.
 #[tokio::test]
 async fn a_directory_that_goes_quiet_after_connecting_times_out() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ldap://{}", listener.local_addr().unwrap());
     // Accept and hold the socket open without ever replying.
-    let _quiet = tokio::spawn(async move {
+    let quiet = tokio::spawn(async move {
         let held = listener.accept().await;
         tokio::time::sleep(Duration::from_secs(30)).await;
         drop(held);
@@ -63,6 +63,9 @@ async fn a_directory_that_goes_quiet_after_connecting_times_out() {
     .await
     .expect("verify_bind must give up by itself, not hang");
     assert!(matches!(outcome, Err(LdapError::Timeout)), "{outcome:?}");
+    // The silent peer's task is left to run out: dropping its handle
+    // detaches it, here at the end of the test as before.
+    drop(quiet);
 }
 
 #[tokio::test]
@@ -163,7 +166,7 @@ fn ldap_dn_escape_hash_only_at_start_of_dn() {
 
 #[test]
 fn ldap_dn_escape_space_at_dn_boundary() {
-    // Leading/trailing spaces use the `\ ` form (line 437 match arm).
+    // Leading/trailing spaces use the `\ ` form (its own match arm).
     assert_eq!(ldap_dn_escape(" alice"), "\\ alice");
     assert_eq!(ldap_dn_escape("alice "), "alice\\ ");
     assert_eq!(ldap_dn_escape(" "), "\\ ");
@@ -207,9 +210,30 @@ fn ldap_filter_escape_special_chars() {
 /// The LDAPMessage of a BindResponse: `SEQUENCE { messageID, [APPLICATION 1]
 /// { resultCode ENUMERATED, matchedDN "", diagnosticMessage "" } }`.
 fn bind_response(message_id: u8, rc: u8) -> Vec<u8> {
-    vec![
-        0x30, 0x0c, 0x02, 0x01, message_id, 0x61, 0x07, 0x0a, 0x01, rc, 0x04, 0x00, 0x04, 0x00,
-    ]
+    bind_response_saying(message_id, rc, "")
+}
+
+/// One BER element: `tag`, the length of `content` in short or long form,
+/// then `content`.
+fn ber(tag: u8, content: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    match content.len() {
+        n @ 0..=0x7f => out.push(n as u8),
+        n @ 0x80..=0xff => out.extend([0x81, n as u8]),
+        n => out.extend([0x82, (n >> 8) as u8, n as u8]),
+    }
+    out.extend_from_slice(content);
+    out
+}
+
+/// As [`bind_response`], with `diagnostic` as the diagnosticMessage.
+fn bind_response_saying(message_id: u8, rc: u8, diagnostic: &str) -> Vec<u8> {
+    let mut result = vec![0x0a, 0x01, rc];
+    result.extend(ber(0x04, b""));
+    result.extend(ber(0x04, diagnostic.as_bytes()));
+    let mut message = vec![0x02, 0x01, message_id];
+    message.extend(ber(0x61, &result));
+    ber(0x30, &message)
 }
 
 /// The messageID of an LDAPMessage: the INTEGER after the outer SEQUENCE
@@ -228,6 +252,12 @@ fn ber_message_id(message: &[u8]) -> Option<u8> {
 /// A directory that answers the first bind with `rc` and then waits for
 /// the client to go. Returns the URL to reach it on.
 async fn directory_answering(rc: u8) -> String {
+    directory_saying(rc, String::new()).await
+}
+
+/// As [`directory_answering`], with `diagnostic` as the answer's
+/// diagnostic message.
+async fn directory_saying(rc: u8, diagnostic: String) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ldap://{}", listener.local_addr().unwrap());
     tokio::spawn(async move {
@@ -238,15 +268,21 @@ async fn directory_answering(rc: u8) -> String {
         let mut buf = [0u8; 512];
         let n = socket.read(&mut buf).await.unwrap_or(0);
         let id = ber_message_id(&buf[..n]).unwrap_or(1);
-        let _ = socket.write_all(&bind_response(id, rc)).await;
+        let _ = socket
+            .write_all(&bind_response_saying(id, rc, &diagnostic))
+            .await;
         let _ = socket.read(&mut buf).await;
     });
     url
 }
 
 async fn bind_against(rc: u8) -> Result<LdapBindResult, LdapError> {
-    let provider = LdapProviderConfig::new(directory_answering(rc).await, "uid={user},dc=example")
-        .with_timeout(Duration::from_secs(5));
+    bind_at(directory_answering(rc).await).await
+}
+
+async fn bind_at(url: String) -> Result<LdapBindResult, LdapError> {
+    let provider =
+        LdapProviderConfig::new(url, "uid={user},dc=example").with_timeout(Duration::from_secs(5));
     tokio::time::timeout(
         Duration::from_secs(10),
         provider.verify_bind("alice", "uid=alice,dc=example", "secret"),
@@ -256,9 +292,9 @@ async fn bind_against(rc: u8) -> Result<LdapBindResult, LdapError> {
 }
 
 /// `busy`, `unavailable`, `unwillingToPerform`, `operationsError` and
-/// `other` say the directory could not judge the password. They used to be
-/// answered `InvalidCredentials`, which the orchestrator counts towards the
-/// lockout: a directory outage locked every user out.
+/// `other` say the directory could not judge the password. Answered as
+/// `InvalidCredentials`, which the orchestrator counts towards the lockout,
+/// they would let a directory outage lock every user out.
 #[tokio::test]
 async fn a_directory_that_cannot_answer_is_not_a_credential_verdict() {
     for rc in [1u8, 51, 52, 53, 80] {
@@ -268,6 +304,42 @@ async fn a_directory_that_cannot_answer_is_not_a_credential_verdict() {
             "rc {rc}: {outcome:?}"
         );
     }
+}
+
+/// The empty diagnostic the encoder writes is the fixed form the other
+/// tests have always sent.
+#[test]
+fn the_encoded_bind_response_with_no_diagnostic_is_the_fixed_form() {
+    assert_eq!(
+        bind_response(7, 51),
+        [
+            0x30, 0x0c, 0x02, 0x01, 7, 0x61, 0x07, 0x0a, 0x01, 51, 0x04, 0x00, 0x04, 0x00
+        ]
+    );
+}
+
+/// The diagnostic message is the directory's text: the error carries it
+/// with control characters escaped and cut at 256 bytes, so a directory
+/// can neither forge a log line nor fill one.
+#[tokio::test]
+async fn a_directory_diagnostic_is_carried_cut_and_escaped() {
+    let diagnostic = format!(
+        "busy\nWARN forged line\r\u{1b}[31m\u{2028}{}",
+        "A".repeat(3000)
+    );
+    let outcome = bind_at(directory_saying(51, diagnostic).await).await;
+    let Err(LdapError::Directory { rc: 51, text }) = &outcome else {
+        panic!("expected the directory's refusal, got {outcome:?}");
+    };
+    assert!(text.len() <= 256, "{} bytes", text.len());
+    assert!(text.ends_with("..."), "the cut is marked: {text}");
+    assert!(
+        !text
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')),
+        "{text:?}"
+    );
+    assert!(text.starts_with("busy\\nWARN forged line\\r"), "{text}");
 }
 
 /// `invalidCredentials`, `inappropriateAuthentication` and `noSuchObject`

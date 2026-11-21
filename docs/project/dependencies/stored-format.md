@@ -1,45 +1,48 @@
-# One stored-data format
+# Stored session formats
 
-## Today
+## What is written and what is read
 
-A stored session is MessagePack, optionally sealed with AES-256-GCM, and every
-decode falls back to JSON on any MessagePack failure:
-`SessionCodec::decode_payload` tries `rmp_serde::from_slice` and then
-`serde_json::from_slice`, and `decode_text` sends a plaintext row that starts
-with `{` straight to `serde_json`. Every stored session can therefore be read
-in two formats, corruption or a downgrade is accepted silently, and the JSON
-path stays a fuzz target (`fuzz/fuzz_targets/session_data_json.rs`) with no
-end date. `rkyv` derives sit on the same types (events, ids, factor types)
-with no storage call site.
+Every session store (SQLite, PostgreSQL, MySQL, Valkey) writes a session as
+MessagePack, sealed with AES-256-GCM when the store holds a
+`SessionCrypto`: `SessionCodec::encode_bytes` serialises with
+`rmp_serde::to_vec_named` on every write, and has since 0.2.0, the first
+release that wrote MessagePack. A read accepts MessagePack and nothing
+else: `SessionCodec::decode_payload` reads the schema version first and
+decodes with `rmp_serde::from_slice`, in the shape this release writes. A
+SQL store reads the binary column only. A row whose binary column is NULL
+fails with `SqlStoreError::Decode` and loads no session, whatever its text
+column holds; so does a row in any other encoding or shape. A row below the
+current schema version is not decoded at all: the store hands up its
+version, and the session layer refuses it (see *Schema migration*).
 
-## Plan
+`LegacyBlobs` does not apply to a session: a stored session is opened in
+the current sealed form only (`axess.session.v2`, bound to the session's
+key), whatever the policy says. The policy decides whether a blob without
+the current format marker is read for device rows and factor secrets (one
+sealed before row binding, a 0.11.0 device format, an OTP secret still in
+plain text), and never how the session inside a blob is encoded.
 
-1. Turn the JSON fallback off by default behind the existing `LegacyBlobs`
-   policy (`session/legacy_blobs.rs`), with an `AcceptUntil` form that names
-   the date after which a JSON row is refused, or a cargo feature
-   `legacy-json-sessions`. The default is a change adopters see: a migration
-   paragraph and a decision.
-2. When a JSON row is read under the policy, re-seal it as MessagePack
-   (`state.stale = true`), so the population drains.
-3. In the next major release delete the fallback and the `decode_text` `{`
-   path. `serde_json` then stops being a stored-data parser.
-4. Mark `rkyv` unsupported or experimental, or remove it. If it stays,
-   callers use the bytecheck access APIs (`rkyv::access`, `from_bytes`) and
-   never `access_unchecked`.
-5. CI prints `cargo tree -e features` for the storage features, so which
-   dependency pulls which feature is visible.
+## A session stored as JSON
 
-## Files
+Before 0.2.0 a session could be stored as JSON. A JSON row, plain or
+sealed, whether the 0.1.x line or a hand-written tool wrote it, is
+refused: its load fails with `SqlStoreError::Decode` and its user signs in
+again. There is no conversion step. An operator who wants the rows gone
+deletes the session rows that do not load; a row that is never loaded
+expires with its TTL.
 
-- `axess-core/src/session/storage/session_codec.rs` and
+## rkyv
+
+The `rkyv` features of `axess-core`, `axess-events`, `axess-identity` and
+`axess-strings` derive archive implementations on the ids, the events and
+the types of an audit event. No store of the library writes or reads rkyv:
+the derives serve an application that encodes these types itself, as the
+documentation of `RichAuthnEvent` shows for an analytics stream.
+
+## Where it lives
+
+- `axess-core/src/session/storage/session_codec.rs` and its tests in
   `axess-core/src/session/storage/session_codec/`
 - `axess-core/src/session/legacy_blobs.rs`
-- `fuzz/fuzz_targets/session_data_json.rs`, `fuzz/fuzz_targets/session_data_msgpack.rs`
-- `Cargo.toml` (`rkyv`), and the `rkyv` features of `axess-core`,
-  `axess-events`, `axess-identity` and `axess-strings`
-
-## Checks
-
-A row written as JSON is read, re-sealed and then read as MessagePack; with
-the policy off the same row is refused by name; the MessagePack fuzz target
-keeps running and the JSON one is deleted with the fallback.
+- `fuzz/fuzz_targets/session_data_msgpack.rs`, which holds the decoder to
+  arbitrary input and to a round trip

@@ -6,7 +6,6 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 documentation = "https://docs.rs/axess-cache"
 readme = "README.md"
 description = """
@@ -25,11 +24,8 @@ exclude = ["tests/", "benches/"]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
-# `cfg(loom)` is a runtime-toggled flag (set via `RUSTFLAGS='--cfg loom'`)
-# that activates the permutation-checked tests in `tests/loom_invariants.rs`.
-# Registering it here so rustc doesn't warn about an unknown cfg name.
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+[lints]
+workspace = true
 
 [dependencies]
 axess-clock = { workspace = true }
@@ -48,13 +44,10 @@ tracing = { workspace = true }
 # full-workspace build another member switches it on, so these tests compiled
 # by accident; `cargo test -p axess-cache` on its own did not.
 axess-clock = { workspace = true, features = ["testing", "allow-testing-in-release"] }
-# `chrono` is only used in tests/doctests to construct fixed wall-clock times
-# for `MockClock::at(...)`; runtime never imports chrono directly, all time
-# decisions go through the injected `Clock`.
-chrono = { workspace = true }
-# Tokio runtime for the `#[tokio::test]` single-flight tests. Production
+# Tokio runtime for the `#[tokio::test]` single-flight tests, and `time` for
+# the bounded naps one of them takes while it waits for a joiner. Production
 # code only needs `tokio::sync` (already in the `[dependencies]` block).
-tokio = { workspace = true, default-features = false, features = ["macros", "rt", "rt-multi-thread", "sync"] }
+tokio = { workspace = true, default-features = false, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 # `criterion` powers the empirical baselines in `benches/cache_bench.rs`.
 # The `async_tokio` feature unlocks `b.to_async(&rt).iter(...)` for the
 # single-flight benches (which require an async harness because

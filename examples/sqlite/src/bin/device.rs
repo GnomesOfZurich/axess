@@ -106,7 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // attributes recompute its fingerprint. This demo draws one random pepper
     // per start; in production derive a per-tenant secret from a vault or a
     // KDF over a master key, stable across restarts.
-    let pepper_resolver: TenantPepperResolver = Arc::new(move |_tenant: &TenantId| pepper);
+    let pepper_resolver: TenantPepperResolver = Arc::new(move |_: &TenantId| pepper);
     let extractor = DefaultFingerprintExtractor::new(pepper_resolver);
     let lifecycle =
         DeviceLifecycleService::new(cached_devices.clone()).with_event_sink(NoopDeviceEventSink);
@@ -117,7 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `with_tenant_fn`: the default reads the session's tenant.
     let demo_tenant = DEMO_TENANT;
     let resolver = LifecycleDeviceResolver::new(extractor, lifecycle, SystemClock)
-        .with_tenant_fn(move |_parts| Some(demo_tenant));
+        .with_tenant_fn(move |_| Some(demo_tenant));
     let resolver: AppResolver = Arc::new(resolver);
 
     // ── 6. background sweep task driving the retention ladder ────────────
@@ -144,6 +144,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     trusted_to_seen = counts.trusted_to_seen,
                     seen_to_revoked = counts.seen_to_revoked,
                     revoked_purged = counts.revoked_purged,
+                    skipped = counts.skipped,
                     "device-sweep tick"
                 ),
                 Err(e) => tracing::warn!(error = %e, "device-sweep tick failed"),
@@ -161,12 +162,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(Extension(devices.clone()))
         .layer(Extension(demo_tenant))
         .layer(
-            // This demo never signs anyone in, so its registry stays empty;
-            // a deployment that does shares the authentication service's.
+            // This demo never signs anyone in, so its registry stays empty
+            // and the layer has no session to end or to record the end of;
+            // a deployment that does shares the authentication service's
+            // registry and passes its `session_end_audit()`.
             SessionLayer::new(
                 sessions,
                 signing_key,
                 axess::MemorySessionRegistry::new().handle(),
+                axess::session::UnrecordedSessionEnds::insecure(),
             )
             .with_secure(secure_cookies())
             .with_ttl(Duration::from_secs(3600)),
@@ -246,7 +250,7 @@ async fn whoami(
     Extension(tenant): Extension<TenantId>,
     req: Request,
 ) -> impl IntoResponse {
-    let (parts, _body) = req.into_parts();
+    let (parts, _) = req.into_parts();
     let device_id = match resolver.resolve(&parts).await {
         Ok(Some(id)) => id,
         Ok(None) => {
@@ -336,7 +340,7 @@ async fn step_up_check(
     Extension(tenant): Extension<TenantId>,
     req: Request,
 ) -> impl IntoResponse {
-    let (parts, _body) = req.into_parts();
+    let (parts, _) = req.into_parts();
     let device_id = match resolver.resolve(&parts).await {
         Ok(Some(id)) => id,
         Ok(None) => return unknown_device_outcome("request too thin to fingerprint"),

@@ -1,0 +1,30 @@
+# axess: the actions the workflows may use, read by
+# scripts/check-workflow-pins.sh (scripts/lib/workflow_jobs.py).
+#
+# One line for each action: its owner and repository, where it may run, and
+# what it is trusted to do. An action that is not listed here is refused in
+# every job. "any job" may run beside a secret, an OIDC permission or a
+# token that can write; "no secret" may run only in a job that holds none
+# of them.
+#
+# The code of no action was read to write this file, and the check does not
+# read it either: it is in another repository, and most of it is
+# JavaScript. A line states a trust, not a finding. What makes the trust
+# hold is the pin: every use of an action names a full commit, with the
+# release it was read from in a comment, and a pull request that moves a
+# pin is where the maintainer reads what the new commit does
+# (docs/project/publishing.md). A line no workflow uses any more is
+# refused, so that no trust outlives its use.
+#
+# NAME | WHERE | TRUSTED TO
+
+actions/checkout | any job | Fetch the repository into the workspace. It installs no tool, restores no cache and runs no script of the repository.
+actions/upload-artifact | any job | Upload the files the job names as an artifact of the run. It installs no tool, restores no cache and runs none of the files.
+actions/download-artifact | any job | Download the files of an artifact into the directory the job names. It installs no tool and runs none of the files; the check holds where they land beside a secret.
+actions/attest-build-provenance | any job | Sign a provenance statement for the files the job names, with the job's OIDC token. It installs no tool, restores no cache and runs none of the files.
+actions/configure-pages | any job | Read and enable the Pages settings of the repository. It installs no tool, restores no cache and runs no script.
+actions/upload-pages-artifact | any job | Pack a directory the job names into the Pages artifact. It installs no tool, restores no cache and runs none of the files.
+actions/deploy-pages | any job | Deploy the Pages artifact of the run, with the job's OIDC token. It installs no tool, restores no cache and runs no script.
+softprops/action-gh-release | any job | Create a GitHub release with the files the job names, with the job's token. It installs no tool, restores no cache and runs none of the files.
+dtolnay/rust-toolchain | any job | Install the Rust toolchain its `toolchain` input names, through rustup, and nothing else. The check holds that input to an exact release in a workflow with a job beside a secret.
+Swatinem/rust-cache | no secret | Restore and save a cache of cargo's registry, its installed programs and the target directory. The files it restores are ones an earlier run made, so it runs in no job beside a secret.

@@ -1,17 +1,18 @@
-//! FAPI + PAR_INFLIGHT mutation coverage: single-use marker, audit-event emission, logout delegation.
+//! FAPI and `PAR_INFLIGHT`: the single-use marker, audit-event emission, logout delegation.
 
 #![cfg(all(feature = "testing", feature = "oauth"))]
 
-mod common;
+use axess_clock::testing::Shift;
+use axess_core::testing::fixtures as common;
 
 use axess_clock::Clock;
 use axess_core::authn::AuditContext;
 use axess_core::authn::event::AuthFailureReason;
-use axess_core::testing::oauth_provider::oauth_setup_provider;
+use axess_core::authn::service::OAuthCallbackRoute;
+use axess_core::testing::oauth_provider::oauth_setup_provider_on;
 use axess_core::{
     authn::service::AuthnService,
     testing::{
-        MockClock,
         mock_authn::{MockFactorStore, MockIdentityStore},
         test_session,
     },
@@ -64,8 +65,8 @@ impl axess_factors::oauth::OAuthProvider for FapiStubProvider {
     fn refresh_token_unchecked<'a>(
         &'a self,
         refresh_token: &'a str,
-        _original_nonce: Option<&'a str>,
-        _dpop: Option<axess_factors::oauth::DpopSigner<'a>>,
+        _: Option<&'a str>,
+        _: Option<axess_factors::oauth::DpopSigner<'a>>,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
@@ -89,7 +90,7 @@ impl axess_factors::oauth::OAuthProvider for FapiStubProvider {
         code: &'a str,
         pkce_verifier: String,
         nonce: String,
-        _dpop: Option<axess_factors::oauth::DpopSigner<'a>>,
+        _: Option<axess_factors::oauth::DpopSigner<'a>>,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
@@ -113,7 +114,7 @@ impl axess_factors::oauth::OAuthProvider for FapiStubProvider {
     fn fetch_userinfo_unchecked<'a>(
         &'a self,
         access_token: &'a str,
-        _dpop: Option<axess_factors::oauth::DpopSigner<'a>>,
+        _: Option<axess_factors::oauth::DpopSigner<'a>>,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
@@ -158,8 +159,8 @@ impl axess_factors::oauth::OAuthProvider for FapiStubProvider {
     fn build_auth_url_par<'a>(
         &'a self,
         options: &'a axess_factors::oauth::OAuthLoginOptions,
-        _rng: &'a dyn axess_rng::SecureRng,
-        _dpop: Option<axess_factors::oauth::DpopSigner<'a>>,
+        _: &'a dyn axess_rng::SecureRng,
+        _: Option<axess_factors::oauth::DpopSigner<'a>>,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
@@ -186,12 +187,14 @@ impl axess_factors::oauth::OAuthProvider for FapiStubProvider {
 
 /// when an active PAR_INFLIGHT has an `expires_at` in the
 /// **future**, `begin_oauth_login` MUST refuse with `CsrfMismatch`.
-/// Pins the `<` operator on line 114: mutating to `==` or `>` would
+/// Pins the `<` operator: mutating to `==` or `>` would
 /// flip the verdict for "now < future" inputs.
 #[tokio::test]
 async fn begin_oauth_login_refuses_with_par_inflight_in_future() {
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let clock = MockClock::now();
+    let clock = common::test_clock();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
     let authn = AuthnService::builder(identity, MockFactorStore::new())
         .with_clock(clock.clone())
         .with_oauth_provider(FapiStubProvider::new("fapi-stub"))
@@ -200,11 +203,11 @@ async fn begin_oauth_login_refuses_with_par_inflight_in_future() {
     let session = test_session();
 
     // Stash a PAR marker that expires 60 s from MockClock's "now".
-    let future = clock.now() + chrono::Duration::seconds(60);
+    let future = clock.now().plus(axess_clock::SignedDuration::seconds(60));
     let mut entry = serde_json::Map::new();
     entry.insert(
         "expires_at".to_string(),
-        serde_json::Value::String(future.to_rfc3339()),
+        serde_json::Value::String(future.to_rfc3339_numeric_offset()),
     );
     session
         .set_custom("axess.oauth.par_inflight", serde_json::Value::Object(entry))
@@ -226,8 +229,10 @@ async fn begin_oauth_login_refuses_with_par_inflight_in_future() {
 /// would flip to true (refusal).
 #[tokio::test]
 async fn begin_oauth_login_succeeds_with_par_inflight_at_exact_now() {
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let clock = MockClock::now();
+    let clock = common::test_clock();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
     let authn = AuthnService::builder(identity, MockFactorStore::new())
         .with_clock(clock.clone())
         .with_oauth_provider(FapiStubProvider::new("fapi-stub-eq"))
@@ -239,7 +244,7 @@ async fn begin_oauth_login_succeeds_with_par_inflight_at_exact_now() {
     let mut entry = serde_json::Map::new();
     entry.insert(
         "expires_at".to_string(),
-        serde_json::Value::String(exactly_now.to_rfc3339()),
+        serde_json::Value::String(exactly_now.to_rfc3339_numeric_offset()),
     );
     session
         .set_custom("axess.oauth.par_inflight", serde_json::Value::Object(entry))
@@ -254,15 +259,17 @@ async fn begin_oauth_login_succeeds_with_par_inflight_at_exact_now() {
     );
 }
 
-/// pins the `+` chrono::Duration arithmetic in the
-/// PAR_INFLIGHT stash on line 148. After a successful FAPI begin, the
+/// pins the `+` axess_clock::SignedDuration arithmetic in the
+/// PAR_INFLIGHT stash. After a successful FAPI begin, the
 /// stored `expires_at` must lie **strictly after** the clock; a
 /// `+ -> -` mutation would leave the marker in the past, defeating
 /// the entire PAR-inflight single-use guard.
 #[tokio::test]
 async fn par_inflight_expires_at_is_in_the_future() {
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let clock = MockClock::now();
+    let clock = common::test_clock();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
     let authn = AuthnService::builder(identity, MockFactorStore::new())
         .with_clock(clock.clone())
         .with_oauth_provider(FapiStubProvider::new("fapi-stub-fut"))
@@ -285,9 +292,8 @@ async fn par_inflight_expires_at_is_in_the_future() {
         .get("expires_at")
         .and_then(|v| v.as_str())
         .expect("expires_at field");
-    let expires_at = chrono::DateTime::parse_from_rfc3339(expires_at_str)
-        .expect("RFC3339 expires_at")
-        .with_timezone(&chrono::Utc);
+    let expires_at =
+        axess_clock::Timestamp::parse_rfc3339(expires_at_str).expect("RFC3339 expires_at");
     assert!(
         expires_at > now,
         "PAR_INFLIGHT expires_at ({expires_at}) must lie after clock now ({now})"
@@ -304,14 +310,18 @@ async fn par_inflight_expires_at_is_in_the_future() {
 #[tokio::test]
 async fn csrf_mismatch_records_failure_audit_event() {
     use axess_core::authn::event::AuthEventStatus;
+    let clock = common::test_clock();
 
     let server = MockServer::start().await;
     let (_, jwk, _) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &jwk).await;
-    let provider = oauth_setup_provider(&server.uri()).await;
+    let provider = oauth_setup_provider_on(&server.uri(), std::sync::Arc::new(clock.clone())).await;
 
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
     let authn = AuthnService::builder(identity.clone(), MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_oauth_provider(provider)
         .build()
         .with_audit_context(AuditContext::default());
@@ -322,7 +332,13 @@ async fn csrf_mismatch_records_failure_audit_event() {
         .unwrap();
 
     let _ = authn
-        .finish_oauth_login("any-code", "wrong-state", &session)
+        .finish_oauth_login(
+            OAuthCallbackRoute::global("test"),
+            "any-code",
+            "wrong-state",
+            None,
+            &session,
+        )
         .await;
 
     let events = identity.events();
@@ -342,18 +358,26 @@ async fn csrf_mismatch_records_failure_audit_event() {
 /// silently disables RP-Initiated Logout for every caller.
 #[tokio::test]
 async fn build_end_session_url_delegates_to_provider() {
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
+    let clock = common::test_clock();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
     let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_oauth_provider(FapiStubProvider::new("logout-stub"))
         .build()
         .with_audit_context(AuditContext::default());
 
-    let url = authn.build_end_session_url(
-        "logout-stub",
-        Some("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.fake.jwt"),
-        Some("https://app.example.com/post-logout"),
-        None,
-    );
+    let url = authn
+        .oauth_global()
+        .build_end_session_url(
+            "logout-stub",
+            Some("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.fake.jwt"),
+            Some("https://app.example.com/post-logout"),
+            None,
+        )
+        .await
+        .expect("the global registration resolves");
 
     let url = url.expect("stub returns Some; facade must propagate");
     let pairs: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
@@ -373,13 +397,17 @@ async fn build_end_session_url_delegates_to_provider() {
 /// `replace with ()` mutation).
 #[tokio::test]
 async fn begin_oauth_login_clears_stale_expected_tenant() {
+    let clock = common::test_clock();
     let server = MockServer::start().await;
     let (_, jwk, _) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &jwk).await;
-    let provider = oauth_setup_provider(&server.uri()).await;
+    let provider = oauth_setup_provider_on(&server.uri(), std::sync::Arc::new(clock.clone())).await;
 
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
     let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_oauth_provider(provider)
         .build()
         .with_audit_context(AuditContext::default());

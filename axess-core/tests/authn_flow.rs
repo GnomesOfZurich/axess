@@ -15,7 +15,11 @@
 
 #![cfg(feature = "testing")]
 
-mod common;
+mod hotp_code;
+mod totp_code;
+use axess_core::testing::fixtures as common;
+use hotp_code::generate_hotp_code;
+use totp_code::generate_totp_code;
 
 use axess_clock::Clock;
 use axess_core::authn::AuditContext;
@@ -37,22 +41,25 @@ use axess_core::{
     },
 };
 use common::{
-    generate_hotp_code, generate_totp_code, password_config, password_method, password_totp_method,
-    test_tenant, test_user, totp_config, uid, user_scope,
+    password_config, password_method, password_totp_method, test_tenant, test_user, totp_config,
+    uid, user_scope,
 };
 
 // ── Full login flow: password only ──────────────────────────────────────────
 
 #[tokio::test]
 async fn password_only_login_flow() {
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new()
-        .with_factor(user_scope(), password_config("Gnomes2+"))
+        .with_factor(user_scope(), password_config("Sample2+"))
         .with_method(&uid("u1"), password_method());
 
     let service = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
         .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());
@@ -67,7 +74,7 @@ async fn password_only_login_flow() {
         LoginOutcome::FactorRequired(FactorKind::Password)
     ));
 
-    let cred = FactorCredential::Password(ZeroizedString::new("Gnomes2+"));
+    let cred = FactorCredential::Password(ZeroizedString::new("Sample2+"));
     let result = service.verify_factor(&cred, &session).await.unwrap();
     assert!(
         matches!(result, FactorOutcome::Authenticated),
@@ -81,16 +88,17 @@ async fn password_only_login_flow() {
 
 #[tokio::test]
 async fn password_totp_login_flow() {
+    let clock = common::test_clock();
     let secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "bob"));
     let factors = MockFactorStore::new()
-        .with_factor(user_scope(), password_config("Gnomes2+"))
+        .with_factor(user_scope(), password_config("Sample2+"))
         .with_factor(user_scope(), totp_config(secret))
         .with_method(&uid("u1"), password_totp_method());
 
-    let clock = MockClock::now();
     let service = AuthnService::builder(identity, factors)
         .with_clock(clock.clone())
         .allow_plaintext_factor_secrets()
@@ -107,14 +115,14 @@ async fn password_totp_login_flow() {
         LoginOutcome::FactorRequired(FactorKind::Password)
     ));
 
-    let pw = FactorCredential::Password(ZeroizedString::new("Gnomes2+"));
+    let pw = FactorCredential::Password(ZeroizedString::new("Sample2+"));
     let r = service.verify_factor(&pw, &session).await.unwrap();
     assert!(
         matches!(r, FactorOutcome::FactorRequired(FactorKind::Totp)),
         "got {r:?}"
     );
 
-    let code = generate_totp_code(secret, clock.now().into());
+    let code = generate_totp_code(secret, clock.now().try_into().unwrap());
     let r = service
         .verify_factor(&FactorCredential::OtpCode(code.into()), &session)
         .await
@@ -127,14 +135,17 @@ async fn password_totp_login_flow() {
 
 #[tokio::test]
 async fn wrong_password_returns_invalid_credential() {
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new()
-        .with_factor(user_scope(), password_config("Gnomes2+"))
+        .with_factor(user_scope(), password_config("Sample2+"))
         .with_method(&uid("u1"), password_method());
 
     let service = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
         .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());
@@ -151,9 +162,13 @@ async fn wrong_password_returns_invalid_credential() {
 
 #[tokio::test]
 async fn user_not_found_returns_invalid_credentials() {
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
+    let clock = common::test_clock();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
     let factors = MockFactorStore::new();
     let service = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
         .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());
@@ -170,7 +185,9 @@ async fn user_not_found_returns_invalid_credentials() {
 
 #[tokio::test]
 async fn lockout_after_max_attempts() {
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"))
         // The lock alone: the throttle between quick guesses has its own
@@ -184,10 +201,11 @@ async fn lockout_after_max_attempts() {
             .without_throttle(),
         );
     let factors = MockFactorStore::new()
-        .with_factor(user_scope(), password_config("Gnomes2+"))
+        .with_factor(user_scope(), password_config("Sample2+"))
         .with_method(&uid("u1"), password_method());
 
     let service = AuthnService::builder(identity.clone(), factors)
+        .with_clock(clock.clone())
         .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());
@@ -219,8 +237,10 @@ async fn lockout_after_max_attempts() {
 
 #[tokio::test]
 async fn lockout_counter_accumulates_across_begin_login_cycles() {
+    let clock = common::test_clock();
     let secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "bob"))
         .with_lockout_policy(
@@ -232,11 +252,12 @@ async fn lockout_counter_accumulates_across_begin_login_cycles() {
             .without_throttle(),
         );
     let factors = MockFactorStore::new()
-        .with_factor(user_scope(), password_config("Gnomes2+"))
+        .with_factor(user_scope(), password_config("Sample2+"))
         .with_factor(user_scope(), totp_config(secret))
         .with_method(&uid("u1"), password_totp_method());
 
     let service = AuthnService::builder(identity.clone(), factors)
+        .with_clock(clock.clone())
         .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());
@@ -246,7 +267,7 @@ async fn lockout_counter_accumulates_across_begin_login_cycles() {
     service.begin_login("bob", "default", &s1).await.unwrap();
     service
         .verify_factor(
-            &FactorCredential::Password(ZeroizedString::new("Gnomes2+")),
+            &FactorCredential::Password(ZeroizedString::new("Sample2+")),
             &s1,
         )
         .await
@@ -265,7 +286,7 @@ async fn lockout_counter_accumulates_across_begin_login_cycles() {
     service.begin_login("bob", "default", &s2).await.unwrap();
     service
         .verify_factor(
-            &FactorCredential::Password(ZeroizedString::new("Gnomes2+")),
+            &FactorCredential::Password(ZeroizedString::new("Sample2+")),
             &s2,
         )
         .await
@@ -298,16 +319,17 @@ async fn lockout_counter_accumulates_across_begin_login_cycles() {
 
 #[tokio::test]
 async fn totp_replay_rejected() {
+    let clock = common::test_clock();
     let secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "bob"));
     let factors = MockFactorStore::new()
-        .with_factor(user_scope(), password_config("Gnomes2+"))
+        .with_factor(user_scope(), password_config("Sample2+"))
         .with_factor(user_scope(), totp_config(secret))
         .with_method(&uid("u1"), password_totp_method());
 
-    let clock = MockClock::now();
     let service = AuthnService::builder(identity, factors)
         .with_clock(clock.clone())
         .allow_plaintext_factor_secrets()
@@ -319,12 +341,12 @@ async fn totp_replay_rejected() {
     service.begin_login("bob", "default", &s1).await.unwrap();
     service
         .verify_factor(
-            &FactorCredential::Password(ZeroizedString::new("Gnomes2+")),
+            &FactorCredential::Password(ZeroizedString::new("Sample2+")),
             &s1,
         )
         .await
         .unwrap();
-    let code = generate_totp_code(secret, clock.now().into());
+    let code = generate_totp_code(secret, clock.now().try_into().unwrap());
     let r = service
         .verify_factor(&FactorCredential::OtpCode(code.clone().into()), &s1)
         .await
@@ -336,7 +358,7 @@ async fn totp_replay_rejected() {
     service.begin_login("bob", "default", &s2).await.unwrap();
     service
         .verify_factor(
-            &FactorCredential::Password(ZeroizedString::new("Gnomes2+")),
+            &FactorCredential::Password(ZeroizedString::new("Sample2+")),
             &s2,
         )
         .await
@@ -355,8 +377,10 @@ async fn totp_replay_rejected() {
 
 #[tokio::test]
 async fn hotp_counter_advances_and_old_rejected() {
+    let clock = common::test_clock();
     let secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "carol"));
 
@@ -366,7 +390,7 @@ async fn hotp_counter_advances_and_old_rejected() {
         user_scope(),
     );
     let factors = MockFactorStore::new()
-        .with_factor(user_scope(), password_config("Gnomes2+"))
+        .with_factor(user_scope(), password_config("Sample2+"))
         .with_factor(
             user_scope(),
             FactorConfig::Hotp(HotpConfig {
@@ -378,6 +402,7 @@ async fn hotp_counter_advances_and_old_rejected() {
         .with_method(&uid("u1"), hotp_method);
 
     let service = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
         .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());
@@ -388,7 +413,7 @@ async fn hotp_counter_advances_and_old_rejected() {
     service.begin_login("carol", "default", &s1).await.unwrap();
     service
         .verify_factor(
-            &FactorCredential::Password(ZeroizedString::new("Gnomes2+")),
+            &FactorCredential::Password(ZeroizedString::new("Sample2+")),
             &s1,
         )
         .await
@@ -404,7 +429,7 @@ async fn hotp_counter_advances_and_old_rejected() {
     service.begin_login("carol", "default", &s2).await.unwrap();
     service
         .verify_factor(
-            &FactorCredential::Password(ZeroizedString::new("Gnomes2+")),
+            &FactorCredential::Password(ZeroizedString::new("Sample2+")),
             &s2,
         )
         .await
@@ -423,14 +448,17 @@ async fn hotp_counter_advances_and_old_rejected() {
 
 #[tokio::test]
 async fn session_regenerate_flag_set_on_authentication() {
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new()
-        .with_factor(user_scope(), password_config("Gnomes2+"))
+        .with_factor(user_scope(), password_config("Sample2+"))
         .with_method(&uid("u1"), password_method());
 
     let service = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
         .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());
@@ -442,7 +470,7 @@ async fn session_regenerate_flag_set_on_authentication() {
         .unwrap();
     service
         .verify_factor(
-            &FactorCredential::Password(ZeroizedString::new("Gnomes2+")),
+            &FactorCredential::Password(ZeroizedString::new("Sample2+")),
             &session,
         )
         .await
@@ -460,15 +488,18 @@ async fn session_regenerate_flag_set_on_authentication() {
 
 #[tokio::test]
 async fn forced_logout_via_registry() {
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new()
-        .with_factor(user_scope(), password_config("Gnomes2+"))
+        .with_factor(user_scope(), password_config("Sample2+"))
         .with_method(&uid("u1"), password_method());
 
-    let registry = MemorySessionRegistry::new();
+    let registry = MemorySessionRegistry::new().with_clock(std::sync::Arc::new(clock.clone()));
     let service = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
         .with_registry(registry.clone())
         .allow_plaintext_factor_secrets()
         .build()
@@ -481,7 +512,7 @@ async fn forced_logout_via_registry() {
         .unwrap();
     service
         .verify_factor(
-            &FactorCredential::Password(ZeroizedString::new("Gnomes2+")),
+            &FactorCredential::Password(ZeroizedString::new("Sample2+")),
             &session,
         )
         .await
@@ -502,7 +533,9 @@ async fn forced_logout_via_registry() {
 
 #[tokio::test]
 async fn email_otp_prepare_and_verify() {
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let email_method =
@@ -513,13 +546,12 @@ async fn email_otp_prepare_and_verify() {
             FactorConfig::EmailOtp(EmailOtpConfig {
                 email: "alice@example.com".into(),
                 code_length: 6,
-                ttl_secs: 300,
+                ttl: std::time::Duration::from_secs(300),
                 ..EmailOtpConfig::default()
             }),
         )
         .with_method(&uid("u1"), email_method);
 
-    let clock = MockClock::now();
     let rng = MockRng::new(42);
     let service = AuthnService::builder(identity, factors)
         .with_clock(clock.clone())
@@ -553,7 +585,9 @@ async fn email_otp_prepare_and_verify() {
 
 #[tokio::test]
 async fn email_otp_cooldown_returns_already_sent() {
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let email_method =
@@ -563,13 +597,12 @@ async fn email_otp_cooldown_returns_already_sent() {
             user_scope(),
             FactorConfig::EmailOtp(EmailOtpConfig {
                 email: "alice@example.com".into(),
-                ttl_secs: 300,
+                ttl: std::time::Duration::from_secs(300),
                 ..EmailOtpConfig::default()
             }),
         )
         .with_method(&uid("u1"), email_method);
 
-    let clock = MockClock::now();
     let service = AuthnService::builder(identity, factors)
         .with_clock(clock.clone())
         .with_rng(MockRng::new(42))
@@ -604,7 +637,9 @@ async fn email_otp_cooldown_returns_already_sent() {
 
 #[tokio::test]
 async fn email_otp_expired_code_rejected() {
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let email_method =
@@ -614,13 +649,12 @@ async fn email_otp_expired_code_rejected() {
             user_scope(),
             FactorConfig::EmailOtp(EmailOtpConfig {
                 email: "alice@example.com".into(),
-                ttl_secs: 300,
+                ttl: std::time::Duration::from_secs(300),
                 ..EmailOtpConfig::default()
             }),
         )
         .with_method(&uid("u1"), email_method);
 
-    let clock = MockClock::now();
     let service = AuthnService::builder(identity, factors)
         .with_clock(clock.clone())
         .with_rng(MockRng::new(42))
@@ -654,14 +688,17 @@ async fn email_otp_expired_code_rejected() {
 
 #[tokio::test]
 async fn scope_fallback_to_system() {
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new()
-        .with_factor(AuthnScope::System, password_config("Gnomes2+"))
+        .with_factor(AuthnScope::System, password_config("Sample2+"))
         .with_method(&uid("u1"), password_method());
 
     let service = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
         .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());
@@ -673,7 +710,7 @@ async fn scope_fallback_to_system() {
         .unwrap();
     let r = service
         .verify_factor(
-            &FactorCredential::Password(ZeroizedString::new("Gnomes2+")),
+            &FactorCredential::Password(ZeroizedString::new("Sample2+")),
             &session,
         )
         .await
@@ -699,14 +736,17 @@ async fn mock_rng_produces_deterministic_session_ids() {
 
 #[tokio::test]
 async fn audit_events_recorded_on_login() {
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new()
-        .with_factor(user_scope(), password_config("Gnomes2+"))
+        .with_factor(user_scope(), password_config("Sample2+"))
         .with_method(&uid("u1"), password_method());
 
     let service = AuthnService::builder(identity.clone(), factors)
+        .with_clock(clock.clone())
         .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());
@@ -718,7 +758,7 @@ async fn audit_events_recorded_on_login() {
         .unwrap();
     service
         .verify_factor(
-            &FactorCredential::Password(ZeroizedString::new("Gnomes2+")),
+            &FactorCredential::Password(ZeroizedString::new("Sample2+")),
             &session,
         )
         .await
@@ -763,13 +803,13 @@ fn recovery_world(
     let secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
     let set = axess_factors::generate_recovery_codes(&MockRng::new(7), 3);
     let shown: Vec<String> = set.display.iter().map(|c| c.to_string()).collect();
-    let clock = MockClock::now();
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
         .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "bob"));
     let factors = MockFactorStore::new()
-        .with_factor(user_scope(), password_config("Gnomes2+"))
+        .with_factor(user_scope(), password_config("Sample2+"))
         .with_factor(user_scope(), totp_config(secret))
         .with_factor(user_scope(), FactorConfig::RecoveryCodes(set.config))
         .with_method(&uid("u1"), method);
@@ -791,7 +831,7 @@ async fn past_the_password(
         .unwrap();
     let r = service
         .verify_factor(
-            &FactorCredential::Password(ZeroizedString::new("Gnomes2+")),
+            &FactorCredential::Password(ZeroizedString::new("Sample2+")),
             &session,
         )
         .await
@@ -833,7 +873,7 @@ async fn a_recovery_code_completes_the_login_once() {
 
     // Another code from the set still works, once the wrong guess's delay
     // has run.
-    clock.advance(chrono::Duration::seconds(1));
+    clock.advance(axess_clock::SignedDuration::seconds(1));
     let r = service
         .verify_factor(
             &FactorCredential::RecoveryCode(codes[2].as_str().into()),
@@ -846,9 +886,9 @@ async fn a_recovery_code_completes_the_login_once() {
 
 #[tokio::test]
 async fn totp_still_completes_a_step_that_also_offers_recovery_codes() {
-    let (service, clock, _codes, secret) = recovery_world(password_then_totp_or_recovery());
+    let (service, clock, _, secret) = recovery_world(password_then_totp_or_recovery());
     let session = past_the_password(&service).await;
-    let code = generate_totp_code(secret, clock.now().into());
+    let code = generate_totp_code(secret, clock.now().try_into().unwrap());
     let r = service
         .verify_factor(&FactorCredential::OtpCode(code.into()), &session)
         .await
@@ -858,7 +898,7 @@ async fn totp_still_completes_a_step_that_also_offers_recovery_codes() {
 
 #[tokio::test]
 async fn a_recovery_code_is_refused_where_the_method_does_not_offer_one() {
-    let (service, _clock, codes, _) = recovery_world(password_totp_method());
+    let (service, _, codes, _) = recovery_world(password_totp_method());
     let session = past_the_password(&service).await;
     let r = service
         .verify_factor(
@@ -878,17 +918,18 @@ async fn a_recovery_code_is_refused_where_the_method_does_not_offer_one() {
 
 #[tokio::test]
 async fn a_replay_that_loses_the_write_race_is_audited_and_counted() {
+    let clock = common::test_clock();
     use axess_core::authn::event::AuthEventStatus;
 
     let secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "bob"));
     let factors = MockFactorStore::new()
-        .with_factor(user_scope(), password_config("Gnomes2+"))
+        .with_factor(user_scope(), password_config("Sample2+"))
         .with_factor(user_scope(), totp_config(secret))
         .with_method(&uid("u1"), password_totp_method());
-    let clock = MockClock::now();
     let service = AuthnService::builder(identity.clone(), factors.clone())
         .with_clock(clock.clone())
         .allow_plaintext_factor_secrets()
@@ -902,7 +943,7 @@ async fn a_replay_that_loses_the_write_race_is_audited_and_counted() {
         .unwrap();
     service
         .verify_factor(
-            &FactorCredential::Password(ZeroizedString::new("Gnomes2+")),
+            &FactorCredential::Password(ZeroizedString::new("Sample2+")),
             &session,
         )
         .await
@@ -911,7 +952,7 @@ async fn a_replay_that_loses_the_write_race_is_audited_and_counted() {
 
     // The swap that spends the step is lost to a concurrent request.
     factors.arm_cas_failures(1);
-    let code = generate_totp_code(secret, clock.now().into());
+    let code = generate_totp_code(secret, clock.now().try_into().unwrap());
     let r = service
         .verify_factor(&FactorCredential::OtpCode(code.into()), &session)
         .await
@@ -956,15 +997,16 @@ impl axess_core::metrics::FactorMetrics for FactorCounts {
 /// A replay that loses the write race is one failure, not also a success.
 #[tokio::test]
 async fn a_replay_that_loses_the_write_race_is_not_counted_as_a_success() {
+    let clock = common::test_clock();
     let secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "bob"));
     let factors = MockFactorStore::new()
-        .with_factor(user_scope(), password_config("Gnomes2+"))
+        .with_factor(user_scope(), password_config("Sample2+"))
         .with_factor(user_scope(), totp_config(secret))
         .with_method(&uid("u1"), password_totp_method());
-    let clock = MockClock::now();
     let counts = FactorCounts::default();
     let service = AuthnService::builder(identity.clone(), factors.clone())
         .with_clock(clock.clone())
@@ -982,7 +1024,7 @@ async fn a_replay_that_loses_the_write_race_is_not_counted_as_a_success() {
         .unwrap();
     service
         .verify_factor(
-            &FactorCredential::Password(ZeroizedString::new("Gnomes2+")),
+            &FactorCredential::Password(ZeroizedString::new("Sample2+")),
             &session,
         )
         .await
@@ -990,7 +1032,7 @@ async fn a_replay_that_loses_the_write_race_is_not_counted_as_a_success() {
     let successes_before = counts.successes.load(std::sync::atomic::Ordering::SeqCst);
 
     factors.arm_cas_failures(1);
-    let code = generate_totp_code(secret, clock.now().into());
+    let code = generate_totp_code(secret, clock.now().try_into().unwrap());
     let r = service
         .verify_factor(&FactorCredential::OtpCode(code.into()), &session)
         .await

@@ -1,0 +1,12 @@
+error[E0423]: cannot initialize a tuple struct which contains private fields
+ --> tests/ui/issuer_custom_label.rs:6:28
+  |
+6 |     let _ = Issuer::Custom(CustomLabel("oauth".to_string()));
+  |                            ^^^^^^^^^^^
+  |
+  = note: a struct named `CustomLabel` exists in another namespace
+note: constructor is not visible here due to private fields
+ --> src/lib.rs
+  |
+  | pub struct CustomLabel(String);
+  |                        ^^^^^^ private field

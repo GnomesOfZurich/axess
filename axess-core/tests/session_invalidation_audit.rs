@@ -3,7 +3,8 @@
 //! `SessionInvalidated` row records the user, the session if one was named and
 //! the actor.
 
-mod common;
+use axess_core::session::SessionKey;
+use axess_core::testing::fixtures as common;
 
 use axess_core::authn::AuditContext;
 use axess_core::authn::event::{AuthEventStatus, AuthEventType};
@@ -14,24 +15,26 @@ use axess_core::testing::{
     mock_authn::{MockFactorStore, MockIdentityStore},
     test_session,
 };
-use chrono::Utc;
 use common::{test_tenant, test_user, tid, uid};
 
 #[tokio::test]
 async fn kicking_one_session_writes_one_row_naming_the_actor() {
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
-    let registry = MemorySessionRegistry::new();
+    let registry = MemorySessionRegistry::new().with_clock(std::sync::Arc::new(clock.clone()));
     let svc = AuthnService::builder(identity.clone(), MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_registry(registry.clone())
         .build()
         .with_audit_context(AuditContext::default());
     let session = test_session();
     session
-        .set_authenticated(uid("u1"), tid("default"), Utc::now())
+        .set_authenticated(uid("u1"), tid("default"), common::start())
         .await;
-    let sid = session.session_id().await;
+    let sid = session.session_key().await;
     registry.register(&uid("u1"), &sid).await.unwrap();
 
     svc.invalidate_session(&uid("u1"), &sid, Actor::Admin(&uid("admin")))
@@ -59,11 +62,14 @@ async fn kicking_one_session_writes_one_row_naming_the_actor() {
 
 #[tokio::test]
 async fn kicking_every_session_is_audited_without_a_session_id() {
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
-    let registry = MemorySessionRegistry::new();
+    let registry = MemorySessionRegistry::new().with_clock(std::sync::Arc::new(clock.clone()));
     let svc = AuthnService::builder(identity.clone(), MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_registry(registry)
         .build()
         .with_audit_context(AuditContext::default());
@@ -81,8 +87,13 @@ async fn kicking_every_session_is_audited_without_a_session_id() {
 
 #[tokio::test]
 async fn without_a_registry_nothing_is_audited() {
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let svc = AuthnService::new(identity.clone(), MockFactorStore::new())
+    let clock = common::test_clock();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
+    let svc = AuthnService::builder(identity.clone(), MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build()
         .with_audit_context(AuditContext::default());
     assert!(
         svc.invalidate_user_sessions(&uid("u1"), Actor::System)
@@ -102,6 +113,7 @@ mod ownership {
     use axess_core::authn::error::AuthnError;
     use axess_core::session::data::SessionData;
     use axess_core::session::store::{MemorySessionStore, SessionStore};
+    use axess_core::testing::registry_double::{RegistryDouble, RegistryOp, Step};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
@@ -109,85 +121,45 @@ mod ownership {
     struct World {
         svc: axess_core::authn::service::RequestAuthnService<MockIdentityStore, MockFactorStore>,
         identity: MockIdentityStore,
-        registry: Mapped,
+        registry: RegistryDouble,
+        asking_down: Arc<AtomicBool>,
         store: MemorySessionStore,
         /// Alice's session.
-        sa: axess_core::session::id::SessionId,
+        sa: SessionKey,
         /// Bob's session.
-        sb: axess_core::session::id::SessionId,
+        sb: SessionKey,
     }
 
-    /// A registry whose `active_sessions` fails while `listing_down` is set,
-    /// every other call working.
-    #[derive(Clone)]
-    struct Mapped {
-        inner: MemorySessionRegistry,
-        listing_down: Arc<AtomicBool>,
-    }
-
-    impl SessionRegistry for Mapped {
-        type Error = std::io::Error;
-        async fn register(
-            &self,
-            u: &axess_core::authn::UserId,
-            s: &axess_core::session::id::SessionId,
-        ) -> Result<(), Self::Error> {
-            self.inner
-                .register(u, s)
-                .await
-                .map_err(std::io::Error::other)
-        }
-        async fn is_valid(
-            &self,
-            u: &axess_core::authn::UserId,
-            s: &axess_core::session::id::SessionId,
-        ) -> Result<bool, Self::Error> {
-            self.inner
-                .is_valid(u, s)
-                .await
-                .map_err(std::io::Error::other)
-        }
-        async fn invalidate_user(&self, u: &axess_core::authn::UserId) -> Result<(), Self::Error> {
-            self.inner
-                .invalidate_user(u)
-                .await
-                .map_err(std::io::Error::other)
-        }
-        async fn invalidate_session(
-            &self,
-            u: &axess_core::authn::UserId,
-            s: &axess_core::session::id::SessionId,
-        ) -> Result<(), Self::Error> {
-            self.inner
-                .invalidate_session(u, s)
-                .await
-                .map_err(std::io::Error::other)
-        }
-        async fn active_sessions(
-            &self,
-            u: &axess_core::authn::UserId,
-        ) -> Result<Vec<axess_core::session::id::SessionId>, Self::Error> {
-            if self.listing_down.load(Ordering::SeqCst) {
-                return Err(std::io::Error::other("registry down"));
+    /// A registry that cannot say which key a session is under while
+    /// `asking_down` is set, every other call working.
+    fn mapped(inner: MemorySessionRegistry, asking_down: Arc<AtomicBool>) -> RegistryDouble {
+        RegistryDouble::over(inner).before(move |call, _| {
+            let down = call.op() == RegistryOp::CurrentKey && asking_down.load(Ordering::SeqCst);
+            async move {
+                if down {
+                    Step::Fail("registry down")
+                } else {
+                    Step::Forward
+                }
             }
-            self.inner
-                .active_sessions(u)
-                .await
-                .map_err(std::io::Error::other)
-        }
+        })
     }
 
     async fn world() -> World {
+        let clock = common::test_clock();
         let identity = MockIdentityStore::new()
+            .with_clock(clock.clone())
             .with_tenant(test_tenant())
             .with_user(test_user("alice", "alice"))
             .with_user(test_user("bob", "bob"));
-        let registry = Mapped {
-            inner: MemorySessionRegistry::new(),
-            listing_down: Arc::new(AtomicBool::new(false)),
-        };
-        let store = MemorySessionStore::new();
+        let asking_down = Arc::new(AtomicBool::new(false));
+        let registry = mapped(
+            MemorySessionRegistry::new().with_clock(std::sync::Arc::new(clock.clone())),
+            asking_down.clone(),
+        );
+        let store = MemorySessionStore::new().with_clock(std::sync::Arc::new(clock.clone()));
         let svc = AuthnService::builder(identity.clone(), MockFactorStore::new())
+            .with_clock(clock.clone())
             .with_registry(registry.clone())
             .with_session_store(store.clone())
             .build()
@@ -196,9 +168,9 @@ mod ownership {
         for who in ["alice", "bob"] {
             let session = test_session();
             session
-                .set_authenticated(uid(who), tid("default"), Utc::now())
+                .set_authenticated(uid(who), tid("default"), common::start())
                 .await;
-            let sid = session.session_id().await;
+            let sid = session.session_key().await;
             registry.register(&uid(who), &sid).await.unwrap();
             store
                 .save(&sid, &SessionData::default(), Duration::from_secs(600))
@@ -210,6 +182,7 @@ mod ownership {
             svc,
             identity,
             registry,
+            asking_down,
             store,
             sa: ids[0],
             sb: ids[1],
@@ -218,7 +191,11 @@ mod ownership {
 
     async fn bob_still_has_his_session(w: &World) {
         assert_eq!(
-            w.registry.inner.active_sessions(&uid("bob")).await.unwrap(),
+            w.registry
+                .inner()
+                .active_sessions(&uid("bob"))
+                .await
+                .unwrap(),
             vec![w.sb],
             "bob's registry entry survives"
         );
@@ -239,7 +216,11 @@ mod ownership {
     async fn a_session_that_is_not_the_users_is_left_alone() {
         let w = world().await;
         assert_eq!(
-            w.registry.inner.active_sessions(&uid("bob")).await.unwrap(),
+            w.registry
+                .inner()
+                .active_sessions(&uid("bob"))
+                .await
+                .unwrap(),
             vec![w.sb]
         );
         assert!(w.store.load(&w.sb).await.unwrap().is_some());
@@ -253,7 +234,7 @@ mod ownership {
         bob_still_has_his_session(&w).await;
         assert_eq!(
             w.registry
-                .inner
+                .inner()
                 .active_sessions(&uid("alice"))
                 .await
                 .unwrap(),
@@ -265,7 +246,7 @@ mod ownership {
     #[tokio::test]
     async fn a_registry_that_cannot_say_whose_the_session_is_refuses() {
         let w = world().await;
-        w.registry.listing_down.store(true, Ordering::SeqCst);
+        w.asking_down.store(true, Ordering::SeqCst);
 
         let res = w
             .svc
@@ -288,7 +269,7 @@ mod ownership {
             .unwrap();
         assert!(
             w.registry
-                .inner
+                .inner()
                 .active_sessions(&uid("bob"))
                 .await
                 .unwrap()

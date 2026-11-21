@@ -5,7 +5,7 @@
 
 #![cfg(feature = "testing")]
 
-mod common;
+use axess_core::testing::fixtures as common;
 
 use axess_clock::testing::MockClock;
 use axess_core::authn::AuditContext;
@@ -21,7 +21,6 @@ use axess_core::client_ip::Source;
 use axess_core::testing::mock_authn::{MockFactorStore, MockIdentityStore};
 use axess_core::testing::test_session;
 use axess_testing::mock_tracing::TracingCapture;
-use chrono::{TimeZone, Utc};
 use common::{password_config, password_method, test_tenant, test_user, uid, user_scope};
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
@@ -43,14 +42,15 @@ struct World {
 
 impl World {
     fn new(policy: LockoutPolicy) -> Self {
-        let clock = MockClock::at(Utc.timestamp_opt(1_700_000_000, 0).unwrap());
+        let clock = common::test_clock();
         let identity = MockIdentityStore::new()
+            .with_clock(clock.clone())
             .with_tenant(test_tenant())
             .with_user(test_user("u1", "alice"))
             .with_lockout_policy(policy)
             .with_clock(clock.clone());
         let factors = MockFactorStore::new()
-            .with_factor(user_scope(), password_config("Gnomes2+"))
+            .with_factor(user_scope(), password_config("Sample2+"))
             .with_method(&uid("u1"), password_method());
         let kdf = std::sync::Arc::new(KdfExecutor::inline());
         let service = AuthnService::builder(identity.clone(), factors)
@@ -80,7 +80,8 @@ impl World {
     }
 
     fn advance_secs(&self, secs: i64) {
-        self.clock.advance(chrono::Duration::seconds(secs));
+        self.clock
+            .advance(axess_clock::SignedDuration::seconds(secs));
     }
 }
 
@@ -181,7 +182,7 @@ async fn login_with_password_conceals_the_throttle_and_still_spends_one_hash() {
     wrong(&from_a).await;
     let hashes = world.kdf.jobs_started();
     let concealed = from_a
-        .login_with_password("alice", "default", "Gnomes2+", &test_session())
+        .login_with_password("alice", "default", "Sample2+", &test_session())
         .await
         .unwrap();
     assert!(
@@ -241,7 +242,7 @@ async fn a_right_guess_clears_the_key() {
     wrong(&from_a).await;
     world.advance_secs(2);
     assert!(matches!(
-        guess(&from_a, "Gnomes2+").await,
+        guess(&from_a, "Sample2+").await,
         FactorOutcome::Authenticated
     ));
     assert!(
@@ -255,13 +256,13 @@ async fn a_right_guess_clears_the_key() {
     );
 }
 
+/// Patient guessing from one address meets the per-account lock.
 #[tokio::test]
-async fn the_per_account_lock_still_caps_everything() {
+async fn the_per_account_lock_caps_patient_guessing_from_one_address() {
     let world = World::new(LockoutPolicy {
         max_attempts: 3,
         ..LockoutPolicy::default()
     });
-    // Patient guessing from one address meets the lock.
     let from_a = world.from(ADDRESS_A);
     wrong(&from_a).await;
     world.advance_secs(1);
@@ -278,8 +279,11 @@ async fn the_per_account_lock_still_caps_everything() {
         matches!(begun, LoginOutcome::InvalidCredentials),
         "{begun:?}"
     );
+}
 
-    // Cycling addresses meets the same lock.
+/// Cycling addresses meets the same per-account lock.
+#[tokio::test]
+async fn the_per_account_lock_caps_guesses_from_cycling_addresses() {
     let world = World::new(LockoutPolicy {
         max_attempts: 3,
         ..LockoutPolicy::default()
@@ -397,14 +401,16 @@ mod known_device {
     //! is not locked: the delay keeps strangers out, not the owner.
 
     use super::*;
+    use axess_clock::Timestamp;
+    use axess_core::Clock;
     use axess_core::authn::ids::DeviceId;
     use axess_core::device::types::{Device, FingerprintHash};
     use axess_core::testing::test_session_on_device;
     use axess_core::{DeviceStore, DeviceTrustLevel, MemoryDeviceStore};
 
-    async fn seen_device(devices: &MemoryDeviceStore) -> DeviceId {
+    /// A device the account was last seen on at `now`.
+    async fn seen_device(devices: &MemoryDeviceStore, now: Timestamp) -> DeviceId {
         let id = axess_core::authn::ids::testing::device("seen");
-        let now = Utc::now();
         devices
             .save(
                 &Device {
@@ -428,17 +434,18 @@ mod known_device {
 
     #[tokio::test]
     async fn a_known_device_is_not_throttled() {
-        let clock = MockClock::at(Utc.timestamp_opt(1_700_000_000, 0).unwrap());
+        let clock = common::test_clock();
         let identity = MockIdentityStore::new()
+            .with_clock(clock.clone())
             .with_tenant(test_tenant())
             .with_user(test_user("u1", "alice"))
             .with_lockout_policy(throttle_only())
             .with_clock(clock.clone());
         let factors = MockFactorStore::new()
-            .with_factor(user_scope(), password_config("Gnomes2+"))
+            .with_factor(user_scope(), password_config("Sample2+"))
             .with_method(&uid("u1"), password_method());
         let devices = MemoryDeviceStore::new();
-        let device = seen_device(&devices).await;
+        let device = seen_device(&devices, clock.now()).await;
         let service = AuthnService::builder(identity, factors)
             .with_clock(clock)
             .with_device_store(devices)
@@ -459,7 +466,7 @@ mod known_device {
             .unwrap();
         let verified = service
             .verify_factor(
-                &FactorCredential::Password(ZeroizedString::new("Gnomes2+")),
+                &FactorCredential::Password(ZeroizedString::new("Sample2+")),
                 &owner,
             )
             .await

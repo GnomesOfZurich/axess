@@ -8,9 +8,10 @@ use crate::provisioning::{Provisioner, Provisioning, Resolution, ResolveError, T
 use axess::authn::{
     AuditContext, AuthnService, EntityState, IdentityLookup, Tenant, TenantId, UserId,
 };
+use axess::federation::oauth::OAuthCallbackRoute;
 use axess::federation::oauth::{
-    BackChannelLogoutHandler, ClientAssertionSigner, DpopKey, OAuthError, OAuthLoginOptions,
-    OAuthProvider, OAuthProviderConfig,
+    BackChannelLogoutHandler, ClientAssertionSigner, DpopKey, EgressPolicy, OAuthError,
+    OAuthLoginOptions, OAuthProvider, OAuthProviderConfig,
 };
 use axess::testing::{MockFactorStore, MockIdentityStore};
 use axess::{
@@ -53,10 +54,6 @@ const SESSION_NONCE: &str = "example.nonce";
 /// tokens work with this key and no other, so it is kept as carefully as the
 /// refresh token beside it, and restored by whichever process refreshes.
 const SESSION_DPOP_KEY: &str = "example.dpop_key";
-/// Session key for the provider the login began with. The callback's path
-/// names a provider too, and the two must agree before the code is redeemed.
-const SESSION_LOGIN_PROVIDER: &str = "example.login_provider";
-
 /// The session spelling of a DPoP key: its seed, in hex.
 fn dpop_key_to_text(key: &DpopKey) -> String {
     key.to_seed_bytes()
@@ -167,14 +164,27 @@ impl ProviderSettings {
     pub async fn discover(
         &self,
     ) -> Result<OAuthProviderConfig, axess::federation::oauth::OAuthError> {
+        self.discover_on(Arc::new(SystemClock)).await
+    }
+
+    /// [`discover`](Self::discover), checking token times on `clock`.
+    pub async fn discover_on(
+        &self,
+        clock: Arc<dyn Clock>,
+    ) -> Result<OAuthProviderConfig, axess::federation::oauth::OAuthError> {
+        // The walkthrough runs against an identity provider on loopback over
+        // plain HTTP, which the default policy refuses; this is the named
+        // opt-in for local development. Everything else stays screened.
+        let policy = EgressPolicy::screened_allowing_loopback_http();
         let config = match &self.client_auth {
             ClientAuth::Secret(secret) => {
-                OAuthProviderConfig::discover(
+                OAuthProviderConfig::discover_screened(
                     &self.name,
                     &self.issuer,
                     &self.client_id,
                     secret,
                     &self.redirect_uri(),
+                    policy,
                 )
                 .await?
             }
@@ -187,18 +197,20 @@ impl ProviderSettings {
                 if let Some(kid) = key_id {
                     signer = signer.with_key_id(kid);
                 }
-                OAuthProviderConfig::discover_with_private_key_jwt(
+                OAuthProviderConfig::discover_screened_with_private_key_jwt(
                     &self.name,
                     &self.issuer,
                     signer,
                     &self.redirect_uri(),
+                    policy,
                 )
                 .await?
             }
         }
         // Without this list the redirect handed to the IdP's logout endpoint
         // is dropped: only an exact match is forwarded.
-        .with_allowed_post_logout_redirect_uris([self.post_logout_redirect.as_str()]);
+        .with_allowed_post_logout_redirect_uris([self.post_logout_redirect.as_str()])
+        .with_clock(clock);
         if self.id_token_algs.is_empty() {
             config.build()
         } else {
@@ -273,7 +285,13 @@ impl std::error::Error for BuildError {}
 
 /// Build the application: providers, tenant, stores, session layer, routes.
 pub async fn build(config: Config) -> Result<App, BuildError> {
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    build_on(config, Arc::new(SystemClock)).await
+}
+
+/// [`build`], with every time-bound part of the application on `clock`: the
+/// service, the providers, the session layer and its stores. A test passes a
+/// mock set to the instant its tokens are signed at.
+pub async fn build_on(config: Config, clock: Arc<dyn Clock>) -> Result<App, BuildError> {
     let rng: Arc<dyn SecureRng> = Arc::new(SystemRng);
 
     // The tenant the federated users belong to. A real application reads it
@@ -288,17 +306,20 @@ pub async fn build(config: Config) -> Result<App, BuildError> {
         clock.now(),
     )
     .map_err(BuildError::Setup)?;
-    let identity = MockIdentityStore::new().with_tenant(tenant);
-    let registry = MemorySessionRegistry::new();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(tenant);
+    let registry = MemorySessionRegistry::new().with_clock(clock.clone());
 
     let mut builder = AuthnService::builder(identity.clone(), MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_registry(registry.clone());
     let mut for_logout = Vec::new();
     for settings in &config.providers {
         let discover = |s: &ProviderSettings| {
-            let s = s.clone();
+            let (s, clock) = (s.clone(), clock.clone());
             async move {
-                s.discover()
+                s.discover_on(clock)
                     .await
                     .map_err(|e| BuildError::Provider(s.name.clone(), e))
             }
@@ -330,7 +351,7 @@ pub async fn build(config: Config) -> Result<App, BuildError> {
             provisioning: config.provisioning,
             require_verified_email: config.require_verified_email,
         },
-        clock,
+        clock.clone(),
         rng,
     ));
 
@@ -339,12 +360,16 @@ pub async fn build(config: Config) -> Result<App, BuildError> {
     let mut signing_key = [0u8; 32];
     SystemRng.fill_bytes(&mut signing_key);
     // A session the registry no longer holds (back-channel logout, a forced
-    // logout) is refused on its next request.
+    // logout) is refused on its next request, and the service's sink writes
+    // the audit row of each session the layer ends that way or at the age
+    // cap.
     let session_layer = SessionLayer::new(
-        MemorySessionStore::new(),
+        MemorySessionStore::new().with_clock(clock.clone()),
         signing_key,
         Arc::new(SessionRegistryAdapter(registry)),
+        authn.session_end_audit(),
     )
+    .with_clock(clock)
     .with_ttl(STRICT_IDLE_TTL)
     .with_max_session_age(Some(STRICT_MAX_SESSION_AGE))
     .with_secure(config.secure_cookies);
@@ -475,15 +500,7 @@ async fn login(
         )
         .await
     {
-        Ok((auth_url, _csrf)) => {
-            session
-                .set_custom(
-                    SESSION_LOGIN_PROVIDER,
-                    serde_json::Value::String(provider.clone()),
-                )
-                .await;
-            Redirect::temporary(auth_url.as_str()).into_response()
-        }
+        Ok((auth_url, _)) => Redirect::temporary(auth_url.as_str()).into_response(),
         Err(e) => {
             tracing::error!(error = %e, "begin_oauth_login failed");
             page(
@@ -504,15 +521,15 @@ struct CallbackParams {
     iss: Option<String>,
 }
 
-/// Finish the login in four steps, each of which can refuse:
+/// Finish the login in three steps, each of which can refuse:
 ///
-/// 0. The provider in the callback's path must be the one the login began
-///    with. Each provider has its own redirect URI, so an answer that comes
-///    back on another one is a mix-up and is refused before any code is
-///    redeemed.
-/// 1. `finish_oauth_login_with_iss` checks the callback and the ID token and
+/// 1. `finish_oauth_login` checks the callback and the ID token and
 ///    returns the claims, and binds them to this session (the claim lock).
-///    The userinfo endpoint, if there is one, is asked for the same subject.
+///    The provider in the callback's path must be the one the login began
+///    with: each provider has its own redirect URI, so an answer that comes
+///    back on another one is a mix-up and the library refuses it before any
+///    code is redeemed. The userinfo endpoint, if there is one, is asked for
+///    the same subject.
 /// 2. [`Provisioner::resolve`] turns the claims into a local user: the one the
 ///    `(issuer, subject)` pair is linked to, or a new one if the tenant's
 ///    policy allows it.
@@ -527,24 +544,15 @@ async fn callback(
     session: AuthSession,
     audit: AuditContext,
 ) -> Response {
-    let began_with = session
-        .get_custom(SESSION_LOGIN_PROVIDER)
-        .await
-        .and_then(|v| v.as_str().map(str::to_owned));
-    if began_with.as_deref() != Some(provider.as_str()) {
-        tracing::error!(
-            path_provider = %provider,
-            "the callback's provider is not the one the login began with"
-        );
-        return page(
-            StatusCode::BAD_REQUEST,
-            "Login failed",
-            "The provider's answer could not be accepted.",
-        );
-    }
     let authn = state.authn.with_audit_context(audit);
     let claims = match authn
-        .finish_oauth_login_with_iss(&params.code, &params.state, params.iss.as_deref(), &session)
+        .finish_oauth_login(
+            OAuthCallbackRoute::global(&provider),
+            &params.code,
+            &params.state,
+            params.iss.as_deref(),
+            &session,
+        )
         .await
     {
         Ok(claims) => claims,
@@ -563,8 +571,11 @@ async fn callback(
     // else refuses the login; any other failure (no endpoint, a scope the
     // token lacks) leaves the ID token's claims, which the login rests on.
     // Tokens bound to a DPoP key travel with a proof signed by it.
+    // The helpers are called on a scope, which says whose provider the name
+    // is: this example registers its providers globally.
     if let Some(access_token) = &claims.access_token {
         match authn
+            .oauth_global()
             .fetch_userinfo(
                 &claims.provider,
                 access_token,
@@ -686,7 +697,11 @@ async fn logout(
         .get_custom(SESSION_ID_TOKEN_HINT)
         .await
         .and_then(|v| v.as_str().map(str::to_owned));
-    if let Err(e) = state.authn.with_audit_context(audit).logout(&session).await {
+    let authn = state.authn.with_audit_context(audit);
+    // The logout URL comes from the registration the session logged in
+    // through, so the scope is read before the session is cleared.
+    let oauth = authn.oauth_for_session(&session).await;
+    if let Err(e) = authn.logout(&session).await {
         // The session is ended whatever the audit store did.
         tracing::error!(error = %e, "logout audit failed");
     }
@@ -697,15 +712,24 @@ async fn logout(
     let mut random = [0u8; 16];
     SystemRng.fill_bytes(&mut random);
     let logout_state: String = random.iter().map(|b| format!("{b:02x}")).collect();
-    let redirect = provider.as_deref().and_then(|name| {
-        let settings = state.providers.iter().find(|p| p.name == name)?;
-        state.authn.build_end_session_url(
-            name,
-            hint.as_deref(),
-            Some(&settings.post_logout_redirect),
-            Some(&logout_state),
-        )
-    });
+    let settings = provider
+        .as_deref()
+        .and_then(|name| state.providers.iter().find(|p| p.name == name));
+    let redirect = match (provider.as_deref(), settings) {
+        (Some(name), Some(settings)) => oauth
+            .build_end_session_url(
+                name,
+                hint.as_deref(),
+                Some(&settings.post_logout_redirect),
+                Some(&logout_state),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "no logout URL for the provider");
+                None
+            }),
+        _ => None,
+    };
     match redirect {
         Some(url) => Redirect::to(url.as_str()).into_response(),
         None => Redirect::to("/").into_response(),
@@ -768,7 +792,10 @@ async fn refresh(
         .as_deref()
         .and_then(dpop_key_from_text);
     let authn = state.authn.with_audit_context(audit);
-    let outcome = match authn
+    // The registration this session logged in through: a tenant's provider
+    // when the login used one, the global registration otherwise.
+    let oauth = authn.oauth_for_session(&session).await;
+    let outcome = match oauth
         .refresh_oauth_token(
             &provider,
             &token,
@@ -792,7 +819,7 @@ async fn refresh(
             );
         }
     };
-    match authn
+    match oauth
         .fetch_userinfo(
             &provider,
             &outcome.access_token,
@@ -814,6 +841,8 @@ async fn refresh(
                 (&*outcome.access_token, "access_token"),
             ] {
                 if let Err(e) = authn
+                    .oauth_for_session(&session)
+                    .await
                     .revoke_oauth_token(&provider, token, Some(hint), None)
                     .await
                 {

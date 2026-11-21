@@ -3,7 +3,7 @@
 # on the release pull request.
 #
 # main changes only by a release pull request, so CI cannot commit the badge
-# after a merge as it once did. Instead release preparation measures line
+# after a merge. Instead release preparation measures line
 # coverage on the release branch and commits the badge with the release, and
 # the Coverage job, on a pull request into main, refuses a committed figure
 # more than TOLERANCE points from the one it measured. The same rule as the
@@ -45,14 +45,15 @@ fi
 is_pct() { [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v p="$1" 'BEGIN { exit !(p >= 0 && p <= 100) }'; }
 
 measured() {
-  (cd "$AXESS_DIR" && cargo llvm-cov report --json --summary-only) \
-    | python3 -I -c 'import json, sys; print("%.2f" % json.load(sys.stdin)["data"][0]["totals"]["lines"]["percent"])'
+  local report
+  report="$(cd "$AXESS_DIR" && cargo llvm-cov report --json --summary-only)" || return 1
+  python3 -I -c 'import json, sys; print("%.2f" % json.load(sys.stdin)["data"][0]["totals"]["lines"]["percent"])' <<<"$report"
 }
 
 badge_figure() {
   [ -f "$BADGE" ] || { echo "REFUSED: no coverage badge at $BADGE" >&2; exit 1; }
   local fig
-  fig="$(grep -oE '>[0-9]+(\.[0-9]+)?%<' "$BADGE" | head -1 | tr -d '<>%')"
+  fig="$(grep -oE '>[0-9]+(\.[0-9]+)?%<' "$BADGE" | sed -n 1p | tr -d '<>%')"
   [ -n "$fig" ] || { echo "REFUSED: $BADGE carries no percentage" >&2; exit 1; }
   printf '%s\n' "$fig"
 }

@@ -29,7 +29,7 @@ What the profile is, what it demands, and who needs it.
 
 A FAPI deployment has two parties. The **OpenID Provider** (OP, also
 called the IdP) owns user identity, runs the login UI, and issues
-tokens; in open-banking this is typically the bank's own SSO or a
+tokens; in open banking this is typically the bank's own SSO or a
 hosted Keycloak / Ory Hydra / Curity instance. The **Relying Party**
 (RP) is the application that delegates identity to the OP, accepts
 the resulting tokens, and runs a session on top. Axess fills the RP
@@ -47,8 +47,8 @@ internal expression of the same boundary; axess does not become the
 OP, and adopters are expected to point at one. The
 [`examples/fapi/`](https://github.com/GnomesOfZurich/axess/tree/main/examples/fapi)
 crate ships a pre-configured Keycloak realm in a podman container as
-a quick way to get an OP locally for the demo, but in production the
-issuer URL would point at whatever OP your organisation already runs.
+a local OP for the demo; in production the issuer URL points at the OP
+your organisation already runs.
 
 The `local-idp` feature is the one place axess does issuance, but
 that is on-host workload-identity issuance (service-to-service flows
@@ -73,7 +73,7 @@ holding a reference to.
 
 DPoP ([RFC 9449]) binds the access token to a key pair the client holds.
 Every request carries a JWT signed with that key, and the resource server
-checks the access token was issued for its thumbprint.
+checks that the access token was issued for that key's thumbprint.
 
 That defeats bearer-token theft. An attacker who lifts the token from
 logs, a misconfigured proxy or a debugging surface cannot use it without
@@ -82,22 +82,53 @@ the private key, which never leaves the client.
 DPoP is not FAPI-only. Outside the profile a provider binds its tokens to
 a DPoP key by default whenever the IdP advertises DPoP, whatever the client
 authenticates with; [OAuth 2.0 and OIDC](oauth.md#binding-tokens-to-a-key-dpop)
-covers that. FAPI builds on the same binding and makes it unconditional: on
-whether or not the IdP advertises it, with the code bound too through PAR,
-and with no way to switch it off.
+covers that. FAPI builds on the same binding and makes it unconditional: it is on
+whether or not the IdP advertises DPoP, the code is bound too through PAR,
+and it cannot be switched off.
+
+Both halves use one algorithm. The client signs proofs with `ES256`, and the
+resource-server half, `verify_dpop_proof`, accepts `ES256` over a P-256 key
+and refuses every other `alg` by policy. RFC 9449 names no mandatory
+algorithm and leaves the accepted set to the server. `ES256` is in every set
+FAPI 2.0 allows. A proof carries its own key, chosen by the sender, so a
+wider list would give the server nothing to rely on and one more parser for
+a key that an anonymous caller supplies. A resource server that
+challenges with `WWW-Authenticate: DPoP` sends `algs="ES256"`, which is the
+`DPOP_SIGNING_ALG` constant.
+
+A proof's `jti` is recorded so the same proof is not accepted twice.
+`verify_dpop_proof` records it in a `DpopJtiCache`, which is synchronous and
+so lives in the process (`MemoryJtiCache`): behind a load balancer each node
+keeps its own, and a proof accepted by one is accepted once more by every
+other. A fleet calls `verify_dpop_proof_with_store` instead, which runs the
+same checks and records the `jti` in a `JtiReplayStore` every node reaches,
+such as `ValkeyJtiReplayStore`; a store that cannot answer refuses the proof.
+The record is `axess.dpop:<key thumbprint>:<jti>`, so one client's `jti`
+never refuses another's, and a store that another verifier also records into
+keeps the two apart. `MemoryJtiCache` used as a `JtiReplayStore` reports a
+full cache as a store that cannot answer, not as a replay.
+
+The Valkey server that holds the records must run `maxmemory-policy
+noeviction`. Every record carries a time to live, so under any other policy
+the server may drop a live record under memory pressure, and a dropped
+record is a proof accepted twice. `ValkeyJtiReplayStore::checked` asks the
+server at start and refuses any other policy, and refuses a server that does
+not report one; on a cluster it asks every node, since each evicts by its own
+setting. `ValkeyJtiReplayStore::new` does not ask; it is for a managed server
+that does not answer `CONFIG GET`, where the operator must confirm the policy.
 
 #### JARM: signed authorization responses
 
 The IdP returns the authorization response as a signed JWT rather than
-query parameters, so it cannot be tampered with after issuance. Optional
-in FAPI 2.0; some implementations use it, some do not.
+query parameters, so it cannot be tampered with after issuance. JARM is
+optional in FAPI 2.0.
 
 #### Short ID token windows
 
 Axess refuses an ID token whose `exp` is more than five minutes after its
-`iat` (the default of `max_id_token_lifetime_secs`), which narrows replay
-through stale tokens, and one whose `nbf` is more than 60 seconds in the
-future, the rule FAPI 2.0 (section 5.3.2.1) sets for every JWT. `nbf` is
+`iat` (the default of `max_id_token_lifetime`), which narrows replay
+through stale tokens. It also refuses one whose `nbf` is more than 60
+seconds in the future, the rule FAPI 2.0 (section 5.3.2.1) sets for every JWT. `nbf` is
 optional: neither OpenID Connect nor FAPI 2.0 requires it in an ID token,
 and Keycloak issues none.
 
@@ -106,7 +137,7 @@ and Keycloak issues none.
 
 ### When to reach for FAPI
 
-The honest answer is: when a regulator requires it. FAPI 2.0 was
+Adopt FAPI when a regulator requires it. FAPI 2.0 was
 designed for the open-banking ecosystem and similar regulated
 financial APIs, and adopting it imposes operational complexity
 (every client needs DPoP key management, every authorize call goes
@@ -123,15 +154,15 @@ you do not, the baseline OAuth chapter covers what you need.
 
 ## The mechanisms
 
-The four things FAPI adds over ordinary OAuth.
+How axess implements what FAPI adds over baseline OAuth.
 
 ### Configuration
 
 `FapiConfig` describes the profile and `OAuthProviderBuilder::with_fapi`
 attaches it to the builder `discover` returns. It is the only way to turn the
-profile on, and `build` either returns a provider that keeps all of it or an
-`OAuthError::Config` naming what is missing, whatever order the settings
-came in.
+profile on, and `build` returns either a provider that keeps all of it or an
+`OAuthError::Config` naming what is missing, in whatever order the settings
+were applied.
 
 ```rust,ignore
 use axess::federation::oauth::{FapiConfig, SenderConstraint};
@@ -150,17 +181,17 @@ let provider = builder
 * `require_jarm` makes the authorization request ask for `response_mode=jwt`
   and the callback finish through `finish_oauth_login_jarm`, below. A plain
   `finish_oauth_login` for such a provider is refused and ends the ceremony.
-* `max_id_token_lifetime_secs` bounds `exp - iat` of the ID token (300 by
-  default), and an `nbf`, when present, must not be more than 60 seconds in
+* `max_id_token_lifetime`, a `Duration`, bounds `exp - iat` of the ID token
+  (300 s by default, compared in whole seconds), and an `nbf`, when present, must not be more than 60 seconds in
   the future.
 * `allowed_id_token_algs` lists the JOSE names an ID token may be signed
   with: `PS256`, `ES256` and `EdDSA` by default, whatever the IdP advertises
-  in `id_token_signing_alg_values_supported`. An IdP that cannot sign with
-  those is a deployment decision to widen this list, knowingly: the profile
+  in `id_token_signing_alg_values_supported`. Widening the list for an IdP
+  that cannot sign with these is a deliberate deployment decision: the profile
   does not accept `RS256`. Symmetric names and `none` are refused, and so is an
-  empty list. With `with_id_token_signing_algs` as well, the provider accepts
-  the algorithms both lists name, and `build` refuses a pin the profile shares
-  nothing with.
+  empty list. When `with_id_token_signing_algs` is also set, the provider accepts
+  the algorithms both lists name, and `build` refuses a pin that shares no
+  algorithm with the profile.
 * A PAR endpoint is required. `begin_oauth_login` then pushes the
   authorization request there.
 * The client authenticates by `private_key_jwt` or mTLS, never by a
@@ -173,9 +204,9 @@ client to prove its identity to the authorization server:
 `private_key_jwt` (RFC 7523) and mTLS (`tls_client_auth` or
 `self_signed_tls_client_auth`, RFC 8705). A shared secret, sent in the
 form or in a Basic header, is not one of them. `build` therefore
-refuses, with an `OAuthError::Config` naming both methods, a provider
-that holds neither a `private_key_jwt` signer nor an mTLS sender
-constraint, and drops any secret the provider was discovered with. No
+refuses a provider that holds neither a `private_key_jwt` signer nor an
+mTLS sender constraint, with an `OAuthError::Config` naming both methods.
+It also drops any secret the provider was discovered with. No
 request a FAPI provider makes (the pushed authorization request, the
 code exchange, the refresh, `client_credentials`, the device grant,
 revocation) carries a secret; userinfo never did.
@@ -183,8 +214,8 @@ revocation) carries a secret; userinfo never did.
 **`private_key_jwt`.** Give the provider its signer: discover it with
 `discover_with_private_key_jwt`, or call `with_private_key_jwt` on the
 builder `discover` returns, before or after `with_fapi`. Each
-request then carries a fresh `client_assertion` signed for the issuer as
-audience (section 5.3.2.1), unless the signer fixed another with
+request then carries a fresh `client_assertion` signed with the issuer as
+audience (section 5.3.2.1), unless the signer sets another audience with
 `ClientAssertionSigner::with_audience`. Sign with `PS256`, `ES256` or
 `EdDSA`. The [OAuth chapter](oauth.md) covers the signer, its key
 formats and the `kid` and thumbprint headers.
@@ -221,7 +252,7 @@ Under the profile it is on whatever the discovery document says, and
 `build` refuses `without_dpop()`. For each login the service makes a `DpopKey` from its `SecureRng` and
 the token request carries a `DPoP` header: a proof with `htm` POST, `htu` the
 token endpoint, a fresh `jti` and `iat` from the provider's clock. When the
-server answers `use_dpop_nonce` with a `DPoP-Nonce` header the request is sent
+server answers `use_dpop_nonce` with a `DPoP-Nonce` header, the request is sent
 once more with a proof that echoes the nonce. The response must say
 `token_type` `DPoP`; a `Bearer` answer is refused, and so is an access token
 that is a JWT with a `cnf.jkt` other than the key's thumbprint. The key comes
@@ -231,8 +262,8 @@ Refresh and userinfo calls are bound to the same key:
 `refresh_oauth_token` and `fetch_userinfo` take it as `dpop_key`, sign their
 requests with it, and send the access token under the `DPoP` authorization
 scheme with a proof that carries the token's hash. A provider configured for
-DPoP refuses them given no key (`OAuthError::DpopKeyRequired`), since they
-would send the token unbound.
+DPoP refuses them when no key is given (`OAuthError::DpopKeyRequired`), since
+they would send the token unbound.
 
 The key is the caller's to keep: axess does not store it. Store
 `DpopKey::to_seed_bytes` beside the refresh token and restore it with
@@ -248,20 +279,22 @@ userinfo, revocation and PAR requests go to the aliases it lists, including
 an endpoint named with `with_par_endpoint` or `with_revocation_endpoint`.
 Missing or unreadable files, a bad PEM, or an alias that is not an HTTPS URL
 fail `build`, not the first login. The tokens are certificate-bound but say
-`Bearer`, as RFC 8705 has it. Under mTLS DPoP is off, even where the IdP
+`Bearer`, as RFC 8705 has it. Under mTLS, DPoP is off, even where the IdP
 advertises it, and `build` refuses `with_dpop()`: the certificate is the binding.
 
 ### JARM
 
 With `require_jarm` the authorization response is a signed JWT in the
 `response` parameter of the callback. Finish the login with
-`finish_oauth_login_jarm(response, &session)`. The JWT is verified against the
+`finish_oauth_login_jarm(route, response, &session)`, where `route` is the
+`OAuthCallbackRoute` the callback arrived on, as for `finish_oauth_login`.
+The JWT is verified against the
 provider's key set with the profile's algorithms (never `none`, never a
 symmetric one): `iss` must be the provider's issuer, `aud` this client, and
 `exp` is required and enforced. A stale key set is refreshed once. The `code`,
 `state` and `iss` inside then go through the same checks as
-`finish_oauth_login_with_iss`, with `iss` required; a response carrying
-`error` ends the ceremony.
+`finish_oauth_login`, the route included and with `iss` required; a response
+carrying `error` ends the ceremony.
 
 ### The PAR flow
 
@@ -276,19 +309,18 @@ let auth_url = service
 //   https://idp.example.com/authorize?client_id=...&request_uri=urn:ietf:params:oauth:request_uri:...
 ```
 
-Internally, `begin_oauth_login` detects the FAPI configuration and
-takes the PAR branch. The branch performs a POST to the IdP's PAR
-endpoint with the full set of authorization parameters (client id,
-redirect URI, scopes, PKCE challenge, CSRF state, nonce), receives
-the `request_uri` and its `expires_in`, and constructs the
-shorter authorize URL the user is redirected to.
+Under FAPI, `begin_oauth_login` POSTs the full set of authorization
+parameters (client id, redirect URI, scopes, PKCE challenge, CSRF state,
+nonce) to the IdP's PAR endpoint, receives the `request_uri` and its
+`expires_in`, and builds the shorter authorize URL the user is
+redirected to.
 
-With DPoP as the sender constraint, the login's key is made at begin:
-the pushed request names it in `dpop_jkt` and carries a DPoP proof
-signed by it (RFC 9449 sections 10 and 10.1), so the authorization
-server binds the code to the key before the token request presents it,
-and a PAR endpoint that answers `use_dpop_nonce` is retried once with
-its nonce. The key travels in the session's ceremony state, beside the
+With DPoP as the sender constraint, the login's key is made when the
+login begins: the pushed request names it in `dpop_jkt` and carries a
+DPoP proof signed by it (RFC 9449 sections 10 and 10.1), so the
+authorization server binds the code to the key before the token request
+presents it. A PAR endpoint that answers `use_dpop_nonce` is retried
+once with its nonce. The key travels in the session's ceremony state, beside the
 PKCE verifier, and the token request at `finish_oauth_login` presents
 it; `OAuthClaims::dpop_key` carries it back as before. On the trait,
 `build_auth_url_par` and `push_authorization_request` take the signer in
@@ -300,10 +332,13 @@ every request of a FAPI provider is: by a `private_key_jwt` assertion
 (audience the issuer) or by the mTLS client certificate, never by a
 client secret (see Client authentication above).
 
-The callback flow on your side is unchanged. The IdP
+Without JARM the callback flow on your side is unchanged. The IdP
 redirects the user back to your callback URL with a
-code; you call `finish_oauth_login` with the code and
-state; axess performs the token exchange and ID token validation.
+code; you call `finish_oauth_login` with the callback route, the code,
+the state and the `iss` parameter when the response has one; axess performs
+the token exchange and ID token validation. With `require_jarm` that call is
+refused, and the callback finishes through `finish_oauth_login_jarm` instead
+(see JARM above).
 
 ### DPoP key management
 
@@ -317,12 +352,12 @@ returns it in `OAuthClaims::dpop_key`; keep it for as long as the token lives
 (`to_seed_bytes` exports the scalar for storage next to the token, and
 `from_seed` restores it), and pass it by reference to every proof and to the
 refresh and userinfo calls. `AuthnService::new_dpop_key` draws one from the
-service's `SecureRng` for the cases where you make the key yourself.
+service's `SecureRng` when you make the key yourself.
 `thumbprint` returns the RFC 7638 thumbprint, which is the `jkt` the
 authorization server binds the token to. `Debug` prints the thumbprint only,
 never the scalar.
 
-`AuthnService::generate_dpop_proof` builds a proof with the key. It draws the
+`ScopedOAuth::generate_dpop_proof` builds a proof with the key. It draws the
 `jti` from the service's `SecureRng` and stamps `iat` from the service's
 `Clock`, so a seeded RNG and a mock clock reproduce the proof exactly. The
 provider trait method it calls, `OAuthProvider::generate_dpop_proof`, takes the
@@ -332,13 +367,17 @@ source itself.
 ```rust,ignore
 let key = claims.dpop_key.expect("a DPoP login returns its key"); // kept for the token's life
 
-let proof: DpopProof = authn.generate_dpop_proof(
-    "bank",                                        // provider name
-    &key,                                          // the token's key
-    "GET",                                         // HTTP method
-    "https://resource.example.com/data",           // target URL
-    Some(&access_token),                           // bind to this access token
-)?;
+let proof: DpopProof = authn
+    .oauth_for_session(&session)                       // the provider the login used
+    .await
+    .generate_dpop_proof(
+        "bank",                                        // provider name
+        &key,                                          // the token's key
+        "GET",                                         // HTTP method
+        "https://resource.example.com/data",           // target URL
+        Some(&access_token),                           // bind to this access token
+    )
+    .await?;
 
 let response = http_client
     .get("https://resource.example.com/data")
@@ -351,8 +390,12 @@ let response = http_client
 The proof JWT contains the HTTP method, the target URL, a unique `jti`, an
 `iat` timestamp, the hash of the access token (`ath`) when one is passed, and
 the public key in its header. Two proofs from one key for different URLs
-carry the same thumbprint. The resource server checks all of these against the
-access token's `cnf` (confirmation) claim.
+carry the same thumbprint. With `verify_dpop_proof` the resource server checks
+the method and URL against the request, `iat` against its clock, `jti`
+against a replay cache and `ath` against the access token. It then matches
+the key's thumbprint, which the verifier returns as `DpopVerified::thumbprint`,
+against the access token's `cnf.jkt` (confirmation) claim; the application
+performs that step itself.
 
 Key lifecycle is the operational concern. A key per session bounds a
 compromised session to one key; a key per application instance is easier to
@@ -379,26 +422,24 @@ Providers with no revocation endpoint return `OAuthError::Config`
 rather than silently succeeding, so a deployment cannot believe it is
 revoking when it is not.
 
-The revocation endpoint, when present in the discovery document, is
-called with the token to revoke and an optional type hint. The IdP
-responds with a 200 regardless of whether the token was actually
-revoked (intentionally, to defeat token-existence enumeration).
+The IdP answers 200 whether or not the token was revoked, so that a
+caller cannot use revocation to learn whether a token exists.
 
 Revoking the refresh token is the more important call. The access
 token typically has a short lifetime (matching the FAPI ID token
 bound) and expires on its own; the refresh token has a longer life
 and an unrevoked one allows continued access through new access
 tokens. A logout that revokes only the access token leaves the
-refresh token active, which is rarely what you want.
+refresh token active.
 
 ## Testing FAPI flows
 
-There are three useful test modes, picked by what you want to
-exercise.
+Three test modes serve different purposes.
 
 For Rust unit and integration tests, the FAPI feature pairs with the
-`local-idp` feature. The `LocalIdpFixture` in `axess-core::testing::local_idp`
-mints FAPI-grade tokens with the right `nbf`/`exp` bounds and exposes
+`local-idp` feature. The `LocalIdpFixture` in `axess::local_idp`, which
+also needs the `testing` feature, mints FAPI-grade tokens with the right
+`nbf`/`exp` bounds and exposes
 a shared `JwkSet` handle that a `JwtVerifier` borrows for signature
 verification. The fixture is an in-process value, not an HTTP service:
 PAR and discovery endpoints are not part of its surface. For FAPI
@@ -437,7 +478,7 @@ FAPI 2.0 closes the attacks baseline OAuth leaves open in regulated
 contexts.
 
 Against authorization-parameter tampering: PAR moves the parameters
-off the URL, so they cannot be modified by an intermediary.
+off the URL, so an intermediary cannot modify them.
 
 Against bearer-token theft: DPoP (or mTLS) binds tokens to keys the
 attacker does not have, so a captured token is unusable.
@@ -466,15 +507,17 @@ only the token endpoint as audience; fix it with
 `ClientAssertionSigner::with_audience`.
 
 If DPoP verification fails at the resource server, the most common
-cause is a clock-skew issue between the client and the resource
-server. The DPoP proof's timestamp is checked within a small window
-(a few seconds typically); larger skew triggers spurious failures.
+cause is clock skew between the client and the resource server. The DPoP
+proof's `iat` is checked within the window the resource server passes as
+`DpopVerifyRequest::max_iat_skew`, a `std::time::Duration` with no default and at most `MAX_IAT_SKEW` (one day).
+RFC 9449 suggests a few seconds, and 60 seconds is a typical upper bound.
+Skew larger than the window triggers spurious failures.
 Synchronise both sides against the same NTP source.
 
 If JARM verification fails, the signing key the IdP uses for JARM
 may differ from the key used for ID token signing. Some IdPs
 publish separate JWKS for the two; the discovery document should
-indicate this, but configurations occasionally miss it. Inspect the
+say so, but configurations sometimes omit it. Inspect the
 discovery document.
 
 ## Further reading

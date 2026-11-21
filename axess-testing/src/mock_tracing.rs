@@ -9,6 +9,18 @@
 //! let events = capture.events();
 //! assert!(events.iter().any(|e| e.contains("session registry")));
 //! ```
+//!
+//! [`TracingCapture`] keeps the fields of each event. What a stock
+//! `tracing_subscriber::fmt` formatter prints holds more: the fields of the
+//! spans an event fired in, and the lines spans print when they open and
+//! close. [`LineCapture::install`] captures those lines, for a test of what
+//! reaches a log file:
+//!
+//! ```rust,ignore
+//! let lines = LineCapture::install();
+//! // ... exercise code that runs inside a span ...
+//! assert!(lines.lines().iter().any(|l| l.contains(" login{")));
+//! ```
 
 use std::sync::{Arc, Mutex};
 use tracing::Level;
@@ -17,12 +29,15 @@ use tracing_subscriber::layer::SubscriberExt;
 /// Captured tracing events for test assertions.
 pub struct TracingCapture {
     events: Arc<Mutex<Vec<CapturedEvent>>>,
-    // `_guard` is a struct-field carve-out from the workspace's no-`_` rule.
-    // `DefaultGuard` is held purely for its `Drop` side-effect (restoring the
-    // previous default subscriber); reading the field is meaningless. The `_`
-    // prefix is the language-idiomatic way to express "RAII hold, never read"
-    // without `#[allow(dead_code)]`.
-    _guard: tracing::subscriber::DefaultGuard,
+    // Held until this capture is dropped, whose `Drop` ends it: ending the
+    // guard restores the previous default subscriber.
+    guard: Option<tracing::subscriber::DefaultGuard>,
+}
+
+impl Drop for TracingCapture {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+    }
 }
 
 /// A single captured tracing event.
@@ -66,7 +81,7 @@ impl TracingCapture {
         tracing::callsite::rebuild_interest_cache();
         Self {
             events,
-            _guard: guard,
+            guard: Some(guard),
         }
     }
 
@@ -93,6 +108,114 @@ impl TracingCapture {
         self.events()
             .iter()
             .any(|e| e.level == level && e.message.contains(needle))
+    }
+}
+
+// ── Printed lines ────────────────────────────────────────────────────────────
+
+/// The text a stock `tracing_subscriber::fmt` formatter wrote: a
+/// [`MakeWriter`](tracing_subscriber::fmt::MakeWriter) into a shared buffer.
+///
+/// [`LineCapture::install`] sets one up with the settings most tests want;
+/// hand this to a formatter of your own when a test needs other settings
+/// (a level filter, an `EnvFilter`, other span events).
+#[derive(Clone, Default)]
+pub struct PrintedLines(Arc<Mutex<Vec<u8>>>);
+
+impl PrintedLines {
+    /// An empty buffer.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Everything written so far, as text (invalid UTF-8 replaced).
+    pub fn text(&self) -> String {
+        let bytes = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// The lines written so far, without their line ends.
+    pub fn lines(&self) -> Vec<String> {
+        self.text().lines().map(str::to_owned).collect()
+    }
+}
+
+impl std::io::Write for PrintedLines {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for PrintedLines {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self {
+        self.clone()
+    }
+}
+
+/// The lines a stock `tracing_subscriber::fmt` formatter prints, captured
+/// for the current thread.
+///
+/// The formatter writes every level, a line for each span as it opens and
+/// as it closes, no ANSI colours, and none of its own cleaning of control
+/// characters, so the lines are what the code under test made of its values
+/// before a formatter saw them. Like [`TracingCapture`] it keeps a second
+/// dispatcher registered, so a callsite another thread hit first is still
+/// captured here.
+pub struct LineCapture {
+    printed: PrintedLines,
+    // Ended by this capture's `Drop`, which restores the previous default
+    // subscriber; see the same field on `TracingCapture`.
+    guard: Option<tracing::subscriber::DefaultGuard>,
+}
+
+impl Drop for LineCapture {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+    }
+}
+
+impl LineCapture {
+    /// Install the formatter as the default subscriber of the current
+    /// thread, until the returned value is dropped.
+    pub fn install() -> Self {
+        let printed = PrintedLines::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(printed.clone())
+            .with_max_level(Level::TRACE)
+            .with_ansi(false)
+            .with_ansi_sanitization(false)
+            .with_span_events(
+                tracing_subscriber::fmt::format::FmtSpan::NEW
+                    | tracing_subscriber::fmt::format::FmtSpan::CLOSE,
+            )
+            .finish();
+        anchor();
+        let guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+        Self {
+            printed,
+            guard: Some(guard),
+        }
+    }
+
+    /// Everything printed so far, as text.
+    pub fn text(&self) -> String {
+        self.printed.text()
+    }
+
+    /// The lines printed so far, without their line ends.
+    pub fn lines(&self) -> Vec<String> {
+        self.printed.lines()
     }
 }
 
@@ -212,6 +335,9 @@ impl tracing::field::Visit for MessageVisitor {
         }
     }
 }
+
+#[cfg(test)]
+mod line_tests;
 
 #[cfg(test)]
 mod tests {

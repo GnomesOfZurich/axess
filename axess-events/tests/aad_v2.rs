@@ -1,15 +1,18 @@
-#![allow(deprecated)]
-//! The second AAD tag binds every envelope field a reader acts on.
+//! The second AAD tag binds every envelope field a reader acts on, a reader
+//! refuses the first tag unless it names the opt-in, and an event sealed
+//! under the first tag is moved to the second by the documented pass.
+
+use std::time::{Duration, SystemTime};
 
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use axess_events::{
     AeadAlgorithm, EncryptedBlob, EnvelopeFields, Event, EventBody, EventId, EventPayload,
-    EventStatus, EventSubject, KeyId, KindTag, TenantId, TraceContext, UserId, envelope_aad,
+    EventStatus, EventSubject, FirstTag, KeyId, KindTag, TenantId, TraceContext, UserId,
     envelope_aad_for, envelope_aad_v2, open_aads_for,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct Thing;
 
 impl EventPayload for Thing {
@@ -49,6 +52,20 @@ fn sealed() -> Event<Thing> {
 
 fn aad(e: &Event<Thing>) -> Vec<u8> {
     envelope_aad_for(e).expect("an encrypted body has associated data")
+}
+
+/// The reader's clock, `secs` seconds after the Unix epoch.
+fn at(secs: u64) -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+}
+
+/// The first-tag AAD of an event, as an event sealed before the second tag
+/// carries it: the second value an accepting reader is listed.
+fn first_tag_aad(e: &Event<Thing>) -> Vec<u8> {
+    open_aads_for(e, FirstTag::Accept, at(0))
+        .expect("an encrypted body has associated data")
+        .pop()
+        .expect("an accepting policy lists the first tag last")
 }
 
 #[test]
@@ -115,7 +132,7 @@ fn the_first_tag_still_builds_and_never_collides_with_the_second() {
     let EventBody::Encrypted(blob) = &e.body else {
         panic!("sealed() is encrypted");
     };
-    let v1 = envelope_aad(&e.id, &e.kind, e.tenant_id.as_ref(), e.subject.as_ref());
+    let v1 = first_tag_aad(&e);
     assert!(String::from_utf8_lossy(&v1).contains("envelope-aad/v1"));
     let v2 = envelope_aad_v2(&EnvelopeFields {
         id: &e.id,
@@ -151,22 +168,27 @@ fn seal(event: &mut Event<Thing>, aad: &[u8], plain: &[u8]) {
         panic!("encrypted body");
     };
     blob.ciphertext = cipher()
-        .encrypt(Nonce::from_slice(&blob.nonce), Payload { msg: plain, aad })
+        .encrypt(&Nonce::from(blob.nonce), Payload { msg: plain, aad })
         .expect("seal");
 }
 
-/// Open the way a reader does: each candidate AAD in order.
-fn open(event: &Event<Thing>) -> Option<(usize, Vec<u8>)> {
+/// Open the way a reader under `first_tag` does at `now`: each
+/// listed AAD in order. The index says which tag opened the event.
+fn open_under(
+    event: &Event<Thing>,
+    first_tag: FirstTag,
+    now: SystemTime,
+) -> Option<(usize, Vec<u8>)> {
     let EventBody::Encrypted(blob) = &event.body else {
         return None;
     };
-    open_aads_for(event)?
+    open_aads_for(event, first_tag, now)?
         .into_iter()
         .enumerate()
         .find_map(|(i, aad)| {
             cipher()
                 .decrypt(
-                    Nonce::from_slice(&blob.nonce),
+                    &Nonce::from(blob.nonce),
                     Payload {
                         msg: &blob.ciphertext,
                         aad: &aad,
@@ -175,6 +197,33 @@ fn open(event: &Event<Thing>) -> Option<(usize, Vec<u8>)> {
                 .ok()
                 .map(|plain| (i, plain))
         })
+}
+
+/// Open the way a reader does by default: under the one value
+/// `envelope_aad_for` returns, with no clock and no policy.
+fn open(event: &Event<Thing>) -> Option<(usize, Vec<u8>)> {
+    let EventBody::Encrypted(blob) = &event.body else {
+        return None;
+    };
+    cipher()
+        .decrypt(
+            &Nonce::from(blob.nonce),
+            Payload {
+                msg: &blob.ciphertext,
+                aad: &envelope_aad_for(event)?,
+            },
+        )
+        .ok()
+        .map(|plain| (0, plain))
+}
+
+/// An event sealed under the first tag, as a release before the second tag
+/// left it in the store.
+fn sealed_under_the_first_tag(plain: &[u8]) -> Event<Thing> {
+    let mut event = sealed();
+    let aad = first_tag_aad(&event);
+    seal(&mut event, &aad, plain);
+    event
 }
 
 /// A newly sealed event is sealed under the second tag, opens under it, and
@@ -203,18 +252,130 @@ fn a_newly_sealed_event_fails_to_open_after_its_status_is_edited() {
     assert_eq!(open(&event), None, "an edited time does not open");
 }
 
-/// An event sealed under the first tag still opens, through the second
-/// candidate, and its status stays editable: that is what the first tag
-/// authenticated.
+/// The default refuses the first tag: the one value listed is the second
+/// tag's, whatever the clock reads, and an event sealed under the first tag
+/// does not open.
 #[test]
-fn an_event_sealed_under_the_first_tag_still_opens() {
-    let mut event = sealed();
-    let aad = envelope_aad(
-        &event.id,
-        &event.kind,
-        event.tenant_id.as_ref(),
-        event.subject.as_ref(),
+fn the_default_refuses_an_event_sealed_under_the_first_tag() {
+    assert_eq!(FirstTag::default(), FirstTag::Reject);
+    let event = sealed_under_the_first_tag(b"old");
+    assert_eq!(open(&event), None, "the default reader");
+    for now in [at(0), at(1_700_000_000), at(u64::from(u32::MAX))] {
+        assert_eq!(
+            open_aads_for(&event, FirstTag::default(), now).expect("aads"),
+            vec![aad(&event)],
+            "only the second tag is listed"
+        );
+        assert_eq!(open_under(&event, FirstTag::Reject, now), None);
+    }
+    assert!(!FirstTag::Reject.accepts_at(at(0)));
+    assert!(FirstTag::Accept.accepts_at(at(u64::from(u32::MAX))));
+}
+
+/// Under the named opt-in an event sealed under the first tag opens, through
+/// the second value listed, and its status stays editable: that is what the
+/// first tag authenticated, and why accepting it is not the default.
+#[test]
+fn the_opt_in_opens_an_event_sealed_under_the_first_tag_rewritten_or_not() {
+    let mut event = sealed_under_the_first_tag(b"old");
+    assert_eq!(
+        open_under(&event, FirstTag::Accept, at(0)),
+        Some((1, b"old".to_vec()))
     );
-    seal(&mut event, &aad, b"old");
-    assert_eq!(open(&event), Some((1, b"old".to_vec())));
+    event.status = EventStatus::Success;
+    assert_eq!(
+        open_under(&event, FirstTag::Accept, at(0)),
+        Some((1, b"old".to_vec())),
+        "the first tag does not bind the status"
+    );
+    assert_eq!(open(&event), None, "and the default refuses it either way");
+}
+
+/// With a cutoff the first tag is tried before it and refused from it on,
+/// on the reader's clock, whatever the event's own time says. The cutoff
+/// and the clock are instants, so no unit can be mistaken for another.
+#[test]
+fn the_first_tag_is_refused_from_the_cutoff_on_the_readers_clock() {
+    let mut event = sealed_under_the_first_tag(b"old");
+    event.status = EventStatus::Success;
+    let cutoff = at(1_800_000_000);
+    let just_before = cutoff - Duration::from_micros(1);
+    assert!(
+        event.time_micros < 1_800_000_000_000_000,
+        "the event's own time is before the cutoff"
+    );
+
+    assert_eq!(
+        open_under(&event, FirstTag::AcceptUntil(cutoff), just_before).map(|(i, _)| i),
+        Some(1),
+        "before the cutoff the first tag is still tried"
+    );
+    for now in [cutoff, cutoff + Duration::from_secs(1)] {
+        assert_eq!(
+            open_under(&event, FirstTag::AcceptUntil(cutoff), now),
+            None,
+            "from the cutoff on the first tag is refused"
+        );
+        assert_eq!(
+            open_aads_for(&event, FirstTag::AcceptUntil(cutoff), now)
+                .expect("aads")
+                .len(),
+            1,
+            "only the second tag is listed from the cutoff on"
+        );
+    }
+    assert_eq!(
+        open_aads_for(&event, FirstTag::AcceptUntil(cutoff), just_before)
+            .expect("aads")
+            .len(),
+        2
+    );
+    assert!(FirstTag::AcceptUntil(cutoff).accepts_at(just_before));
+    assert!(!FirstTag::AcceptUntil(cutoff).accepts_at(cutoff));
+}
+
+/// The documented pass: an event that opens only under the first tag is
+/// sealed again under the second, with a fresh nonce, and from then on opens
+/// under the default and no longer opens once a field is edited. An event
+/// already under the second tag is left alone.
+#[test]
+fn the_reseal_pass_moves_a_first_tag_event_to_the_second_tag() {
+    let mut store = vec![sealed_under_the_first_tag(b"old"), {
+        let mut current = sealed();
+        current.id = EventId::from_bytes([8; 16]);
+        let aad = envelope_aad_for(&current).expect("aad");
+        seal(&mut current, &aad, b"new");
+        current
+    }];
+    let untouched = store[1].clone();
+
+    let mut moved = 0;
+    for event in &mut store {
+        match open_under(event, FirstTag::Accept, at(0)) {
+            Some((0, _)) => {}
+            Some((_, plain)) => {
+                if let EventBody::Encrypted(blob) = &mut event.body {
+                    blob.nonce = [9; 12];
+                }
+                let aad = envelope_aad_for(event).expect("aad");
+                seal(event, &aad, &plain);
+                moved += 1;
+            }
+            None => panic!("every event of this store opens under one of the tags"),
+        }
+    }
+
+    assert_eq!(moved, 1, "one event was sealed under the first tag");
+    assert_eq!(open(&store[0]), Some((0, b"old".to_vec())));
+    assert_eq!(open(&store[1]), Some((0, b"new".to_vec())));
+    assert_eq!(
+        store[1].body, untouched.body,
+        "an event under the second tag is not rewritten"
+    );
+    store[0].status = EventStatus::Success;
+    assert_eq!(
+        open_under(&store[0], FirstTag::Accept, at(0)),
+        None,
+        "after the pass an edited status no longer opens, under any policy"
+    );
 }

@@ -5,6 +5,7 @@
 //! workloads, custom token validators) without taking the full OAuth
 //! ceremony surface.
 
+use crate::egress::{EgressPolicy, ScreenedClient};
 use crate::oidc::error::OidcError;
 use jsonwebtoken::jwk::JwkSet;
 use std::sync::{Arc, Mutex, RwLock};
@@ -117,20 +118,66 @@ fn within(stamp_ms: i64, now_ms: i64, window: Duration) -> bool {
 }
 
 impl JwksCache {
-    /// Fetch a JWKS from `jwks_uri` and return a cache primed with it.
+    /// Fetch a key set from `jwks_uri` through `client`, under the policy
+    /// the client was built with, and return a cache primed with it.
     ///
-    /// The supplied `http_client` is cloned and retained for subsequent
-    /// [`refresh`](Self::refresh) calls. Callers should configure the
-    /// client with redirects disabled (SSRF defense) and a per-operation
-    /// timeout before passing it in.
+    /// `jwks_uri` is checked against the policy first. The client is kept
+    /// for every [`refresh`](Self::refresh), so each follows no redirect
+    /// and, under a screened policy, connects to no reserved address; a
+    /// redirected answer is refused.
+    ///
+    /// # Errors
+    ///
+    /// [`OidcError::EgressRefused`] for a URL the policy refuses,
+    /// [`OidcError::NonHttpsIssuer`] for plain HTTP to a host that is not
+    /// loopback, [`OidcError::JwksFetch`] for a transport failure, a non-2xx
+    /// status or a redirected answer, and [`OidcError::JwksParse`] for a
+    /// body that is not a key set.
     pub async fn fetch(
         jwks_uri: impl Into<String>,
-        http_client: &openidconnect::reqwest::Client,
+        client: &ScreenedClient,
     ) -> Result<Self, OidcError> {
         let jwks_uri = jwks_uri.into();
-        let jwks = fetch_key_set(http_client, &jwks_uri).await?;
+        check_jwks_uri(client.policy(), &jwks_uri)?;
+        Self::fetch_raw(jwks_uri, client.inner()).await
+    }
 
-        Ok(Self {
+    /// A cache primed with a key set already in hand, refreshing from
+    /// `jwks_uri` through `client` under the policy the client was built
+    /// with: for a caller that fetched the first key set itself, beside the
+    /// discovery document.
+    ///
+    /// # Errors
+    ///
+    /// [`OidcError::NonHttpsIssuer`] for plain HTTP to a host that is not
+    /// loopback, and [`OidcError::EgressRefused`] for a `jwks_uri` the
+    /// policy refuses.
+    pub fn from_parts(
+        jwks_uri: impl Into<String>,
+        client: &ScreenedClient,
+        jwks: JwkSet,
+    ) -> Result<Self, OidcError> {
+        let jwks_uri = jwks_uri.into();
+        check_jwks_uri(client.policy(), &jwks_uri)?;
+        Ok(Self::from_parts_raw(jwks_uri, client.inner(), jwks))
+    }
+
+    /// The fetch itself, for a `jwks_uri` the caller has checked against the
+    /// policy of the client it passes.
+    async fn fetch_raw(
+        jwks_uri: String,
+        http_client: &openidconnect::reqwest::Client,
+    ) -> Result<Self, OidcError> {
+        let jwks = fetch_key_set(http_client, &jwks_uri).await?;
+        Ok(Self::from_parts_raw(jwks_uri, http_client, jwks))
+    }
+
+    fn from_parts_raw(
+        jwks_uri: String,
+        http_client: &openidconnect::reqwest::Client,
+        jwks: JwkSet,
+    ) -> Self {
+        Self {
             jwks_uri,
             http_client: http_client.clone(),
             jwks: Arc::new(RwLock::new(jwks)),
@@ -138,30 +185,7 @@ impl JwksCache {
             clock: Arc::new(SystemClock),
             last_refresh: Arc::new(Mutex::new(None)),
             last_failure: Arc::new(Mutex::new(None)),
-            fetched_at: Arc::new(Mutex::new(SystemClock.now().timestamp_millis())),
-            max_age: DEFAULT_JWKS_MAX_AGE,
-        })
-    }
-
-    /// Construct a cache from a pre-parsed [`JwkSet`].
-    ///
-    /// Useful when discovery and JWKS fetch are interleaved (e.g.
-    /// [`crate::oidc::Discovery::fetch`]) so the initial JWKS bytes don't
-    /// have to be fetched twice.
-    pub fn from_parts(
-        jwks_uri: impl Into<String>,
-        http_client: &openidconnect::reqwest::Client,
-        jwks: JwkSet,
-    ) -> Self {
-        Self {
-            jwks_uri: jwks_uri.into(),
-            http_client: http_client.clone(),
-            jwks: Arc::new(RwLock::new(jwks)),
-            refresh_lock: Arc::new(AsyncMutex::new(())),
-            clock: Arc::new(SystemClock),
-            last_refresh: Arc::new(Mutex::new(None)),
-            last_failure: Arc::new(Mutex::new(None)),
-            fetched_at: Arc::new(Mutex::new(SystemClock.now().timestamp_millis())),
+            fetched_at: Arc::new(Mutex::new(SystemClock.now().unix_millis())),
             max_age: DEFAULT_JWKS_MAX_AGE,
         }
     }
@@ -174,7 +198,7 @@ impl JwksCache {
         *self
             .fetched_at
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = clock.now().timestamp_millis();
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = clock.now().unix_millis();
         self.clock = clock;
         self
     }
@@ -203,11 +227,11 @@ impl JwksCache {
             .fetched_at
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let age_ms = self.clock.now().timestamp_millis().saturating_sub(fetched);
+        let age_ms = self.clock.now().unix_millis().saturating_sub(fetched);
         if age_ms > 0 && u128::from(age_ms.unsigned_abs()) > self.max_age.as_millis() {
             return Err(OidcError::JwksExpired {
-                age_secs: age_ms.unsigned_abs() / 1000,
-                max_age_secs: self.max_age.as_secs(),
+                age: Duration::from_millis(age_ms.unsigned_abs()),
+                max_age: self.max_age,
             });
         }
         Ok(())
@@ -225,6 +249,13 @@ impl JwksCache {
         &self.jwks_uri
     }
 
+    /// The URL as a log line carries it. A discovery document may have
+    /// named it, and a URL parses with a line break inside it, so it is
+    /// escaped and cut like every other remote text.
+    fn logged_jwks_uri(&self) -> String {
+        crate::log_text::log_safe(&self.jwks_uri, crate::remote_text::PARSE_ERROR_LOG_BYTES)
+    }
+
     /// Shared handle to the cached `JwkSet`. Verifiers should clone this
     /// and take a read lock per verification to avoid holding the lock
     /// across `.await`.
@@ -240,7 +271,7 @@ impl JwksCache {
     pub async fn refresh(&self) -> Result<(), OidcError> {
         let refresh_guard = self.refresh_lock.lock().await;
 
-        let now_ms = self.clock.now().timestamp_millis();
+        let now_ms = self.clock.now().unix_millis();
         let last = self
             .last_refresh
             .lock()
@@ -251,7 +282,7 @@ impl JwksCache {
             && within(prev, now_ms, MIN_JWKS_REFRESH_INTERVAL)
         {
             tracing::debug!(
-                jwks_uri = %self.jwks_uri,
+                jwks_uri = %self.logged_jwks_uri(),
                 age_secs = now_ms.saturating_sub(prev) / 1000,
                 "JWKS refresh coalesced; peer refreshed within debounce window",
             );
@@ -288,7 +319,7 @@ impl JwksCache {
                     .last_failure
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                    Some(self.clock.now().timestamp_millis());
+                    Some(self.clock.now().unix_millis());
                 return Err(e);
             }
         };
@@ -301,37 +332,53 @@ impl JwksCache {
         *self
             .fetched_at
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = self.clock.now().timestamp_millis();
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = self.clock.now().unix_millis();
         *self
             .last_refresh
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some(self.clock.now().timestamp_millis());
+            Some(self.clock.now().unix_millis());
         *self
             .last_failure
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-        tracing::info!(jwks_uri = %self.jwks_uri, "JWKS refreshed successfully");
+        tracing::info!(jwks_uri = %self.logged_jwks_uri(), "JWKS refreshed successfully");
         drop(refresh_guard);
         Ok(())
     }
 }
 
+/// `jwks_uri` under the transport rule (HTTPS, or HTTP to loopback) and
+/// then under `policy`, refused by name.
+fn check_jwks_uri(policy: EgressPolicy, jwks_uri: &str) -> Result<(), OidcError> {
+    crate::oidc::discovery::require_https_or_loopback(jwks_uri)?;
+    policy
+        .check_url(jwks_uri, "jwks_uri")
+        .map_err(|e| OidcError::EgressRefused {
+            setting: e.setting,
+            range: e.range,
+        })
+}
+
 /// GET `jwks_uri` and parse the body as a key set.
 ///
-/// Refuses a non-HTTPS `jwks_uri` (loopback excepted), a body over
-/// [`MAX_JWKS_BYTES`] and any non-2xx response, so an error page that happens to parse as a key set can never
-/// replace trusted keys.
+/// Refuses a non-HTTPS `jwks_uri` (loopback excepted), a redirected answer,
+/// a body over [`MAX_JWKS_BYTES`] and any non-2xx response, so an error page
+/// that happens to parse as a key set can never replace trusted keys.
 async fn fetch_key_set(
     http_client: &openidconnect::reqwest::Client,
     jwks_uri: &str,
 ) -> Result<JwkSet, OidcError> {
     crate::oidc::discovery::require_https_or_loopback(jwks_uri)?;
+    let requested = openidconnect::reqwest::Url::parse(jwks_uri)
+        .map_err(|e| OidcError::JwksFetch(format!("{e}")))?;
     let mut response = http_client
-        .get(jwks_uri)
+        .get(requested.clone())
         .send()
         .await
         .map_err(|e| OidcError::JwksFetch(format!("{e}")))?;
+    crate::oidc::body::require_answered_in_place(&response, &requested)
+        .map_err(OidcError::JwksFetch)?;
     let status = response.status();
     if !status.is_success() {
         return Err(OidcError::JwksFetch(format!("HTTP {status}")));
@@ -343,7 +390,8 @@ async fn fetch_key_set(
         |e| OidcError::JwksFetch(format!("read body: {e}")),
     )
     .await?;
-    serde_json::from_slice(&bytes).map_err(|e| OidcError::JwksParse(format!("{e}")))
+    serde_json::from_slice(&bytes)
+        .map_err(|e| OidcError::JwksParse(crate::remote_text::parse_error(&e)))
 }
 
 #[cfg(test)]

@@ -110,7 +110,7 @@ impl BackChannelLogoutHandler {
             for (tenant, name) in shadowing {
                 tracing::warn!(
                     %tenant,
-                    provider = %name,
+                    provider = %crate::authn::service::log_text::logged_request_text(name),
                     "back-channel logout: a tenant provider has the issuer and client id of a \
                      global one and is ignored"
                 );
@@ -143,7 +143,7 @@ impl BackChannelLogoutHandler {
         for b in &broken {
             tracing::warn!(
                 tenant = %b.tenant,
-                provider = %b.name,
+                provider = %crate::authn::service::log_text::logged_request_text(&b.name),
                 error = %b.error,
                 "back-channel logout: a tenant provider the token is addressed to could not be built"
             );

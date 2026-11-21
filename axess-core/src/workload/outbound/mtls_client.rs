@@ -4,7 +4,7 @@
 //! X509 client certificate during the TLS handshake. Used when axess
 //! calls a 3rd-party mTLS-protected endpoint (FAPI 2.0 / PSD2 SCA
 //! token endpoints, bank swap-data repositories, FIX-over-TLS
-//! gateways, private backplane traffic between gnomes services).
+//! gateways, private backplane traffic between internal services).
 //!
 //! # Scope
 //!

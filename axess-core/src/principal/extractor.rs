@@ -6,14 +6,14 @@
 //!
 //! # Resolution chain
 //!
-//! Today the chain is single-step: [`SessionResolver`] over the request's
-//! [`AuthSession`]. When the+ workload resolvers
-//! (JWT-SVID / mTLS / SPIRE) land, they'll be wired in by middleware that
-//! injects a typed `PrincipalResolverChain` into request extensions; the
-//! extractor will read that chain first and fall back to the session
-//! resolver. The extractor surface here stays stable through that
-//! change. Adopter handlers that write `async fn handler(p: AuthPrincipal, ...)`
-//! today pick up new resolver kinds automatically as they land.
+//! The extractors resolve through the [`PrincipalResolverChain`] the
+//! application installs in the request's extensions: session, workload, or
+//! both, in the order it states. A request with no chain resolves through
+//! [`SessionResolver`] over the request's [`AuthSession`] alone. Every
+//! extractor runs every step of the chain the same way: a credential a step
+//! refuses refuses the request in each, and so do two credentials that
+//! resolve to different principals. The chain's documentation says what
+//! each rejection means.
 //!
 //! # Naming
 //!
@@ -34,6 +34,7 @@ use axum::extract::FromRequestParts;
 use axum::http::{StatusCode, request::Parts};
 use axum::response::IntoResponse;
 
+use super::chain::{PrincipalResolverChain, Step};
 use super::session_resolver::SessionResolver;
 use crate::AuthSession;
 use crate::session::extractor::SessionMissing;
@@ -67,8 +68,10 @@ impl Deref for AuthPrincipal {
     }
 }
 
-/// Axum extractor that narrows to a human principal. Resolved workloads
-/// are rejected with [`PrincipalRejection::WrongKind`].
+/// Axum extractor that narrows to a human principal: it runs the
+/// [`PrincipalResolverChain`] as [`AuthPrincipal`] does, and admits the
+/// principal the request resolves to when it is a human. A request that
+/// resolves to a workload is rejected with [`PrincipalRejection::WrongKind`].
 #[derive(Debug, Clone)]
 pub struct AuthHumanPrincipal(pub HumanPrincipal);
 
@@ -87,8 +90,10 @@ impl Deref for AuthHumanPrincipal {
     }
 }
 
-/// Axum extractor that narrows to a workload principal. Resolved humans
-/// are rejected with [`PrincipalRejection::WrongKind`].
+/// Axum extractor that narrows to a workload principal: it runs the
+/// [`PrincipalResolverChain`] as [`AuthPrincipal`] does, and admits the
+/// principal the request resolves to when it is a workload. A request that
+/// resolves to a human is rejected with [`PrincipalRejection::WrongKind`].
 #[derive(Debug, Clone)]
 pub struct AuthWorkloadPrincipal(pub WorkloadPrincipal);
 
@@ -120,13 +125,21 @@ pub enum PrincipalRejection {
     NotAuthenticated,
 
     /// A principal was resolved but its kind (human vs. workload) does
-    /// not match the extractor used. Surfaces as 403.
+    /// not match the extractor used, or a workload step's resolver answered
+    /// a human. Surfaces as 403.
     WrongKind,
 
-    /// The resolver returned an [`IdentityError`] other than
-    /// `NotAuthenticated` (e.g. malformed SPIFFE ID at a future
-    /// workload resolver). Surfaces as 401 to fail closed.
+    /// A workload step's resolver refused the credential the request
+    /// presented with an [`IdentityError`] other than `NotAuthenticated`
+    /// (a malformed SPIFFE ID, a trust domain it does not accept).
+    /// Surfaces as 401 to fail closed.
     Identity(IdentityError),
+
+    /// Two steps of the chain resolved the credentials the request
+    /// presented to different principals: a signed-in session and a
+    /// workload credential, or two workload credentials of different
+    /// workloads. The request is not admitted as either. Surfaces as 401.
+    ConflictingCredentials,
 }
 
 impl IntoResponse for PrincipalRejection {
@@ -139,28 +152,140 @@ impl IntoResponse for PrincipalRejection {
             Self::NotAuthenticated => (StatusCode::UNAUTHORIZED, "not authenticated"),
             Self::WrongKind => (StatusCode::FORBIDDEN, "principal kind mismatch"),
             Self::Identity(_) => (StatusCode::UNAUTHORIZED, "identity resolution failed"),
+            Self::ConflictingCredentials => (StatusCode::UNAUTHORIZED, "conflicting credentials"),
         };
         (status, msg).into_response()
     }
 }
 
-async fn resolve_principal<S>(parts: &mut Parts, state: &S) -> Result<Principal, PrincipalRejection>
+/// Which principals an extractor admits.
+#[derive(Clone, Copy)]
+enum Wanted {
+    /// Either kind.
+    Any,
+    /// A human.
+    Human,
+    /// A workload.
+    Workload,
+}
+
+impl Wanted {
+    fn admits(self, principal: &Principal) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Human => matches!(principal, Principal::Human(_)),
+            Self::Workload => matches!(principal, Principal::Workload(_)),
+        }
+    }
+}
+
+/// The chain the request carries, or the session alone.
+fn chain_of(parts: &Parts) -> PrincipalResolverChain {
+    parts
+        .extensions
+        .get::<PrincipalResolverChain>()
+        .cloned()
+        .unwrap_or_else(|| PrincipalResolverChain::new().session())
+}
+
+/// What one step answers: the principal it resolved, `None` when the
+/// request presents nothing it reads, or the refusal that refuses the
+/// request.
+async fn resolve_step<S>(
+    parts: &mut Parts,
+    state: &S,
+    step: &Step,
+) -> Result<Option<Principal>, PrincipalRejection>
 where
     S: Send + Sync,
 {
-    // Today: SessionResolver only.+ will read a registered
-    // resolver chain from `parts.extensions` and try those first,
-    // falling through to SessionResolver as the human path.
-    let session = AuthSession::from_request_parts(parts, state)
-        .await
-        .map_err(|_: SessionMissing| PrincipalRejection::SessionLayerMissing)?;
-    SessionResolver::new(session)
-        .resolve()
-        .await
-        .map_err(|e| match e {
-            IdentityError::NotAuthenticated => PrincipalRejection::NotAuthenticated,
-            other => PrincipalRejection::Identity(other),
-        })
+    match step {
+        Step::Session => {
+            let session = AuthSession::from_request_parts(parts, state)
+                .await
+                .map_err(|_: SessionMissing| PrincipalRejection::SessionLayerMissing)?;
+            match SessionResolver::new(session).resolve().await {
+                Ok(principal) => Ok(Some(principal)),
+                // A session that is not authenticated presents no one; the
+                // next step may.
+                Err(IdentityError::NotAuthenticated) => Ok(None),
+                Err(other) => Err(PrincipalRejection::Identity(other)),
+            }
+        }
+        Step::Workload(source) => {
+            let Some(resolution) = source.begin(parts) else {
+                return Ok(None);
+            };
+            // The request presented a credential: the resolver's answer
+            // decides, and a refusal is never passed on to a later step.
+            match resolution.await {
+                Ok(Principal::Workload(workload)) => Ok(Some(Principal::Workload(workload))),
+                Ok(Principal::Human(_)) => {
+                    tracing::error!(
+                        "a workload step of the principal chain resolved a human; refused"
+                    );
+                    Err(PrincipalRejection::WrongKind)
+                }
+                Err(IdentityError::NotAuthenticated) => Err(PrincipalRejection::NotAuthenticated),
+                Err(other) => Err(PrincipalRejection::Identity(other)),
+            }
+        }
+    }
+}
+
+/// Whether two resolved principals are the same principal: the same user
+/// of the same tenant, or the same workload of the same tenant. Attributes
+/// are not compared, as two resolvers of one workload may read different
+/// ones.
+fn same_principal(a: &Principal, b: &Principal) -> bool {
+    match (a, b) {
+        (Principal::Human(a), Principal::Human(b)) => {
+            a.user_id == b.user_id && a.tenant_id == b.tenant_id
+        }
+        (Principal::Workload(a), Principal::Workload(b)) => {
+            a.workload_id == b.workload_id && a.tenant_id == b.tenant_id
+        }
+        _ => false,
+    }
+}
+
+/// Every step of the chain, in its order, the same for every extractor:
+/// each step that reads a credential the request presents runs, whatever
+/// an earlier step resolved. A credential a step refuses refuses the
+/// request; two steps that resolve different principals refuse it as
+/// [`PrincipalRejection::ConflictingCredentials`]. The principal the steps
+/// agree on is admitted when `wanted` admits its kind, and
+/// [`PrincipalRejection::WrongKind`] otherwise.
+async fn resolve_principal<S>(
+    parts: &mut Parts,
+    state: &S,
+    wanted: Wanted,
+) -> Result<Principal, PrincipalRejection>
+where
+    S: Send + Sync,
+{
+    let chain = chain_of(parts);
+    let mut resolved: Option<Principal> = None;
+    for step in chain.steps() {
+        let Some(principal) = resolve_step(parts, state, step).await? else {
+            continue;
+        };
+        match &resolved {
+            None => resolved = Some(principal),
+            Some(first) if same_principal(first, &principal) => {}
+            Some(_) => {
+                tracing::warn!(
+                    "two credentials of one request resolved to different principals; refused"
+                );
+                return Err(PrincipalRejection::ConflictingCredentials);
+            }
+        }
+    }
+    match resolved {
+        Some(principal) if wanted.admits(&principal) => Ok(principal),
+        Some(_) => Err(PrincipalRejection::WrongKind),
+        None => Err(PrincipalRejection::NotAuthenticated),
+    }
 }
 
 impl<S> FromRequestParts<S> for AuthPrincipal
@@ -170,7 +295,9 @@ where
     type Rejection = PrincipalRejection;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        resolve_principal(parts, state).await.map(AuthPrincipal)
+        resolve_principal(parts, state, Wanted::Any)
+            .await
+            .map(AuthPrincipal)
     }
 }
 
@@ -181,7 +308,7 @@ where
     type Rejection = PrincipalRejection;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        match resolve_principal(parts, state).await? {
+        match resolve_principal(parts, state, Wanted::Human).await? {
             Principal::Human(h) => Ok(AuthHumanPrincipal(h)),
             Principal::Workload(_) => Err(PrincipalRejection::WrongKind),
         }
@@ -195,7 +322,7 @@ where
     type Rejection = PrincipalRejection;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        match resolve_principal(parts, state).await? {
+        match resolve_principal(parts, state, Wanted::Workload).await? {
             Principal::Workload(w) => Ok(AuthWorkloadPrincipal(w)),
             Principal::Human(_) => Err(PrincipalRejection::WrongKind),
         }
@@ -203,137 +330,7 @@ where
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::Arc;
+mod tests;
 
-    use axum::http::{Request, StatusCode};
-    use tokio::sync::RwLock;
-
-    use super::*;
-    use crate::session::data::SessionData;
-    use crate::session::id::SessionId;
-    use crate::session::layer::{SessionHandle, SessionInner};
-    use crate::{AuthState, TenantId, UserId};
-    use axess_rng::SystemRng;
-
-    fn make_parts_with_session(data: SessionData) -> Parts {
-        let inner = SessionInner {
-            id: SessionId::new(&SystemRng),
-            data,
-            modified: false,
-            needs_persist: false,
-            regenerate: false,
-            pre_cycle_id: None,
-            rng: std::sync::Arc::new(axess_rng::SystemRng),
-            pending_fingerprint: None,
-            max_custom_bytes: 64 * 1024,
-            consume: None,
-        };
-        let handle = SessionHandle(Arc::new(RwLock::new(inner)));
-        let request = Request::builder()
-            .uri("/")
-            .extension(handle)
-            .body(())
-            .expect("build request");
-        let (parts, _) = request.into_parts();
-        parts
-    }
-
-    fn make_parts_without_session() -> Parts {
-        let request = Request::builder().uri("/").body(()).expect("build request");
-        let (parts, _) = request.into_parts();
-        parts
-    }
-
-    fn authenticated(user_id: UserId, tenant_id: TenantId) -> SessionData {
-        SessionData {
-            auth_state: AuthState::Authenticated {
-                user_id,
-                tenant_id,
-                authn_time: chrono::Utc::now(),
-                factors_completed: Vec::new(),
-                impersonator: None,
-                ldap_groups: None,
-                assurance: Vec::new(),
-            },
-            ..SessionData::default()
-        }
-    }
-
-    /// Authenticated session resolves to a human principal.
-    #[tokio::test]
-    async fn auth_principal_resolves_human_from_session() {
-        let user_id = UserId::new(&SystemRng);
-        let tenant_id = TenantId::new(&SystemRng);
-        let mut parts = make_parts_with_session(authenticated(user_id, tenant_id));
-
-        let extracted = AuthPrincipal::from_request_parts(&mut parts, &()).await;
-        let principal = extracted.expect("authenticated session must resolve").0;
-        match principal {
-            Principal::Human(h) => {
-                assert_eq!(h.user_id, user_id);
-                assert_eq!(h.tenant_id, tenant_id);
-            }
-            Principal::Workload(_) => panic!("session-backed extractor returned workload"),
-        }
-    }
-
-    /// Guest session rejects with 401.
-    #[tokio::test]
-    async fn auth_principal_rejects_guest_session() {
-        let mut parts = make_parts_with_session(SessionData::default());
-        let err = AuthPrincipal::from_request_parts(&mut parts, &())
-            .await
-            .expect_err("guest session must reject");
-        assert!(
-            matches!(err, PrincipalRejection::NotAuthenticated),
-            "got {err:?}"
-        );
-        assert_eq!(err.into_response().status(), StatusCode::UNAUTHORIZED);
-    }
-
-    /// Missing session layer surfaces 500 (adopter wiring error).
-    #[tokio::test]
-    async fn auth_principal_rejects_missing_session_layer() {
-        let mut parts = make_parts_without_session();
-        let err = AuthPrincipal::from_request_parts(&mut parts, &())
-            .await
-            .expect_err("no session layer must reject");
-        assert!(
-            matches!(err, PrincipalRejection::SessionLayerMissing),
-            "got {err:?}"
-        );
-        assert_eq!(
-            err.into_response().status(),
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
-    }
-
-    /// Human-narrowing extractor succeeds when a human resolves.
-    #[tokio::test]
-    async fn auth_human_principal_succeeds_for_session() {
-        let user_id = UserId::new(&SystemRng);
-        let tenant_id = TenantId::new(&SystemRng);
-        let mut parts = make_parts_with_session(authenticated(user_id, tenant_id));
-
-        let human = AuthHumanPrincipal::from_request_parts(&mut parts, &())
-            .await
-            .expect("human extractor must succeed");
-        assert_eq!(human.user_id, user_id);
-    }
-
-    /// Workload-narrowing extractor rejects with 403 when only a human
-    /// is available (the case today; no workload resolver wired).
-    #[tokio::test]
-    async fn auth_workload_principal_rejects_human() {
-        let user_id = UserId::new(&SystemRng);
-        let tenant_id = TenantId::new(&SystemRng);
-        let mut parts = make_parts_with_session(authenticated(user_id, tenant_id));
-
-        let err = AuthWorkloadPrincipal::from_request_parts(&mut parts, &())
-            .await
-            .expect_err("workload extractor over human session must reject");
-        assert!(matches!(err, PrincipalRejection::WrongKind), "got {err:?}");
-        assert_eq!(err.into_response().status(), StatusCode::FORBIDDEN);
-    }
-}
+#[cfg(test)]
+mod chain_tests;

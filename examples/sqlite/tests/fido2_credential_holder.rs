@@ -1,21 +1,23 @@
-//! The cross-user passkey check reads the credential ids out of stored
-//! factor rows, within one tenant.
+//! The claim on a passkey credential id reads the ids out of stored factor
+//! rows too, within one tenant: a passkey stored without a claim holds its
+//! id for the user it is stored for.
 //!
 //! The row is written as the store writes it, straight into `factor_configs`,
 //! so the test reads the same bytes whether or not the `fido2` feature is on
 //! (with it, `Fido2Config::credentials` is typed and a hand-made passkey would
 //! have to be a complete one; the lookup only reads the JSON).
 
-use axess::SystemClock;
-use axess::authn::{FactorStore, TenantId, UserId};
+use axess::authn::{FactorStore, Fido2CredentialClaim, TenantId, UserId};
+use axess_clock::testing::MockClock;
 use axess_example_sqlite::models::backend::{OurBackend, seed};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::str::FromStr;
 
 const TENANT: &str = "00000000-0000-0000-0000-000000000001";
 const ALICE: &str = "00000000-0000-0000-0000-000000000010";
+const BOB: &str = "00000000-0000-0000-0000-000000000011";
 
-async fn pool() -> sqlx::SqlitePool {
+async fn pool(clock: &MockClock) -> sqlx::SqlitePool {
     let opts = SqliteConnectOptions::from_str("sqlite::memory:")
         .expect("in-memory url")
         .create_if_missing(true);
@@ -26,9 +28,10 @@ async fn pool() -> sqlx::SqlitePool {
         .expect("connect in-memory sqlite");
     sqlx::migrate!().run(&pool).await.expect("migrations");
     seed(
-        &SystemClock,
+        clock,
         &pool,
-        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF"),
+        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF")
+            .with_clock(std::sync::Arc::new(clock.clone())),
     )
     .await
     .expect("seed");
@@ -58,29 +61,45 @@ async fn store_alice_passkey(pool: &sqlx::SqlitePool) {
     .expect("stored passkey row");
 }
 
+/// Another user's claim on the id of a stored passkey is refused and names
+/// the user the passkey is stored for; an id no stored passkey carries is
+/// free, and so is the same id in another tenant.
 #[tokio::test]
-async fn the_holder_of_a_stored_credential_id_is_found_within_its_tenant() {
-    let pool = pool().await;
+async fn a_stored_passkey_refuses_another_users_claim_within_its_tenant() {
+    let clock = MockClock::at_reference();
+    let pool = pool(&clock).await;
     store_alice_passkey(&pool).await;
-    let backend = OurBackend::new(pool);
+    let backend = OurBackend::new(pool).with_clock(std::sync::Arc::new(clock.clone()));
     let tenant = TenantId::try_new(TENANT).expect("tenant");
+    let (alice, bob) = (
+        UserId::try_new(ALICE).expect("user"),
+        UserId::try_new(BOB).expect("user"),
+    );
 
-    let holder = backend
-        .fido2_credential_holder(&tenant, b"aaaa")
+    let refused = backend
+        .claim_fido2_credential(&tenant, &bob, b"aaaa")
         .await
-        .expect("lookup");
-    assert_eq!(holder, Some(UserId::try_new(ALICE).expect("user")));
+        .expect("claim");
+    assert_eq!(refused, Fido2CredentialClaim::HeldBy(alice));
 
     let other_id = backend
-        .fido2_credential_holder(&tenant, b"bbbb")
+        .claim_fido2_credential(&tenant, &bob, b"bbbb")
         .await
-        .expect("lookup");
-    assert_eq!(other_id, None, "an id nobody holds");
+        .expect("claim");
+    assert_eq!(
+        other_id,
+        Fido2CredentialClaim::Claimed,
+        "an id nobody holds"
+    );
 
     let other_tenant = TenantId::try_new("00000000-0000-0000-0000-000000000002").expect("tenant");
     let elsewhere = backend
-        .fido2_credential_holder(&other_tenant, b"aaaa")
+        .claim_fido2_credential(&other_tenant, &bob, b"aaaa")
         .await
-        .expect("lookup");
-    assert_eq!(elsewhere, None, "another tenant does not see it");
+        .expect("claim");
+    assert_eq!(
+        elsewhere,
+        Fido2CredentialClaim::Claimed,
+        "another tenant does not see it"
+    );
 }

@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::session::crypto::{BoundFormat, LegacyBlobs, SessionCrypto};
+use crate::session::id::{SessionId, SessionKey};
 use crate::testing::sql_live;
 use axess_clock::testing::MockClock;
 use axess_rng::SystemRng;
@@ -22,7 +23,9 @@ async fn store() -> MysqlSessionStore {
 }
 
 async fn store_with_clock() -> (MysqlSessionStore, Arc<MockClock>) {
-    let clock = Arc::new(MockClock::at(chrono::Utc::now()));
+    let clock = Arc::new(MockClock::at(
+        axess_clock::testing::MockClock::reference_time(),
+    ));
     (store().await.with_clock(clock.clone()), clock)
 }
 
@@ -33,11 +36,11 @@ fn admin() -> SessionData {
     }
 }
 
-fn new_id() -> SessionId {
-    SessionId::new(&SystemRng)
+fn new_id() -> SessionKey {
+    SessionKey::of(&SessionId::new(&SystemRng))
 }
 
-async fn raw(store: &MysqlSessionStore, id: &SessionId) -> Vec<u8> {
+async fn raw(store: &MysqlSessionStore, id: &SessionKey) -> Vec<u8> {
     sqlx::query_scalar("SELECT data_bin FROM sessions WHERE id = ?")
         .bind(id.to_string())
         .fetch_one(&store.pool)
@@ -46,7 +49,7 @@ async fn raw(store: &MysqlSessionStore, id: &SessionId) -> Vec<u8> {
 }
 
 /// Both data columns of a row: the binary one may be NULL.
-async fn columns(store: &MysqlSessionStore, id: &SessionId) -> (Option<Vec<u8>>, String) {
+async fn columns(store: &MysqlSessionStore, id: &SessionKey) -> (Option<Vec<u8>>, String) {
     sqlx::query_as("SELECT data_bin, data FROM sessions WHERE id = ?")
         .bind(id.to_string())
         .fetch_one(&store.pool)
@@ -54,7 +57,7 @@ async fn columns(store: &MysqlSessionStore, id: &SessionId) -> (Option<Vec<u8>>,
         .unwrap()
 }
 
-async fn expiry(store: &MysqlSessionStore, id: &SessionId) -> i64 {
+async fn expiry(store: &MysqlSessionStore, id: &SessionKey) -> i64 {
     sqlx::query_scalar("SELECT expires_at FROM sessions WHERE id = ?")
         .bind(id.to_string())
         .fetch_one(&store.pool)
@@ -63,7 +66,7 @@ async fn expiry(store: &MysqlSessionStore, id: &SessionId) -> i64 {
 }
 
 /// A blob sealed without the row binding, in the binary column.
-async fn plant_unbound(store: &MysqlSessionStore, id: &SessionId, expires_at: i64) -> Vec<u8> {
+async fn plant_unbound(store: &MysqlSessionStore, id: &SessionKey, expires_at: i64) -> Vec<u8> {
     let blob = SessionCrypto::new(KEY)
         .encrypt_unbound(&rmp_serde::to_vec_named(&admin()).unwrap())
         .unwrap();
@@ -77,9 +80,9 @@ async fn plant_unbound(store: &MysqlSessionStore, id: &SessionId, expires_at: i6
     blob
 }
 
-/// A bound row as an earlier release wrote it: base64 in the text column
-/// only.
-async fn plant_text(store: &MysqlSessionStore, id: &SessionId) {
+/// A bound row as an earlier release wrote it: base64 of a blob in the
+/// current sealed form, in the text column only.
+async fn plant_text(store: &MysqlSessionStore, id: &SessionKey) {
     let text = BASE64.encode(store.codec.encode_bytes(id, &admin()).unwrap());
     sqlx::query("INSERT INTO sessions (id, data, expires_at) VALUES (?, ?, ?)")
         .bind(id.to_string())
@@ -135,65 +138,60 @@ async fn data_copied_into_another_sessions_row_does_not_load() {
     assert!(store.load(&admin_id).await.unwrap().is_some());
 }
 
-/// A load reads a row that carries no row binding under the legacy window
-/// but leaves it as it is (it proves nothing about the row it sits under);
-/// the next save writes the bound form.
+/// A row that carries no row binding is refused, though this store's crypto
+/// reads legacy blobs with no end date: such a blob opens under any row, so
+/// reading it as a session would let a row be moved. The refused row is left
+/// as it is, and the session's next save writes the current form.
 #[tokio::test]
 #[ignore = "requires a running MySQL (MYSQL_URL)"]
-async fn load_reads_an_unbound_row_without_resealing_it() {
+async fn an_unbound_row_is_refused_under_a_policy_that_reads_legacy_blobs() {
     let store = store().await;
     let id = new_id();
-    let expires = store.clock.now().timestamp() + 600;
+    let expires = store.clock.now().unix_seconds() + 600;
     let unbound = plant_unbound(&store, &id, expires).await;
     assert!(!BoundFormat::SESSION.marks(&unbound));
 
-    let loaded = store.load(&id).await.unwrap().expect("unbound row loads");
-    assert_eq!(loaded.custom, admin().custom);
+    assert!(matches!(
+        store.load(&id).await,
+        Err(SqlStoreError::Crypto(_))
+    ));
     assert_eq!(
         raw(&store, &id).await,
         unbound,
-        "left as it was by the read"
+        "the refused blob is left as it was found"
     );
     assert_eq!(expiry(&store, &id).await, expires);
 
-    store
-        .save(&id, &loaded, Duration::from_secs(60))
-        .await
-        .unwrap();
+    store.save(&id, &admin(), TTL).await.unwrap();
     assert!(BoundFormat::SESSION.marks(&raw(&store, &id).await));
     assert!(store.load(&id).await.unwrap().is_some());
 }
 
-/// A bound row in the legacy text column is moved to the binary column by
-/// its load.
+/// A row whose binary column is NULL is not read, whatever its text column
+/// holds: base64 of a blob in the current sealed form, bound to the row, is
+/// refused as undecodable and left as it lies.
 #[tokio::test]
 #[ignore = "requires a running MySQL (MYSQL_URL)"]
-async fn load_moves_a_text_column_row_to_the_binary_column() {
+async fn a_text_column_row_is_not_read() {
     let store = store().await;
     let id = new_id();
     plant_text(&store, &id).await;
+    let before = columns(&store, &id).await;
 
-    assert_eq!(
-        store.load(&id).await.unwrap().unwrap().custom,
-        admin().custom
-    );
-    let (bin, text): (Option<Vec<u8>>, String) =
-        sqlx::query_as("SELECT data_bin, data FROM sessions WHERE id = ?")
-            .bind(id.to_string())
-            .fetch_one(&store.pool)
-            .await
-            .unwrap();
-    assert!(bin.is_some_and(|b| BoundFormat::SESSION.marks(&b)));
-    assert!(text.is_empty());
+    assert!(matches!(
+        store.load(&id).await,
+        Err(SqlStoreError::Decode(_))
+    ));
+    assert_eq!(columns(&store, &id).await, before, "left as it lies");
 }
 
 /// The re-seal is conditional on the bytes that were read: a save that
-/// landed in between is kept, for a binary row and for a text row.
+/// landed in between is kept.
 #[tokio::test]
 #[ignore = "requires a running MySQL (MYSQL_URL)"]
 async fn a_reseal_never_overwrites_a_save_that_landed_meanwhile() {
     let store = store().await;
-    let now = store.clock.now().timestamp();
+    let now = store.clock.now().unix_seconds();
     let newer = SessionData {
         custom: serde_json::json!({"role": "newer"}),
         ..SessionData::default()
@@ -202,23 +200,8 @@ async fn a_reseal_never_overwrites_a_save_that_landed_meanwhile() {
     let id = new_id();
     let stale = plant_unbound(&store, &id, i64::MAX).await;
     store.save(&id, &newer, TTL).await.unwrap();
-    store.reseal(&id, &admin(), Some(&stale), "", now).await;
+    store.reseal(&id, &admin(), &stale, now).await;
     assert_eq!(store.load(&id).await.unwrap().unwrap().custom, newer.custom);
-
-    let text_id = new_id();
-    plant_text(&store, &text_id).await;
-    let (_, text): (Option<Vec<u8>>, String) =
-        sqlx::query_as("SELECT data_bin, data FROM sessions WHERE id = ?")
-            .bind(text_id.to_string())
-            .fetch_one(&store.pool)
-            .await
-            .unwrap();
-    store.save(&text_id, &newer, TTL).await.unwrap();
-    store.reseal(&text_id, &admin(), None, &text, now).await;
-    assert_eq!(
-        store.load(&text_id).await.unwrap().unwrap().custom,
-        newer.custom
-    );
 }
 
 /// With legacy blobs rejected, an unbound row is refused and left as it is;
@@ -374,12 +357,12 @@ async fn racing_rotations_leave_the_data_under_one_id() {
     assert!(store.load(&old).await.unwrap().is_none());
 }
 
-/// The documented upgrade of a table created before the binary column,
-/// holding rows as the releases before it wrote them: an unbound blob in the
-/// text column, and `data_bin` NULL once the upgrade step has run. A read
-/// leaves such a row as it is (an unbound blob proves nothing about the row
-/// it sits under); the row's next write seals it in the bound form. The
-/// conditional writes compare the NULL binary column.
+/// The documented upgrade of a table created before the binary column: its
+/// rows hold their blob in the text column, and `data_bin` is NULL once the
+/// upgrade step has run. No such row is read, whatever its blob: one in the
+/// current sealed form and one from before row binding are both refused as
+/// undecodable and left as they lie, and a conditional write that meets one
+/// is refused the same way. A session saved after the step loads.
 #[tokio::test]
 #[ignore = "requires a running MySQL (MYSQL_URL)"]
 async fn the_documented_upgrade_step_makes_an_old_table_work() {
@@ -392,11 +375,16 @@ async fn the_documented_upgrade_step_makes_an_old_table_work() {
         pool.clone(),
         SessionCrypto::new(KEY).with_legacy_blobs(LegacyBlobs::Accept),
     );
-    let (kept, ended) = (new_id(), new_id());
-    for id in [&kept, &ended] {
-        let old = SessionCrypto::new(KEY)
-            .encrypt_unbound(&rmp_serde::to_vec_named(&admin()).unwrap())
-            .unwrap();
+    let (kept, ended, unbound) = (new_id(), new_id(), new_id());
+    let current = |id: &SessionKey| store.codec.encode_bytes(id, &admin()).unwrap();
+    let before_binding = SessionCrypto::new(KEY)
+        .encrypt_unbound(&rmp_serde::to_vec_named(&admin()).unwrap())
+        .unwrap();
+    for (id, old) in [
+        (&kept, current(&kept)),
+        (&ended, current(&ended)),
+        (&unbound, before_binding),
+    ] {
         sqlx::query("INSERT INTO sessions (id, data, expires_at) VALUES (?, ?, ?)")
             .bind(id.to_string())
             .bind(BASE64.encode(old))
@@ -406,59 +394,39 @@ async fn the_documented_upgrade_step_makes_an_old_table_work() {
             .unwrap();
     }
 
-    sqlx::query(
-        "ALTER TABLE sessions MODIFY data MEDIUMTEXT NOT NULL, ADD COLUMN data_bin LONGBLOB NULL",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    sqlx::query("ALTER TABLE sessions ADD COLUMN data_bin LONGBLOB NULL")
+        .execute(&pool)
+        .await
+        .unwrap();
     store
         .init_schema()
         .await
         .expect("init_schema on an upgraded table");
 
-    let loaded = store.load(&kept).await.unwrap().expect("an old row loads");
-    assert_eq!(loaded.custom, admin().custom);
-    let (binary, text) = columns(&store, &kept).await;
-    assert!(binary.is_none(), "a read leaves an unbound row as it is");
-    assert!(!text.is_empty());
-
-    let next = SessionData {
-        revision: loaded.revision + 1,
-        ..loaded.clone()
-    };
-    assert_eq!(
-        store
-            .update_if_revision(&kept, loaded.revision, &next, TTL)
-            .await
-            .unwrap(),
-        ConditionalUpdate::Written
-    );
-    let (binary, text) = columns(&store, &kept).await;
     assert!(
-        binary.is_some_and(|b| BoundFormat::SESSION.marks(&b)),
-        "the write seals the bound form"
+        matches!(store.load(&unbound).await, Err(SqlStoreError::Decode(_))),
+        "a blob from before row binding is not a session"
     );
-    assert_eq!(text, "");
-    assert_eq!(
-        store.load(&kept).await.unwrap().unwrap().revision,
-        next.revision
-    );
+    let (binary, text) = columns(&store, &unbound).await;
+    assert!(binary.is_none() && !text.is_empty(), "left as it was");
 
-    let old = store.load(&ended).await.unwrap().expect("an old row loads");
-    assert_eq!(
-        store
-            .update_if_revision(&ended, old.revision, &old, Duration::ZERO)
-            .await
-            .unwrap(),
-        ConditionalUpdate::Gone
-    );
-    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE id = ?")
-        .bind(ended.to_string())
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(left, 0, "a zero TTL removes the old row");
+    for (what, row) in [("in the current form", &kept), ("never loaded", &ended)] {
+        let before = columns(&store, row).await;
+        assert!(
+            matches!(store.load(row).await, Err(SqlStoreError::Decode(_))),
+            "a text row {what} is not read"
+        );
+        assert!(
+            matches!(
+                store
+                    .update_if_revision(row, admin().revision, &admin(), Duration::ZERO)
+                    .await,
+                Err(SqlStoreError::Decode(_))
+            ),
+            "a conditional write that meets a text row {what} is refused"
+        );
+        assert_eq!(columns(&store, row).await, before, "left as it lies");
+    }
 
     let fresh = new_id();
     store.save(&fresh, &admin(), TTL).await.unwrap();
@@ -515,4 +483,206 @@ async fn a_session_carrying_assurance_round_trips() {
 async fn spawn_cleanup_task_refuses_a_zero_interval_by_name() {
     let s = store().await;
     drop(s.spawn_cleanup_task(Duration::ZERO));
+}
+
+// ── What the store holds for a session ───────────────────────────────────────
+
+/// A plaintext store and a sealed one, each on a schema of its own.
+async fn stored_form_stores() -> [MysqlSessionStore; 2] {
+    let plain = MysqlSessionStore::plaintext_insecure(sql_live::mysql_pool(2).await);
+    let sealed = MysqlSessionStore::new(sql_live::mysql_pool(2).await, SessionCrypto::new(KEY));
+    for store in [&plain, &sealed] {
+        store.init_schema().await.expect("init_schema");
+    }
+    [plain, sealed]
+}
+
+fn revised(revision: u64) -> SessionData {
+    SessionData {
+        revision,
+        ..admin()
+    }
+}
+
+/// Every row, every column: the name, the text column and the binary one.
+async fn all_rows(store: &MysqlSessionStore) -> Vec<(String, String, Option<Vec<u8>>)> {
+    sqlx::query_as("SELECT id, data, data_bin FROM sessions ORDER BY id")
+        .fetch_all(&store.pool)
+        .await
+        .unwrap()
+}
+
+async fn row_names(store: &MysqlSessionStore) -> Vec<String> {
+    let mut names: Vec<String> = all_rows(store).await.into_iter().map(|row| row.0).collect();
+    // In byte order, whatever collation the server sorts the column by.
+    names.sort();
+    names
+}
+
+/// No column of any row holds `id`: not its hyphenated text, not its 32
+/// hexadecimal digits, not its 16 bytes.
+async fn assert_holds_no_id(store: &MysqlSessionStore, id: &SessionId) {
+    let forms = [
+        id.to_string().into_bytes(),
+        id.as_uuid().simple().to_string().into_bytes(),
+        id.as_bytes().to_vec(),
+    ];
+    for (name, text, binary) in all_rows(store).await {
+        for column in [
+            name.as_bytes(),
+            text.as_bytes(),
+            binary.as_deref().unwrap_or_default(),
+        ] {
+            for form in &forms {
+                assert!(
+                    !column.windows(form.len()).any(|window| window == form),
+                    "a column holds the session id"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a running MySQL (MYSQL_URL)"]
+async fn the_row_is_named_by_the_key() {
+    for store in stored_form_stores().await {
+        let id = SessionId::new(&SystemRng);
+        let key = SessionKey::of(&id);
+        store.save(&key, &revised(1), TTL).await.unwrap();
+
+        let names = row_names(&store).await;
+        assert_eq!(names, [key.to_string()]);
+        assert_eq!(names[0].len(), 64);
+        assert_holds_no_id(&store, &id).await;
+
+        // Every later write of the session leaves it under the same name.
+        assert!(store.update(&key, &revised(1), TTL).await.unwrap());
+        assert_eq!(
+            store
+                .update_if_revision(&key, 1, &revised(2), TTL)
+                .await
+                .unwrap(),
+            ConditionalUpdate::Written
+        );
+        assert_eq!(row_names(&store).await, [key.to_string()]);
+        assert_holds_no_id(&store, &id).await;
+        assert_eq!(store.load(&key).await.unwrap().unwrap().revision, 2);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a running MySQL (MYSQL_URL)"]
+async fn a_rotation_names_both_rows_by_their_keys() {
+    for store in stored_form_stores().await {
+        let ids = [
+            SessionId::new(&SystemRng),
+            SessionId::new(&SystemRng),
+            SessionId::new(&SystemRng),
+        ];
+        let [first, second, third] = ids.map(|id| SessionKey::of(&id));
+        store.save(&first, &revised(1), TTL).await.unwrap();
+
+        assert_eq!(
+            store
+                .cycle(&first, &second, &revised(1), TTL, true)
+                .await
+                .unwrap(),
+            CycleOutcome::Rotated
+        );
+        assert_eq!(row_names(&store).await, [second.to_string()]);
+
+        assert_eq!(
+            store
+                .cycle_if_revision(&second, &third, &revised(1), TTL, true, 1)
+                .await
+                .unwrap(),
+            CycleOutcome::Rotated
+        );
+        assert_eq!(row_names(&store).await, [third.to_string()]);
+        for id in &ids {
+            assert_holds_no_id(&store, id).await;
+        }
+
+        // The zero-ttl form removes the rows under both keys, and no other.
+        store.save(&first, &revised(1), TTL).await.unwrap();
+        store.save(&second, &revised(1), TTL).await.unwrap();
+        assert_eq!(
+            store
+                .cycle(&third, &first, &revised(1), Duration::ZERO, true)
+                .await
+                .unwrap(),
+            CycleOutcome::SessionGone
+        );
+        assert_eq!(row_names(&store).await, [second.to_string()]);
+    }
+}
+
+/// A row an earlier release stored under the session id itself is not the
+/// session's row: it does not load under the id's key, and the documented
+/// statement removes it and leaves the rows of this release.
+#[tokio::test]
+#[ignore = "requires a running MySQL (MYSQL_URL)"]
+async fn a_row_under_a_session_id_is_not_read_and_one_statement_removes_it() {
+    let [store, _] = stored_form_stores().await;
+    let id = SessionId::new(&SystemRng);
+    let key = SessionKey::of(&id);
+    // What such a row holds does not matter to the lookup; a plaintext
+    // store would read this one if it found it.
+    let blob = rmp_serde::to_vec_named(&revised(1)).unwrap();
+    for name in [id.to_string(), id.as_uuid().simple().to_string()] {
+        sqlx::query("INSERT INTO sessions (id, data, data_bin, expires_at) VALUES (?, '', ?, ?)")
+            .bind(name)
+            .bind(&blob)
+            .bind(i64::MAX)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+    }
+    assert!(store.load(&key).await.unwrap().is_none());
+    assert!(!store.update(&key, &revised(1), TTL).await.unwrap());
+
+    store.save(&key, &revised(1), TTL).await.unwrap();
+    assert_eq!(row_names(&store).await.len(), 3);
+    let removed = sqlx::query("DELETE FROM sessions WHERE CHAR_LENGTH(id) <> 64")
+        .execute(&store.pool)
+        .await
+        .unwrap()
+        .rows_affected();
+    assert_eq!(removed, 2);
+    assert_eq!(row_names(&store).await, [key.to_string()]);
+    assert!(store.load(&key).await.unwrap().is_some());
+}
+
+/// The `id` column holds a key whole and as it is printed: two keys that
+/// differ in one hexadecimal digit are two rows, and each row's name is the
+/// 64 lowercase characters of its key.
+#[tokio::test]
+#[ignore = "requires a running MySQL (MYSQL_URL)"]
+async fn two_keys_that_differ_in_one_digit_are_two_rows() {
+    let [store, _] = stored_form_stores().await;
+    let key = SessionKey::of(&SessionId::new(&SystemRng));
+    // The last digit, and a digit that is a letter in one of the two keys:
+    // a comparison that cut the text, or folded its case, would join them.
+    let mut bytes = *key.as_bytes();
+    bytes[31] ^= 0x01;
+    let last_digit = SessionKey::from_bytes(bytes);
+    let mut bytes = *key.as_bytes();
+    bytes[0] = (bytes[0] & 0xf0) | if bytes[0] & 0x0f == 0x0a { 0x0b } else { 0x0a };
+    let a_letter = SessionKey::from_bytes(bytes);
+
+    for (key, revision) in [(&key, 1), (&last_digit, 2), (&a_letter, 3)] {
+        store.save(key, &revised(revision), TTL).await.unwrap();
+    }
+    for (key, revision) in [(&key, 1), (&last_digit, 2), (&a_letter, 3)] {
+        assert_eq!(store.load(key).await.unwrap().unwrap().revision, revision);
+    }
+    let mut expected = [key, last_digit, a_letter].map(|key| key.to_string());
+    expected.sort();
+    assert_eq!(row_names(&store).await, expected);
+    let widths: Vec<i64> = sqlx::query_scalar("SELECT CHAR_LENGTH(id) FROM sessions")
+        .fetch_all(&store.pool)
+        .await
+        .unwrap();
+    assert_eq!(widths, [64, 64, 64]);
 }

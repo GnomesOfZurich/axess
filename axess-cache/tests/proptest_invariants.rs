@@ -32,7 +32,6 @@
 use axess_cache::ClockTtlCache;
 use axess_clock::Clock;
 use axess_clock::testing::MockClock;
-use chrono::{TimeZone, Utc};
 use proptest::prelude::*;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -42,8 +41,8 @@ use std::time::Duration;
 /// [`op_strategy`] and applied via [`apply_op`].
 ///
 /// `Advance` carries an `i64` because `MockClock::advance_secs` takes
-/// `i64` (chrono's native unit); proptest's bounded ranges keep us
-/// well clear of overflow.
+/// `i64`; proptest's bounded ranges keep us well clear of the end of the
+/// clock's range.
 #[derive(Debug, Clone)]
 enum Op {
     Insert(u32, u32),
@@ -66,9 +65,7 @@ fn op_strategy() -> impl Strategy<Value = Op> {
 }
 
 fn build_cache(capacity: usize, ttl_secs: u64) -> (ClockTtlCache<u32, u32>, Arc<MockClock>) {
-    let clock = Arc::new(MockClock::at(
-        Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
-    ));
+    let clock = Arc::new(MockClock::at_reference());
     let cache = ClockTtlCache::new(
         NonZeroUsize::new(capacity).unwrap(),
         Duration::from_secs(ttl_secs),
@@ -120,7 +117,7 @@ proptest! {
     /// (TTL, advance); easy to write, easy to break with off-by-one.
     ///
     /// The expiry instant is exclusive: at exactly
-    /// `expires_at_micros == now_micros` the entry is already gone.
+    /// `expires_at == now` the entry is already gone.
     #[cfg_attr(miri, ignore = "hundreds of randomised sequences are too slow to interpret; the unit tests cover the cache under Miri")]
     #[test]
     fn ttl_boundary_get_within_returns_some_after_returns_none(
@@ -163,7 +160,7 @@ proptest! {
         kvs in proptest::collection::vec((0u32..16, any::<u32>()), 1..=20),
         target in 0u32..16,
     ) {
-        let (cache, _clock) = build_cache(capacity, 60);
+        let (cache, _) = build_cache(capacity, 60);
         for (k, v) in &kvs {
             cache.insert(*k, *v);
         }
@@ -189,7 +186,7 @@ proptest! {
         capacity in 4usize..=32,
         values in proptest::collection::vec(any::<u32>(), 1..=20),
     ) {
-        let (cache, _clock) = build_cache(capacity, 60);
+        let (cache, _) = build_cache(capacity, 60);
         let key = 42u32;
         let mut last_value = None;
         for v in &values {

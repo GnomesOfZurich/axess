@@ -2,17 +2,21 @@
 
 use super::*;
 use crate::delegated::stored::credential::MemoryDelegatedCredentialStore;
+use axess_clock::Timestamp;
 use axess_rng::testing::MockRng;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use chrono::{TimeZone, Utc};
 
 fn credential() -> StoredDelegation {
     StoredDelegation {
         provider: "gmail".to_string(),
+        registration: Some(crate::delegated::stored::GrantRegistration {
+            provider: "gmail".to_string(),
+            fingerprint: "gmail-registration".to_string(),
+        }),
         access_token: ZeroizedString::from("at-plaintext"),
         refresh_token: Some(ZeroizedString::from("rt-plaintext")),
-        expires_at: Some(Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap()),
+        expires_at: Some(Timestamp::from_utc(2030, 1, 1, 0, 0, 0).unwrap()),
         scopes: vec!["gmail.send".to_string()],
         token_type: "Bearer".to_string(),
     }

@@ -26,7 +26,7 @@ This is the crate most applications should depend on. It re-exports the curated 
 
 ```toml
 [dependencies]
-axess = { version = "0.19.0", features = ["sqlite", "authz"] }
+axess = { version = "0.20.0", features = ["sqlite", "authz"] }
 ```
 
 ```rust,no_run
@@ -48,20 +48,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     session_store.init_schema().await?;
 
     let backend = InMemoryBackend::new()
-        .with_user_password("alice", "default", "Gnomes2+");
+        .with_user_password("alice", "default", "Sample2+");
     // One registry for the service (it records every login) and the session
     // layer (it ends a revoked session on every route). Use the Valkey
     // registry for more than one instance.
     let registry = MemorySessionRegistry::new();
-    let _service = Arc::new(
+    let service = Arc::new(
         AuthnService::builder_from_backend(backend)
             .with_registry(registry.clone())
             .build(),
     );
 
     let signing_key: [u8; 32] = [/* load from your secret store */ 0; 32];
-    let session_layer = SessionLayer::new(session_store, signing_key, registry.handle())
-        .with_ttl(Duration::from_secs(86400));
+    // The service's sink records each session the layer ends by itself
+    // (an age cap, a registry entry gone) as an audit row.
+    let session_layer = SessionLayer::new(
+        session_store,
+        signing_key,
+        registry.handle(),
+        service.session_end_audit(),
+    )
+    .with_ttl(Duration::from_secs(86400));
 
     let app = Router::new()
         .route("/", get(|| async { "hello" }))

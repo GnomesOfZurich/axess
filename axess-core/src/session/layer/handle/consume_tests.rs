@@ -3,11 +3,15 @@
 //! its retry carries the concurrent write along instead of overwriting it.
 
 use super::*;
+use crate::session::id::{SessionId, SessionKey};
 use crate::session::store::{ConditionalUpdate, MemorySessionStore, SessionStore};
 
 /// The row at `id` as the store holds it.
 async fn stored(store: &MemorySessionStore, id: &SessionId) -> SessionData {
-    SessionStore::load(store, id).await.unwrap().unwrap()
+    SessionStore::load(store, &SessionKey::of(id))
+        .await
+        .unwrap()
+        .unwrap()
 }
 use crate::testing::mock_random::MockRng;
 
@@ -29,20 +33,15 @@ fn request_holding(
     loaded: &SessionData,
 ) -> SessionInner {
     SessionInner {
-        id,
+        session: CookieSession::of_id(id),
         data: loaded.clone(),
-        modified: false,
-        needs_persist: false,
-        regenerate: false,
-        pre_cycle_id: None,
-        pending_fingerprint: None,
         max_custom_bytes: 0,
-        rng: Arc::new(MockRng::new(1)),
         consume: Some(ConsumeTarget {
             store: Arc::new(store.clone()),
             ttl: TTL,
             loaded: Some(loaded.clone()),
         }),
+        ..SessionInner::detached(Arc::new(MockRng::new(1)))
     }
 }
 
@@ -58,9 +57,15 @@ async fn concurrent_write(
     written.custom = custom;
     written.revision = loaded.revision.wrapping_add(1);
     assert_eq!(
-        SessionStore::update_if_revision(store, id, loaded.revision, &written, TTL)
-            .await
-            .unwrap(),
+        SessionStore::update_if_revision(
+            store,
+            &SessionKey::of(id),
+            loaded.revision,
+            &written,
+            TTL
+        )
+        .await
+        .unwrap(),
         ConditionalUpdate::Written
     );
 }
@@ -76,7 +81,10 @@ async fn a_take_that_lost_the_swap_hands_out_the_stored_value_and_keeps_the_conc
         custom: bag(&[("reg_state", "S1"), ("csrf", "T1")]),
         ..SessionData::default()
     };
-    store.save(&id, &loaded, TTL).await.unwrap();
+    store
+        .save(&SessionKey::of(&id), &loaded, TTL)
+        .await
+        .unwrap();
     let mut a = request_holding(&store, id, &loaded);
     concurrent_write(
         &store,
@@ -116,7 +124,10 @@ async fn a_take_that_lost_the_swap_keeps_this_requests_own_changes() {
         custom: bag(&[("reg_state", "S1")]),
         ..SessionData::default()
     };
-    store.save(&id, &loaded, TTL).await.unwrap();
+    store
+        .save(&SessionKey::of(&id), &loaded, TTL)
+        .await
+        .unwrap();
     let mut a = request_holding(&store, id, &loaded);
     a.data.custom["cart"] = serde_json::json!(1);
     a.modified = true;
@@ -147,7 +158,10 @@ async fn a_take_that_lost_the_swap_to_another_take_gets_nothing() {
         custom: bag(&[("reg_state", "S1")]),
         ..SessionData::default()
     };
-    store.save(&id, &loaded, TTL).await.unwrap();
+    store
+        .save(&SessionKey::of(&id), &loaded, TTL)
+        .await
+        .unwrap();
     let mut a = request_holding(&store, id, &loaded);
     concurrent_write(&store, &id, &loaded, bag(&[])).await;
 
@@ -167,12 +181,15 @@ async fn a_take_after_the_id_rotated_does_not_write_the_login_to_the_old_row() {
         custom: bag(&[("reg_state", "S1"), ("csrf", "T1")]),
         ..SessionData::default()
     };
-    store.save(&id, &loaded, TTL).await.unwrap();
+    store
+        .save(&SessionKey::of(&id), &loaded, TTL)
+        .await
+        .unwrap();
     let mut a = request_holding(&store, id, &loaded);
     a.data.auth_state.set_authenticated(
         axess_identity::testing::user("u-fix"),
         axess_identity::testing::tenant("t-fix"),
-        chrono::Utc::now(),
+        axess_clock::testing::MockClock::reference_time(),
     );
     a.data.fingerprint = Some("fp".into());
     a.modified = true;
@@ -210,12 +227,15 @@ async fn a_rotated_take_that_lost_the_swap_carries_the_concurrent_take_into_its_
         custom: bag(&[("k1", "one"), ("k2", "two")]),
         ..SessionData::default()
     };
-    store.save(&id, &loaded, TTL).await.unwrap();
+    store
+        .save(&SessionKey::of(&id), &loaded, TTL)
+        .await
+        .unwrap();
     let mut a = request_holding(&store, id, &loaded);
     a.data.auth_state.set_authenticated(
         axess_identity::testing::user("u-fix"),
         axess_identity::testing::tenant("t-fix"),
-        chrono::Utc::now(),
+        axess_clock::testing::MockClock::reference_time(),
     );
     a.modified = true;
     a.rotate_id();
@@ -245,12 +265,15 @@ async fn a_rotated_take_does_not_carry_keys_planted_on_the_retired_row() {
         custom: bag(&[("reg_state", "S1")]),
         ..SessionData::default()
     };
-    store.save(&id, &loaded, TTL).await.unwrap();
+    store
+        .save(&SessionKey::of(&id), &loaded, TTL)
+        .await
+        .unwrap();
     let mut a = request_holding(&store, id, &loaded);
     a.data.auth_state.set_authenticated(
         axess_identity::testing::user("u-fix"),
         axess_identity::testing::tenant("t-fix"),
-        chrono::Utc::now(),
+        axess_clock::testing::MockClock::reference_time(),
     );
     a.modified = true;
     a.rotate_id();

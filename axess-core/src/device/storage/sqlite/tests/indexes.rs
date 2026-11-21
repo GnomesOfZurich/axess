@@ -19,7 +19,7 @@ async fn plan(store: &SqliteDeviceStore, sql: &str) -> String {
 }
 
 /// `find_by_fingerprint` reads the newest sighting from the index, with no
-/// temporary sort: the cost no longer grows with the devices that share a
+/// temporary sort: the cost does not grow with the devices that share a
 /// fingerprint.
 #[tokio::test]
 async fn the_fingerprint_lookup_is_served_in_order_by_its_index() {

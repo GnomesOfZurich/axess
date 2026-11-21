@@ -4,8 +4,9 @@
 use super::*;
 use crate::device::store::MemoryDeviceStore;
 use crate::device::types::{Device, FingerprintHash};
+use axess_clock::Timestamp;
 use axess_clock::testing::MockClock;
-use chrono::TimeZone;
+use axess_clock::testing::Shift;
 use std::pin::Pin;
 use std::sync::Mutex;
 
@@ -32,6 +33,10 @@ async fn fire(slot: &Mutex<Option<Hook>>) {
 
 impl DeviceStore for HookedStore {
     type Error = <MemoryDeviceStore as DeviceStore>::Error;
+
+    async fn load_fresh(&self, t: &TenantId, id: &DeviceId) -> Result<Option<Device>, Self::Error> {
+        self.inner.load_fresh(t, id).await
+    }
 
     async fn load(&self, t: &TenantId, id: &DeviceId) -> Result<Option<Device>, Self::Error> {
         let row = self.inner.load(t, id).await?;
@@ -60,11 +65,11 @@ impl DeviceStore for HookedStore {
     ) -> impl Future<Output = Result<Vec<Device>, Self::Error>> + Send {
         self.inner.find_by_refresh_family(t, f)
     }
-    async fn save(&self, d: &Device, now: DateTime<Utc>) -> Result<(), Self::Error> {
+    async fn save(&self, d: &Device, now: Timestamp) -> Result<(), Self::Error> {
         fire(&self.before_write).await;
         self.inner.save(d, now).await
     }
-    async fn create_or_find(&self, d: &Device, now: DateTime<Utc>) -> Result<Device, Self::Error> {
+    async fn create_or_find(&self, d: &Device, now: Timestamp) -> Result<Device, Self::Error> {
         fire(&self.before_write).await;
         self.inner.create_or_find(d, now).await
     }
@@ -72,7 +77,7 @@ impl DeviceStore for HookedStore {
         &self,
         t: &TenantId,
         id: &DeviceId,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<DeviceTrustLevel, Self::Error>> + Send {
         self.inner.record_sighting(t, id, now)
     }
@@ -81,12 +86,51 @@ impl DeviceStore for HookedStore {
         t: &TenantId,
         id: &DeviceId,
         level: DeviceTrustLevel,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Result<(), Self::Error> {
         fire(&self.before_write).await;
         let result = self.inner.set_trust_level(t, id, level, now).await;
         fire(&self.after_write).await;
         result
+    }
+    async fn set_trust_level_if(
+        &self,
+        t: &TenantId,
+        id: &DeviceId,
+        expected: DeviceTrustLevel,
+        level: DeviceTrustLevel,
+        now: Timestamp,
+    ) -> Result<crate::device::store::TrustTransition, Self::Error> {
+        fire(&self.before_write).await;
+        let result = self
+            .inner
+            .set_trust_level_if(t, id, expected, level, now)
+            .await;
+        fire(&self.after_write).await;
+        result
+    }
+    async fn claim_owner(
+        &self,
+        t: &TenantId,
+        id: &DeviceId,
+        user: &UserId,
+        now: Timestamp,
+    ) -> Result<crate::device::store::OwnerClaim, Self::Error> {
+        fire(&self.before_write).await;
+        self.inner.claim_owner(t, id, user, now).await
+    }
+    async fn replace_bindings(
+        &self,
+        t: &TenantId,
+        id: &DeviceId,
+        expected: &[crate::device::types::DeviceBinding],
+        bindings: &[crate::device::types::DeviceBinding],
+        now: Timestamp,
+    ) -> Result<crate::device::store::BindingsUpdate, Self::Error> {
+        fire(&self.before_write).await;
+        self.inner
+            .replace_bindings(t, id, expected, bindings, now)
+            .await
     }
     async fn delete(&self, t: &TenantId, id: &DeviceId) -> Result<(), Self::Error> {
         fire(&self.before_write).await;
@@ -95,14 +139,14 @@ impl DeviceStore for HookedStore {
     fn sweep(
         &self,
         t: &TenantId,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<SweepCounts, Self::Error>> + Send {
         self.inner.sweep(t, now)
     }
 }
 
-fn now() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()
+fn now() -> Timestamp {
+    Timestamp::from_utc(2026, 1, 1, 0, 0, 0).unwrap()
 }
 
 fn device(level: DeviceTrustLevel) -> Device {
@@ -122,8 +166,12 @@ fn device(level: DeviceTrustLevel) -> Device {
 
 /// Cached store over a `HookedStore` holding one Trusted device.
 async fn setup() -> (CachedDeviceStore<HookedStore>, HookedStore, Device) {
+    setup_holding(device(DeviceTrustLevel::Trusted)).await
+}
+
+/// Cached store over a `HookedStore` holding `d`.
+async fn setup_holding(d: Device) -> (CachedDeviceStore<HookedStore>, HookedStore, Device) {
     let hooked = HookedStore::default();
-    let d = device(DeviceTrustLevel::Trusted);
     hooked
         .inner
         .save(&d, crate::device::test_now())
@@ -178,6 +226,88 @@ async fn delete_is_not_undone_by_a_load_during_the_write() {
     assert!(cached.load(&d.tenant_id, &d.id).await.unwrap().is_none());
 }
 
+// The conditional writes, each raced the same way: a load that lands while
+// the write is under way caches the row as it was, and the write's
+// invalidation, which comes after the write, drops it again.
+
+#[tokio::test]
+async fn a_conditional_trust_change_is_not_undone_by_a_load_during_the_write() {
+    use crate::device::store::TrustTransition;
+    let (cached, hooked, d) = setup().await;
+    *hooked.before_write.lock().unwrap() = Some(reader(&cached, &d));
+    let changed = cached
+        .set_trust_level_if(
+            &d.tenant_id,
+            &d.id,
+            DeviceTrustLevel::Trusted,
+            DeviceTrustLevel::Revoked,
+            now(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(changed, TrustTransition::Applied);
+    let seen = cached.load(&d.tenant_id, &d.id).await.unwrap().unwrap();
+    assert_eq!(seen.trust_level, DeviceTrustLevel::Revoked);
+}
+
+#[tokio::test]
+async fn a_bindings_swap_is_not_undone_by_a_load_during_the_write() {
+    use crate::device::store::BindingsUpdate;
+    use crate::device::types::DeviceBinding;
+    let (cached, hooked, d) = setup().await;
+    *hooked.before_write.lock().unwrap() = Some(reader(&cached, &d));
+    let bound = vec![DeviceBinding::Refresh {
+        family_id: "family-1".into(),
+        issued_at: now(),
+        last_used_at: now(),
+    }];
+    let swapped = cached
+        .replace_bindings(&d.tenant_id, &d.id, &[], &bound, now())
+        .await
+        .unwrap();
+    assert_eq!(swapped, BindingsUpdate::Written);
+    let seen = cached.load(&d.tenant_id, &d.id).await.unwrap().unwrap();
+    assert_eq!(seen.bindings, bound);
+}
+
+#[tokio::test]
+async fn an_owner_claim_is_not_undone_by_a_load_during_the_write() {
+    use crate::device::store::OwnerClaim;
+    let unowned = Device {
+        user_id: None,
+        ..device(DeviceTrustLevel::Seen)
+    };
+    let (cached, hooked, d) = setup_holding(unowned).await;
+    *hooked.before_write.lock().unwrap() = Some(reader(&cached, &d));
+    let user = crate::authn::ids::testing::user("user-2");
+    let claimed = cached
+        .claim_owner(&d.tenant_id, &d.id, &user, now())
+        .await
+        .unwrap();
+    assert_eq!(claimed, OwnerClaim::Claimed);
+    let seen = cached.load(&d.tenant_id, &d.id).await.unwrap().unwrap();
+    assert_eq!(seen.user_id, Some(user));
+}
+
+/// A create that finds no live device of its fingerprint and owner writes
+/// its row, here over the device's earlier row under another fingerprint.
+#[tokio::test]
+async fn a_create_is_not_undone_by_a_load_during_the_write() {
+    let (cached, hooked, d) = setup().await;
+    *hooked.before_write.lock().unwrap() = Some(reader(&cached, &d));
+    let refingerprinted = Device {
+        fingerprint_hash: FingerprintHash::from_bytes([2u8; 32]),
+        ..d.clone()
+    };
+    let created = cached
+        .create_or_find(&refingerprinted, crate::device::test_now())
+        .await
+        .unwrap();
+    assert_eq!(created.fingerprint_hash, refingerprinted.fingerprint_hash);
+    let seen = cached.load(&d.tenant_id, &d.id).await.unwrap().unwrap();
+    assert_eq!(seen.fingerprint_hash, refingerprinted.fingerprint_hash);
+}
+
 /// The load reads the Trusted row, then a full revocation lands before the
 /// load returns. The stale row must not be promoted into the cache.
 #[tokio::test]
@@ -201,7 +331,7 @@ async fn sweep_drops_cached_rows_of_the_tenant() {
     let hooked = HookedStore {
         inner: MemoryDeviceStore::new().with_sweep_config(
             crate::device::store::SweepConfig::builder()
-                .trusted_idle(chrono::Duration::days(1))
+                .trusted_idle(std::time::Duration::from_hours(24))
                 .build()
                 .unwrap(),
         ),
@@ -216,7 +346,7 @@ async fn sweep_drops_cached_rows_of_the_tenant() {
     let cached = CachedDeviceStore::new(hooked).with_clock(Arc::new(MockClock::at(now())) as _);
     drop(cached.load(&d.tenant_id, &d.id).await.unwrap());
 
-    let later = now() + chrono::Duration::days(2);
+    let later = now().plus(axess_clock::SignedDuration::days(2));
     let counts = cached.sweep(&d.tenant_id, later).await.unwrap();
     assert_eq!(counts.trusted_to_seen, 1);
     let seen = cached.load(&d.tenant_id, &d.id).await.unwrap().unwrap();
@@ -253,7 +383,7 @@ async fn builders_keep_each_others_settings() {
 #[tokio::test]
 async fn conditional_writes_invalidate_the_cached_row() {
     use crate::device::store::{BindingsUpdate, TrustTransition};
-    let (cached, _hooked, d) = setup().await;
+    let (cached, _, d) = setup().await;
     let (t, id) = (d.tenant_id, d.id);
     assert_eq!(
         cached.load(&t, &id).await.unwrap().unwrap().trust_level,
@@ -288,7 +418,9 @@ async fn conditional_writes_invalidate_the_cached_row() {
 /// A revocation whose future is dropped after the store committed it (a
 /// request cancelled, a timeout) still drops the cached row: without the
 /// drop guard the cache would keep serving the Trusted row for a full TTL
-/// although the device is revoked in storage.
+/// although the device is revoked in storage. A load also lands while the
+/// write is under way, so the row it caches then is dropped too: the guard
+/// is dropped with the cancelled future, after the write, not before it.
 #[tokio::test]
 async fn a_revocation_cancelled_after_the_write_still_drops_the_cached_row() {
     let (cached, hooked, d) = setup().await;
@@ -302,6 +434,7 @@ async fn a_revocation_cancelled_after_the_write_still_drops_the_cached_row() {
         DeviceTrustLevel::Trusted,
         "the Trusted row is cached"
     );
+    *hooked.before_write.lock().unwrap() = Some(reader(&cached, &d));
     *hooked.after_write.lock().unwrap() = Some(Box::new(|| Box::pin(std::future::pending::<()>())));
     let revoke = cached.set_trust_level(&d.tenant_id, &d.id, DeviceTrustLevel::Revoked, now());
     let outcome = tokio::time::timeout(Duration::from_millis(50), revoke).await;

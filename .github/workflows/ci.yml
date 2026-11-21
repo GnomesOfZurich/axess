@@ -34,9 +34,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+      - uses: ./.github/actions/pinned-toolchain
         with:
-          toolchain: stable
           components: rustfmt
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -73,7 +72,7 @@ jobs:
           fi
           echo "OK: no #[non_exhaustive] occurrences."
 
-  # (2026-05-16): block `cargo-mutants` mutation markers from
+  # Block `cargo-mutants` mutation markers from
   # landing on `main`. A local `cargo mutants` run in-place (or one
   # that crashed mid-flight) leaves `/* ~ changed by cargo-mutants ~ */`
   # markers in the source tree; if the developer subsequently `git add`s
@@ -123,12 +122,14 @@ jobs:
     name: Lockfile Drift
     runs-on: ubuntu-latest
     steps:
+      # The whole history and its tags: the lock-age check below judges the
+      # lockfiles against the last release tag and reads the trailers of the
+      # commits since.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: stable
+          fetch-depth: 0
+      - uses: ./.github/actions/pinned-toolchain
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Verify Cargo.lock is up-to-date and unchanged
         run: |
@@ -140,12 +141,34 @@ jobs:
           #    (would mean we're rebuilding against a different lockfile
           #    than the committed one: defence in depth).
           git diff --exit-code Cargo.lock
+      # The fuzz crate is a workspace of its own with a lock file of its
+      # own. It is committed so a fuzz build is the same build twice, held
+      # current for the fuzz manifest here, and held to the versions the
+      # workspace's lock file names by the script, so the targets run
+      # against the code the workspace ships.
+      - name: Crafted cases for the fuzz lock check
+        run: ./scripts/check-fuzz-lock-tests.sh
+      - name: The fuzz lock file is current and agrees with the workspace's
+        run: |
+          set -eu
+          cargo metadata --locked --format-version 1 --manifest-path fuzz/Cargo.toml > /dev/null
+          git diff --exit-code fuzz/Cargo.lock
+          ./scripts/check-fuzz-lock.sh
+      # No crates.io entry younger than the cooldown in .cargo/config.toml
+      # enters a lockfile unless the commit that adds it ends with a
+      # `Cooldown-Exempt: <advisory id> <crate>` trailer. The publish times
+      # come from the crates.io sparse index; an entry whose time cannot be
+      # read fails.
+      - name: Crafted cases for the lock-age check
+        run: ./scripts/check-lock-age-tests.sh
+      - name: No lockfile entry younger than the cooldown without an advisory trailer
+        run: ./scripts/check-lock-age.sh
 
   # Detect orphan source files: any `.rs` under `src/` (other than the
   # crate entry points) must be reachable from its parent module file
-  # via a `mod NAME;` declaration. The Phase A/B/C restructure left two
-  # orphans behind that `cargo build` silently ignored (the compiler
-  # only reads files it is told to read); this gate catches a repeat.
+  # via a `mod NAME;` declaration. `cargo build` silently ignores an
+  # orphan (the compiler only reads files it is told to read), so a file
+  # a move leaves behind stays in the tree unbuilt; this gate refuses one.
   #
   # Convention: modern Rust module layout (`foo.rs` + sibling `foo/`).
   # For `crate/src/A/B/X.rs` the parent file is `crate/src/A/B.rs`
@@ -204,13 +227,23 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+      # libclang and the system SQLite header: every feature on switches
+      # `sqlite-unbundled` on, whose bindings bindgen generates.
+      - uses: ./.github/actions/build-prerequisites
+      - uses: ./.github/actions/pinned-toolchain
         with:
-          toolchain: stable
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Run Clippy
         run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+      # The step above refuses an unused dependency only because the
+      # workspace's lint table denies cargo's `unused_dependencies` lint;
+      # this runs the lint on a probe crate to prove it fires there, after
+      # the crafted cases for what it reads as the lint refusing.
+      - name: Crafted cases for the unused-dependency lint check
+        run: ./scripts/check-unused-dependency-lint-tests.sh
+      - name: The unused-dependency lint fires
+        run: ./scripts/check-unused-dependency-lint.sh
 
   # `cargo doc` under `-D warnings` so broken intradoc links and other
   # rustdoc-level rot fail the build instead of degrading docs.rs
@@ -224,14 +257,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: stable
+      # libclang and the system SQLite header: every feature on switches
+      # `sqlite-unbundled` on, whose bindings bindgen generates.
+      - uses: ./.github/actions/build-prerequisites
+      - uses: ./.github/actions/pinned-toolchain
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      # Was `-p axess -p axess-core`: two crates of eighteen, which is how 29
-      # unresolved intra-doc links accumulated elsewhere in the workspace. The
-      # script covers every member and proves it rendered each one, since
+      # Every member of the workspace, not the facade and the core alone: an
+      # unresolved intra-doc link in a crate that is not built here is found
+      # by no one. The script proves it rendered each member, since
       # `cargo doc` prints nothing and exits 0 when the docs are fresh.
+      # Every member is documented even when one fails, and each error is
+      # reported with its crate.
+      - name: Crafted cases for the documentation report
+        run: ./scripts/check-doc-links-tests.sh
       - name: Build rustdoc with warnings as errors
         run: ./scripts/check-doc-links.sh
 
@@ -262,8 +300,43 @@ jobs:
 
       # Copy-pasteable `axess = { version = "..." }` snippets name the
       # workspace version; nothing else keeps them in step with a bump.
+      - name: Crafted cases for the documented-version check
+        run: ./scripts/check-doc-versions-tests.sh
       - name: Documented versions
         run: ./scripts/check-doc-versions.sh
+
+      # Every migrating page is in the book and has no empty section.
+      - name: Migrating pages
+        run: ./scripts/check-migrating-pages.sh
+      - name: Crafted cases for the migrating-page check
+        run: ./scripts/check-migrating-pages-tests.sh
+
+      # The changelog's sections from 0.20.0 on keep their form: the known
+      # headings once each, one sentence an entry, no tracker row, seat or
+      # author named.
+      - name: Crafted cases for the changelog check
+        run: ./scripts/check-changelog-tests.sh
+      - name: Changelog form
+        run: ./scripts/check-changelog.sh
+
+  # The documentation of every published crate, built as docs.rs builds it:
+  # on a nightly, with the features each crate's `[package.metadata.docs.rs]`
+  # names and `--cfg docsrs` handed to rustdoc. A crate that marks items
+  # with `doc(cfg(..))` and does not switch `doc_cfg` on in its root passes
+  # the Rustdoc job above and fails on docs.rs alone; it fails here.
+  docsrs_build:
+    name: Docs.rs Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/pinned-nightly
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Crafted cases for the docs.rs build
+        run: ./scripts/check-docsrs-build-tests.sh
+      - name: Every published crate's documentation builds as docs.rs builds it
+        run: ./scripts/check-docsrs-build.sh
 
   # The source-layout rules from AGENTS.md that the release preflight
   # enforces: no inline test block over the limit, and production files and
@@ -275,19 +348,118 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Crafted cases for the inline test block check
+        run: ./scripts/check-inline-tests-tests.sh
       - name: Inline test block sizes
         run: ./scripts/check-inline-tests.sh
+      # The prose gate itself runs in the rustdoc job; its cases run here,
+      # with the other source rules' cases.
+      - name: Crafted cases for the prose-style check
+        run: ./scripts/check-prose-style-tests.sh
+      - name: Crafted cases for the size gate
+        run: ./scripts/check-file-sizes-tests.sh
       - name: File and function sizes
         run: ./scripts/check-file-sizes.sh
-      - name: Wall-clock reads outside axess-clock
+      - name: Crafted cases for the clock-usage check
+        run: ./scripts/check-clock-usage-tests.sh
+      - name: Clock reads outside axess-clock and the test's
         run: ./scripts/check-clock-usage.sh
+      - name: Crafted cases for the test-log guard
+        run: ./scripts/check-test-log-tests.sh
+      - name: Crafted cases for the disk floor
+        run: ./scripts/check-disk-floor-tests.sh
+      - name: Crafted cases for the check of keys left by the live tests
+        run: ./scripts/check-live-keys-left-tests.sh
+      - name: Crafted cases for the live-sweep check
+        run: ./scripts/check-live-sweeps-tests.sh
+      - name: Every live Valkey test holds a sweep
+        run: ./scripts/check-live-sweeps.sh
+      - name: Crafted cases for the testing-gate check
+        run: ./scripts/check-testing-gates-tests.sh
+      - name: Every crate with a testing feature carries the release-build gate
+        run: ./scripts/check-testing-gates.sh
+      - name: Crafted cases for the docs.rs feature check
+        run: ./scripts/check-docsrs-features-tests.sh
+      - name: docs.rs builds every feature but the named exclusions
+        run: ./scripts/check-docsrs-features.sh
+      - name: Crafted cases for the supply-chain waiver and geiger step
+        run: ./scripts/supply-chain-tests.sh
+      # The conformance runner's own cases, with no suite and no network:
+      # the conformance page's results section is what it writes from
+      # scripts/conformance/results.json.
+      - name: Crafted cases for the conformance runner
+        run: python3 -I scripts/conformance/run_rp_tests.py
+      - name: Crafted cases for the rsa call-site check
+        run: ./scripts/check-rsa-sites-tests.sh
       - name: rsa call sites
         run: ./scripts/check-rsa-sites.sh
+      - name: Crafted cases for the jsonwebtoken provider-site check
+        run: ./scripts/check-jwt-provider-sites-tests.sh
+      - name: jsonwebtoken operations go through axess_factors::jwt
+        run: ./scripts/check-jwt-provider-sites.sh
+      - name: Crafted cases for the cluster URL read check
+        run: ./scripts/check-cluster-url-reads-tests.sh
+      - name: VALKEY_CLUSTER_URL is read only in cluster_url, after its guard
+        run: ./scripts/check-cluster-url-reads.sh
+      - name: Crafted cases for the log-text site census
+        run: ./scripts/check-log-text-sites-tests.sh
+      - name: Raw log fields of caller text
+        run: ./scripts/check-log-text-sites.sh
+      - name: Crafted cases for the ignore-reason check
+        run: ./scripts/check-ignore-reasons-tests.sh
+      - name: Every ignored test gives its reason
+        run: ./scripts/check-ignore-reasons.sh
+      - name: Crafted cases for the member lint check
+        run: ./scripts/check-member-lints-tests.sh
+      - name: Every member takes the workspace lint table
+        run: ./scripts/check-member-lints.sh
+      - name: Crafted cases for the lint-allowance check
+        run: ./scripts/check-lint-allowances-tests.sh
+      - name: No lint allowed away in the source or the cargo configuration
+        run: ./scripts/check-lint-allowances.sh
+      - name: Crafted cases for the underscore-name check
+        run: ./scripts/check-underscore-names-tests.sh
+      - name: No underscore-prefixed name in the Rust sources
+        run: ./scripts/check-underscore-names.sh
+      - name: Crafted cases for the pipe-reader check
+        run: ./scripts/check-pipe-readers-tests.sh
+      - name: No pipe has a reader that may stop before its writer is done
+        run: ./scripts/check-pipe-readers.sh
+      - name: Crafted cases for the owner-name check
+        run: ./scripts/check-owner-names-tests.sh
+      - name: No name of the publisher outside its exemption list
+        run: ./scripts/check-owner-names.sh
+      - name: Crafted cases for the publish step of the release workflow
+        run: ./scripts/release-publish-tests.sh
+      - name: Crafted cases for the advisory-fix watch
+        run: ./scripts/watch-advisory-fixes-tests.sh
+      - name: Crafted cases for the scheduled-run check
+        run: ./scripts/check-scheduled-runs-tests.sh
+      - name: Crafted cases for the width of the mutation sweep
+        run: ./scripts/check-mutants-width-tests.sh
+
+  # Every shell script of the repository, read by the ShellCheck that
+  # scripts/install-shellcheck.sh pins, as the release preflight's step
+  # reads them: a directive ShellCheck cannot parse, a finding at warning or
+  # above, or a sourced file it cannot find fails here.
+  shell_scripts:
+    name: Shell Scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned ShellCheck
+        run: ./scripts/install-shellcheck.sh
+      - name: Crafted cases for the shell-script check
+        run: ./scripts/check-shellcheck-tests.sh
+      - name: Every shell script passes ShellCheck
+        run: ./scripts/check-shellcheck.sh
 
   # The book, built and tested with the mdBook the docs workflow publishes
   # with (both install through scripts/install-mdbook.sh). The docs workflow
   # runs only after a merge to main, so without this job a book.toml the
-  # pinned mdBook rejects, or a book example that no longer compiles, was
+  # pinned mdBook rejects, or a book example that does not compile, is
   # found after the release it shipped in.
   book:
     name: Book
@@ -296,9 +468,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: stable
+      # libclang and the system SQLite header: every feature on switches
+      # `sqlite-unbundled` on, whose bindings bindgen generates.
+      - uses: ./.github/actions/build-prerequisites
+      - uses: ./.github/actions/pinned-toolchain
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Install mdBook + mdbook-mermaid
         run: ./scripts/install-mdbook.sh
@@ -306,19 +479,24 @@ jobs:
         run: mdbook-mermaid install docs
       - name: Build book
         run: mdbook build docs
-      - name: Build the crates the book's examples import
-        run: cargo build -p axess --all-features -p axess-example-minimal
+      # The script builds the crates the book's examples import and puts
+      # the directories cargo names for them on mdbook's search path.
       - name: Test book code
-        run: mdbook test docs -L target/debug/deps
+        run: ./scripts/book-test.sh
 
   # Tests
   test:
     name: Test Suite
     runs-on: ubuntu-latest
-    
+    # Line tables only: a backtrace keeps its files and lines, and each test
+    # binary leaves out the rest of the debug info, the largest part of it.
+    # .github/actions/disk-headroom says why this job needs the room.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
     services:
       # Every service image below is pinned by the digest of its multi-arch
-      # index (read from the registry on 2026-11-08), with the tag kept for the
+      # index, read from the registry, with the tag kept for the
       # reader: the tag says what was meant, the digest is what runs. Moving a
       # pin is a deliberate edit that reads the new digest from the registry.
       # Valkey (Redis-compatible). Service name and redis-cli are standard;
@@ -362,10 +540,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: ./.github/actions/disk-headroom
+      # libclang and the system SQLite header: every feature on switches
+      # `sqlite-unbundled` on, whose bindings bindgen generates.
+      - uses: ./.github/actions/build-prerequisites
 
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: stable
+      - uses: ./.github/actions/pinned-toolchain
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
@@ -381,16 +561,56 @@ jobs:
             -v "$PWD/examples/fapi/keycloak/fapi-realm.json:/opt/keycloak/data/import/fapi-realm.json:ro" \
             quay.io/keycloak/keycloak:26.0@sha256:09a381c715ab0b111835b70f2905955274843a219c6f27efb348e4d9f4086858 start-dev --import-realm
 
+      # A three-node Valkey cluster for the Valkey tests that need one
+      # (VALKEY_CLUSTER_URL, the valkey_cluster suites). One container runs
+      # the three nodes on the host network, on loopback, from the image of
+      # the Valkey service above.
+      - name: Start a Valkey cluster
+        run: |
+          docker run -d --name axess-valkey-cluster --network host \
+            valkey/valkey:latest@sha256:3add1a336a920ea54770a001ab6feb3da5fceea96a40373a3a2cd469b815f0b7 \
+            sh -c 'for p in 7001 7002 7003; do valkey-server --port $p --bind 127.0.0.1 --cluster-enabled yes --cluster-config-file nodes-$p.conf --save "" --appendonly no --daemonize yes; done; sleep 1; valkey-cli --cluster create 127.0.0.1:7001 127.0.0.1:7002 127.0.0.1:7003 --cluster-replicas 0 --cluster-yes; exec sleep infinity'
+          for _ in $(seq 1 30); do
+            info="$(docker exec axess-valkey-cluster valkey-cli -p 7001 cluster info || true)"
+            grep -q cluster_state:ok <<<"$info" && exit 0
+            sleep 1
+          done
+          docker logs axess-valkey-cluster | tail -50
+          exit 1
+
+      # The test binaries, in a step of their own so that the free space is
+      # read between the build and the run. The run builds none of them
+      # again.
+      - name: Build the workspace tests
+        run: cargo test --workspace --all-features --no-run
+
+      # What the run writes after the build: trybuild's target directory for
+      # its four projects (about 3 GB), the doctests rustdoc builds in the
+      # temporary directory, and the data of the services, a few GB in all.
+      # A run with less than 10 GiB free stops here by name, before a test
+      # runs (scripts/check-disk-floor.sh says why).
+      - name: Room for the workspace tests
+        run: ./scripts/check-disk-floor.sh "Test Suite, before the workspace tests" 10
+
       # Every test not marked ignored: unit, integration and doc tests, the
-      # release preflight's "Workspace tests" step. This used to be `--lib`
-      # plus `--doc`, which left the non-ignored tests under each crate's
-      # tests/ to the Coverage job alone.
+      # release preflight's "Workspace tests" step. `--lib` plus `--doc`
+      # would leave the non-ignored tests under each crate's tests/ to the
+      # Coverage job alone.
       - name: Run workspace tests
         run: cargo test --workspace --all-features
         env:
           VALKEY_URL: redis://localhost:6379
           POSTGRES_URL: postgres://postgres:postgres@localhost:5432/postgres
           MYSQL_URL: mysql://root:mysql@localhost:3306/axess_test
+
+      # Read again after the run, whatever its end: what the run wrote is
+      # still on disk, so this is close to the least room it had. A run
+      # that came within 2 GiB of a full disk fails here by name, whatever
+      # its tests reported, and so does a build that the disk stopped
+      # (scripts/check-disk-floor.sh says why).
+      - name: Room left after the workspace tests
+        if: always()
+        run: ./scripts/check-disk-floor.sh "Test Suite, after the workspace tests" 2
 
       # The workspace tests above give Keycloak its start-up time; this only
       # waits for whatever is left of it.
@@ -403,15 +623,32 @@ jobs:
           docker logs axess-keycloak-test | tail -50
           exit 1
 
+      # The same floor before the second run of the same binaries.
+      - name: Room for the live-store tests
+        run: ./scripts/check-disk-floor.sh "Test Suite, before the live-store tests" 10
+
       # The script the release preflight runs: the ignored tests against the
-      # live stores, refused when a URL is unset or when nothing passed.
+      # live stores, refused when a URL is unset, when nothing passed or when
+      # the run left a key on the Valkey servers.
       - name: Run integration tests (with Valkey + Postgres + MySQL + Keycloak)
+        id: live
         run: ./scripts/check-live-stores.sh
         env:
           KEYCLOAK_URL: http://127.0.0.1:8080
           VALKEY_URL: redis://localhost:6379
+          VALKEY_CLUSTER_URL: redis-cluster://127.0.0.1:7001
+          # The container whose client the check of keys left after the run
+          # asks with: it runs on the host network, so it reaches the Valkey
+          # service as well.
+          VALKEY_CLI_CONTAINER: axess-valkey-cluster
           POSTGRES_URL: postgres://postgres:postgres@localhost:5432/postgres
           MYSQL_URL: mysql://root:mysql@localhost:3306/axess_test
+
+      # The same reading after the live-store tests, whatever their end, when
+      # they ran.
+      - name: Room left after the live-store tests
+        if: always() && steps.live.outcome != 'skipped'
+        run: ./scripts/check-disk-floor.sh "Test Suite, after the live-store tests" 2
 
   # CockroachDB wire-protocol compatibility. Cockroach speaks the Postgres
   # wire protocol, so the existing `postgres` backend (sqlx::PgPool) should
@@ -449,18 +686,59 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: stable
+      - uses: ./.github/actions/pinned-toolchain
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # Cockroach defaults to user `root` with no password on `--insecure`
       # mode. We point the existing postgres integration suite at port
       # 26257: same `POSTGRES_URL` env var consumed by the tests, just
       # against a different backend speaking the same wire protocol.
+      # The same guard as scripts/check-live-stores.sh: a run in which no
+      # postgres test passed is a refusal, not a green job.
       - name: Run postgres integration tests against CockroachDB
-        run: cargo test -p axess-core --features postgres,testing -- --ignored
+        run: |
+          set -u
+          cargo test -p axess-core --features postgres,testing -- --ignored 2>&1 | tee cockroach.log
+          ./scripts/check-test-log.sh "${PIPESTATUS[0]}" cockroach.log postgres
         env:
           POSTGRES_URL: postgres://root@localhost:26257/defaultdb?sslmode=disable
+
+  # The SPIRE Workload API client against a real agent. The agent attests a
+  # workload on its own host, so the server and the agent run on the runner
+  # itself, as the runner's user, from the release SPIRE publishes: one
+  # archive, named by version and held to the SHA-256 SPIRE publishes
+  # beside it, since an archive has no tag to pin an action or an image by.
+  # It is checked before it is unpacked, into a directory of its own, and
+  # scripts/check-workflow-pins.sh runs its programs only from there.
+  # scripts/spire-live.sh starts both, registers two identities for the
+  # runner's uid, runs the ignored tests of axess-core/tests/spire_live.rs
+  # through scripts/check-live-stores.sh, and deletes a registration entry
+  # each time a test asks for it: the suite sees an X.509 SVID with its
+  # bundle, a JWT SVID it validates, one rotation, and both withdrawals.
+  spire_live:
+    name: SPIRE Workload API
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SPIRE_VERSION: 1.16.0
+      SPIRE_SHA256: 7bcf5e167151a1fc58293768462b44e155ba8784214582aefa6adf18c633d1d5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/pinned-toolchain
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Fetch the SPIRE release and check its digest
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/spire.tar.gz"
+          curl --proto '=https' --proto-redir '=https' --tlsv1.2 --fail --silent --show-error --location \
+            --output "$archive" \
+            "https://github.com/spiffe/spire/releases/download/v${SPIRE_VERSION}/spire-${SPIRE_VERSION}-linux-amd64-musl.tar.gz"
+          echo "${SPIRE_SHA256}  ${archive}" | sha256sum --check --strict -
+          mkdir "$RUNNER_TEMP/spire"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/spire"
+      - name: Run the live suite against a server and an agent of its own
+        run: ./scripts/spire-live.sh "$RUNNER_TEMP/spire/spire-${SPIRE_VERSION}/bin"
 
   # MSRV check: verify the declared minimum supported Rust version still
   # builds and tests. Bump in lockstep with `rust-version` in each Cargo.toml.
@@ -475,11 +753,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # libclang and the system SQLite header: every feature on switches
+      # `sqlite-unbundled` on, whose bindings bindgen generates.
+      - uses: ./.github/actions/build-prerequisites
       - id: msrv
         name: Read rust-version from Cargo.toml
         run: |
           version=$(sed -n '/^\[workspace.package\]/,/^\[/p' Cargo.toml \
-            | grep -m1 '^rust-version' | sed 's/.*"\(.*\)".*/\1/')
+            | grep '^rust-version' | sed -n 1p | sed 's/.*"\(.*\)".*/\1/')
           test -n "$version" || { echo "could not read rust-version" >&2; exit 1; }
           echo "version=$version" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -497,19 +778,35 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # Every test binary of the workspace, as the Test Suite job builds them,
+    # with line tables only for the same reason.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # libclang and the system SQLite header: every feature on switches
+      # `sqlite-unbundled` on, whose bindings bindgen generates.
+      - uses: ./.github/actions/build-prerequisites
 
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: stable
+      - uses: ./.github/actions/pinned-toolchain
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Build all targets
         run: cargo build --workspace --all-features --all-targets
+
+      # The release-build guard on the testing feature, from the other side:
+      # the workspace apart from the examples built on mock stores checks in
+      # release with no testing feature on, and a mock example refuses by
+      # name. One platform is enough: the guard is a cfg, not a target.
+      - name: Crafted cases for the release-build check
+        if: matrix.os == 'ubuntu-latest'
+        run: ./scripts/check-release-build-tests.sh
+      - name: A release build carries no testing feature, and every mock example refuses one
+        if: matrix.os == 'ubuntu-latest'
+        run: ./scripts/check-release-build.sh
 
   # Feature isolation matrix. The default `--all-features` build hides
   # gate regressions: a `pub use Foo` that should live behind
@@ -524,6 +821,9 @@ jobs:
     # profiles between the two gates, which only this matrix compiles.
     env:
       RUSTFLAGS: -D warnings
+      # The flags of the profile reach the scripts as a variable, never as
+      # text pasted into them.
+      FLAGS: ${{ matrix.flags }}
     strategy:
       fail-fast: false
       matrix:
@@ -543,10 +843,17 @@ jobs:
           # SQLite-only: catches a re-export from a sibling crate (e.g.
           # `axess-identity`) that fails to gate properly when the
           # caller enables a storage feature without also enabling
-          # `testing`. Previously regressed once: see the
-          # `pub use axess_identity::testing` fix in `axess-core/src/authn/ids.rs`.
+          # `testing`: the `pub use axess_identity::testing` in
+          # `axess-core/src/authn/ids.rs` is such a re-export.
           - profile: sqlite-only
             flags: --no-default-features --features sqlite
+          # The system's SQLite library in place of the bundled source: the
+          # only profile that compiles the stores without `sqlite` on
+          # (dev-dependencies and `--all-features` both switch the bundled
+          # source on). The runner must hold the SQLite header
+          # (`libsqlite3-dev`) and libclang, which generates the bindings.
+          - profile: sqlite-unbundled-only
+            flags: --no-default-features --features sqlite-unbundled
           # Postgres-only: same shape as sqlite-only, different backend.
           - profile: postgres-only
             flags: --no-default-features --features postgres
@@ -561,34 +868,79 @@ jobs:
           - profile: valkey-only
             flags: --no-default-features --features valkey
           # `delegated` without a store: session crypto compiles for the
-          # encrypted credential store alone. Its unit tests once failed to
-          # build here (the bound seal's subkey was gated on the stores).
+          # encrypted credential store alone, and so do its unit tests (the
+          # bound seal's subkey must not be gated on the stores).
           - profile: delegated-only
             flags: --no-default-features --features delegated,jwt-rust-crypto
+          # `spire` alone: the Workload API client with neither rustls nor a
+          # JOSE library beside it; what it hands to each is gated on that
+          # feature too.
+          - profile: spire-only
+            flags: --no-default-features --features spire
+          # Device keys alone: the session layer's enforcement and the key
+          # service with no store backend, factor or OAuth beside them.
+          - profile: device-keys-only
+            flags: --no-default-features --features device-keys,jwt-rust-crypto
+          # The local IdP without its RSA keys, which is how `local-idp`
+          # builds: nothing outside the `local-idp-rsa` module may name an
+          # RSA constructor or the `rsa` crate, in the library or its unit
+          # tests.
+          - profile: local-idp-only
+            flags: --no-default-features --features local-idp,jwt-aws-lc
+          # The W3C Trace Context layer alone: the audit context reads the
+          # trace id from it under this feature, and from nothing without it.
+          - profile: trace-context-only
+            flags: --no-default-features --features trace-context
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: stable
+      # libclang and the system SQLite header, for the one profile that
+      # builds `sqlite-unbundled`.
+      - uses: ./.github/actions/build-prerequisites
+        if: matrix.profile == 'sqlite-unbundled-only'
+      - uses: ./.github/actions/pinned-toolchain
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # `cargo check --lib` rather than `cargo build`: faster (skips
       # link), and matches what catches the missing-cfg-gate class of
       # bugs locally. `--lib` keeps the check scoped to library targets
       # only so the absence of a feature can't be masked by an
       # integration-test target pulling extra deps.
+      # $FLAGS is several words, so it stands unquoted.
       - name: Check axess-core (${{ matrix.profile }})
-        run: cargo check -p axess-core --lib ${{ matrix.flags }}
+        run: cargo check -p axess-core --lib $FLAGS
       - name: Check axess facade (${{ matrix.profile }})
-        run: cargo check -p axess --lib ${{ matrix.flags }}
-      # `#[cfg(test)]` widens gates, so the unit tests compile code the
-      # library alone does not.
-      - name: Check axess-core unit tests (${{ matrix.profile }})
-        run: cargo check -p axess-core --lib --profile test ${{ matrix.flags }}
+        run: cargo check -p axess --lib $FLAGS
+      # Every target: the unit tests, where `#[cfg(test)]` widens gates,
+      # the integration tests, examples and benches, which compile code and
+      # use dependencies the library alone does not. A test gated on a store
+      # alone that reaches a `testing` fixture, or a dependency no target of
+      # a profile uses, shows only here.
+      - name: Check every target of axess-core (${{ matrix.profile }})
+        run: cargo check -p axess-core --all-targets $FLAGS
+      - name: Check every target of the axess facade (${{ matrix.profile }})
+        run: cargo check -p axess --all-targets $FLAGS
+      # A doc example compiles only in a test run, and the workspace's test
+      # run has every feature on: one that names an item of a feature it is
+      # not gated on breaks only in a profile without that feature.
+      - name: Doctests of axess-core (${{ matrix.profile }})
+        run: cargo test -p axess-core --doc $FLAGS
+      - name: Doctests of the axess facade (${{ matrix.profile }})
+        run: cargo test -p axess --doc $FLAGS
+      # The other library crates, without default features, with them and
+      # with each feature alone, in one row of the matrix.
+      - name: Doctests of the other library crates under each of their features
+        if: matrix.profile == 'no-default-features'
+        run: ./scripts/doctest-crates.sh
+      # The one profile without `local-idp-rsa`: the local IdP refuses
+      # every RSA algorithm by naming the feature. The workspace's test run
+      # has every feature on, so it runs here only.
+      - name: Local IdP refuses RSA (${{ matrix.profile }})
+        if: matrix.profile == 'local-idp-only'
+        run: cargo test -p axess-core --lib $FLAGS testing::local_idp::rsa_refused
 
   # Each factor or protocol feature of axess-factors alone, so a dependency a
-  # feature uses without naming (`totp` once needed `chrono` from `hotp`)
+  # feature uses without naming (`totp` taking `axess-clock` from `hotp`)
   # fails here instead of in an adopter's build. Mirrored by
   # scripts/check-feature-matrix.sh.
   factor_isolation:
@@ -596,6 +948,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -D warnings
+      FEATURES: ${{ matrix.features }}
     strategy:
       fail-fast: false
       matrix:
@@ -615,16 +968,89 @@ jobs:
           - bearer,jwt-rust-crypto
           - oauth,jwt-rust-crypto
           - outbound-oauth,jwt-rust-crypto
+          - key-proof,jwt-rust-crypto
+          # The client assertion signs with an RSA key only where a build
+          # chose it: with `client-assertion-rsa` on the pure-Rust backend,
+          # and on the aws-lc backend without it.
+          - outbound-oauth,jwt-rust-crypto,client-assertion-rsa
+          - outbound-oauth,jwt-aws-lc
+          # Both backends compiled: the provider in place decides, so the
+          # test binary that installs RustCrypto's provider before axess
+          # installs aws-lc runs here, with and without the choice.
+          - outbound-oauth,jwt-aws-lc,jwt-rust-crypto
+          - outbound-oauth,jwt-aws-lc,jwt-rust-crypto,client-assertion-rsa
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: stable
+      - uses: ./.github/actions/pinned-toolchain
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Check axess-factors (${{ matrix.features }} alone)
-        run: cargo check -p axess-factors --lib --no-default-features --features ${{ matrix.features }}
+        run: cargo check -p axess-factors --lib --no-default-features --features "$FEATURES"
+      - name: Check every target of axess-factors (${{ matrix.features }} alone)
+        run: cargo check -p axess-factors --all-targets --no-default-features --features "$FEATURES"
+      - name: Doctests of axess-factors (${{ matrix.features }} alone)
+        run: cargo test -p axess-factors --doc --no-default-features --features "$FEATURES"
+      # The workspace's test run has both backends on, so the refusal of an
+      # RSA signer on the pure-Rust backend, and each backend's RSA
+      # signature, are run only here.
+      # The rows with both backends run the test binary below instead, as
+      # scripts/check-feature-matrix.sh does.
+      - name: Client assertion tests (${{ matrix.features }})
+        if: startsWith(matrix.features, 'outbound-oauth') && !contains(matrix.features, 'jwt-aws-lc,jwt-rust-crypto')
+        run: cargo test -p axess-factors --lib --no-default-features --features "$FEATURES" client_assertion
+      # The installed provider is process-wide, so its cases run in a test
+      # binary of their own, each in a process of its own.
+      - name: Installed provider tests (${{ matrix.features }})
+        if: contains(matrix.features, 'jwt-aws-lc,jwt-rust-crypto')
+        run: cargo test -p axess-factors --no-default-features --features "$FEATURES" --test client_assertion_installed_provider
+
+  # Feature sets a user can name for one crate that the matrices above do
+  # not hold, each of which failed once: every target of the crate under
+  # the set, warnings denied. Mirrored by scripts/check-feature-matrix.sh.
+  crate_feature_sets:
+    name: Crate Feature Sets (${{ matrix.crate }} ${{ matrix.flags }})
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
+      CRATE: ${{ matrix.crate }}
+      FLAGS: ${{ matrix.flags }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # axess-identity's unit tests without `serde`.
+          - crate: axess-identity
+            flags: --no-default-features
+          - crate: axess-identity
+            flags: --no-default-features --features testing
+          # `testing` without `authz`: tests of the Cedar bridge are gated
+          # on it.
+          - crate: axess-core
+            flags: --no-default-features --features testing
+          # OAuth with `testing` and without `device`.
+          - crate: axess-core
+            flags: --no-default-features --features oauth,testing,jwt-rust-crypto
+          # Token exchange without a store.
+          - crate: axess-core
+            flags: --no-default-features --features delegated-exchange,jwt-rust-crypto
+          # The id derives of `sqlx` alone, with no store.
+          - crate: axess-core
+            flags: --no-default-features --features sqlx
+          # LDAP with `testing` and without `fido2`.
+          - crate: axess-core
+            flags: --no-default-features --features ldap,testing
+          - crate: axess
+            flags: --no-default-features --features testing
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/pinned-toolchain
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # $FLAGS is several words, so it stands unquoted.
+      - name: Check every target of ${{ matrix.crate }} (${{ matrix.flags }})
+        run: cargo check -p "$CRATE" --all-targets $FLAGS
 
   # Check that examples compile
   examples:
@@ -635,9 +1061,7 @@ jobs:
         with:
           persist-credentials: false
       
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: stable
+      - uses: ./.github/actions/pinned-toolchain
       
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       
@@ -646,11 +1070,13 @@ jobs:
           cargo build --package axess-example-sqlite
           cargo build --package axess-example-oauth
           cargo build --package axess-example-authz
+          cargo build --package axess-example-fido2
 
   # coverage-guided fuzzing of decode hot-paths. Smoke run only
   # on PR/push: 30 s per target catches the easy crashes without
-  # blocking CI on a deeper soak. Schedule a longer run in a separate
-  # workflow if/when needed.
+  # blocking CI on a deeper soak, which the Hardening workflow makes
+  # (120 s per target). The targets are the ones the fuzz crate lists,
+  # so a new target is run here without being named here.
   fuzz:
     name: Fuzz Smoke
     runs-on: ubuntu-latest
@@ -658,9 +1084,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: nightly
+      - uses: ./.github/actions/pinned-nightly
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: fuzz
@@ -668,14 +1092,28 @@ jobs:
         run: cargo install cargo-fuzz@0.13.2 --locked
       - name: Build fuzz targets
         working-directory: fuzz
-        run: cargo +nightly fuzz build
+        run: cargo fuzz build
+      # The Hardening workflow's matrix is a list written by hand. It is
+      # held to the targets the fuzz crate lists, so "every target" stays
+      # true of it when a target is added.
+      - name: The hardening matrix names every target
+        working-directory: fuzz
+        run: |
+          set -eu
+          listed="$(cargo fuzz list | sort)"
+          matrix="$(sed -n '/^        target:$/,/^    steps:$/s/^          - //p' ../.github/workflows/hardening.yml | sort)"
+          if [ "$listed" != "$matrix" ]; then
+            echo "hardening.yml's fuzz matrix and the fuzz crate's targets differ:"
+            diff <(echo "$listed") <(echo "$matrix") || true
+            exit 1
+          fi
       - name: Run each target for 30 s
         working-directory: fuzz
         run: |
           set -eu
-          for target in session_data_msgpack session_data_json jwt_payload_split pkce_verifier_predicate; do
+          for target in $(cargo fuzz list); do
             echo "::group::fuzz $target"
-            cargo +nightly fuzz run "$target" -- -max_total_time=30
+            cargo fuzz run "$target" -- -max_total_time=30
             echo "::endgroup::"
           done
       - name: Upload crash artifacts
@@ -694,10 +1132,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # libclang and the system SQLite header: every feature on switches
+      # `sqlite-unbundled` on, whose bindings bindgen generates.
+      - uses: ./.github/actions/build-prerequisites
 
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: stable
+      - uses: ./.github/actions/pinned-toolchain
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
@@ -724,9 +1163,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: stable
+      - uses: ./.github/actions/pinned-toolchain
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # `cargo publish --dry-run` for leaf crates: a true end-to-end check
       # including the registry-resolution step. Catches the long tail of
@@ -774,9 +1211,10 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: stable
+      # libclang and the system SQLite header: every feature on switches
+      # `sqlite-unbundled` on, whose bindings bindgen generates.
+      - uses: ./.github/actions/build-prerequisites
+      - uses: ./.github/actions/pinned-toolchain
       # `cache-bin: "true"` (default in v2, pinned explicitly here) keeps
       # ~/.cargo/bin/cargo-semver-checks across runs, so the install step
       # below is a no-op on warm cache. The first run under `shared-key:
@@ -792,8 +1230,15 @@ jobs:
         run: |
           command -v cargo-semver-checks >/dev/null \
             || cargo install cargo-semver-checks@0.51.0 --locked
+      # Its crafted cases, against a stand-in cargo and canned reports. They
+      # run here, in the job that installs the tool, because the workflow
+      # pin check reads the script they run as one that runs the tool.
+      - name: Crafted cases for the semver check and its inventory
+        run: ./scripts/check-semver-tests.sh
       # The script the release preflight runs. It refuses when no release
-      # tag is below HEAD instead of skipping, as the registry baseline did.
+      # tag is below HEAD instead of skipping, as the registry baseline did,
+      # forces the minor release type so the major-level lints run, and
+      # holds every break the tool reports to the migration page.
       - name: SemVer checks against the last release tag
         run: ./scripts/check-semver.sh
 
@@ -805,9 +1250,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: stable
+      - uses: ./.github/actions/pinned-toolchain
       - name: Install audit tools
         run: cargo install cargo-audit@0.22.2 cargo-deny@0.20.2 cargo-cyclonedx@0.5.10 --locked
       # cargo-deny and cargo-audit read different ignore files; a drift
@@ -826,6 +1269,10 @@ jobs:
         run: |
           cargo deny --config deny-production.toml check bans
           scripts/check-test-crate-edges.sh
+      - name: Crafted cases for the chrono-edges check
+        run: ./scripts/check-chrono-edges-tests.sh
+      - name: chrono is named only where an upstream crate hands it
+        run: ./scripts/check-chrono-edges.sh
       - name: Generate SBOM (CycloneDX)
         run: cargo cyclonedx --all --format json
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -837,6 +1284,11 @@ jobs:
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
+    # Line tables only, as in the Test Suite job. The coverage counts and
+    # their source regions are in sections of their own that
+    # `-C instrument-coverage` writes; llvm-cov reads no debug info.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
     services:
       # Valkey (Redis-compatible); see note in Integration Tests job above.
@@ -866,9 +1318,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+      - uses: ./.github/actions/disk-headroom
+      # libclang and the system SQLite header: every feature on switches
+      # `sqlite-unbundled` on, whose bindings bindgen generates.
+      - uses: ./.github/actions/build-prerequisites
+      - uses: ./.github/actions/pinned-toolchain
         with:
-          toolchain: stable
           components: llvm-tools-preview
       # Instrumented builds use a different profile than the clippy/test
       # cache, so scope this cache separately: sharing the default key
@@ -877,6 +1332,15 @@ jobs:
         with:
           shared-key: coverage
       - run: cargo install cargo-llvm-cov@0.9.1 --locked
+      # The step below builds the instrumented tests and runs them in one
+      # cargo-llvm-cov call, so the floor read before it covers the build as
+      # well as the run: the instrumented test binaries, trybuild's target
+      # directory and the profile data of every test process. The 20 GiB are
+      # an estimate, and the free space each run prints here is the reading
+      # to move them by; the reading after the step holds a run that wrote
+      # more.
+      - name: Room for the instrumented build and tests
+        run: ./scripts/check-disk-floor.sh "Coverage, before the instrumented tests" 20
       # Run the instrumented test suite ONCE, then render summary + HTML
       # from the same profile data. The old version invoked
       # `cargo llvm-cov` twice (`--summary-only`, then `--html`), each
@@ -887,6 +1351,14 @@ jobs:
         env:
           VALKEY_URL: redis://localhost:6379
           POSTGRES_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # Read again after the build and the run, whatever their end: the
+      # binaries, trybuild's target directory and the profile data are all
+      # still on disk, so this is close to the least room the step had. A
+      # run that came within 2 GiB of a full disk fails here by name and
+      # renders no coverage (scripts/check-disk-floor.sh says why).
+      - name: Room left after the instrumented tests
+        if: always()
+        run: ./scripts/check-disk-floor.sh "Coverage, after the instrumented tests" 2
       - name: Render coverage summary
         run: cargo llvm-cov report --summary-only 2>&1 | tee coverage-summary.txt
       - name: Render coverage HTML
@@ -898,9 +1370,11 @@ jobs:
           echo "pct=${pct}" >> "$GITHUB_OUTPUT"
           echo "Coverage: ${pct}%"
       - name: Print summary
+        env:
+          PCT: ${{ steps.cov.outputs.pct }}
         run: |
           {
-            echo "## Coverage: ${{ steps.cov.outputs.pct }}%"
+            echo "## Coverage: ${PCT}%"
             echo '```'
             cat coverage-summary.txt
             echo '```'
@@ -1017,14 +1491,18 @@ jobs:
       - unreachable_sources
       - clippy
       - rustdoc
+      - docsrs_build
       - source_rules
+      - shell_scripts
       - book
       - test
       - cockroach_compat
+      - spire_live
       - msrv
       - build
       - feature_isolation
       - factor_isolation
+      - crate_feature_sets
       - examples
       - fuzz
       - bench

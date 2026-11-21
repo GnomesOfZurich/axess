@@ -1,6 +1,6 @@
 //! Shared error type for the delegated (OBO) module.
 //!
-//! Both [`super::stored`](crate::delegated::stored) and [`super::exchange`](crate::delegated::exchange) surface failures
+//! Both [the stored module](crate::delegated::stored) and [the exchange module](crate::delegated::exchange) surface failures
 //! through the same `DelegatedError` so adopter code consuming both
 //! shapes can match on one enum.
 
@@ -19,7 +19,12 @@ pub enum DelegatedError {
         /// HTTP status code from the upstream token endpoint.
         status: u16,
         /// Best-effort response body for adopter logging: the first 1 KiB,
-        /// with `…[truncated]` appended when the body was longer.
+        /// with `…[truncated]` appended when the body was longer, and every
+        /// character [`escapes`](axess_identity::log_text::escapes) names
+        /// (control characters, the line and paragraph separators,
+        /// bidirectional controls, zero-width characters, the byte order mark,
+        /// the Hangul fillers) escaped, so the endpoint cannot forge a log
+        /// line through it.
         body: String,
     },
     /// 2xx response body failed to deserialise as an RFC 6749 / RFC 8693
@@ -35,6 +40,24 @@ pub enum DelegatedError {
     /// passed back through the [`GrantContext`](super::stored::GrantContext).
     #[error("PKCE code verifier missing or malformed")]
     PkceVerifier,
+
+    /// A registration other than the one a grant or a credential belongs
+    /// to: `complete_grant` was handed another provider than the grant began
+    /// with, or a `StoredDelegationSession` was built with another provider
+    /// than the stored credential was granted through, or the credential was
+    /// stored with no registration (by a release before 0.20.0). "Another"
+    /// includes one of the same name with another client id or endpoint
+    /// (see [`GrantRegistration`](super::stored::GrantRegistration)).
+    /// Nothing is sent; for a stored credential the user grants again.
+    /// `provider` is the name of the provider the call was given, the
+    /// application's own configuration.
+    #[error(
+        "this registration of provider `{provider}` is not the one the grant or credential belongs to"
+    )]
+    RegistrationMismatch {
+        /// The `name` of the provider the call was given.
+        provider: String,
+    },
     /// Credential store read / write failed. Adopter-defined error
     /// message bubbles up; the trait surface erases the concrete
     /// store error type to keep [`DelegatedError`] adopter-agnostic.

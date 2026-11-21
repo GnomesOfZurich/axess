@@ -8,10 +8,9 @@ use crate::federation::oauth_tenant::{
     BrokenTenantProvider, IssuerFuture, IssuerProviders, ProviderFuture, TenantOAuthProviders,
     TenantProvider,
 };
-use crate::session::id::SessionId;
+use crate::session::id::{SessionId, SessionKey};
 use crate::session::store::{MemorySessionRegistry, SessionRegistry, SessionRegistryAdapter};
 use crate::testing::mock_random::MockRng;
-use axess_clock::SystemClock;
 use axess_factors::oauth::{MockOAuthProvider, OAuthError};
 use axess_factors::oidc::logout_token::BACKCHANNEL_LOGOUT_EVENT;
 use axum::extract::{Form, State};
@@ -31,6 +30,8 @@ struct Source {
 struct PartlyBroken {
     providers: Vec<TenantProvider>,
     broken: Vec<(&'static str, &'static str)>,
+    /// The name each broken record carries.
+    broken_name: &'static str,
 }
 
 impl TenantOAuthProviders for PartlyBroken {
@@ -56,7 +57,7 @@ impl TenantOAuthProviders for PartlyBroken {
                     .iter()
                     .map(|(label, client_id)| BrokenTenantProvider {
                         tenant: tenant(label),
-                        name: "sso".into(),
+                        name: self.broken_name.into(),
                         client_id: (*client_id).to_string(),
                         error: OAuthError::Config("the credential does not open".into()),
                     })
@@ -115,7 +116,7 @@ fn token(iss: &str, client_id: &str, extra: serde_json::Value) -> String {
     let mut payload = serde_json::json!({
         "iss": iss,
         "aud": client_id,
-        "iat": chrono::Utc::now().timestamp(),
+        "iat": axess_clock::testing::MockClock::reference_time().unix_seconds(),
         "events": { BACKCHANNEL_LOGOUT_EVENT: {} },
     });
     payload
@@ -142,7 +143,7 @@ fn tenants_only(
         }),
         Arc::new(SessionRegistryAdapter(registry.clone())),
         sid_map,
-        Arc::new(SystemClock),
+        Arc::new(axess_clock::testing::MockClock::at_reference()),
     )
 }
 
@@ -163,9 +164,9 @@ async fn login(
     tenant_label: &str,
     iss: &str,
     sid: &str,
-) -> (crate::authn::ids::UserId, SessionId) {
+) -> (crate::authn::ids::UserId, SessionKey) {
     let user = axess_identity::testing::user(user);
-    let session = SessionId::new(rng);
+    let session = SessionKey::of(&SessionId::new(rng));
     registry.register(&user, &session).await.unwrap();
     sid_map.insert_displacing(
         (iss.to_string(), sid.to_string()),
@@ -173,7 +174,7 @@ async fn login(
         Some(tenant(tenant_label)),
         user,
         session,
-        chrono::Utc::now(),
+        axess_clock::testing::MockClock::reference_time(),
     );
     (user, session)
 }
@@ -300,12 +301,13 @@ async fn a_tenant_matching_the_global_registration_does_not_shadow_it() {
         &global,
         Arc::new(SessionRegistryAdapter(registry.clone())),
         SidMap::new(),
-        Arc::new(SystemClock),
+        Arc::new(axess_clock::testing::MockClock::at_reference()),
     )
     .expect("handler")
     .with_tenant_providers(Arc::new(PartlyBroken {
         providers: vec![offered("acme", ISS_A, "client-x")],
         broken: vec![("beta", "client-x")],
+        broken_name: "sso",
     }));
     let claims = serde_json::json!({ "aud": "client-x" });
 
@@ -332,7 +334,7 @@ async fn global_providers_resolve_beside_a_tenant_source() {
         &global,
         Arc::new(SessionRegistryAdapter(registry.clone())),
         SidMap::new(),
-        Arc::new(SystemClock),
+        Arc::new(axess_clock::testing::MockClock::at_reference()),
     )
     .expect("handler")
     .with_tenant_providers(Arc::new(Source {
@@ -362,7 +364,7 @@ async fn a_failing_tenant_source_is_a_retryable_503() {
         }),
         Arc::new(SessionRegistryAdapter(registry.clone())),
         SidMap::new(),
-        Arc::new(SystemClock),
+        Arc::new(axess_clock::testing::MockClock::at_reference()),
     );
     let t = token(
         ISS_A,
@@ -379,10 +381,14 @@ fn partly_broken(
     sid_map: SidMap,
 ) -> BackChannelLogoutHandler {
     BackChannelLogoutHandler::for_tenants(
-        Arc::new(PartlyBroken { providers, broken }),
+        Arc::new(PartlyBroken {
+            providers,
+            broken,
+            broken_name: "sso",
+        }),
         Arc::new(SessionRegistryAdapter(registry.clone())),
         sid_map,
-        Arc::new(SystemClock),
+        Arc::new(axess_clock::testing::MockClock::at_reference()),
     )
 }
 
@@ -443,6 +449,39 @@ async fn a_token_addressed_to_a_broken_tenant_provider_is_a_retryable_503() {
     );
 }
 
+/// A broken record's name is its tenant's text: the line that says the
+/// provider could not be built carries it escaped.
+#[tokio::test]
+async fn a_broken_providers_name_reaches_the_log_escaped() {
+    let registry = MemorySessionRegistry::new();
+    let h = BackChannelLogoutHandler::for_tenants(
+        Arc::new(PartlyBroken {
+            providers: vec![offered("acme", ISS_A, "client-a")],
+            broken: vec![("beta", "client-b")],
+            broken_name: "sso\nWARN forged\u{202E}",
+        }),
+        Arc::new(SessionRegistryAdapter(registry.clone())),
+        SidMap::new(),
+        Arc::new(axess_clock::testing::MockClock::at_reference()),
+    );
+    let capture = axess_testing::mock_tracing::TracingCapture::install();
+
+    let claims = serde_json::json!({ "aud": "client-b" });
+    assert!(h.entry_for(ISS_A, &claims).await.is_err());
+
+    let events = capture.events();
+    let line = events
+        .iter()
+        .find(|e| e.message.contains("could not be built"))
+        .unwrap_or_else(|| panic!("no line for the broken provider among {events:?}"));
+    assert!(
+        !line.message.chars().any(axess_identity::log_text::escapes),
+        "{:?}",
+        line.message
+    );
+    assert!(line.message.contains("WARN forged"), "{:?}", line.message);
+}
+
 /// A broken provider that shares the issuer and client id with a working one
 /// keeps the token ambiguous: it is not attributed to the one that built.
 #[tokio::test]
@@ -485,9 +524,9 @@ async fn login_with_subject(
     user: &str,
     tenant_label: &str,
     sid: &str,
-) -> (crate::authn::ids::UserId, SessionId) {
+) -> (crate::authn::ids::UserId, SessionKey) {
     let user = axess_identity::testing::user(user);
-    let session = SessionId::new(rng);
+    let session = SessionKey::of(&SessionId::new(rng));
     registry.register(&user, &session).await.unwrap();
     let tenant = Some(tenant(tenant_label));
     sid_map.register_subject_session(ISS_A, "idp-sub", tenant, user, session);
@@ -497,7 +536,7 @@ async fn login_with_subject(
         tenant,
         user,
         session,
-        chrono::Utc::now(),
+        axess_clock::testing::MockClock::reference_time(),
     );
     (user, session)
 }
@@ -595,7 +634,7 @@ impl TenantOAuthProviders for Counting {
 #[tokio::test]
 async fn an_unknown_issuer_is_not_looked_up_on_every_request() {
     use std::sync::atomic::Ordering;
-    let clock = axess_clock::testing::MockClock::now();
+    let clock = axess_clock::testing::MockClock::at_reference();
     let source = Arc::new(Counting(Default::default()));
     let h = BackChannelLogoutHandler::for_tenants(
         source.clone(),
@@ -640,7 +679,7 @@ async fn a_zero_unknown_issuer_memory_asks_the_source_every_time() {
         source.clone(),
         Arc::new(SessionRegistryAdapter(MemorySessionRegistry::new())),
         SidMap::new(),
-        Arc::new(SystemClock),
+        Arc::new(axess_clock::testing::MockClock::at_reference()),
     )
     .with_unknown_issuer_memory(std::time::Duration::ZERO);
     for n in 0..3 {
@@ -667,7 +706,7 @@ async fn a_provider_added_to_the_live_registry_is_found_despite_a_remembered_mis
         live.clone(),
         Arc::new(SessionRegistryAdapter(registry.clone())),
         sid_map.clone(),
-        Arc::new(SystemClock),
+        Arc::new(axess_clock::testing::MockClock::at_reference()),
     );
     let rng = MockRng::new(25);
     let (user, session) = login(&registry, &sid_map, &rng, "alice", "acme", ISS_A, "s1").await;
@@ -689,13 +728,15 @@ async fn a_provider_added_to_the_live_registry_is_found_despite_a_remembered_mis
                 .with_issuer(ISS_A)
                 .with_client_id("client-a"),
         ),
-    );
+        crate::authn::factor::FederatedProvider::Custom("sso".into()),
+    )
+    .expect("the pair is free");
     assert_eq!(post(&h, t("j2")).await, Ok(StatusCode::OK));
     assert!(!registry.is_valid(&user, &session).await.unwrap());
 }
 
-/// A memory interval an operator set to an extreme value (zero, the largest
-/// duration chrono holds, `Duration::MAX`) is a setting, not a way to abort
+/// A memory interval an operator set to an extreme value (zero, one past the
+/// range of a reading, `Duration::MAX`) is a setting, not a way to abort
 /// the unauthenticated request that reads it.
 #[tokio::test]
 async fn an_extreme_unknown_issuer_memory_never_panics_the_request() {
@@ -704,7 +745,7 @@ async fn an_extreme_unknown_issuer_memory_never_panics_the_request() {
             Arc::new(Counting(Default::default())),
             Arc::new(SessionRegistryAdapter(MemorySessionRegistry::new())),
             SidMap::new(),
-            Arc::new(SystemClock),
+            Arc::new(axess_clock::testing::MockClock::at_reference()),
         )
         .with_unknown_issuer_memory(extreme.value);
         let t = token(

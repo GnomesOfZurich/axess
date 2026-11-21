@@ -237,3 +237,71 @@ async fn a_current_dispatchers_close_drops_its_connection() {
     assert_eq!(watcher.slot.next().await, Event::Closed);
     assert!(shared.lock().lost);
 }
+
+/// The reconnector of a replaced connection reports a reconnect late: the
+/// newer connection stays at its generation, no watcher is woken, no loss is
+/// recorded, and the stale reconnector is told to stop.
+#[tokio::test]
+async fn a_stale_reconnectors_reconnect_leaves_the_new_connection_alone() {
+    let shared = SharedSubscriber::new();
+    let watcher = shared.register(channels(1));
+    let (connection, probe) = idle_connection(2);
+    {
+        let mut state = shared.lock();
+        state.generation = 2;
+        state.connection = Some(connection);
+    }
+
+    let resubscribe = on_reconnect(&shared, 1);
+
+    assert!(!resubscribe, "a stale reconnector resubscribed");
+    assert_eq!(wakeups(&watcher), 0, "a stale reconnect woke a watcher");
+    assert!(!shared.lock().lost, "a stale reconnect recorded a loss");
+    assert_eq!(
+        shared
+            .current_connection()
+            .map(|(_, generation)| generation),
+        Some(2)
+    );
+    assert!(!probe.is_finished());
+}
+
+/// A reconnect of the current connection tells every watcher the connection
+/// was lost, records the loss for the recheck that follows the resubscribe,
+/// and has the reconnector subscribe the patterns again.
+#[tokio::test]
+async fn a_current_reconnectors_reconnect_tells_the_watchers() {
+    let shared = SharedSubscriber::new();
+    let watcher = shared.register(channels(1));
+    let (connection, _) = idle_connection(2);
+    {
+        let mut state = shared.lock();
+        state.generation = 2;
+        state.connection = Some(connection);
+    }
+
+    assert!(
+        on_reconnect(&shared, 2),
+        "the current reconnector resubscribes"
+    );
+    assert_eq!(watcher.slot.next().await, Event::Closed);
+    assert!(shared.lock().lost);
+    shared.finish_reconnect();
+    assert_eq!(watcher.slot.next().await, Event::Recheck);
+}
+
+/// The connection's name is the registry's prefix after a fixed label, with
+/// every byte a client name may not hold, and `%` itself, written as `%XX`.
+#[test]
+fn the_connection_name_spells_the_prefix_in_printable_ascii() {
+    assert_eq!(connection_name("axess"), "axess-revocations:axess");
+    assert_eq!(
+        connection_name("{tenant-a}:sessions"),
+        "axess-revocations:{tenant-a}:sessions"
+    );
+    assert_eq!(
+        connection_name("a b\n%\u{e9}\u{7f}"),
+        "axess-revocations:a%20b%0A%25%C3%A9%7F"
+    );
+    assert_ne!(connection_name("a b"), connection_name("a%20b"));
+}

@@ -3,12 +3,11 @@
 //! the IdP's resend ends the session once the registry is back.
 
 use super::*;
-use crate::session::id::SessionId;
+use crate::session::id::{SessionId, SessionKey};
 use crate::session::store::{
     MemorySessionRegistry, RevocationError, SessionRegistry, SessionRegistryAdapter,
 };
 use crate::testing::mock_random::MockRng;
-use axess_clock::SystemClock;
 use axess_factors::oauth::MockOAuthProvider;
 use axess_factors::oidc::logout_token::BACKCHANNEL_LOGOUT_EVENT;
 use axum::extract::{Form, State};
@@ -26,7 +25,7 @@ const CLIENT: &str = "client-outage";
 enum Refuse {
     None,
     Every,
-    Only(SessionId),
+    Only(SessionKey),
 }
 
 /// A registry whose `invalidate_session` fails on demand without touching
@@ -41,7 +40,7 @@ impl Flaky {
         *self.refuse.lock().unwrap() = refuse;
     }
 
-    fn refuses(&self, session: &SessionId) -> bool {
+    fn refuses(&self, session: &SessionKey) -> bool {
         match *self.refuse.lock().unwrap() {
             Refuse::None => false,
             Refuse::Every => true,
@@ -61,12 +60,21 @@ impl SessionRevoker for Flaky {
     fn invalidate_session<'a>(
         &'a self,
         user_id: &'a UserId,
-        session_id: &'a SessionId,
+        session: &'a SessionKey,
     ) -> Pin<Box<dyn Future<Output = Result<(), RevocationError>> + Send + 'a>> {
-        if self.refuses(session_id) {
+        if self.refuses(session) {
             return Box::pin(async { Err(RevocationError("connection lost".into())) });
         }
-        self.inner.invalidate_session(user_id, session_id)
+        self.inner.invalidate_session(user_id, session)
+    }
+
+    fn current_key<'a>(
+        &'a self,
+        user_id: &'a UserId,
+        session: &'a SessionKey,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<SessionKey>, RevocationError>> + Send + 'a>>
+    {
+        self.inner.current_key(user_id, session)
     }
 }
 
@@ -77,7 +85,7 @@ struct CountingAudit(AtomicUsize);
 impl LogoutAudit for CountingAudit {
     fn session_ended<'a>(
         &'a self,
-        _ended: &'a IdpSessionEnded,
+        _: &'a IdpSessionEnded,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { Ok(()) })
@@ -88,7 +96,7 @@ fn token(extra: serde_json::Value) -> String {
     let mut payload = serde_json::json!({
         "iss": ISS,
         "aud": CLIENT,
-        "iat": chrono::Utc::now().timestamp(),
+        "iat": axess_clock::testing::MockClock::reference_time().unix_seconds(),
         "events": { BACKCHANNEL_LOGOUT_EVENT: {} },
     });
     payload
@@ -128,7 +136,7 @@ fn rig() -> Rig {
         &providers,
         flaky.clone(),
         sid_map.clone(),
-        Arc::new(SystemClock),
+        Arc::new(axess_clock::testing::MockClock::at_reference()),
     )
     .expect("handler")
     .with_audit(audit.clone());
@@ -158,7 +166,7 @@ async fn post(h: &BackChannelLogoutHandler, t: &str) -> Result<StatusCode, Statu
 async fn a_failed_sid_invalidation_is_retryable_and_the_resend_ends_the_session() {
     let r = rig();
     let rng = MockRng::new(11);
-    let session = SessionId::new(&rng);
+    let session = SessionKey::of(&SessionId::new(&rng));
     let user = axess_identity::testing::user("user-outage");
     r.registry.register(&user, &session).await.unwrap();
     let key: SidKey = (ISS.to_string(), "sid-1".to_string());
@@ -170,7 +178,7 @@ async fn a_failed_sid_invalidation_is_retryable_and_the_resend_ends_the_session(
         None,
         user,
         session,
-        chrono::Utc::now(),
+        axess_clock::testing::MockClock::reference_time(),
     );
     assert!(r.sid_map.contains_key(&key), "the case to refuse exists");
 
@@ -226,7 +234,10 @@ async fn a_failed_sid_invalidation_is_retryable_and_the_resend_ends_the_session(
 async fn a_partly_failed_sub_logout_keeps_the_failed_session_for_the_retry() {
     let r = rig();
     let rng = MockRng::new(12);
-    let (x, y) = (SessionId::new(&rng), SessionId::new(&rng));
+    let (x, y) = (
+        SessionKey::of(&SessionId::new(&rng)),
+        SessionKey::of(&SessionId::new(&rng)),
+    );
     let user = axess_identity::testing::user("user-two");
     for s in [&x, &y] {
         r.registry.register(&user, s).await.unwrap();
@@ -240,7 +251,7 @@ async fn a_partly_failed_sub_logout_keeps_the_failed_session_for_the_retry() {
         None,
         user,
         y,
-        chrono::Utc::now(),
+        axess_clock::testing::MockClock::reference_time(),
     );
     assert_eq!(r.sid_map.subject_len(), 2);
 

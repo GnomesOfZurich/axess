@@ -2,8 +2,9 @@
 //! its time does, a status it does not know is an error, and an auth method
 //! whose steps cannot be read is an error, never a method with no steps.
 
-use axess::SystemClock;
 use axess::authn::{EntityState, FactorStore, IdentityLookup, TenantId, UserId};
+use axess_clock::testing::MockClock;
+use axess_clock::testing::Shift;
 use axess_example_sqlite::models::backend::{OurBackend, seed};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::str::FromStr;
@@ -11,7 +12,7 @@ use std::str::FromStr;
 const TENANT: &str = "00000000-0000-0000-0000-000000000001";
 const ALICE: &str = "00000000-0000-0000-0000-000000000010";
 
-async fn pool() -> sqlx::SqlitePool {
+async fn pool(clock: &MockClock) -> sqlx::SqlitePool {
     let opts = SqliteConnectOptions::from_str("sqlite::memory:")
         .expect("in-memory url")
         .create_if_missing(true);
@@ -22,9 +23,10 @@ async fn pool() -> sqlx::SqlitePool {
         .expect("connect in-memory sqlite");
     sqlx::migrate!().run(&pool).await.expect("migrations");
     seed(
-        &SystemClock,
+        clock,
         &pool,
-        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF"),
+        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF")
+            .with_clock(std::sync::Arc::new(clock.clone())),
     )
     .await
     .expect("seed");
@@ -43,11 +45,14 @@ async fn set_user(pool: &sqlx::SqlitePool, status: &str, locked_until: Option<&s
 
 #[tokio::test]
 async fn a_timed_suspension_that_has_ended_no_longer_suspends() {
-    let pool = pool().await;
-    let backend = OurBackend::new(pool.clone());
+    let clock = MockClock::at_reference();
+    let pool = pool(&clock).await;
+    let backend = OurBackend::new(pool.clone()).with_clock(std::sync::Arc::new(clock.clone()));
     let alice = UserId::try_new(ALICE).expect("user");
 
-    let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+    let past = MockClock::reference_time()
+        .minus(axess_clock::SignedDuration::hours(1))
+        .to_rfc3339_numeric_offset();
     set_user(&pool, "suspended", Some(&past)).await;
     let state = backend.account_status(&alice).await.expect("status");
     assert!(
@@ -55,7 +60,9 @@ async fn a_timed_suspension_that_has_ended_no_longer_suspends() {
         "still suspended after its end: {state:?}"
     );
 
-    let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    let future = MockClock::reference_time()
+        .plus(axess_clock::SignedDuration::hours(1))
+        .to_rfc3339_numeric_offset();
     set_user(&pool, "suspended", Some(&future)).await;
     let state = backend.account_status(&alice).await.expect("status");
     assert!(matches!(state, EntityState::Suspended(_)), "{state:?}");
@@ -67,8 +74,9 @@ async fn a_timed_suspension_that_has_ended_no_longer_suspends() {
 
 #[tokio::test]
 async fn an_unknown_status_is_an_error() {
-    let pool = pool().await;
-    let backend = OurBackend::new(pool.clone());
+    let clock = MockClock::at_reference();
+    let pool = pool(&clock).await;
+    let backend = OurBackend::new(pool.clone()).with_clock(std::sync::Arc::new(clock.clone()));
     let alice = UserId::try_new(ALICE).expect("user");
     set_user(&pool, "actvie", None).await;
     let state = backend.account_status(&alice).await;
@@ -77,8 +85,9 @@ async fn an_unknown_status_is_an_error() {
 
 #[tokio::test]
 async fn an_auth_method_with_unreadable_steps_is_an_error() {
-    let pool = pool().await;
-    let backend = OurBackend::new(pool.clone());
+    let clock = MockClock::at_reference();
+    let pool = pool(&clock).await;
+    let backend = OurBackend::new(pool.clone()).with_clock(std::sync::Arc::new(clock.clone()));
     let alice = UserId::try_new(ALICE).expect("user");
     let tenant = TenantId::try_new(TENANT).expect("tenant");
     sqlx::query("UPDATE auth_methods SET steps_json = 'not json'")
@@ -95,16 +104,18 @@ async fn an_auth_method_with_unreadable_steps_is_an_error() {
 #[tokio::test]
 async fn a_suspension_reads_back_with_the_cause_it_was_written_with() {
     use axess::authn::{IdentityAdmin, StatusCause, StatusDetail};
-    let pool = pool().await;
-    let backend = OurBackend::new(pool.clone());
+    let clock = MockClock::at_reference();
+    let pool = pool(&clock).await;
+    let backend = OurBackend::new(pool.clone()).with_clock(std::sync::Arc::new(clock.clone()));
     let alice = UserId::try_new(ALICE).expect("user");
-    let now = chrono::Utc::now();
+    let now = MockClock::reference_time();
 
     backend
         .suspend_user(
             &alice,
-            StatusDetail::lockout("too many attempts", now)
-                .with_until(Some(now + chrono::Duration::hours(1))),
+            StatusDetail::lockout("too many attempts", now).with_until(Some(
+                axess_clock::Until::At(now.plus(axess_clock::SignedDuration::hours(1))),
+            )),
         )
         .await
         .expect("suspend");
@@ -135,8 +146,9 @@ async fn a_suspension_reads_back_with_the_cause_it_was_written_with() {
 #[tokio::test]
 async fn a_row_without_a_stored_cause_reads_by_its_status() {
     use axess::authn::StatusCause;
-    let pool = pool().await;
-    let backend = OurBackend::new(pool.clone());
+    let clock = MockClock::at_reference();
+    let pool = pool(&clock).await;
+    let backend = OurBackend::new(pool.clone()).with_clock(std::sync::Arc::new(clock.clone()));
     let alice = UserId::try_new(ALICE).expect("user");
 
     set_user(&pool, "suspended", None).await;

@@ -1,7 +1,8 @@
 //! PKCE utilities exposed for application-side validation.
 //!
 //! The library validates `code_verifier`s internally before sending
-//! them to the authorization server (see `AuthnService::finish_oauth_login`),
+//! them to the authorization server (see
+//! `RequestAuthnService::finish_oauth_login`),
 //! but applications occasionally want the same predicate at their own
 //! boundary, for instance to reject a malformed verifier early in a
 //! custom callback handler before any session work happens.

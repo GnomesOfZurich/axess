@@ -132,11 +132,9 @@ impl StepUpPolicy {
     /// Construct via the builder.
     ///
     /// Thin wrapper over [`StepUpPolicyBuilder::default`]: exists so
-    /// callers don't have to import the builder type directly.
-    /// `cargo-mutants` will flag the `builder -> Default::default()`
-    /// mutant as behaviour-preserving; that's by design (the function
-    /// has no observable behaviour beyond constructing the builder).
-    /// Skip from sweeps via `.cargo-mutants.toml` if it becomes noisy.
+    /// callers don't have to import the builder type directly. It has
+    /// no behaviour beyond constructing the builder, so replacing its
+    /// body with `Default::default()` changes nothing a test can see.
     pub fn builder() -> StepUpPolicyBuilder {
         StepUpPolicyBuilder::default()
     }
@@ -269,10 +267,10 @@ fn factors_or_none(factors: &[FactorKind]) -> Option<Vec<FactorKind>> {
 mod tests {
     use super::*;
     use crate::device::types::FingerprintHash;
-    use chrono::{TimeZone, Utc};
+    use axess_clock::Timestamp;
 
     fn build_device(level: DeviceTrustLevel) -> Device {
-        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let now = Timestamp::from_utc(2026, 1, 1, 0, 0, 0).unwrap();
         Device {
             id: crate::authn::ids::testing::device("d"),
             tenant_id: crate::authn::ids::testing::tenant("t"),
@@ -419,10 +417,9 @@ mod tests {
         assert_eq!(built, StepUpPolicy::default());
     }
 
-    /// mutant kill: `StepUpPolicyBuilder::revoked` was missed by
-    /// the original test set because every example used `Trusted` or
-    /// `Unknown` as the override target. Exercise the `revoked` setter
-    /// explicitly so a no-op replacement of its body cannot survive.
+    /// `StepUpPolicyBuilder::revoked` sets the action for a revoked
+    /// device: the built policy carries the value given, not the
+    /// default, so a setter that did nothing would fail here.
     #[test]
     fn revoked_builder_setter_threads_through_to_build() {
         let p = StepUpPolicy::builder()

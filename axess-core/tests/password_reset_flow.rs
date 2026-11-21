@@ -1,17 +1,16 @@
 #![cfg(feature = "testing")]
-//! mutation-coverage tests for
-//! `authn::service::account::password_reset`.
+//! Integration tests for `authn::service::account::password_reset`.
 //!
-//! `password_reset.rs` had **zero** integration tests before this
-//! file. The 19 mutations identified by `cargo mutants` cluster across:
+//! They pin each rail of the reset flow:
 //! - `begin_password_reset` (token generation, tenant guard, user
 //!   validate guard, expires_at arithmetic),
 //! - `complete_password_reset_in_tenant` (cross-tenant rail),
 //! - `complete_password_reset` (token-verify rail, body),
-//! - the two `pub(super)` helpers `verify_reset_token_hash` and
-//!   `verify_new_password_not_in_history` (history-check rail).
+//! - the helpers behind it: the token check (`peek_reset_token`,
+//!   `spend_reset_token`, over `reset_token_hash`) and the history check
+//!   (`check_history_and_hash`).
 
-mod common;
+use axess_core::testing::fixtures as common;
 
 use axess_core::authn::event::{AuthEventStatus, AuthEventType};
 use axess_core::authn::store::IdentityPasswordHistory;
@@ -23,11 +22,10 @@ use axess_core::{
     },
     testing::mock_authn::{MockFactorStore, MockIdentityStore},
 };
-use chrono::Utc;
 use common::{test_tenant, tid, uid};
 
 fn fixture_user(user_id: &str, identifier: &str, tenant: &str) -> User {
-    let now = Utc::now();
+    let now = common::start();
     User {
         id: uid(user_id),
         tenant_id: tid(tenant),
@@ -43,26 +41,24 @@ fn fixture_user(user_id: &str, identifier: &str, tenant: &str) -> User {
 }
 
 fn make_service_with_user(user: User) -> RequestAuthnService<MockIdentityStore, MockFactorStore> {
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(user);
-    AuthnService::new(identity, MockFactorStore::new()).with_audit_context(AuditContext::default())
+    AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build()
+        .with_audit_context(AuditContext::default())
 }
 
 // ── begin_password_reset ───────────────────────────────────────────────
 
 /// Happy path: existing active user yields `Ok(Some(token))` and the
-/// audit row is recorded. Kills the line-56 body-replacement
-/// mutations (`Ok(None)`, `Ok(Some(""))`, `Ok(Some("xyzzy"))`):
-/// `Ok(None)` is caught by the `is_some()` assertion; the canned-string
-/// mutations are caught because the mock stores the canned string's
-/// hash, but `complete_password_reset` is then called with the same
-/// canned string and verifies; so we additionally pin one-time-token
-/// behaviour by asserting the returned token is non-empty AND that a
-/// follow-up complete with that token succeeds (kills the canned-string
-/// mutations because the mock stored the canned-string hash, but the
-/// happy-path complete with that token must succeed; the canned
-/// mutation does NOT pre-store a hash and so verify fails).
+/// audit row is recorded. The token is the one whose hash was stored:
+/// it is non-empty, and completing the reset with it succeeds, which a
+/// `begin_password_reset` that answered `Ok(None)` or a fixed string
+/// without storing its hash would not allow.
 #[tokio::test]
 async fn begin_password_reset_returns_token_for_existing_user() {
     let svc = make_service_with_user(fixture_user("u1", "alice", "t1"));
@@ -77,19 +73,24 @@ async fn begin_password_reset_returns_token_for_existing_user() {
     );
 }
 
-/// Inactive (Suspended) tenant returns `Ok(None)`. Kills line-63
-/// match guard `t.status.is_active()` to `true` (which would proceed
+/// Inactive (Suspended) tenant returns `Ok(None)`. Kills the mutation of
+/// the match guard `t.status.is_active()` to `true` (which would proceed
 /// into find_user). The mutation `false` would also force `Ok(None)`,
 /// so we pair this with the active-tenant happy-path test above;
 /// together they discriminate both directions.
 #[tokio::test]
 async fn begin_password_reset_inactive_tenant_returns_none() {
+    let clock = common::test_clock();
     let mut suspended = test_tenant();
-    suspended.status = EntityState::Suspended(StatusDetail::administrative("test", Utc::now()));
+    suspended.status =
+        EntityState::Suspended(StatusDetail::administrative("test", common::start()));
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(suspended)
         .with_user(fixture_user("u1", "alice", "t1"));
-    let svc = AuthnService::new(identity, MockFactorStore::new())
+    let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build()
         .with_audit_context(AuditContext::default());
     let token = svc
         .begin_password_reset("alice", "default", std::time::Duration::from_secs(300))
@@ -102,21 +103,26 @@ async fn begin_password_reset_inactive_tenant_returns_none() {
 }
 
 /// Unknown user (timing-equalized path) returns `Ok(None)`. Kills
-/// line-74 match guard `u.validate().is_ok()` to `true` (which would
+/// match guard `u.validate().is_ok()` to `true` (which would
 /// continue with a Some) and to `false` (which would always force None
 /// even for valid users; paired with the happy-path test above).
 /// A suspended account is answered like an unknown identifier: no token.
-/// It used to be issued one, which `complete_password_reset` then refused,
-/// so the mail went out for nothing.
+/// One issued to it would be refused by `complete_password_reset`, and the
+/// mail would go out for nothing.
 #[tokio::test]
 async fn begin_password_reset_suspended_account_returns_none() {
+    let clock = common::test_clock();
     let mut suspended = fixture_user("u1", "alice", "t1");
-    suspended.status = EntityState::Suspended(StatusDetail::administrative("hold", Utc::now()));
+    suspended.status =
+        EntityState::Suspended(StatusDetail::administrative("hold", common::start()));
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(suspended);
     let inspector = identity.clone();
-    let svc = AuthnService::new(identity, MockFactorStore::new())
+    let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build()
         .with_audit_context(AuditContext::default());
 
     let token = svc
@@ -140,8 +146,13 @@ async fn begin_password_reset_suspended_account_returns_none() {
 
 #[tokio::test]
 async fn begin_password_reset_unknown_user_returns_none() {
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let svc = AuthnService::new(identity, MockFactorStore::new())
+    let clock = common::test_clock();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
+    let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build()
         .with_audit_context(AuditContext::default());
     let token = svc
         .begin_password_reset("nobody", "default", std::time::Duration::from_secs(300))
@@ -153,18 +164,22 @@ async fn begin_password_reset_unknown_user_returns_none() {
     );
 }
 
-/// `expires_at` must be `now + ttl`, NOT `now - ttl`. Kills line-110
-/// `+` to `-` mutation. Discriminator: with TTL=300s, baseline stores
-/// expiry ~5min in the future → `verify_reset_token` accepts the
-/// follow-up token. With `-` mutation, expiry is ~5min in the PAST →
-/// verify_reset_token returns false and the token cannot be redeemed.
+/// `expires_at` must be `now + ttl`, NOT `now - ttl`. With TTL=300s the
+/// stored expiry is five minutes in the future and `verify_reset_token`
+/// accepts the token; with `now - ttl` the expiry is five minutes in
+/// the past, `verify_reset_token` returns false and the token cannot be
+/// redeemed.
 #[tokio::test]
 async fn begin_password_reset_expires_at_is_in_the_future() {
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(fixture_user("u1", "alice", "t1"));
     let inspector = identity.clone();
-    let svc = AuthnService::new(identity, MockFactorStore::new())
+    let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build()
         .with_audit_context(AuditContext::default());
     let token = svc
         .begin_password_reset("alice", "default", std::time::Duration::from_secs(300))
@@ -193,9 +208,8 @@ async fn begin_password_reset_expires_at_is_in_the_future() {
 
 /// Cross-tenant attempt answers `Ok(false)`, exactly as an unknown user
 /// does (a distinct error told a link holder which ids exist in other
-/// tenants). Kills line-152
-/// `!=` to `==` mutation (which would invert the rail and refuse only
-/// when tenants MATCH) and the line-146 body replacements
+/// tenants). Kills the `!=` to `==` mutation (which would invert the rail and refuse only
+/// when tenants MATCH) and the body replacements
 /// (Ok(true)/Ok(false); both would make the cross-tenant attempt
 /// silently succeed or silently no-op).
 #[tokio::test]
@@ -213,7 +227,7 @@ async fn complete_password_reset_in_tenant_refuses_cross_tenant() {
 }
 
 /// Same-tenant call delegates to `complete_password_reset`. Kills the
-/// line-146 body replacements: `Ok(true)` would skip the cross-tenant rail
+/// body replacements: `Ok(true)` would skip the cross-tenant rail
 /// AND skip the actual reset; `Ok(false)` would refuse a perfectly
 /// valid same-tenant reset. Discriminator: pre-load a valid reset
 /// token, verify the helper actually consumes it (subsequent verify
@@ -237,7 +251,7 @@ async fn complete_password_reset_in_tenant_accepts_same_tenant() {
 // ── complete_password_reset ────────────────────────────────────────────
 
 /// Invalid (never-issued) token returns `Ok(false)`. Kills the
-/// line-183 body replacement to `Ok(true)` (would lie that the reset
+/// body replacement to `Ok(true)` (would lie that the reset
 /// worked). The complementary "valid token returns true" case is
 /// covered by the in_tenant happy-path test above (which calls
 /// through to `complete_password_reset`).
@@ -255,19 +269,23 @@ async fn complete_password_reset_invalid_token_returns_false() {
     );
 }
 
-/// line 74: a user whose `validate()` returns `Err` (e.g. null
+/// A user whose `validate()` returns `Err` (e.g. null
 /// byte in display_name) must yield `Ok(None)`; NOT a token. The
 /// match guard `u.validate().is_ok()` would, when forced to `true`,
 /// continue and produce a token for the malformed user.
 #[tokio::test]
 async fn begin_password_reset_invalid_user_returns_none() {
+    let clock = common::test_clock();
     let mut bad_user = fixture_user("u1", "alice", "t1");
     // Null byte in display_name → `User::validate()` returns Err.
     bad_user.display_name = "Alice\x00Evil".into();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(bad_user);
-    let svc = AuthnService::new(identity, MockFactorStore::new())
+    let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build()
         .with_audit_context(AuditContext::default());
     let token = svc
         .begin_password_reset("alice", "default", std::time::Duration::from_secs(300))
@@ -279,23 +297,23 @@ async fn begin_password_reset_invalid_user_returns_none() {
     );
 }
 
-/// line 347 `verify_new_password_not_in_history` body and
-/// rail. With history_count > 0 and the new password's hash already
-/// in history, the function returns `Ok(true)`; `complete_password_reset`
-/// then refuses with `Ok(false)`. Mutation `Ok(false)`: history check
-/// always passes → reused passwords accepted. Mutation `==` to `!=`:
-/// with history_count > 0, the early return fires (returns Ok(false)
-///; "not reused") and the loop is skipped, so reuse goes undetected.
+/// The history check (`check_history_and_hash`). With history_count > 0
+/// and the new password already in the history, the check finds the
+/// reuse and `complete_password_reset` refuses with `Ok(false)`. A check
+/// that always passes accepts a reused password, and so does one that
+/// returns before it has compared the new password with each old hash.
 ///
 /// Discriminator: pre-load a password into history, attempt reset
 /// with the same hash, baseline rejects (Ok(false) from
 /// complete_password_reset), mutation accepts (Ok(true)).
 #[tokio::test]
 async fn complete_password_reset_rejects_password_reuse() {
+    let clock = common::test_clock();
     use axess_core::authn::factor::PasswordRules;
 
     let user = fixture_user("u1", "alice", "t1");
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(user.clone())
         .with_password_rules(
@@ -306,7 +324,9 @@ async fn complete_password_reset_rejects_password_reuse() {
             },
         );
     let inspector = identity.clone();
-    let svc = AuthnService::new(identity, MockFactorStore::new())
+    let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build()
         .with_audit_context(AuditContext::default());
 
     // Begin a reset to issue a real token.
@@ -341,12 +361,11 @@ async fn complete_password_reset_rejects_password_reuse() {
     );
 }
 
-/// line 183:12 `delete !` on `if !verify_reset_token_hash(...)`.
-/// Removing the `!` inverts the polarity: a VALID token is rejected
-/// (Ok(false)) while INVALID tokens are processed and crash later
-/// because `get_user` returns Some but the password hash is the
-/// invalid input. Discriminator: provide a valid token, expect
-/// `Ok(true)` (baseline); mutation returns `Ok(false)`.
+/// The polarity of the token check (`peek_reset_token` before the new
+/// password is judged, `spend_reset_token` after). Either one inverted
+/// rejects a valid token (`Ok(false)`) and takes an invalid one for the
+/// user's. Discriminator: provide a valid token and expect `Ok(true)`; an
+/// inverted check returns `Ok(false)`.
 #[tokio::test]
 async fn complete_password_reset_valid_token_returns_true() {
     let user = fixture_user("u1", "alice", "t1");
@@ -367,14 +386,17 @@ async fn complete_password_reset_valid_token_returns_true() {
 /// already the newest entry, so three changes leave three entries, not five.
 #[tokio::test]
 async fn password_history_records_each_hash_once() {
+    let clock = common::test_clock();
     let user = fixture_user("u1", "alice", "t1");
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(user.clone());
     let inspector = identity.clone();
     // Three resets in a row for one account: the default cooldown would
     // refuse the second.
     let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
         .without_password_reset_cooldown()
         .build()
         .with_audit_context(AuditContext::default());
@@ -402,12 +424,14 @@ async fn password_history_records_each_hash_once() {
 /// The current password still counts as a reuse.
 #[tokio::test]
 async fn a_refused_reset_writes_no_password_history() {
+    let clock = common::test_clock();
     use axess_core::authn::factor::{FactorConfig, PasswordConfig, PasswordRules};
     use axess_core::authn::types::AuthnScope;
 
     let user = fixture_user("u1", "alice", "t1");
     let current = "Current-password-1";
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(user.clone())
         .with_password_rules(
@@ -431,7 +455,10 @@ async fn a_refused_reset_writes_no_password_history() {
         }),
     );
     let inspector = identity.clone();
-    let svc = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
+    let svc = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
+        .build()
+        .with_audit_context(AuditContext::default());
     assert!(
         inspector
             .password_history(&user.id, 10)
@@ -465,6 +492,7 @@ async fn a_refused_reset_writes_no_password_history() {
 /// compliant password. One case per rule, plus the default minimum length.
 #[tokio::test]
 async fn a_reset_to_a_password_that_breaks_the_rules_is_refused_and_keeps_the_old_one() {
+    let clock = common::test_clock();
     use axess_core::authn::factor::{
         FactorConfig, FactorKind, PasswordConfig, PasswordRules, ZeroizedString,
     };
@@ -477,6 +505,7 @@ async fn a_reset_to_a_password_that_breaks_the_rules_is_refused_and_keeps_the_ol
         ..PasswordRules::default()
     };
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(user.clone())
         .with_password_rules(&user.tenant_id, rules.clone());
@@ -494,7 +523,10 @@ async fn a_reset_to_a_password_that_breaks_the_rules_is_refused_and_keeps_the_ol
         }),
     );
     let inspector = factors.clone();
-    let svc = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
+    let svc = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
+        .build()
+        .with_audit_context(AuditContext::default());
     let token = svc
         .begin_password_reset("alice", "default", std::time::Duration::from_secs(300))
         .await
@@ -541,12 +573,13 @@ async fn a_reset_to_a_password_that_breaks_the_rules_is_refused_and_keeps_the_ol
 /// machine's clock would see a 2031 expiry as years away and accept both.
 #[tokio::test]
 async fn complete_password_reset_judges_expiry_on_the_service_clock() {
-    use chrono::TimeZone;
-    let origin = Utc.with_ymd_and_hms(2031, 3, 1, 12, 0, 0).unwrap();
+    use axess_clock::Timestamp;
+    let origin = Timestamp::from_utc(2031, 3, 1, 12, 0, 0).unwrap();
     let ttl = std::time::Duration::from_secs(300);
     for (advance_secs, accepted) in [(299, true), (301, false)] {
         let clock = axess_clock::testing::MockClock::at(origin);
         let identity = MockIdentityStore::new()
+            .with_clock(clock.clone())
             .with_tenant(test_tenant())
             .with_user(fixture_user("u1", "alice", "t1"));
         identity
@@ -562,7 +595,7 @@ async fn complete_password_reset_judges_expiry_on_the_service_clock() {
             .await
             .unwrap()
             .expect("token expected");
-        clock.advance(chrono::Duration::seconds(advance_secs));
+        clock.advance(axess_clock::SignedDuration::seconds(advance_secs));
         let redeemed = svc
             .complete_password_reset(&uid("u1"), &token, "New-password-123")
             .await

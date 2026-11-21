@@ -25,6 +25,17 @@
 //! one login per user inside the window. A secret sealed under the previous
 //! key is re-sealed under the current one the same way.
 //!
+//! A tenant OAuth credential sealed by 0.15 to 0.19 is bound to its issuer and
+//! client id only. The directory moves every such credential to the current
+//! binding when it starts
+//! ([`StoredTenantOAuthProviders::started`](crate::federation::oauth_tenant::StoredTenantOAuthProviders::started)),
+//! and at use the policy given to
+//! [`with_earlier_tenant_binding`](FactorSecretCipher::with_earlier_tenant_binding)
+//! decides: the default, [`Reject`](LegacyBlobs::Reject), refuses one;
+//! [`Accept`](LegacyBlobs::Accept), for a rolling upgrade in which 0.19.0
+//! nodes still write, reads it and the directory re-seals it on first use;
+//! [`AcceptUntil`](LegacyBlobs::AcceptUntil) sets a cutoff.
+//!
 //! # Nonces
 //!
 //! Each seal draws a random 96-bit nonce. A secret is sealed once at
@@ -45,6 +56,7 @@ use axess_rng::{SecureRng, SystemRng};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use zeroize::{Zeroize, Zeroizing};
 
 const NONCE_LEN: usize = 12;
 
@@ -54,14 +66,17 @@ fn put(buf: &mut Vec<u8>, bytes: &[u8]) {
     buf.extend_from_slice(bytes);
 }
 
-/// A 32-byte AES key, zeroed when dropped.
-struct Key([u8; 32]);
+/// A 32-byte AES key, held in a buffer that is zeroed when it is dropped.
+struct Key(Zeroizing<[u8; 32]>);
 
-impl Drop for Key {
-    fn drop(&mut self) {
-        zeroize::Zeroize::zeroize(&mut self.0);
+impl Key {
+    /// Reads the key through a reference: the only copy this makes is the
+    /// one in the key's own buffer.
+    fn new(key: &[u8; 32]) -> Self {
+        Self(Zeroizing::new(*key))
     }
 }
+
 const AAD_LABEL: &[u8] = b"axess.factor-secret.v2";
 /// The label of the binding before the factor kind carried its variant and a
 /// row could carry extra context. Secrets sealed under it are still opened.
@@ -200,38 +215,48 @@ pub struct FactorSecretCipher {
     clock: Arc<dyn Clock>,
     plain: LegacyBlobs,
     first_binding: LegacyBlobs,
+    earlier_tenant_binding: LegacyBlobs,
 }
 
 impl FactorSecretCipher {
     /// A cipher sealing under `key`.
+    ///
+    /// The key is copied into a buffer that is zeroed on drop, and the copy
+    /// handed to this call is zeroed before it returns. The caller's own
+    /// copy is the caller's to wipe.
     ///
     /// # Panics
     ///
     /// On a key that is a single repeated byte. Use
     /// [`try_new`](Self::try_new) to handle the refusal.
     #[track_caller]
-    pub fn new(key: [u8; 32]) -> Self {
+    pub fn new(mut key: [u8; 32]) -> Self {
         crate::session::weak_key::refuse_constant_key("factor secret encryption key", &key);
-        Self::new_unchecked_inner(key)
+        let cipher = Self::new_unchecked_inner(&key);
+        key.zeroize();
+        cipher
     }
 
     /// [`new`](Self::new) without the constant-key check, for tests that use
     /// a placeholder key.
     #[cfg(any(test, feature = "testing"))]
-    pub fn new_unchecked(key: [u8; 32]) -> Self {
-        Self::new_unchecked_inner(key)
+    pub fn new_unchecked(mut key: [u8; 32]) -> Self {
+        let cipher = Self::new_unchecked_inner(&key);
+        key.zeroize();
+        cipher
     }
 
-    fn new_unchecked_inner(key: [u8; 32]) -> Self {
-        let current_id = key_id(&key);
+    fn new_unchecked_inner(key: &[u8; 32]) -> Self {
+        let current_id = key_id(key);
         Self {
-            current: Arc::new(Key(key)),
+            current: Arc::new(Key::new(key)),
             current_id,
             previous: None,
             rng: Arc::new(SystemRng),
             clock: Arc::new(SystemClock),
             plain: LegacyBlobs::default(),
             first_binding: LegacyBlobs::Reject,
+            earlier_tenant_binding: LegacyBlobs::Reject,
         }
     }
 
@@ -240,11 +265,13 @@ impl FactorSecretCipher {
     /// # Errors
     ///
     /// [`WeakKeyError`] for such a key.
-    pub fn try_new(key: [u8; 32]) -> Result<Self, WeakKeyError> {
+    pub fn try_new(mut key: [u8; 32]) -> Result<Self, WeakKeyError> {
         if is_constant_key(&key) {
             return Err(WeakKeyError);
         }
-        Ok(Self::new_unchecked_inner(key))
+        let cipher = Self::new_unchecked_inner(&key);
+        key.zeroize();
+        Ok(cipher)
     }
 
     /// Keep secrets sealed under `key` readable, for a key rotation. They are
@@ -255,7 +282,7 @@ impl FactorSecretCipher {
     /// On a previous key that is a single repeated byte, or that equals the
     /// current key.
     #[track_caller]
-    pub fn with_previous_key(mut self, key: [u8; 32]) -> Self {
+    pub fn with_previous_key(mut self, mut key: [u8; 32]) -> Self {
         crate::session::weak_key::refuse_constant_key(
             "previous factor secret encryption key",
             &key,
@@ -265,7 +292,8 @@ impl FactorSecretCipher {
             id != self.current_id,
             "previous factor secret key equals the current key; the rotation protects nothing"
         );
-        self.previous = Some((Arc::new(Key(key)), id));
+        self.previous = Some((Arc::new(Key::new(&key)), id));
+        key.zeroize();
         self
     }
 
@@ -289,6 +317,26 @@ impl FactorSecretCipher {
     /// that, those users cannot open their secret.
     pub fn with_first_binding(mut self, policy: LegacyBlobs) -> Self {
         self.first_binding = policy;
+        self
+    }
+
+    /// Whether a tenant OAuth credential sealed under the binding of 0.15 to
+    /// 0.19 (the issuer and client id as its only context, not the redirect
+    /// URL, scopes, DPoP mode, credential kind and signer spec bound since)
+    /// is still opened, and until when.
+    ///
+    /// The default is [`LegacyBlobs::Reject`]: such a credential is refused
+    /// as [`FactorSecretError::Open`] at use.
+    /// [`StoredTenantOAuthProviders::started`](crate::federation::oauth_tenant::StoredTenantOAuthProviders::started)
+    /// moves every stored one to the current binding when the directory
+    /// starts, reading the earlier binding whatever this policy says, so
+    /// after the pass none is left to refuse. [`LegacyBlobs::Accept`] is the
+    /// named opt-in for a rolling upgrade in which 0.19.0 nodes still write
+    /// records: those open, are reported as due a re-seal and are written
+    /// back under every field on first use. [`LegacyBlobs::AcceptUntil`]
+    /// bounds that window with a cutoff.
+    pub fn with_earlier_tenant_binding(mut self, policy: LegacyBlobs) -> Self {
+        self.earlier_tenant_binding = policy;
         self
     }
 
@@ -322,6 +370,17 @@ impl FactorSecretCipher {
         }
     }
 
+    /// True while a tenant OAuth credential sealed under the earlier binding
+    /// (the issuer and client id only) may still be read; see
+    /// [`with_earlier_tenant_binding`](Self::with_earlier_tenant_binding).
+    pub fn earlier_tenant_binding_readable(&self) -> bool {
+        match self.earlier_tenant_binding {
+            LegacyBlobs::Reject => false,
+            LegacyBlobs::AcceptUntil(until) => self.clock.now() < until,
+            LegacyBlobs::Accept => true,
+        }
+    }
+
     /// Whether `sealed` is at rest under the current key.
     pub fn is_current(&self, sealed: &SealedFactorSecret) -> bool {
         sealed.key_id == self.current_id
@@ -338,7 +397,7 @@ impl FactorSecretCipher {
         binding: FactorSecretBinding<'_>,
     ) -> Result<SealedFactorSecret, FactorSecretError> {
         let cipher =
-            Aes256Gcm::new_from_slice(&self.current.0).map_err(|_| FactorSecretError::Seal)?;
+            Aes256Gcm::new_from_slice(&self.current.0[..]).map_err(|_| FactorSecretError::Seal)?;
         let mut nonce_bytes = [0u8; NONCE_LEN];
         self.rng.fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::try_from(&nonce_bytes[..]).map_err(|_| FactorSecretError::Seal)?;
@@ -387,8 +446,18 @@ impl FactorSecretCipher {
         if nonce_bytes.len() != NONCE_LEN {
             return Err(FactorSecretError::Open);
         }
+        // Every ciphertext ends in a tag, an empty secret's included. One
+        // shorter was never sealed: it is refused, and logged as the damaged
+        // row it is, before any key or binding is tried.
+        if ciphertext.len() < crate::aead::TAG_LEN {
+            tracing::warn!(
+                key_id = %sealed.key_id,
+                "refusing a sealed factor secret too short to have been sealed"
+            );
+            return Err(FactorSecretError::Open);
+        }
         let nonce = Nonce::try_from(&nonce_bytes[..]).map_err(|_| FactorSecretError::Open)?;
-        let cipher = Aes256Gcm::new_from_slice(&key.0).map_err(|_| FactorSecretError::Open)?;
+        let cipher = Aes256Gcm::new_from_slice(&key.0[..]).map_err(|_| FactorSecretError::Open)?;
         let attempt = |aad: Vec<u8>| {
             cipher.decrypt(
                 &nonce,
@@ -462,6 +531,7 @@ impl std::fmt::Debug for FactorSecretCipher {
             .field("has_previous_key", &self.previous.is_some())
             .field("plain", &self.plain)
             .field("first_binding", &self.first_binding)
+            .field("earlier_tenant_binding", &self.earlier_tenant_binding)
             .finish()
     }
 }

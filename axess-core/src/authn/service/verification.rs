@@ -17,12 +17,20 @@ use std::sync::Arc;
 /// means the default.
 pub(crate) const DEFAULT_MAX_OTP_ATTEMPTS: u8 = 5;
 
-/// The attempt limit in force for a configured `max_attempts`.
+/// The most guesses an OTP factor allows before it locks, whatever its
+/// config says: ten, the throttling parameter RFC 4226 §7.4 recommends as
+/// the ceiling. A larger `max_attempts` reaches a config the same ways a
+/// zero does, and 255 guesses per lock is most of a six-digit code's
+/// entropy given away over a few locks.
+pub(crate) const MAX_OTP_ATTEMPTS: u8 = 10;
+
+/// The attempt limit in force for a configured `max_attempts`: zero reads as
+/// [`DEFAULT_MAX_OTP_ATTEMPTS`], anything above [`MAX_OTP_ATTEMPTS`] as that.
 pub(crate) fn effective_max_attempts(configured: u8) -> u8 {
     if configured == 0 {
         DEFAULT_MAX_OTP_ATTEMPTS
     } else {
-        configured
+        configured.min(MAX_OTP_ATTEMPTS)
     }
 }
 
@@ -38,7 +46,7 @@ pub(crate) fn effective_max_attempts(configured: u8) -> u8 {
 /// their own token for good.
 pub(crate) fn apply_hotp_failure(
     prior: &crate::authn::factor::HotpConfig,
-    now: chrono::DateTime<chrono::Utc>,
+    now: axess_clock::Timestamp,
 ) -> crate::authn::factor::HotpConfig {
     let mut next = prior.clone();
     if prior.is_locked_at(now) {
@@ -111,7 +119,7 @@ pub(crate) enum VerifyOutcome {
 /// Verify a credential against a factor config.
 ///
 /// `now` is supplied by the caller (from an injectable [`Clock`]) rather than
-/// reading `Utc::now()` directly, keeping the function deterministically
+/// reading the system clock directly, keeping the function deterministically
 /// testable under DST. Converted to `SystemTime` only for the TOTP path
 /// which requires it.
 ///
@@ -123,7 +131,7 @@ pub(crate) fn verify_credential(
     credential: &FactorCredential,
     config: &FactorConfig,
     kind: &FactorKind,
-    now: chrono::DateTime<chrono::Utc>,
+    now: axess_clock::Timestamp,
     peppers: &RecoveryPeppers,
 ) -> VerifyOutcome {
     match (credential, config, kind) {
@@ -186,11 +194,7 @@ fn verify_password_factor(pwd_str: &str, cfg: &PasswordConfig) -> VerifyOutcome 
 }
 
 /// Check a TOTP code, refusing a step at or before the last accepted one.
-fn verify_totp_factor(
-    code: &str,
-    cfg: &TotpConfig,
-    now: chrono::DateTime<chrono::Utc>,
-) -> VerifyOutcome {
+fn verify_totp_factor(code: &str, cfg: &TotpConfig, now: axess_clock::Timestamp) -> VerifyOutcome {
     if code.len() > MAX_OTP_CODE_BYTES {
         return VerifyOutcome::Fail;
     }
@@ -210,7 +214,7 @@ fn verify_totp_factor(
         now,
         axess_factors::TotpVerifyParams {
             length: Some(cfg.digits as usize),
-            period: Some(cfg.period_secs as u64),
+            period: Some(cfg.period),
             past_window: Some(cfg.past_window as u64),
             future_window: Some(cfg.future_window as u64),
             algorithm,
@@ -233,11 +237,7 @@ fn verify_totp_factor(
 }
 
 /// Check an HOTP code inside the lookahead window, throttled per counter.
-fn verify_hotp_factor(
-    code: &str,
-    cfg: &HotpConfig,
-    now: chrono::DateTime<chrono::Utc>,
-) -> VerifyOutcome {
+fn verify_hotp_factor(code: &str, cfg: &HotpConfig, now: axess_clock::Timestamp) -> VerifyOutcome {
     if code.len() > MAX_OTP_CODE_BYTES {
         return VerifyOutcome::Fail;
     }
@@ -256,6 +256,17 @@ fn verify_hotp_factor(
     if cfg.attempt_count >= effective_max_attempts(cfg.max_attempts) {
         tracing::warn!("HOTP attempt limit reached; factor locked");
         return VerifyOutcome::FailWithUpdate(FactorConfig::Hotp(apply_hotp_failure(cfg, now)));
+    }
+    // A stored window past the bound verifies nothing: the factor is
+    // refused by name here, where the operator can read why, and again
+    // inside `verify_hotp`, which holds the bound.
+    if cfg.lookahead_window > axess_factors::MAX_HOTP_LOOKAHEAD {
+        tracing::error!(
+            lookahead_window = cfg.lookahead_window,
+            max = axess_factors::MAX_HOTP_LOOKAHEAD,
+            "HOTP lookahead_window above the bound; the factor cannot verify until it is corrected"
+        );
+        return VerifyOutcome::Fail;
     }
     let hotp_algo = match cfg.algorithm {
         OtpAlgorithm::Sha1 => axess_factors::HotpAlgorithm::Sha1,
@@ -302,7 +313,7 @@ fn verify_hotp_factor(
 fn verify_email_otp_factor(
     code: &str,
     cfg: &EmailOtpConfig,
-    now: chrono::DateTime<chrono::Utc>,
+    now: axess_clock::Timestamp,
 ) -> VerifyOutcome {
     // Reject oversized codes before Argon2; prevents CPU DoS.
     if code.len() > MAX_OTP_CODE_BYTES {
@@ -328,7 +339,7 @@ fn verify_email_otp_factor(
     // A code with no expiry is never valid: refuse rather than
     // accept a code that would live forever.
     match cfg.pending_until {
-        Some(until) if now <= until => {}
+        Some(until) if axess_clock::Until::At(now) <= until => {}
         _ => return VerifyOutcome::Fail,
     }
 
@@ -363,7 +374,7 @@ fn verify_email_otp_factor(
 fn verify_recovery_code_factor(
     code: &str,
     cfg: &RecoveryCodesConfig,
-    now: chrono::DateTime<chrono::Utc>,
+    now: axess_clock::Timestamp,
     peppers: &RecoveryPeppers,
 ) -> VerifyOutcome {
     if code.len() > MAX_OTP_CODE_BYTES {
@@ -407,7 +418,7 @@ pub(crate) async fn verify_credential_blocking(
     credential: &FactorCredential,
     config: &FactorConfig,
     kind: &FactorKind,
-    now: chrono::DateTime<chrono::Utc>,
+    now: axess_clock::Timestamp,
     peppers: &RecoveryPeppers,
 ) -> Result<VerifyOutcome, KdfError> {
     if !runs_kdf(credential, config) {

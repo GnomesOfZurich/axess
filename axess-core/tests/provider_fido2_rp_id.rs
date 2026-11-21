@@ -5,10 +5,11 @@
 //!
 //! Run with: `cargo test -p axess-core --features testing,jwt-aws-lc,fido2 --test provider_fido2_rp_id`
 
-#![cfg(feature = "fido2")]
+#![cfg(all(feature = "fido2", feature = "testing"))]
 
-mod common;
+use axess_core::testing::fixtures as common;
 
+use axess_core::authn::AuditContext;
 use axess_core::authn::service::{
     AuthnService, BuiltProvider, ProviderChangeKind, ProviderEntry, ProviderKey,
     ProviderReloadError, ProviderSource, ProviderSourceError, ReloadFido2,
@@ -20,7 +21,7 @@ use axess_core::testing::{
     mock_authn::{MockFactorStore, MockIdentityStore},
 };
 use axess_factors::fido2::{DefaultFido2Provider, Fido2Provider, MockFido2Provider};
-use common::test_tenant;
+use common::{provider_admin, reload_refusal, test_tenant};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -30,10 +31,14 @@ fn service(
     metrics: &Arc<RecordingMetrics>,
     first: impl Fido2Provider,
 ) -> AuthnService<MockIdentityStore, MockFactorStore> {
+    let clock = common::test_clock();
     AuthnService::builder(
-        MockIdentityStore::new().with_tenant(test_tenant()),
+        MockIdentityStore::new()
+            .with_clock(clock.clone())
+            .with_tenant(test_tenant()),
         MockFactorStore::new(),
     )
+    .with_clock(clock.clone())
     .with_metrics(MetricSinks::all(metrics.clone()))
     .with_fido2(first)
     .build()
@@ -48,7 +53,10 @@ async fn the_same_relying_party_id_swaps() {
     let metrics = Arc::new(RecordingMetrics::default());
     let service = service(&metrics, mock("example.com"));
     let change = service
-        .reload_fido2(async { Ok::<_, String>(mock("example.com")) })
+        .with_audit_context(AuditContext::default())
+        .reload_fido2_as(&provider_admin(), async {
+            Ok::<_, String>(mock("example.com"))
+        })
         .await
         .expect("a like-for-like swap is accepted");
     assert_eq!(change.kind, ProviderChangeKind::Replaced);
@@ -60,8 +68,12 @@ async fn a_changed_relying_party_id_is_refused_by_name_and_the_old_provider_stay
     let metrics = Arc::new(RecordingMetrics::default());
     let service = service(&metrics, mock("example.com"));
     let refused = service
-        .reload_fido2(async { Ok::<_, String>(mock("example.org")) })
+        .with_audit_context(AuditContext::default())
+        .reload_fido2_as(&provider_admin(), async {
+            Ok::<_, String>(mock("example.org"))
+        })
         .await
+        .map_err(reload_refusal)
         .expect_err("a changed relying-party id is refused");
     match &refused {
         ProviderReloadError::RpIdChanged { current, candidate } => {
@@ -79,13 +91,19 @@ async fn a_changed_relying_party_id_is_refused_by_name_and_the_old_provider_stay
     // to its id is accepted, one to the refused id is refused again.
     assert!(
         service
-            .reload_fido2(async { Ok::<_, String>(mock("example.com")) })
+            .with_audit_context(AuditContext::default())
+            .reload_fido2_as(&provider_admin(), async {
+                Ok::<_, String>(mock("example.com"))
+            })
             .await
             .is_ok()
     );
     assert!(
         service
-            .reload_fido2(async { Ok::<_, String>(mock("example.org")) })
+            .with_audit_context(AuditContext::default())
+            .reload_fido2_as(&provider_admin(), async {
+                Ok::<_, String>(mock("example.org"))
+            })
             .await
             .is_err()
     );
@@ -96,7 +114,9 @@ async fn a_changed_relying_party_id_with_the_acknowledgement_swaps_and_is_record
     let metrics = Arc::new(RecordingMetrics::default());
     let service = service(&metrics, mock("example.com"));
     let change = service
-        .reload_fido2_with(
+        .with_audit_context(AuditContext::default())
+        .reload_fido2_with_as(
+            &provider_admin(),
             async { Ok::<_, String>(mock("example.org")) },
             ReloadFido2::allow_rp_id_change(),
         )
@@ -108,22 +128,33 @@ async fn a_changed_relying_party_id_with_the_acknowledgement_swaps_and_is_record
 
     // The new id is the one in force now: the old id is a change again.
     let back = service
-        .reload_fido2(async { Ok::<_, String>(mock("example.com")) })
-        .await;
+        .with_audit_context(AuditContext::default())
+        .reload_fido2_as(&provider_admin(), async {
+            Ok::<_, String>(mock("example.com"))
+        })
+        .await
+        .map_err(reload_refusal);
     assert!(matches!(back, Err(ProviderReloadError::RpIdChanged { .. })));
 }
 
 #[tokio::test]
 async fn adding_the_first_provider_has_no_id_to_change() {
+    let clock = common::test_clock();
     let metrics = Arc::new(RecordingMetrics::default());
     let service = AuthnService::builder(
-        MockIdentityStore::new().with_tenant(test_tenant()),
+        MockIdentityStore::new()
+            .with_clock(clock.clone())
+            .with_tenant(test_tenant()),
         MockFactorStore::new(),
     )
+    .with_clock(clock.clone())
     .with_metrics(MetricSinks::all(metrics.clone()))
     .build();
     let added = service
-        .reload_fido2(async { Ok::<_, String>(mock("example.com")) })
+        .with_audit_context(AuditContext::default())
+        .reload_fido2_as(&provider_admin(), async {
+            Ok::<_, String>(mock("example.com"))
+        })
         .await
         .unwrap();
     assert_eq!(added.kind, ProviderChangeKind::Added);
@@ -161,7 +192,7 @@ impl ProviderSource for FidoSource {
 
     fn build<'a>(
         &'a self,
-        _key: &'a ProviderKey,
+        _: &'a ProviderKey,
     ) -> ReloadFuture<'a, Result<BuiltProvider, ProviderSourceError>> {
         Box::pin(async move {
             let (_, rp_id, acknowledged) = self.state.lock().unwrap().clone();
@@ -187,12 +218,16 @@ async fn eventually(what: &str, mut check: impl FnMut() -> bool) {
 
 #[tokio::test]
 async fn a_follower_refuses_a_source_that_changes_the_id_unless_the_source_says_so() {
+    let clock = common::test_clock();
     let metrics = Arc::new(RecordingMetrics::default());
     let bus = Arc::new(InProcessCoordinator::new(NonZeroUsize::new(8).unwrap()));
     let service = AuthnService::builder(
-        MockIdentityStore::new().with_tenant(test_tenant()),
+        MockIdentityStore::new()
+            .with_clock(clock.clone())
+            .with_tenant(test_tenant()),
         MockFactorStore::new(),
     )
+    .with_clock(clock.clone())
     .with_metrics(MetricSinks::all(metrics.clone()))
     .with_provider_coordinator(bus.clone())
     .with_fido2(mock("example.com"))
@@ -200,7 +235,7 @@ async fn a_follower_refuses_a_source_that_changes_the_id_unless_the_source_says_
     let source = Arc::new(FidoSource {
         state: Mutex::new(("r1".into(), "example.org", false)),
     });
-    let _follower = service
+    let follower = service
         .follow_provider_reloads(source.clone(), Duration::from_secs(3600))
         .await
         .unwrap();
@@ -218,4 +253,5 @@ async fn a_follower_refuses_a_source_that_changes_the_id_unless_the_source_says_
     })
     .await;
     assert_eq!(metrics.count("provider_reloaded:fido2"), 1);
+    drop(follower);
 }

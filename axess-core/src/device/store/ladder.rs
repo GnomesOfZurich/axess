@@ -1,7 +1,8 @@
 //! The retention ladder and the conditional writes, on the in-memory store.
 
 use super::*;
-use chrono::TimeZone;
+use axess_clock::Timestamp;
+use axess_clock::testing::Shift;
 
 /// One row of the retention ladder: a device at `level`, un-sighted for
 /// `idle_days`, demoted from Trusted `demoted_days_ago` days before the
@@ -16,13 +17,15 @@ pub(crate) struct LadderRow {
 }
 
 impl LadderRow {
-    pub(crate) fn last_seen(&self, now: DateTime<Utc>) -> DateTime<Utc> {
-        now - chrono::Duration::days(self.idle_days)
+    pub(crate) fn last_seen(&self, now: Timestamp) -> Timestamp {
+        now.minus(axess_clock::SignedDuration::days(
+            i32::try_from(self.idle_days).unwrap(),
+        ))
     }
 
-    pub(crate) fn demoted_at(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    pub(crate) fn demoted_at(&self, now: Timestamp) -> Option<Timestamp> {
         self.demoted_days_ago
-            .map(|d| now - chrono::Duration::days(d))
+            .map(|d| now.minus(axess_clock::SignedDuration::days(i32::try_from(d).unwrap())))
     }
 }
 
@@ -95,11 +98,11 @@ fn tenant() -> TenantId {
     crate::authn::ids::testing::tenant("tenant-1")
 }
 
-fn at() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap()
+fn at() -> Timestamp {
+    Timestamp::from_utc(2026, 6, 1, 0, 0, 0).unwrap()
 }
 
-fn device(name: &str, byte: u8, level: DeviceTrustLevel, last_seen: DateTime<Utc>) -> Device {
+fn device(name: &str, byte: u8, level: DeviceTrustLevel, last_seen: Timestamp) -> Device {
     Device {
         id: crate::authn::ids::testing::device(name),
         tenant_id: tenant(),
@@ -154,7 +157,7 @@ async fn memory_sweep_follows_the_ladder_table() {
 #[tokio::test]
 async fn a_demoted_trusted_device_keeps_its_seen_window() {
     let store = MemoryDeviceStore::new();
-    let seen_last = at() - chrono::Duration::days(100);
+    let seen_last = at().minus(axess_clock::SignedDuration::days(100));
     let d = device("row", 1, DeviceTrustLevel::Trusted, seen_last);
     store.save(&d, crate::device::test_now()).await.unwrap();
     let row = |s: &MemoryDeviceStore| {
@@ -162,7 +165,7 @@ async fn a_demoted_trusted_device_keeps_its_seen_window() {
         let id = d.id;
         async move { s.load(&tenant(), &id).await.unwrap().unwrap() }
     };
-    let day = |n: i64| at() + chrono::Duration::days(n);
+    let day = |n: i64| at().plus(axess_clock::SignedDuration::days(i32::try_from(n).unwrap()));
 
     store.sweep(&tenant(), at()).await.unwrap();
     let demoted = row(&store).await;
@@ -180,8 +183,8 @@ async fn a_demoted_trusted_device_keeps_its_seen_window() {
 async fn a_sighting_restarts_a_demoted_devices_seen_window() {
     let store = MemoryDeviceStore::new();
     let mut d = device("row", 1, DeviceTrustLevel::Seen, at());
-    d.demoted_at = Some(at() - chrono::Duration::days(40));
-    d.last_seen_at = at() - chrono::Duration::days(5);
+    d.demoted_at = Some(at().minus(axess_clock::SignedDuration::days(40)));
+    d.last_seen_at = at().minus(axess_clock::SignedDuration::days(5));
     store.save(&d, crate::device::test_now()).await.unwrap();
     store.sweep(&tenant(), at()).await.unwrap();
     let got = store.load(&tenant(), &d.id).await.unwrap().unwrap();
@@ -201,8 +204,8 @@ async fn explicit_transitions_stamp_and_clear_the_demotion() {
         let id = d.id;
         async move { s.load(&tenant(), &id).await.unwrap().unwrap().demoted_at }
     };
-    let t1 = at() + chrono::Duration::hours(1);
-    let t2 = at() + chrono::Duration::hours(2);
+    let t1 = at().plus(axess_clock::SignedDuration::hours(1));
+    let t2 = at().plus(axess_clock::SignedDuration::hours(2));
 
     store
         .set_trust_level(&tenant(), &d.id, DeviceTrustLevel::Seen, t1)

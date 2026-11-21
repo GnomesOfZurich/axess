@@ -2,7 +2,7 @@
 //! A FIDO2 login authenticates only while the passkey it used is still
 //! stored, and the ceremony state of each flow is single-use and separate.
 
-mod common;
+use axess_core::testing::fixtures as common;
 
 use axess_core::Clock;
 use axess_core::authn::AuditContext;
@@ -24,7 +24,7 @@ use axess_factors::fido2::{
     DefaultFido2Provider, Fido2Authentication, Fido2Ceremony, Fido2Key, Fido2Provider,
     Fido2Registration,
 };
-use common::{session_for, test_tenant, test_user, uid};
+use common::{session_for, start, test_clock, test_tenant, test_user, uid};
 use url::Url;
 use webauthn_rs::prelude::*;
 
@@ -68,13 +68,34 @@ fn result_for(id: &str) -> AuthenticationResult {
     .expect("authentication result fixture")
 }
 
-fn assertion() -> PublicKeyCredential {
+/// The WebAuthn user handle on Alice's record, and its URL-safe base64.
+const ALICE_HANDLE: &[u8; 16] = b"alice-handle-001";
+const ALICE_HANDLE_B64: &str = "YWxpY2UtaGFuZGxlLTAwMQ";
+/// The URL-safe base64 of another account's handle, `bob-handle-00002`.
+const BOB_HANDLE_B64: &str = "Ym9iLWhhbmRsZS0wMDAwMg";
+
+/// Alice as the application resolves her from a credential id: the stored
+/// user, with her WebAuthn handle.
+fn alice() -> axess_core::authn::types::User {
+    let mut user = test_user("u1", "alice");
+    user.webauthn_id = Some(uuid::Uuid::from_bytes(*ALICE_HANDLE));
+    user
+}
+
+/// An assertion carrying `user_handle`, as the authenticator returns the
+/// handle it stored with the credential.
+fn assertion_naming(user_handle: Option<&str>) -> PublicKeyCredential {
     serde_json::from_value(serde_json::json!({
         "id": "AAAA", "rawId": "AAAA", "type": "public-key",
         "response": { "authenticatorData": "AAAA", "clientDataJSON": "AAAA",
-                      "signature": "AAAA", "userHandle": null }
+                      "signature": "AAAA", "userHandle": user_handle }
     }))
     .unwrap()
+}
+
+/// An assertion by Alice's passkey, naming Alice.
+fn assertion() -> PublicKeyCredential {
+    assertion_naming(Some(ALICE_HANDLE_B64))
 }
 
 fn registration() -> RegisterPublicKeyCredential {
@@ -150,7 +171,7 @@ struct Fixture {
     factors: MockFactorStore,
     clock: MockClock,
     scope: AuthnScope,
-    stored_at: chrono::DateTime<chrono::Utc>,
+    stored_at: axess_clock::Timestamp,
 }
 
 /// A user with passkey `AAAA` stored (when `with_passkey`) and a
@@ -188,8 +209,8 @@ fn fixture_with_steps(
         tenant_id: user.tenant_id,
         user_id: user.id,
     };
-    let clock = MockClock::now();
-    let stored_at = chrono::Utc::now();
+    let clock = test_clock();
+    let stored_at = clock.now();
     let mut factors = MockFactorStore::new();
     for (n, steps) in methods.into_iter().enumerate() {
         factors = factors.with_method(
@@ -217,6 +238,7 @@ fn fixture_with_steps(
     let mut tenant = test_tenant();
     tenant.status = tenant_status;
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_default_tenant(tenant)
         .with_user(user);
     let service = AuthnService::builder(identity.clone(), factors.clone())
@@ -280,7 +302,7 @@ async fn a_passkey_deleted_mid_login_cannot_finish_a_discoverable_login() {
 
     let err = f
         .service
-        .finish_discoverable_login(&assertion(), &test_user("u1", "alice"), &stale, &session)
+        .finish_discoverable_login(&assertion(), &alice(), &stale, &session)
         .await
         .unwrap_err();
 
@@ -310,7 +332,7 @@ async fn a_caller_credential_with_the_stored_id_but_another_key_does_not_log_in(
 
     let err = f
         .service
-        .finish_discoverable_login(&assertion(), &test_user("u1", "alice"), &forged, &session)
+        .finish_discoverable_login(&assertion(), &alice(), &forged, &session)
         .await
         .unwrap_err();
 
@@ -326,7 +348,7 @@ async fn a_stored_passkey_still_finishes_a_discoverable_login_and_records_use() 
     let list = begin_discoverable(&f, &session).await;
 
     f.service
-        .finish_discoverable_login(&assertion(), &test_user("u1", "alice"), &list, &session)
+        .finish_discoverable_login(&assertion(), &alice(), &list, &session)
         .await
         .unwrap();
 
@@ -348,7 +370,7 @@ async fn a_user_without_a_fido2_row_gets_none_from_a_discoverable_login() {
 
     let err = f
         .service
-        .finish_discoverable_login(&assertion(), &test_user("u1", "alice"), &list, &session)
+        .finish_discoverable_login(&assertion(), &alice(), &list, &session)
         .await
         .unwrap_err();
 
@@ -502,12 +524,12 @@ async fn a_discoverable_failure_leaves_no_ceremony_timestamp() {
     session
         .set_custom(
             "axess.fido2.disc_started",
-            serde_json::Value::String(f.clock.now().to_rfc3339()),
+            serde_json::Value::String(f.clock.now().to_rfc3339_numeric_offset()),
         )
         .await;
     let err = f
         .service
-        .finish_discoverable_login(&assertion(), &test_user("u1", "alice"), &[], &session)
+        .finish_discoverable_login(&assertion(), &alice(), &[], &session)
         .await
         .unwrap_err();
     assert!(matches!(err, AuthnError::NoFlow), "got {err:?}");
@@ -523,7 +545,7 @@ async fn a_discoverable_failure_leaves_no_ceremony_timestamp() {
     f.identity.arm_record_failed_attempt_failure();
     let _ = f
         .service
-        .finish_discoverable_login(&assertion(), &test_user("u1", "alice"), &list, &session)
+        .finish_discoverable_login(&assertion(), &alice(), &list, &session)
         .await;
     let state = session.get_custom("axess.fido2.disc_state").await;
     let ts = session.get_custom("axess.fido2.disc_started").await;
@@ -636,7 +658,7 @@ async fn an_account_suspended_mid_registration_cannot_add_a_passkey() {
     f.identity
         .suspend_user(
             &user.id,
-            StatusDetail::administrative("test", chrono::Utc::now()),
+            StatusDetail::administrative("test", f.clock.now()),
         )
         .await
         .unwrap();
@@ -688,7 +710,7 @@ async fn a_passkey_only_method_ends_authenticated_with_the_passkey_recorded() {
     let list = begin_discoverable(&f, &session).await;
     let outcome = f
         .service
-        .finish_discoverable_login(&assertion(), &test_user("u1", "alice"), &list, &session)
+        .finish_discoverable_login(&assertion(), &alice(), &list, &session)
         .await
         .unwrap();
     assert!(
@@ -720,7 +742,7 @@ async fn a_password_then_passkey_method_is_not_satisfied_by_the_passkey_alone() 
     let list = begin_discoverable(&f, &session).await;
     let err = f
         .service
-        .finish_discoverable_login(&assertion(), &test_user("u1", "alice"), &list, &session)
+        .finish_discoverable_login(&assertion(), &alice(), &list, &session)
         .await
         .unwrap_err();
     assert!(matches!(err, AuthnError::NoFlow), "{err:?}");
@@ -743,7 +765,7 @@ async fn a_passkey_first_method_with_an_empty_choice_is_never_shortened() {
     let list = begin_discoverable(&f, &session).await;
     let err = f
         .service
-        .finish_discoverable_login(&assertion(), &test_user("u1", "alice"), &list, &session)
+        .finish_discoverable_login(&assertion(), &alice(), &list, &session)
         .await
         .unwrap_err();
     assert!(matches!(err, AuthnError::NoFlow), "{err:?}");
@@ -761,7 +783,7 @@ async fn a_passkey_then_more_method_continues_with_the_next_factor() {
     let list = begin_discoverable(&f, &session).await;
     let outcome = f
         .service
-        .finish_discoverable_login(&assertion(), &test_user("u1", "alice"), &list, &session)
+        .finish_discoverable_login(&assertion(), &alice(), &list, &session)
         .await
         .unwrap();
     assert!(
@@ -777,13 +799,13 @@ async fn a_suspended_tenant_refuses_the_passkey_login() {
     let f = fixture_with(
         true,
         vec![vec![FactorKind::Fido2]],
-        EntityState::Suspended(StatusDetail::administrative("hold", chrono::Utc::now())),
+        EntityState::Suspended(StatusDetail::administrative("hold", start())),
     );
     let session = test_session();
     let list = begin_discoverable(&f, &session).await;
     let err = f
         .service
-        .finish_discoverable_login(&assertion(), &test_user("u1", "alice"), &list, &session)
+        .finish_discoverable_login(&assertion(), &alice(), &list, &session)
         .await
         .unwrap_err();
     assert!(matches!(err, AuthnError::InvalidAssertion), "{err:?}");
@@ -801,7 +823,7 @@ async fn a_tenant_bound_ceremony_refuses_a_user_of_another_tenant() {
     let list = stored(&f).await.unwrap_or_default();
     let err = f
         .service
-        .finish_discoverable_login(&assertion(), &test_user("u1", "alice"), &list, &session)
+        .finish_discoverable_login(&assertion(), &alice(), &list, &session)
         .await
         .unwrap_err();
     assert!(matches!(err, AuthnError::CrossTenant), "{err:?}");
@@ -853,12 +875,12 @@ async fn a_missing_ceremony_state_does_not_leave_its_timestamp_behind() {
     session
         .set_custom(
             "axess.fido2.disc_started",
-            serde_json::Value::String(f.clock.now().to_rfc3339()),
+            serde_json::Value::String(f.clock.now().to_rfc3339_numeric_offset()),
         )
         .await;
     let err = f
         .service
-        .finish_discoverable_login(&assertion(), &test_user("u1", "alice"), &[], &session)
+        .finish_discoverable_login(&assertion(), &alice(), &[], &session)
         .await
         .unwrap_err();
     assert!(matches!(err, AuthnError::NoFlow), "{err:?}");
@@ -883,13 +905,14 @@ impl axess_core::metrics::AuthFlowMetrics for FailureCount {
 
 /// A ceremony begun for one tenant refusing a user of another is a login
 /// refusal like any other: it leaves a failed row naming the user and the
-/// reason, and counts as a failure. It used to be answered silently.
+/// reason, and counts as a failure. It is not answered silently.
 #[tokio::test]
 async fn a_cross_tenant_refusal_is_audited_and_counted() {
     use axess_core::authn::event::{AuthEventStatus, AuthEventType};
     let f = fixture(true);
     let counter = FailureCount::default();
     let service = AuthnService::builder(f.identity.clone(), f.factors.clone())
+        .with_clock(f.clock.clone())
         .with_fido2(AcceptingProvider(DefaultFido2Provider::new(
             WebauthnBuilder::new("localhost", &Url::parse("https://localhost:8443").unwrap())
                 .unwrap()
@@ -911,7 +934,7 @@ async fn a_cross_tenant_refusal_is_audited_and_counted() {
     let list = stored(&f).await.unwrap_or_default();
 
     let err = service
-        .finish_discoverable_login(&assertion(), &test_user("u1", "alice"), &list, &session)
+        .finish_discoverable_login(&assertion(), &alice(), &list, &session)
         .await
         .unwrap_err();
 
@@ -935,7 +958,7 @@ async fn a_cross_tenant_refusal_is_audited_and_counted() {
         Some(test_user("u1", "alice").tenant_id),
         "attributed to the user's tenant of record"
     );
-    assert_eq!(rows[0].session_id, Some(session.session_id().await));
+    assert_eq!(rows[0].session_id, Some(session.session_key().await));
     assert_eq!(
         counter.0.load(std::sync::atomic::Ordering::SeqCst),
         1,
@@ -977,14 +1000,14 @@ async fn a_wrong_tenant_on_the_record_is_audited_against_the_tenant_of_record() 
 
 /// The tenant a ceremony began for is retired with the ceremony on every
 /// way out, so it cannot bind a later ceremony begun without one. The
-/// tenant-gate exit (a suspended tenant) used to leave it behind.
+/// tenant-gate exit (a suspended tenant) is one of those ways out.
 #[tokio::test]
 async fn the_ceremony_tenant_is_cleared_on_the_tenant_gate_exit() {
     use axess_core::authn::types::{EntityState, StatusDetail};
     let f = fixture_with(
         true,
         vec![vec![FactorKind::Fido2]],
-        EntityState::Suspended(StatusDetail::administrative("hold", chrono::Utc::now())),
+        EntityState::Suspended(StatusDetail::administrative("hold", start())),
     );
     let session = test_session();
     f.service
@@ -994,7 +1017,7 @@ async fn the_ceremony_tenant_is_cleared_on_the_tenant_gate_exit() {
     let list = stored(&f).await.unwrap_or_default();
     let err = f
         .service
-        .finish_discoverable_login(&assertion(), &test_user("u1", "alice"), &list, &session)
+        .finish_discoverable_login(&assertion(), &alice(), &list, &session)
         .await
         .unwrap_err();
     assert!(matches!(err, AuthnError::InvalidAssertion), "{err:?}");
@@ -1015,10 +1038,10 @@ async fn the_ceremony_tenant_is_cleared_on_the_expiry_exit() {
         .await
         .unwrap();
     let list = stored(&f).await.unwrap_or_default();
-    f.clock.advance(chrono::Duration::hours(1));
+    f.clock.advance(axess_clock::SignedDuration::hours(1));
     let err = f
         .service
-        .finish_discoverable_login(&assertion(), &test_user("u1", "alice"), &list, &session)
+        .finish_discoverable_login(&assertion(), &alice(), &list, &session)
         .await
         .unwrap_err();
     assert!(matches!(err, AuthnError::NoFlow), "{err:?}");
@@ -1045,7 +1068,7 @@ async fn a_store_error_at_a_gate_clears_the_discoverable_ceremony() {
 
     let result = f
         .service
-        .finish_discoverable_login(&assertion(), &test_user("u1", "alice"), &list, &session)
+        .finish_discoverable_login(&assertion(), &alice(), &list, &session)
         .await;
 
     assert!(matches!(result, Err(AuthnError::Store(_))), "{result:?}");
@@ -1056,4 +1079,93 @@ async fn a_store_error_at_a_gate_clears_the_discoverable_ceremony() {
             .is_none_or(|v| v.is_null()),
         "the ceremony state outlived a failed call"
     );
+}
+
+// ── The assertion names its user ─────────────────────────────────────────────
+
+/// What a passwordless finish answers for `assertion` presented as `user`,
+/// with the stored passkey and a provider that accepts any signature: only
+/// the user handle stands between the assertion and a login.
+async fn finish_as(
+    assertion: &PublicKeyCredential,
+    user: &axess_core::authn::types::User,
+) -> (
+    Fixture,
+    axess_core::session::extractor::AuthSession,
+    Result<FactorOutcome, String>,
+) {
+    let f = fixture(true);
+    let session = test_session();
+    let list = begin_discoverable(&f, &session).await;
+    let outcome = f
+        .service
+        .finish_discoverable_login(assertion, user, &list, &session)
+        .await
+        .map_err(|e| format!("{e:?}"));
+    (f, session, outcome)
+}
+
+/// A refused handle is a failed assertion: counted, the ceremony consumed,
+/// nobody signed in.
+async fn assert_refused_as_a_failed_assertion(
+    f: &Fixture,
+    session: &axess_core::session::extractor::AuthSession,
+    outcome: Result<FactorOutcome, String>,
+    case: &str,
+) {
+    assert_eq!(
+        outcome.as_ref().err().map(String::as_str),
+        Some("InvalidAssertion"),
+        "{case}: {outcome:?}"
+    );
+    assert!(!session.is_authenticated().await, "{case}");
+    assert_eq!(f.identity.failed_attempts_for("u1"), 1, "{case}");
+    assert!(
+        session
+            .get_custom("axess.fido2.disc_state")
+            .await
+            .is_none_or(|v| v.is_null()),
+        "{case}: the challenge was consumed"
+    );
+}
+
+#[tokio::test]
+async fn an_assertion_whose_user_handle_names_another_account_is_refused() {
+    let (f, session, outcome) = finish_as(&assertion_naming(Some(BOB_HANDLE_B64)), &alice()).await;
+    assert_refused_as_a_failed_assertion(&f, &session, outcome, "another account's handle").await;
+}
+
+#[tokio::test]
+async fn an_assertion_with_no_user_handle_is_refused() {
+    let (f, session, outcome) = finish_as(&assertion_naming(None), &alice()).await;
+    assert_refused_as_a_failed_assertion(&f, &session, outcome, "no handle").await;
+}
+
+/// A user whose record holds no WebAuthn handle cannot be named by one: the
+/// application did not keep the handle its registration minted.
+#[tokio::test]
+async fn a_user_with_no_handle_on_record_is_refused() {
+    let (f, session, outcome) = finish_as(&assertion(), &test_user("u1", "alice")).await;
+    assert_refused_as_a_failed_assertion(&f, &session, outcome, "no handle on record").await;
+}
+
+#[tokio::test]
+async fn an_assertion_naming_its_user_signs_in() {
+    let (_, session, outcome) = finish_as(&assertion(), &alice()).await;
+    assert!(
+        matches!(outcome, Ok(FactorOutcome::Authenticated)),
+        "{outcome:?}"
+    );
+    assert!(session.is_authenticated().await);
+}
+
+/// The start of a ceremony is stored in the session as RFC 3339 text with a
+/// numeric UTC offset, the form earlier releases wrote and read.
+#[tokio::test]
+async fn a_ceremony_start_is_stored_as_rfc_3339_with_a_numeric_offset() {
+    let f = fixture(true);
+    let session = test_session();
+    f.service.begin_discoverable_login(&session).await.unwrap();
+    let stored = session.get_custom("axess.fido2.disc_started").await;
+    assert_eq!(stored, Some(serde_json::json!("2026-01-01T00:00:00+00:00")));
 }

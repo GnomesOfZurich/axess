@@ -1,0 +1,23 @@
+error[E0560]: struct `AuthzInstallation` has no field named `store`
+  --> tests/ui/authz_installation_without_new.rs:14:9
+   |
+14 |         store,
+   |         ^^^^^ `AuthzInstallation` does not have this field
+   |
+   = note: all struct fields are already assigned
+
+error[E0560]: struct `AuthzInstallation` has no field named `entities`
+  --> tests/ui/authz_installation_without_new.rs:15:9
+   |
+15 |         entities,
+   |         ^^^^^^^^ `AuthzInstallation` does not have this field
+   |
+   = note: all struct fields are already assigned
+
+error[E0560]: struct `AuthzInstallation` has no field named `context`
+  --> tests/ui/authz_installation_without_new.rs:16:9
+   |
+16 |         context: None,
+   |         ^^^^^^^ `AuthzInstallation` does not have this field
+   |
+   = note: all struct fields are already assigned

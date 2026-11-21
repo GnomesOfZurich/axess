@@ -13,18 +13,27 @@ release-candidate RSA:
 | `hmac`, `sha1`, `sha2`, `argon2` | two each |
 | `rand`, `base64` | three each |
 
-The old lines come from `jsonwebtoken` (p256 0.13) and `axess`'s own pin; the
-new ones from `openidconnect` and `webauthn-rs` through `crypto-glue`. Two
-advisory ignores stay only because of the old lines.
+The old curve line comes from `jsonwebtoken` (p256 and p384 0.13, for its
+`rust_crypto` backend). The old `rsa` line comes from `jsonwebtoken`,
+`openidconnect`, `axess-core`'s `local-idp-rsa`, `axess-testing` and the
+workspace's test code. The new lines come from `openidconnect`, `webauthn-rs`
+through `crypto-glue`, and `axess`'s own `p256`, which is on 0.14. Two
+advisory ignores stay. The one for `crypto-bigint` stays only because of the
+old curve line. The one for `rsa` stays because of both lines: the new one
+is `rsa` 0.10.0-rc.19 under `fido2`, a pre-release of the fixed release,
+which the advisory counts as affected.
 
 ## Plan
 
 1. After the JOSE core merge ([jose-core.md](jose-core.md)) the verify paths
    use one backend. Track a `jsonwebtoken` release on p256 0.14.
-2. Until then, move the direct `p256` uses (`oauth/types/dpop_key.rs`,
+2. The direct `p256` uses (`oauth/types/dpop_key.rs`,
    `oauth/provider/dpop.rs`, the local IdP's EC keys in
-   `local_idp/primitives.rs`) to the backend `jsonwebtoken` uses, or sign DPoP
-   proofs through aws-lc when `jwt-aws-lc` is on.
+   `local_idp/primitives.rs`) are on 0.14, so a build on `jwt-aws-lc` carries
+   no 0.13 curve stack. Every `rsa` requirement of the workspace moves to
+   0.10.0 when `crypto-glue` takes that release and `jsonwebtoken` and
+   `openidconnect` accept it (see
+   [Held back, and what lifts each](README.md#held-back-and-what-lifts-each)).
 3. Settle on one TLS and crypto provider: switch `ldap3` from
    `tls-rustls-ring` to its aws-lc feature, so ring leaves a build that has
    `ldap` and the rest on aws-lc.

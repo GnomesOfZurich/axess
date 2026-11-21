@@ -5,13 +5,14 @@
 //! Typically composed under [`super::EntityCache`] as the L2 tier.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::Duration;
 
 use cedar_policy::{Entities, EntityUid};
 use fred::prelude::*;
 use tracing::warn;
 
-use self::index_ops::drain_index;
+use self::index_ops::{drain_index, store_indexed, ttl_millis};
 use super::generation::Generations;
 use crate::authz::error::AuthzError;
 use crate::authz::provider::RequestEntityProvider;
@@ -22,6 +23,14 @@ pub(crate) mod index_ops;
 
 #[cfg(test)]
 mod index_tests;
+#[cfg(test)]
+mod key_tests;
+#[cfg(test)]
+mod live_scope_tests;
+#[cfg(test)]
+mod live_tests;
+#[cfg(test)]
+mod untagged_cluster_tests;
 
 const DEFAULT_PREFIX: &str = "axess";
 const DEFAULT_TTL_SECS: u64 = 60;
@@ -63,8 +72,14 @@ const DEFAULT_TTL_SECS: u64 = 60;
 /// the three `EntityUid` `Display` representations and the tenant joined
 /// with `|`, then the SHA-256 (hex) of the inner provider's
 /// [`cache_discriminator`](RequestEntityProvider::cache_discriminator), or
-/// nothing when it has none. Cedar UIDs are already serialisable text and
-/// unique enough that no extra hashing is needed.
+/// nothing when it has none. Each part has its `%` and `|` percent-escaped
+/// (`%25`, `%7C`), so a part cannot produce the separator and two different
+/// inputs cannot produce one key; the tenant segment is `t:{tenant}` for a
+/// session with a tenant and empty for one without, so no tenant and an
+/// empty tenant are different keys. The tenant has its `:` escaped as well
+/// (`%3A`), so its segment holds one `:`, after the `t`, and an entity UID
+/// (whose text always holds `::`) cannot spell it. Cedar UIDs are already
+/// serialisable text and unique enough that no extra hashing is needed.
 ///
 /// # Entity index
 ///
@@ -75,8 +90,11 @@ const DEFAULT_TTL_SECS: u64 = 60;
 /// of that SET and deletes the entries they name, so it also drops the
 /// entries built under a parent (a folder, group or role) whose UID is in
 /// their entity sets. A member another pod adds while it runs stays in the
-/// SET until a later read takes it. An entry whose index could not be
-/// written is not stored.
+/// SET until a later read takes it. The index is written before the entry
+/// and again after it, so an entry whose index could not be written is not
+/// stored, and an entry whose member an invalidation on another pod took
+/// between its index write and its entry write is indexed again for the
+/// next invalidation.
 ///
 /// # Caching contract
 ///
@@ -109,6 +127,18 @@ const DEFAULT_TTL_SECS: u64 = 60;
 /// TTL is a safety net, not a substitute. Short TTLs (60s default)
 /// bound the worst-case exposure; explicit invalidation on mutation is
 /// the correctness path.
+///
+/// # On a Valkey cluster
+///
+/// Give the prefix a hash tag (`with_prefix("{axess}")`): every entry and
+/// index key then hashes to one slot, so the SCAN of an invalidation reaches
+/// every entry and its DEL is one slot's. Without a hash tag the entries
+/// would spread over the nodes, where the SCAN of an invalidation reaches
+/// one node and its DEL is refused across slots, so an entry could outlive
+/// the invalidation meant to drop it. On a clustered client whose prefix has
+/// no hash tag the cache therefore stores nothing: every call reads the
+/// inner provider, the first says why at `warn`, and an invalidation has
+/// nothing to drop.
 ///
 /// # Cross-pod invalidation
 ///
@@ -148,6 +178,8 @@ where
     prefix: Arc<str>,
     ttl: Duration,
     generations: Generations,
+    /// Set once the cache has said it stores nothing on this cluster.
+    untagged_warned: AtomicBool,
 }
 
 impl<P> ValkeyEntityCache<P>
@@ -163,6 +195,7 @@ where
             prefix: DEFAULT_PREFIX.into(),
             ttl: Duration::from_secs(DEFAULT_TTL_SECS),
             generations: Generations::new(),
+            untagged_warned: AtomicBool::new(false),
         }
     }
 
@@ -179,6 +212,7 @@ where
             prefix: prefix.into(),
             ttl,
             generations: Generations::new(),
+            untagged_warned: AtomicBool::new(false),
         }
     }
 
@@ -194,6 +228,13 @@ where
         self
     }
 
+    /// Whether entries may be stored: on a single node always, on a cluster
+    /// only under a hash-tag prefix (see the struct docs). Read on each call,
+    /// since [`with_prefix`](Self::with_prefix) may change the prefix.
+    fn stores_entries(&self) -> bool {
+        !self.client.is_clustered() || has_hash_tag(&self.prefix)
+    }
+
     /// Build the cache key for `(principal, tenant, resource, action)`.
     /// Tenant from session disambiguates entries for the same user
     /// acting in different tenants (membership model).
@@ -206,9 +247,12 @@ where
         discriminator: Option<&str>,
     ) -> String {
         format!(
-            "{}:authz-entities:{principal}|{t}|{resource}|{action}|{d}",
+            "{}:authz-entities:{p}|{t}|{r}|{a}|{d}",
             self.prefix,
-            t = tenant.unwrap_or(""),
+            p = key_part(&principal.to_string()),
+            t = tenant_part(tenant),
+            r = key_part(&resource.to_string()),
+            a = key_part(&action.to_string()),
             d = discriminator.map(hash_discriminator).unwrap_or_default(),
         )
     }
@@ -234,10 +278,10 @@ where
         let pattern = format!(
             "{}:authz-entities:{}|{}|{}|{}|*",
             self.prefix,
-            glob_escape(&principal.to_string()),
-            glob_escape(tenant.unwrap_or("")),
-            glob_escape(&resource.to_string()),
-            glob_escape(&action.to_string()),
+            glob_escape(&key_part(&principal.to_string())),
+            glob_escape(&tenant_part(tenant)),
+            glob_escape(&key_part(&resource.to_string())),
+            glob_escape(&key_part(&action.to_string())),
         );
         self.scan_and_delete(&pattern).await
     }
@@ -262,6 +306,10 @@ where
     /// avoid pulling `futures-util` into axess-core's transitive
     /// surface for one call site.
     async fn scan_and_delete(&self, pattern: &str) -> Result<(), fred::error::Error> {
+        if !self.stores_entries() {
+            // Nothing was stored, so there is nothing to find.
+            return Ok(());
+        }
         let mut cursor: String = "0".to_string();
         loop {
             let (next_cursor, batch): (String, Vec<String>) = self
@@ -304,7 +352,7 @@ where
         let pattern = format!(
             "{}:authz-entities:{}|*",
             self.prefix,
-            glob_escape(&principal.to_string())
+            glob_escape(&key_part(&principal.to_string()))
         );
         self.scan_and_delete(&pattern).await
     }
@@ -326,12 +374,14 @@ where
         resource: &EntityUid,
     ) -> Result<(), fred::error::Error> {
         self.generations.bump_resource(resource);
-        let index = self.index_key(resource);
-        drain_index(&self.client, &index).await?;
+        if self.stores_entries() {
+            let index = self.index_key(resource);
+            drain_index(&self.client, &index).await?;
+        }
         let pattern = format!(
             "{}:authz-entities:*|{}|*",
             self.prefix,
-            glob_escape(&resource.to_string())
+            glob_escape(&key_part(&resource.to_string()))
         );
         self.scan_and_delete(&pattern).await
     }
@@ -341,43 +391,41 @@ where
         format!("{}:authz-entities-uid:{uid}", self.prefix)
     }
 
-    /// Record `entry_key` in the index SET of every entity in `entities` and
-    /// of `resource`, each expiring with the entry. Written before the entry
-    /// so an entry is never stored unindexed.
-    async fn write_index(
-        &self,
-        entry_key: &str,
-        resource: &EntityUid,
-        entities: &Entities,
-    ) -> Result<(), fred::error::Error> {
+    /// The index SETs an entry built for `resource` from `entities` is named
+    /// in: one per entity in the set, and the resource's own.
+    fn index_keys(&self, resource: &EntityUid, entities: &Entities) -> Vec<String> {
         let mut uids: Vec<EntityUid> = entities.iter().map(|e| e.uid()).collect();
         if !uids.contains(resource) {
             uids.push(resource.clone());
         }
-        let ttl_ms = self.ttl.as_millis().clamp(1, i64::MAX as u128) as i64;
-        let pipeline = self.client.pipeline();
-        for uid in uids {
-            let index = self.index_key(&uid);
-            let _: () = pipeline.sadd(&index, entry_key).await?;
-            let _: () = pipeline.pexpire(&index, ttl_ms, None).await?;
-        }
-        let _: Vec<Value> = pipeline.all().await?;
-        Ok(())
+        uids.iter().map(|uid| self.index_key(uid)).collect()
     }
 
     /// Drop every cache entry whose `tenant` segment matches.
     ///
     /// Implementation note: the cache key encodes principal **before**
-    /// tenant, so a glob like `*|{tenant}|*` would match across the
-    /// whole `*` (principal) range, which Valkey supports but
-    /// requires care if the principal stringification can contain
-    /// `|`. Cedar EntityUid strings do not contain `|` in practice,
-    /// so the pattern is safe; if you adopt a custom EntityUid format
-    /// that does, prefer a per-tenant key prefix instead.
+    /// tenant, so the glob `*|t:{tenant}|*` matches across the whole `*`
+    /// (principal) range, and any segment of a key could be the one it
+    /// matches. The principal, tenant, resource and action of a key have
+    /// their `|` and `%` percent-escaped, the tenant its `:` as well, and
+    /// the discriminator is a hex digest. So the tenant segment holds one
+    /// `:`, the principal, resource and action segments are entity UIDs
+    /// whose text always holds `::` (a resource of type `t` included), and
+    /// none of them can produce the `|t:{tenant}|` segment of a tenant; a
+    /// tenant carrying `|` or `:` matches only its own entries.
     pub async fn invalidate_tenant(&self, tenant: &str) -> Result<(), fred::error::Error> {
         self.generations.bump_tenant(tenant);
-        let pattern = format!("{}:authz-entities:*|{}|*", self.prefix, glob_escape(tenant));
+        let pattern = self.tenant_pattern(tenant);
         self.scan_and_delete(&pattern).await
+    }
+
+    /// The SCAN pattern matching every entry of `tenant`.
+    fn tenant_pattern(&self, tenant: &str) -> String {
+        format!(
+            "{}:authz-entities:*|{}|*",
+            self.prefix,
+            glob_escape(&tenant_part(Some(tenant)))
+        )
     }
 }
 
@@ -388,6 +436,35 @@ fn hash_discriminator(discriminator: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(discriminator.as_bytes());
     digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A part of a cache key: `%` and the separator `|` percent-escaped, so a
+/// part cannot produce the separator, two different inputs cannot produce
+/// one key, and a part cannot produce the segment of another part's value.
+fn key_part(s: &str) -> String {
+    s.replace('%', "%25").replace('|', "%7C")
+}
+
+/// The tenant segment of a cache key: empty for a session without a tenant,
+/// `t:` and the escaped tenant for one with, so no tenant and an empty
+/// tenant are different keys. The tenant's `:` is escaped too (`%3A`, after
+/// `%`, so the escape stays one to one), which leaves the segment one `:`
+/// and keeps an entity UID, whose text always holds `::`, from spelling it.
+fn tenant_part(tenant: Option<&str>) -> String {
+    match tenant {
+        None => String::new(),
+        Some(t) => format!("t:{}", key_part(t).replace(':', "%3A")),
+    }
+}
+
+/// Whether keys under `prefix` hash by a tag of the prefix: the key's first
+/// `{` is in the prefix, and the first `}` after it is too, with something
+/// between them. Every key under such a prefix is in one cluster slot.
+fn has_hash_tag(prefix: &str) -> bool {
+    prefix
+        .find('{')
+        .and_then(|open| prefix[open + 1..].find('}'))
+        .is_some_and(|len| len > 0)
 }
 
 /// Escape the characters SCAN MATCH reads as a glob (`*`, `?`, `[`, `]`,
@@ -448,6 +525,18 @@ where
         Box<dyn std::future::Future<Output = Result<Entities, AuthzError>> + Send + 'a>,
     > {
         Box::pin(async move {
+            if !self.stores_entries() {
+                if !self.untagged_warned.swap(true, AtomicOrdering::Relaxed) {
+                    warn!(
+                        prefix = %self.prefix,
+                        "valkey cache: the client is clustered and the prefix has no hash tag, so nothing is cached (give it one, such as {{axess}}); said once"
+                    );
+                }
+                return self
+                    .inner
+                    .entities_for(session, principal, resource, action)
+                    .await;
+            }
             let tenant = session.tenant_id().await;
             let tenant_str = tenant.as_ref().map(|t| t.to_string());
             let discriminator = self.inner.cache_discriminator(session).await;
@@ -514,29 +603,30 @@ where
             }
 
             // Best-effort populate. Failure to write is a warn, not a hard
-            // error; the request already has its answer.
+            // error; the request already has its answer. The index is
+            // written around the entry (see `store_indexed`), so a failure
+            // leaves the entry unstored or indexed, never unindexed.
             let mut buf = Vec::new();
             match entities.write_to_json(&mut buf) {
                 Ok(()) => match String::from_utf8(buf) {
                     Ok(s) => {
-                        if let Err(e) = self.write_index(&key, resource, &entities).await {
-                            warn!(?e, key = %key, "valkey cache: index write failed; not storing");
-                            return Ok(entities);
+                        let indexes = self.index_keys(resource, &entities);
+                        let stored =
+                            store_indexed(&self.client, &indexes, &key, &s, ttl_millis(self.ttl))
+                                .await;
+                        if let Err(e) = &stored {
+                            warn!(?e, key = %key, "valkey cache: storing the entry failed");
                         }
-                        let res: Result<(), _> = self
-                            .client
-                            .set(&key, s, Some(expiration_for(self.ttl)), None, false)
-                            .await;
-                        if let Err(e) = res {
-                            warn!(?e, key = %key, "valkey cache: SET failed");
-                        } else if !self.generations.is_current(
+                        // Whether or not the store reported an error (the
+                        // entry may have been written before it): an
+                        // invalidation slipped in between the check and the
+                        // write, so take the write back.
+                        if !self.generations.is_current(
                             generation,
                             principal,
                             tenant_str.as_deref(),
                             resource,
                         ) {
-                            // An invalidation slipped in between the check
-                            // and the write: take the write back.
                             let _: Result<(), _> = self.client.del(&key).await;
                         }
                     }
@@ -580,236 +670,5 @@ where
                 Err(_) => HealthStatus::Unhealthy("valkey cache PING timeout (2s)".into()),
             }
         })
-    }
-}
-
-/// The `SET` expiry for a cache TTL. Written in milliseconds so a TTL under a
-/// second is not rounded to zero (which Valkey refuses, silently disabling the
-/// cache); never less than 1 ms.
-fn expiration_for(ttl: Duration) -> Expiration {
-    Expiration::PX(ttl.as_millis().clamp(1, i64::MAX as u128) as i64)
-}
-
-#[cfg(test)]
-mod tests {
-    /// A sub-second TTL must still be a positive expiry.
-    #[test]
-    fn a_sub_second_ttl_is_a_positive_expiry() {
-        for ttl in [Duration::from_millis(500), Duration::ZERO] {
-            match super::expiration_for(ttl) {
-                Expiration::EX(n) | Expiration::PX(n) => assert!(n >= 1, "{ttl:?} gave {n}"),
-                other => panic!("unexpected {other:?}"),
-            }
-        }
-        assert!(matches!(
-            super::expiration_for(Duration::from_secs(60)),
-            Expiration::PX(60_000)
-        ));
-    }
-
-    /// The glob characters a principal or tenant may carry are escaped, so a
-    /// principal `a[1]` matches its own key and a tenant `*` matches only
-    /// the tenant spelled `*`.
-    #[test]
-    fn glob_escape_neutralises_pattern_characters() {
-        assert_eq!(
-            super::glob_escape(r#"App::User::"a[1]""#),
-            r#"App::User::"a\[1\]""#
-        );
-        assert_eq!(super::glob_escape("*"), r"\*");
-        assert_eq!(super::glob_escape("plain-tenant"), "plain-tenant");
-        assert_eq!(super::glob_escape(r"a\b?"), r"a\\b\?");
-    }
-
-    use super::*;
-    use cedar_policy::Entities;
-    use std::str::FromStr;
-
-    struct StubProvider;
-    impl RequestEntityProvider for StubProvider {
-        fn entities_for<'a>(
-            &'a self,
-            _session: &'a AuthSession,
-            _principal: &'a EntityUid,
-            _resource: &'a EntityUid,
-            _action: &'a EntityUid,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<Entities, AuthzError>> + Send + 'a>,
-        > {
-            Box::pin(async { Ok(Entities::empty()) })
-        }
-    }
-
-    fn uid(s: &str) -> EntityUid {
-        EntityUid::from_str(s).expect("valid EntityUid literal")
-    }
-
-    fn cache() -> ValkeyEntityCache<StubProvider> {
-        ValkeyEntityCache::new(StubProvider, Client::default())
-    }
-
-    #[test]
-    fn cache_key_distinguishes_inputs_and_carries_components() {
-        let c = cache();
-        let p = uid("App::User::\"alice\"");
-        let r1 = uid("App::Doc::\"doc-1\"");
-        let r2 = uid("App::Doc::\"doc-2\"");
-        let a = uid("App::Action::\"View\"");
-
-        let k1 = c.cache_key(&p, Some("t1"), &r1, &a, None);
-        let k2 = c.cache_key(&p, Some("t1"), &r2, &a, None);
-        let k3 = c.cache_key(&p, Some("t2"), &r1, &a, None);
-        let k_none = c.cache_key(&p, None, &r1, &a, None);
-
-        assert!(
-            k1.contains("alice") && k1.contains("doc-1") && k1.contains("View"),
-            "key must carry principal/resource/action: {k1}"
-        );
-        assert!(
-            k1.starts_with(&format!("{DEFAULT_PREFIX}:authz-entities:")),
-            "key must carry prefix namespace: {k1}"
-        );
-        assert_ne!(k1, k2, "different resources must yield different keys");
-        assert_ne!(k1, k3, "different tenants must yield different keys");
-        assert_ne!(
-            k1, k_none,
-            "Some(tenant) and None must yield different keys"
-        );
-        assert!(
-            !k1.is_empty() && k1 != "xyzzy",
-            "kills `String::new()` and `xyzzy` mutations"
-        );
-    }
-
-    /// A session-state discriminator separates entries of one user and
-    /// tenant, and reaches the key only as a hash.
-    #[test]
-    fn cache_key_separates_sessions_by_discriminator_without_leaking_it() {
-        let c = cache();
-        let p = uid("App::User::\"alice\"");
-        let r = uid("App::Doc::\"doc-1\"");
-        let a = uid("App::Action::\"View\"");
-
-        let plain = c.cache_key(&p, Some("t1"), &r, &a, None);
-        let mfa = c.cache_key(&p, Some("t1"), &r, &a, Some("mfa=1"));
-        let no_mfa = c.cache_key(&p, Some("t1"), &r, &a, Some("mfa=0"));
-        assert_ne!(mfa, no_mfa);
-        assert_ne!(plain, mfa);
-        assert!(!mfa.contains("mfa=1"), "the discriminator is hashed: {mfa}");
-        assert_eq!(mfa, c.cache_key(&p, Some("t1"), &r, &a, Some("mfa=1")));
-        assert_eq!(hash_discriminator("mfa=1").len(), 64);
-    }
-}
-
-// ── live-server tests (ignored by default) ──────────────────────────────
-
-#[cfg(test)]
-mod live_tests {
-    use super::*;
-    use std::collections::{HashMap, HashSet};
-    use std::str::FromStr;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    /// A provider whose resource sits in a folder: the folder is part of
-    /// every entity set it builds, as the resource's parent.
-    struct FolderedProvider {
-        calls: Arc<AtomicUsize>,
-        folder: EntityUid,
-    }
-
-    impl RequestEntityProvider for FolderedProvider {
-        fn entities_for<'a>(
-            &'a self,
-            session: &'a AuthSession,
-            principal: &'a EntityUid,
-            resource: &'a EntityUid,
-            action: &'a EntityUid,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<Entities, AuthzError>> + Send + 'a>,
-        > {
-            let _ = (session, action);
-            Box::pin(async move {
-                self.calls.fetch_add(1, Ordering::SeqCst);
-                let entity = |uid: &EntityUid, parents: HashSet<EntityUid>| {
-                    cedar_policy::Entity::new(uid.clone(), HashMap::new(), parents).unwrap()
-                };
-                Ok(Entities::from_entities(
-                    vec![
-                        entity(principal, HashSet::new()),
-                        entity(&self.folder, HashSet::new()),
-                        entity(resource, HashSet::from([self.folder.clone()])),
-                    ],
-                    None,
-                )
-                .unwrap())
-            })
-        }
-    }
-
-    fn guest_session() -> AuthSession {
-        use crate::session::SessionData;
-        use crate::session::id::SessionId;
-        use crate::session::layer::{SessionHandle, SessionInner};
-        use tokio::sync::RwLock;
-
-        let inner = SessionInner {
-            id: SessionId::new(&axess_rng::SystemRng),
-            data: SessionData::default(),
-            modified: false,
-            needs_persist: false,
-            regenerate: false,
-            pre_cycle_id: None,
-            rng: Arc::new(axess_rng::SystemRng),
-            pending_fingerprint: None,
-            max_custom_bytes: 64 * 1024,
-            consume: None,
-        };
-        AuthSession(SessionHandle(Arc::new(RwLock::new(inner))))
-    }
-
-    async fn live_client() -> Client {
-        let url = std::env::var("VALKEY_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
-        let client = Client::new(Config::from_url(&url).expect("url"), None, None, None);
-        client.init().await.expect("connect");
-        client
-    }
-
-    /// Invalidating a folder drops the entries of the documents in it, on
-    /// the shared tier as on the in-process one: the folder is in their
-    /// entity sets, not in their keys.
-    #[tokio::test]
-    #[ignore = "requires a running Valkey (VALKEY_URL)"]
-    async fn invalidating_a_folder_drops_the_entries_of_the_documents_in_it() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let folder = EntityUid::from_str("App::Folder::\"f1\"").unwrap();
-        let cached = ValkeyEntityCache::with_options(
-            FolderedProvider {
-                calls: calls.clone(),
-                folder: folder.clone(),
-            },
-            live_client().await,
-            "axt_folder",
-            Duration::from_secs(60),
-        );
-        let s = guest_session();
-        let p = EntityUid::from_str("App::User::\"alice\"").unwrap();
-        let a = EntityUid::from_str("App::Action::\"View\"").unwrap();
-        let docs = [
-            EntityUid::from_str("App::Doc::\"d1\"").unwrap(),
-            EntityUid::from_str("App::Doc::\"d2\"").unwrap(),
-        ];
-        cached.invalidate_all().await.unwrap();
-        for res in &docs {
-            cached.entities_for(&s, &p, res, &a).await.unwrap();
-        }
-        cached.invalidate_resource(&folder).await.unwrap();
-        for res in &docs {
-            cached.entities_for(&s, &p, res, &a).await.unwrap();
-        }
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            4,
-            "both documents are rebuilt after their folder changed"
-        );
     }
 }

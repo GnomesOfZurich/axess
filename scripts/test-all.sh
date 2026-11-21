@@ -275,9 +275,8 @@ fi
 
 # ── 6. Rustdoc links (backgrounded; the script isolates its own target dir) ──
 #
-# `cargo doc` ran nowhere in this script until 0.5.0, which is how the
-# workspace came to carry 29 unresolved intra-doc links: rustdoc warnings are
-# not compile errors and not test failures, so nothing read them. The script
+# Rustdoc warnings are not compile errors and not test failures, so without
+# this step nothing reads them and unresolved intra-doc links accumulate. The script
 # runs rustdoc with `-D warnings` and then proves it actually documented every
 # workspace member: `cargo doc` prints nothing and exits 0 when the docs are
 # already fresh, the same "green over nothing" shape the vacuity check above

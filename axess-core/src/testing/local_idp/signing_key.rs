@@ -1,12 +1,16 @@
+use axess_clock::testing::Shift;
+use std::sync::Arc;
+
 use super::*;
+use crate::testing::MockClock;
 use axess_factors::jwt::verifier::JwtVerifier;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 struct CustomClaims {}
 
-fn one_hour_from_now() -> DateTime<Utc> {
-    Utc::now() + Duration::hours(1)
+fn one_hour_from_now() -> Timestamp {
+    axess_clock::testing::MockClock::reference_time().plus(SignedDuration::hours(1))
 }
 
 /// Helper to PEM-encode a fresh RSA private key for the
@@ -31,16 +35,19 @@ fn fresh_rsa_pkcs8_pem() -> String {
 
 #[tokio::test]
 async fn from_rsa_pem_pkcs1_round_trips_through_verifier() {
+    let clock = MockClock::at_reference();
     let pem = fresh_rsa_pkcs1_pem();
     let signing_key = LocalIdpSigningKey::from_rsa_pem(&pem, "stable-kid", Algorithm::RS256)
         .expect("PKCS#1 PEM parse");
-    let idp = LocalIdpFixture::with_signing_key("https://test.idp.local", signing_key);
+    let idp = LocalIdpFixture::with_signing_key("https://test.idp.local", signing_key)
+        .with_clock(clock.clone());
     let token = idp.mint(
         &MintClaims::new("alice", one_hour_from_now())
             .with_audience("https://api.example.com")
-            .with_issued_at(Utc::now()),
+            .with_issued_at(axess_clock::testing::MockClock::reference_time()),
     );
     let verifier = JwtVerifier::new(idp.jwks_handle())
+        .with_clock(Arc::new(clock.clone()))
         .with_audience("https://api.example.com")
         .allow_any_issuer();
     verifier
@@ -52,16 +59,19 @@ async fn from_rsa_pem_pkcs1_round_trips_through_verifier() {
 
 #[tokio::test]
 async fn from_rsa_pem_pkcs8_round_trips_through_verifier() {
+    let clock = MockClock::at_reference();
     let pem = fresh_rsa_pkcs8_pem();
     let signing_key = LocalIdpSigningKey::from_rsa_pem(&pem, "pkcs8-kid", Algorithm::RS256)
         .expect("PKCS#8 PEM parse");
-    let idp = LocalIdpFixture::with_signing_key("https://test.idp.local", signing_key);
+    let idp = LocalIdpFixture::with_signing_key("https://test.idp.local", signing_key)
+        .with_clock(clock.clone());
     let token = idp.mint(
         &MintClaims::new("alice", one_hour_from_now())
             .with_audience("https://api.example.com")
-            .with_issued_at(Utc::now()),
+            .with_issued_at(axess_clock::testing::MockClock::reference_time()),
     );
     let verifier = JwtVerifier::new(idp.jwks_handle())
+        .with_clock(Arc::new(clock.clone()))
         .with_audience("https://api.example.com")
         .allow_any_issuer();
     verifier
@@ -82,19 +92,22 @@ fn from_rsa_pem_malformed_returns_error() {
 
 #[tokio::test]
 async fn from_rsa_pkcs1_der_round_trips() {
+    let clock = MockClock::at_reference();
     use rsa::pkcs1::EncodeRsaPrivateKey;
     let mut rng = rsa::rand_core::OsRng;
     let key = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("gen");
     let der = key.to_pkcs1_der().expect("DER").as_bytes().to_vec();
     let signing_key = LocalIdpSigningKey::from_rsa_pkcs1_der(&der, "der-kid", Algorithm::RS256)
         .expect("DER parse");
-    let idp = LocalIdpFixture::with_signing_key("https://test.idp.local", signing_key);
+    let idp = LocalIdpFixture::with_signing_key("https://test.idp.local", signing_key)
+        .with_clock(clock.clone());
     let token = idp.mint(
         &MintClaims::new("alice", one_hour_from_now())
             .with_audience("https://api.example.com")
-            .with_issued_at(Utc::now()),
+            .with_issued_at(axess_clock::testing::MockClock::reference_time()),
     );
     let verifier = JwtVerifier::new(idp.jwks_handle())
+        .with_clock(Arc::new(clock.clone()))
         .with_audience("https://api.example.com")
         .allow_any_issuer();
     verifier
@@ -115,19 +128,23 @@ fn from_rsa_pkcs1_der_malformed_returns_error() {
 /// key really is shared.
 #[tokio::test]
 async fn same_pem_loaded_twice_produces_interchangeable_fixtures() {
+    let clock = MockClock::at_reference();
     let pem = fresh_rsa_pkcs1_pem();
     let key1 = LocalIdpSigningKey::from_rsa_pem(&pem, "kid", Algorithm::RS256).unwrap();
     let key2 = LocalIdpSigningKey::from_rsa_pem(&pem, "kid", Algorithm::RS256).unwrap();
-    let idp1 = LocalIdpFixture::with_signing_key("https://test.idp.local", key1);
-    let idp2 = LocalIdpFixture::with_signing_key("https://test.idp.local", key2);
+    let idp1 =
+        LocalIdpFixture::with_signing_key("https://test.idp.local", key1).with_clock(clock.clone());
+    let idp2 =
+        LocalIdpFixture::with_signing_key("https://test.idp.local", key2).with_clock(clock.clone());
 
     let token = idp1.mint(
         &MintClaims::new("alice", one_hour_from_now())
             .with_audience("https://api.example.com")
-            .with_issued_at(Utc::now()),
+            .with_issued_at(axess_clock::testing::MockClock::reference_time()),
     );
     // Verify using idp2's JWKS handle; they should be interchangeable.
     let verifier = JwtVerifier::new(idp2.jwks_handle())
+        .with_clock(Arc::new(clock.clone()))
         .with_audience("https://api.example.com")
         .allow_any_issuer();
     verifier

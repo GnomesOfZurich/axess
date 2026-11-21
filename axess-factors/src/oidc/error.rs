@@ -50,13 +50,15 @@ pub enum OidcError {
     /// The cached key set is older than the cache's maximum age, so it is not
     /// used to verify anything until a refresh succeeds.
     #[error(
-        "cached JWKS is {age_secs} s old, past its {max_age_secs} s maximum age; refresh required"
+        "cached JWKS is {} s old, past its {} s maximum age; refresh required",
+        .age.as_secs(),
+        .max_age.as_secs()
     )]
     JwksExpired {
-        /// Seconds since the key set was fetched.
-        age_secs: u64,
-        /// The cache's maximum age, in seconds.
-        max_age_secs: u64,
+        /// How long ago the key set was fetched, to the millisecond.
+        age: std::time::Duration,
+        /// The cache's maximum age.
+        max_age: std::time::Duration,
     },
 
     /// The JWKS body was fetched but could not be parsed as RFC 7517 JSON.

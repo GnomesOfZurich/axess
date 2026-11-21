@@ -24,10 +24,9 @@ fn probe(policy: EgressPolicy) {
         .unwrap();
     runtime.block_on(async {
         let client = policy
-            .client_builder()
-            .timeout(Duration::from_secs(2))
-            .build()
-            .unwrap();
+            .build_client(|settings| settings.timeout(Duration::from_secs(2)))
+            .unwrap()
+            .into_inner();
         for url in ["http://localhost:9/", "https://localhost:9/"] {
             let _ = client.get(url).send().await;
         }

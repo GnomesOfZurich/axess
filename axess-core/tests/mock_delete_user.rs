@@ -2,7 +2,7 @@
 //! `MockIdentityStore::delete_user` follows the erasure contract instead of
 //! hitting the trait's panicking default.
 
-mod common;
+use axess_core::testing::fixtures as common;
 
 use axess_core::authn::factor::{
     FactorConfig, FactorKind, PasswordConfig, PasswordRules, ZeroizedString,
@@ -12,11 +12,10 @@ use axess_core::authn::store::{
 };
 use axess_core::authn::types::{AuthnScope, EntityState, User};
 use axess_core::testing::mock_authn::{MockFactorStore, MockIdentityStore, MockStoreError};
-use chrono::Utc;
 use common::{test_tenant, tid, uid};
 
 fn user(label: &str, identifier: &str) -> User {
-    let now = Utc::now();
+    let now = common::start();
     User {
         id: uid(label),
         tenant_id: tid("t1"),
@@ -54,6 +53,7 @@ async fn delete_user_erases_the_user_its_history_and_its_factors() {
             AuthMethod::sequential("password", vec![FactorKind::Password], scope(&alice)),
         );
     let identity = MockIdentityStore::new()
+        .with_clock(common::test_clock())
         .with_tenant(test_tenant())
         .with_user(alice.clone())
         .with_user(bob.clone())
@@ -117,7 +117,9 @@ async fn delete_user_erases_the_user_its_history_and_its_factors() {
 
 #[tokio::test]
 async fn delete_user_of_a_missing_user_is_not_found() {
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
+    let identity = MockIdentityStore::new()
+        .with_clock(common::test_clock())
+        .with_tenant(test_tenant());
     let err = identity.delete_user(&uid("ghost")).await.unwrap_err();
     assert!(matches!(err, MockStoreError::NotFound), "{err:?}");
 

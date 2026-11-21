@@ -23,7 +23,7 @@ use crate::authn::{
     types::AuthnScope,
 };
 use crate::session::extractor::AuthSession;
-use chrono::{DateTime, Utc};
+use axess_clock::Timestamp;
 use serde::{Deserialize, Serialize};
 
 /// Session custom key holding the [`FlowStamp`].
@@ -31,7 +31,7 @@ pub(crate) const FLOW_KEY: &str = crate::session::data::LOGIN_FLOW_KEY;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct FlowStamp {
-    started_at: DateTime<Utc>,
+    started_at: Timestamp,
     method: String,
     epoch: String,
     /// The steps the epoch was computed over, for a flow whose steps are
@@ -226,9 +226,8 @@ where
             session.clear().await;
             return Err(AuthnError::NoFlow);
         };
-        let age = self.inner.clock.now() - stamp.started_at;
-        let expired = age
-            .to_std()
+        let age = self.inner.clock.now().since(stamp.started_at);
+        let expired = std::time::Duration::try_from(age)
             .map(|a| a > self.inner.flow_ttl)
             // A start time in the future is a clock step or tampering.
             .unwrap_or(true);
@@ -296,12 +295,21 @@ mod stamp_tests {
         assert_ne!(password_identity(None), carried);
     }
 
+    /// The stamp's start is stored as an RFC 3339 instant in UTC with the
+    /// fewest fraction digits that hold it, and a stored stamp reads back.
+    #[test]
+    fn a_stamp_keeps_the_text_of_its_start() {
+        let stored = r#"{"started_at":"2026-01-01T00:00:00.120Z","method":"password","epoch":"e"}"#;
+        let stamp: FlowStamp = serde_json::from_str(stored).expect("reads");
+        assert_eq!(serde_json::to_string(&stamp).expect("writes"), stored);
+    }
+
     /// A step-up stamp carries its steps as a list in the stamp itself, not
     /// as a JSON string inside it.
     #[test]
     fn a_step_up_stamp_carries_its_steps_as_a_list() {
         let stamp = FlowStamp {
-            started_at: chrono::DateTime::UNIX_EPOCH,
+            started_at: Timestamp::UNIX_EPOCH,
             method: "step-up".into(),
             epoch: "e".into(),
             steps: Some(vec![FactorStep::Required(FactorKind::Totp)]),

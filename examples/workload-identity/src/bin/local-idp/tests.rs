@@ -1,10 +1,11 @@
 use super::*;
+use axess_clock::testing::Shift;
 
 #[test]
 fn issue_refuses_a_huge_lifetime_and_a_missing_audience() {
-    let now = chrono::Utc::now();
-    // These used to reach `now + Duration::seconds(..)`, which panics
-    // on overflow, or minted a token with no audience.
+    let now = axess_clock::testing::MockClock::reference_time();
+    // Unchecked, these would ask for an expiry past the range of a reading,
+    // or mint a token with no audience.
     for ttl in [i64::MAX, i64::MIN, 0, -1, MAX_TTL_SECS + 1] {
         let err = validated_expiry(now, ttl, Some("api")).unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST, "ttl {ttl}");
@@ -15,7 +16,7 @@ fn issue_refuses_a_huge_lifetime_and_a_missing_audience() {
     }
     assert_eq!(
         validated_expiry(now, MAX_TTL_SECS, Some("api")).unwrap(),
-        now + Duration::seconds(MAX_TTL_SECS)
+        now.plus(SignedDuration::seconds(MAX_TTL_SECS))
     );
 }
 
@@ -61,7 +62,11 @@ const ADMIN_TOKEN: &str = "admin-token-0123456789";
 const CI_TOKEN: &str = "ci-issue-token-0123456789";
 
 async fn state_in(dir: &Path) -> AppState {
-    state_in_with_clock(dir, Arc::new(SystemClock)).await
+    state_in_with_clock(
+        dir,
+        Arc::new(axess_clock::testing::MockClock::at_reference()),
+    )
+    .await
 }
 
 async fn state_in_with_clock(dir: &Path, clock: Arc<dyn Clock>) -> AppState {
@@ -70,7 +75,8 @@ async fn state_in_with_clock(dir: &Path, clock: Arc<dyn Clock>) -> AppState {
     let idp = LocalIdp::from_key_store(ISSUER, store.clone())
         .await
         .unwrap()
-        .with_max_ttl(Duration::seconds(MAX_TTL_SECS));
+        .with_clock(clock.clone())
+        .with_max_ttl(MAX_TTL);
     AppState {
         idp,
         store,
@@ -127,8 +133,11 @@ async fn retire(state: &AppState, kid: &str) -> Result<StatusCode, StatusCode> {
 fn age_rotation(store: &FileLocalIdpKeyStore, kid: &str) {
     let dir = store.root.join("rotated_at");
     std::fs::create_dir_all(&dir).unwrap();
-    let long_ago = store.clock.now() - Duration::seconds(2 * MAX_TTL_SECS);
-    std::fs::write(dir.join(kid), long_ago.to_rfc3339()).unwrap();
+    let long_ago = store
+        .clock
+        .now()
+        .minus(SignedDuration::seconds(2 * MAX_TTL_SECS));
+    std::fs::write(dir.join(kid), long_ago.to_rfc3339_numeric_offset()).unwrap();
 }
 
 #[tokio::test]
@@ -204,13 +213,13 @@ async fn a_key_minted_but_never_rotated_in_is_not_published() {
 #[tokio::test]
 async fn the_rotation_is_stamped_by_the_clock_the_retire_check_reads() {
     let dir = scratch_dir("clock");
-    let t0 = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+    let t0 = Timestamp::from_unix_seconds(1_800_000_000).unwrap();
     let clock = axess_clock::testing::MockClock::at(t0);
     let state = state_in_with_clock(&dir, Arc::new(clock.clone())).await;
     rotate(&state, "v2").await.unwrap();
 
     let stamped = std::fs::read_to_string(state.store.rotated_at_path("v1")).unwrap();
-    assert_eq!(stamped, t0.to_rfc3339());
+    assert_eq!(stamped, t0.to_rfc3339_numeric_offset());
     assert_eq!(retire(&state, "v1").await, Err(StatusCode::CONFLICT));
     clock.advance_secs(MAX_TTL_SECS + 1);
     assert_eq!(retire(&state, "v1").await, Ok(StatusCode::NO_CONTENT));
@@ -223,7 +232,7 @@ async fn the_rotation_is_stamped_by_the_clock_the_retire_check_reads() {
 #[tokio::test]
 async fn a_historical_key_with_no_record_is_stamped_and_then_retires() {
     let dir = scratch_dir("legacy");
-    let t0 = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+    let t0 = Timestamp::from_unix_seconds(1_800_000_000).unwrap();
     let clock = axess_clock::testing::MockClock::at(t0);
     let state = state_in_with_clock(&dir, Arc::new(clock.clone())).await;
     rotate(&state, "v2").await.unwrap();

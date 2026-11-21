@@ -1,14 +1,15 @@
-//! `tests`: extracted from `memory.rs` per the
-//! 200-LoC inline-test rule in AGENTS.md.
+//! `tests`: the unit tests of `memory.rs`, kept beside it per the
+//! 200-line inline-test rule in AGENTS.md.
 
 use super::*;
+use axess_clock::Timestamp;
 use axess_clock::testing::MockClock;
-use chrono::TimeZone;
+use axess_clock::testing::Shift;
 
 type S = MemoryStore<String, u32>;
 
-fn anchor() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()
+fn anchor() -> Timestamp {
+    Timestamp::from_utc(2026, 1, 1, 0, 0, 0).unwrap()
 }
 
 fn store_with_clock() -> (S, Arc<MockClock>) {
@@ -19,7 +20,7 @@ fn store_with_clock() -> (S, Arc<MockClock>) {
 
 #[tokio::test]
 async fn put_then_get_returns_value() {
-    let (s, _clock) = store_with_clock();
+    let (s, _) = store_with_clock();
     s.put(&"k".to_string(), &42, Duration::from_secs(60))
         .await
         .unwrap();
@@ -28,13 +29,13 @@ async fn put_then_get_returns_value() {
 
 #[tokio::test]
 async fn get_missing_returns_none() {
-    let (s, _clock) = store_with_clock();
+    let (s, _) = store_with_clock();
     assert_eq!(s.get(&"missing".to_string()).await.unwrap(), None);
 }
 
 #[tokio::test]
 async fn put_overwrites_existing_value() {
-    let (s, _clock) = store_with_clock();
+    let (s, _) = store_with_clock();
     s.put(&"k".to_string(), &1, Duration::from_secs(60))
         .await
         .unwrap();
@@ -46,7 +47,7 @@ async fn put_overwrites_existing_value() {
 
 #[tokio::test]
 async fn delete_removes_entry() {
-    let (s, _clock) = store_with_clock();
+    let (s, _) = store_with_clock();
     s.put(&"k".to_string(), &1, Duration::from_secs(60))
         .await
         .unwrap();
@@ -56,7 +57,7 @@ async fn delete_removes_entry() {
 
 #[tokio::test]
 async fn delete_missing_is_idempotent() {
-    let (s, _clock) = store_with_clock();
+    let (s, _) = store_with_clock();
     s.delete(&"never-existed".to_string()).await.unwrap();
 }
 
@@ -91,7 +92,7 @@ async fn prune_expired_reclaims_only_expired_entries() {
 
 #[tokio::test]
 async fn prune_expired_returns_zero_when_nothing_expired() {
-    let (s, _clock) = store_with_clock();
+    let (s, _) = store_with_clock();
     s.put(&"k".to_string(), &1, Duration::from_secs(60))
         .await
         .unwrap();
@@ -161,7 +162,7 @@ async fn update_returns_false_at_exact_expiry_time() {
 
 #[tokio::test]
 async fn update_mutates_existing_entry() {
-    let (s, _clock) = store_with_clock();
+    let (s, _) = store_with_clock();
     s.put(&"k".to_string(), &10, Duration::from_secs(60))
         .await
         .unwrap();
@@ -172,7 +173,7 @@ async fn update_mutates_existing_entry() {
 
 #[tokio::test]
 async fn update_returns_false_for_missing_key() {
-    let (s, _clock) = store_with_clock();
+    let (s, _) = store_with_clock();
     let updated = s.update(&"never-existed".to_string(), |v| *v += 1);
     assert!(!updated);
 }
@@ -190,7 +191,7 @@ async fn update_returns_false_for_expired_entry() {
 
 #[tokio::test]
 async fn clone_shares_state_via_arc() {
-    let (s1, _clock) = store_with_clock();
+    let (s1, _) = store_with_clock();
     let s2 = s1.clone();
     s1.put(&"k".to_string(), &42, Duration::from_secs(60))
         .await
@@ -200,7 +201,7 @@ async fn clone_shares_state_via_arc() {
 
 #[tokio::test]
 async fn len_and_is_empty_track_size() {
-    let (s, _clock) = store_with_clock();
+    let (s, _) = store_with_clock();
     assert!(s.is_empty());
     s.put(&"a".to_string(), &1, Duration::from_secs(60))
         .await
@@ -214,15 +215,19 @@ async fn len_and_is_empty_track_size() {
 
 #[tokio::test]
 async fn default_clock_is_system_clock() {
-    // Default `new()` uses SystemClock; verified by `now()` falling
-    // within ~5s of std `Utc::now()`. (Not 0; SystemClock is
-    // wall-clock-driven; we just confirm the value is plausibly
-    // current.)
+    // Default `new()` uses SystemClock: its time moves by itself while the
+    // test waits, which no mock does, and it is past the reference instant
+    // every mock in the workspace starts at. The test reads no clock of its
+    // own; the store's is the subject.
     let s = S::new();
-    let now_via_clock = s.clock().now();
-    let now_via_std = Utc::now();
-    let drift = (now_via_std - now_via_clock).num_seconds().abs();
-    assert!(drift < 5, "SystemClock drift {drift}s exceeds tolerance");
+    let first = s.clock().now();
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let second = s.clock().now();
+    assert!(
+        second > first,
+        "the default clock did not move: {first} then {second}"
+    );
+    assert!(first > axess_clock::testing::MockClock::reference_time());
 }
 
 /// Pruning while other threads insert must report what it removed, not the
@@ -235,11 +240,13 @@ fn prune_count_survives_concurrent_inserts() {
             format!("seed-{i}"),
             super::Entry {
                 value: 1,
-                expires_at: anchor() + chrono::Duration::seconds(1),
+                expires_at: axess_clock::Until::At(
+                    anchor().plus(axess_clock::SignedDuration::seconds(1)),
+                ),
             },
         );
     }
-    clock.advance(chrono::Duration::seconds(10));
+    clock.advance(axess_clock::SignedDuration::seconds(10));
     let writer = {
         let s = s.clone();
         std::thread::spawn(move || {
@@ -248,7 +255,9 @@ fn prune_count_survives_concurrent_inserts() {
                     format!("live-{i}"),
                     super::Entry {
                         value: 2,
-                        expires_at: anchor() + chrono::Duration::days(1),
+                        expires_at: axess_clock::Until::At(
+                            anchor().plus(axess_clock::SignedDuration::days(1)),
+                        ),
                     },
                 );
             }

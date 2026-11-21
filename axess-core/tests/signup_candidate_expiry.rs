@@ -3,7 +3,7 @@
 //! time, so a stranger who starts a signup nobody finishes cannot keep the
 //! identifier from the person it belongs to.
 
-mod common;
+use axess_core::testing::fixtures as common;
 
 use axess_clock::testing::MockClock;
 use axess_core::authn::{AuditContext, RequestAuthnService};
@@ -18,14 +18,13 @@ use axess_core::testing::{
     mock_authn::{MockFactorStore, MockIdentityStore},
     test_session,
 };
-use chrono::Utc;
 use common::{test_tenant, tid, uid};
 use std::time::Duration;
 
 type Svc = RequestAuthnService<MockIdentityStore, MockFactorStore>;
 
 fn candidate(id: &str, identifier: &str) -> User {
-    let now = Utc::now();
+    let now = common::start();
     User {
         id: uid(id),
         tenant_id: tid("t1"),
@@ -43,8 +42,10 @@ fn candidate(id: &str, identifier: &str) -> User {
 fn rig(
     configure: impl FnOnce(AuthnServiceBuilder) -> AuthnServiceBuilder,
 ) -> (Svc, MockClock, MockIdentityStore) {
-    let clock = MockClock::at(Utc::now());
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
+    let clock = common::test_clock();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
     let builder =
         AuthnService::builder(identity.clone(), MockFactorStore::new()).with_clock(clock.clone());
     let svc = configure(builder)
@@ -71,7 +72,10 @@ async fn an_expired_unverified_candidate_no_longer_holds_its_identifier() {
     ));
 
     clock.advance(
-        chrono::Duration::from_std(DEFAULT_CANDIDATE_TTL).unwrap() + chrono::Duration::seconds(1),
+        axess_clock::SignedDuration::try_from(DEFAULT_CANDIDATE_TTL)
+            .unwrap()
+            .checked_add(axess_clock::SignedDuration::seconds(1))
+            .unwrap(),
     );
     let out = begin(&svc, "victim", "alice@corp.example").await;
 
@@ -101,7 +105,10 @@ async fn a_candidate_inside_its_lifetime_still_holds_its_identifier() {
     begin(&svc, "first", "alice@corp.example").await;
 
     clock.advance(
-        chrono::Duration::from_std(DEFAULT_CANDIDATE_TTL).unwrap() - chrono::Duration::seconds(1),
+        axess_clock::SignedDuration::try_from(DEFAULT_CANDIDATE_TTL)
+            .unwrap()
+            .checked_sub(axess_clock::SignedDuration::seconds(1))
+            .unwrap(),
     );
     let out = begin(&svc, "second", "alice@corp.example").await;
 
@@ -116,7 +123,7 @@ async fn the_lifetime_is_the_builders() {
     });
     begin(&svc, "first", "alice@corp.example").await;
 
-    clock.advance(chrono::Duration::seconds(601));
+    clock.advance(axess_clock::SignedDuration::seconds(601));
     let out = begin(&svc, "second", "alice@corp.example").await;
 
     assert!(matches!(out, SignupOutcome::Started(Some(_))), "{out:?}");
@@ -130,7 +137,7 @@ async fn a_candidate_never_expires_before_its_verification_secret() {
     });
     begin(&svc, "first", "alice@corp.example").await;
 
-    clock.advance(chrono::Duration::seconds(600));
+    clock.advance(axess_clock::SignedDuration::seconds(600));
     let out = begin(&svc, "second", "alice@corp.example").await;
 
     assert!(matches!(out, SignupOutcome::Started(None)), "{out:?}");
@@ -145,7 +152,10 @@ async fn the_session_that_began_a_signup_resumes_it_past_the_lifetime() {
         .unwrap();
 
     clock.advance(
-        chrono::Duration::from_std(DEFAULT_CANDIDATE_TTL).unwrap() + chrono::Duration::hours(1),
+        axess_clock::SignedDuration::try_from(DEFAULT_CANDIDATE_TTL)
+            .unwrap()
+            .checked_add(axess_clock::SignedDuration::hours(1))
+            .unwrap(),
     );
     let out = svc
         .begin_signup(candidate("mine", "alice@corp.example"), "default", &session)
@@ -168,7 +178,7 @@ async fn an_active_account_never_expires() {
     };
     svc.complete_signup(&session, v.secret()).await.unwrap();
 
-    clock.advance(chrono::Duration::days(400));
+    clock.advance(axess_clock::SignedDuration::days(400));
     let out = begin(&svc, "other", "alice@corp.example").await;
 
     assert!(matches!(out, SignupOutcome::Started(None)), "{out:?}");
@@ -186,7 +196,7 @@ async fn the_sweep_deletes_expired_candidates_nobody_asked_for_again() {
     let (svc, clock, identity) = rig(|b| b);
     begin(&svc, "old-a", "a@corp.example").await;
     begin(&svc, "old-b", "b@corp.example").await;
-    clock.advance(chrono::Duration::hours(25));
+    clock.advance(axess_clock::SignedDuration::hours(25));
     begin(&svc, "young", "c@corp.example").await;
 
     let deleted = svc.purge_expired_candidates(100).await.unwrap();
@@ -232,7 +242,7 @@ async fn the_sweep_is_bounded_and_never_touches_an_active_account() {
     for n in 0..5 {
         begin(&svc, &format!("c{n}"), &format!("c{n}@corp.example")).await;
     }
-    clock.advance(chrono::Duration::days(3));
+    clock.advance(axess_clock::SignedDuration::days(3));
 
     assert_eq!(svc.purge_expired_candidates(3).await.unwrap(), 3);
     assert_eq!(svc.purge_expired_candidates(3).await.unwrap(), 2);
@@ -243,4 +253,34 @@ async fn the_sweep_is_bounded_and_never_touches_an_active_account() {
             .unwrap()
             .is_some_and(|u| u.id == uid("real"))
     );
+}
+
+/// The lifetime ends after its last instant, not at it: a candidate exactly
+/// as old as the lifetime still holds its identifier and the sweep leaves
+/// it; one second later the sweep takes it.
+#[tokio::test]
+async fn a_candidate_exactly_as_old_as_its_lifetime_has_not_expired() {
+    let (svc, clock, _) = rig(|b| b);
+    begin(&svc, "first", "alice@corp.example").await;
+
+    clock.advance(axess_clock::SignedDuration::try_from(DEFAULT_CANDIDATE_TTL).unwrap());
+    assert_eq!(svc.purge_expired_candidates(100).await.unwrap(), 0);
+    let out = begin(&svc, "second", "alice@corp.example").await;
+    assert!(matches!(out, SignupOutcome::Started(None)), "{out:?}");
+
+    clock.advance(axess_clock::SignedDuration::seconds(1));
+    assert_eq!(svc.purge_expired_candidates(100).await.unwrap(), 1);
+}
+
+/// A lifetime longer than a duration can count is no bound at all: the
+/// candidate keeps its identifier and the sweep leaves it.
+#[tokio::test]
+async fn a_lifetime_too_long_to_count_never_ends() {
+    let (svc, clock, _) = rig(|b| b.with_candidate_ttl(Duration::MAX));
+    begin(&svc, "first", "alice@corp.example").await;
+
+    clock.advance(axess_clock::SignedDuration::days(36_500));
+    assert_eq!(svc.purge_expired_candidates(100).await.unwrap(), 0);
+    let out = begin(&svc, "second", "alice@corp.example").await;
+    assert!(matches!(out, SignupOutcome::Started(None)), "{out:?}");
 }

@@ -1,5 +1,5 @@
-//! `tests`: extracted from `encrypted.rs` per the
-//! 200-LoC inline-test rule in AGENTS.md.
+//! `tests`: the unit tests of `encrypted.rs`, kept beside it per the
+//! 200-line inline-test rule in AGENTS.md.
 
 use super::*;
 use base64::Engine;
@@ -8,7 +8,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use super::envelope::decrypt_envelope;
 use crate::delegated::stored::credential::MemoryDelegatedCredentialStore;
 use crate::session::crypto::LegacyBlobs;
-use chrono::{TimeZone, Utc};
+use axess_clock::Timestamp;
 
 fn sample_tenant() -> TenantId {
     TenantId::from_bytes([1u8; 16])
@@ -21,9 +21,13 @@ fn sample_user() -> UserId {
 fn sample_credential() -> StoredDelegation {
     StoredDelegation {
         provider: "gmail".to_string(),
+        registration: Some(crate::delegated::stored::GrantRegistration {
+            provider: "gmail".to_string(),
+            fingerprint: "gmail-registration".to_string(),
+        }),
         access_token: ZeroizedString::from("at-plaintext"),
         refresh_token: Some(ZeroizedString::from("rt-plaintext")),
-        expires_at: Some(Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap()),
+        expires_at: Some(Timestamp::from_utc(2030, 1, 1, 0, 0, 0).unwrap()),
         scopes: vec!["gmail.send".to_string()],
         token_type: "Bearer".to_string(),
     }
@@ -79,13 +83,13 @@ async fn inner_store_holds_ciphertext_not_plaintext() {
         .expect("inner load")
         .expect("present");
     assert!(
-        (*raw.access_token).starts_with("v3.k1."),
+        (*raw.access_token).starts_with("v4.k1."),
         "expected envelope prefix, got: {:?}",
         &*raw.access_token
     );
     assert_ne!(&*raw.access_token, "at-plaintext");
     let rt = raw.refresh_token.as_deref().expect("refresh present");
-    assert!(rt.starts_with("v3.k1."));
+    assert!(rt.starts_with("v4.k1."));
     assert_ne!(rt, "rt-plaintext");
 }
 
@@ -287,7 +291,7 @@ async fn historical_key_decrypts_pre_rotation_rows() {
         .expect("load")
         .expect("present");
     assert!(
-        (*rewritten.access_token).starts_with("v3.k2."),
+        (*rewritten.access_token).starts_with("v4.k2."),
         "after re-save, row should be under new current key, got: {:?}",
         &*rewritten.access_token
     );
@@ -380,6 +384,43 @@ async fn short_envelope_body_rejects_as_malformed() {
     assert!(matches!(err, EnvelopeError::Malformed(_)));
 }
 
+/// A body one byte short of a nonce and a tag was never sealed: it is
+/// malformed, and is refused before its key is looked up or tried, whether
+/// the key id is one the provider holds or not.
+#[tokio::test]
+async fn an_envelope_body_one_byte_short_of_a_nonce_and_a_tag_is_malformed() {
+    let keys = MemoryKeyProvider::new("k1", test_key(0)).expect("valid");
+    let aad = build_aad("gmail", &sample_tenant(), &sample_user(), FIELD_ACCESS);
+    let body = URL_SAFE_NO_PAD.encode([0u8; NONCE_LEN + TAG_LEN - 1]);
+    for key_id in ["k1", "k9"] {
+        let short = format!("v1.{key_id}.{body}");
+        let err = decrypt_envelope(&keys, &short, &aad).unwrap_err();
+        assert!(
+            matches!(err, EnvelopeError::Malformed(_)),
+            "key {key_id}: {err:?}"
+        );
+    }
+}
+
+/// The shortest body a seal produces, a nonce and the tag of an empty
+/// plaintext, opens.
+#[tokio::test]
+async fn the_envelope_of_an_empty_plaintext_opens() {
+    let keys = MemoryKeyProvider::new("k1", test_key(4)).expect("valid");
+    let aad = build_aad("gmail", &sample_tenant(), &sample_user(), FIELD_ACCESS);
+    let current = keys.current().expect("a current key");
+    let rng = axess_rng::testing::MockRng::new(11);
+    let envelope = super::envelope::encrypt_envelope(&current, &rng, "", &aad).unwrap();
+    let body = envelope.rsplit('.').next().expect("a body");
+    assert_eq!(
+        URL_SAFE_NO_PAD.decode(body).unwrap().len(),
+        NONCE_LEN + TAG_LEN
+    );
+    let aad_for = |version: &str| (version == ENVELOPE_VERSION).then(|| aad.clone());
+    let opened = super::envelope::open_envelope(&keys, &envelope, &aad_for).unwrap();
+    assert_eq!(opened.plain, "");
+}
+
 /// The v2 AAD covers `scopes` and `token_type`: a store that widens the
 /// granted scopes or changes the token type under the ciphertext makes the
 /// row fail to open.
@@ -445,7 +486,7 @@ async fn a_v1_row_under_a_retired_key_is_read_as_expired_and_left_alone() {
     let aad_a = build_aad("gmail", &tenant, &user, FIELD_ACCESS);
     let aad_r = build_aad("gmail", &tenant, &user, FIELD_REFRESH);
     let rng = axess_rng::SystemRng;
-    let v1 = |env: String| env.replacen("v3.", "v1.", 1);
+    let v1 = |env: String| env.replacen("v4.", "v1.", 1);
     let legacy = StoredDelegation {
         access_token: ZeroizedString::from(v1(encrypt_envelope(
             &old,
@@ -474,7 +515,7 @@ async fn a_v1_row_under_a_retired_key_is_read_as_expired_and_left_alone() {
         .with_legacy_envelopes(LegacyBlobs::Accept);
     let loaded = store.load(&tenant, &user, "gmail").await.unwrap().unwrap();
     assert_eq!(&*loaded.access_token, "at-plaintext");
-    assert_eq!(loaded.expires_at, Some(chrono::DateTime::UNIX_EPOCH));
+    assert_eq!(loaded.expires_at, Some(Timestamp::UNIX_EPOCH));
 
     let raw = store
         .inner()
@@ -531,7 +572,7 @@ async fn changing_only_expires_at_on_the_stored_row_fails_the_load() {
 
     // Forward-dated: the token would look fresh past its real expiry.
     let mut moved = raw.clone();
-    moved.expires_at = Some(Utc.with_ymd_and_hms(2031, 1, 1, 0, 0, 0).unwrap());
+    moved.expires_at = Some(Timestamp::from_utc(2031, 1, 1, 0, 0, 0).unwrap());
     store.inner().save(&tenant, &user, moved).await.unwrap();
     let err = store
         .load(&tenant, &user, "gmail")
@@ -555,9 +596,10 @@ async fn changing_only_expires_at_on_the_stored_row_fails_the_load() {
 }
 
 /// A row written by the previous release (v2, AAD without `expires_at`)
-/// opens without any legacy setting, as an expired row; a later save writes v3.
+/// opens without any legacy setting, as an expired row; a later save writes
+/// the current version.
 #[tokio::test]
-async fn a_v2_row_is_read_by_default_and_a_save_writes_v3() {
+async fn a_v2_row_is_read_by_default_and_a_save_writes_the_current_version() {
     let (tenant, user) = (sample_tenant(), sample_user());
     let cred = sample_credential();
     let current = CurrentKey {
@@ -565,7 +607,7 @@ async fn a_v2_row_is_read_by_default_and_a_save_writes_v3() {
         key: Arc::new(EncryptionKey::from_bytes(test_key(3))),
     };
     let rng = axess_rng::SystemRng;
-    let v2 = |env: String| env.replacen("v3.", "v2.", 1);
+    let v2 = |env: String| env.replacen("v4.", "v2.", 1);
     let aad_a = build_aad_v2(
         "gmail",
         &tenant,
@@ -617,7 +659,7 @@ async fn a_v2_row_is_read_by_default_and_a_save_writes_v3() {
     assert_eq!(&*loaded.access_token, "at-plaintext");
     assert_eq!(loaded.refresh_token.as_deref(), Some("rt-plaintext"));
 
-    assert_eq!(loaded.expires_at, Some(chrono::DateTime::UNIX_EPOCH));
+    assert_eq!(loaded.expires_at, Some(Timestamp::UNIX_EPOCH));
 
     let mut refreshed = loaded;
     refreshed.expires_at = sample_credential().expires_at;
@@ -629,11 +671,11 @@ async fn a_v2_row_is_read_by_default_and_a_save_writes_v3() {
         .unwrap()
         .unwrap();
     assert!(
-        (*raw.access_token).starts_with("v3.k1."),
+        (*raw.access_token).starts_with("v4.k1."),
         "{:?}",
         &*raw.access_token
     );
-    assert!(raw.refresh_token.as_deref().unwrap().starts_with("v3.k1."));
+    assert!(raw.refresh_token.as_deref().unwrap().starts_with("v4.k1."));
 
     // The saved row binds its expiry: moving it fails the next load.
     let mut moved = raw;

@@ -13,12 +13,14 @@ pub struct ExtremeDuration {
     pub value: Duration,
 }
 
-/// Zero, the smallest step, the largest span `chrono::Duration` converts
-/// (`i64::MAX` milliseconds), the first span past it, and [`Duration::MAX`].
+/// Zero, the smallest step, the largest span `chrono::Duration` converted
+/// (`i64::MAX` milliseconds) and the first span past it, the longest span
+/// `axess_clock::SignedDuration` holds (`i64::MAX` seconds and a fraction)
+/// and the first span past it, and [`Duration::MAX`].
 ///
-/// The middle one passes `chrono::Duration::from_std` and still overflows
-/// when added to a date, which is the shape of bug a clamp that only
-/// handles the `from_std` failure misses.
+/// Each of the two "largest" values converts to its signed span and still
+/// runs past the range of a reading when added to one, which is the shape
+/// of bug a clamp that only handles the failed conversion misses.
 pub fn extreme_durations() -> Vec<ExtremeDuration> {
     vec![
         ExtremeDuration {
@@ -36,6 +38,14 @@ pub fn extreme_durations() -> Vec<ExtremeDuration> {
         ExtremeDuration {
             name: "first span past chrono's range",
             value: Duration::from_millis(i64::MAX as u64 + 1),
+        },
+        ExtremeDuration {
+            name: "longest signed span",
+            value: Duration::new(i64::MAX as u64, 999_999_999),
+        },
+        ExtremeDuration {
+            name: "first span past the longest signed span",
+            value: Duration::from_secs(i64::MAX as u64 + 1),
         },
         ExtremeDuration {
             name: "Duration::MAX",

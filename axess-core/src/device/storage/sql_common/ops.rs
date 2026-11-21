@@ -425,6 +425,9 @@ pub(crate) async fn sweep_in_batches<D: DeviceSql>(
             trusted_to_seen,
             seen_to_revoked,
             revoked_purged,
+            // Each stage decides and moves its rows in one statement: a row
+            // is moved or it was not due.
+            skipped: 0,
         },
         s0 + s1 + s2 + s3,
     ))

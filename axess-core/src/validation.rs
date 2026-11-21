@@ -147,10 +147,12 @@ pub fn is_printable(s: &str) -> bool {
 /// the Arabic and Syriac number and end-of-ayah marks, the Kaithi number
 /// signs, the Egyptian hieroglyph and shorthand format controls, the
 /// musical beam and tie controls, the language and tag characters) or a
-/// noncharacter. None of them has any business in a login identifier (the
-/// zero width non-joiner and joiner, U+200C and U+200D, are spelled into
-/// ordinary words in several scripts and are allowed), and each makes two
-/// identifiers look the same on screen while comparing different.
+/// noncharacter. None of them has any business in a login identifier, and
+/// each makes two identifiers look the same on screen while comparing
+/// different. The zero width non-joiner and joiner, U+200C and U+200D, are
+/// not in this list; an identifier refuses them all the same, as one of the
+/// classes of [`escapes`](axess_identity::log_text::escapes) (see
+/// [`is_acceptable_identifier`]).
 ///
 /// The list is the whole of Cf in Unicode 16.0 (170 code points) less the
 /// two joiners; `validation_tests` checks it against the category's ranges,
@@ -212,11 +214,22 @@ pub fn normalise_identifier(raw: &str) -> Option<String> {
 }
 
 /// Whether a login identifier is acceptable: printable, free of invisible
-/// format characters and noncharacters, and already in Unicode
-/// normalisation form C. Checked at signup and by
+/// format characters and noncharacters, free of every character the one
+/// log-text predicate escapes
+/// ([`escapes`](axess_identity::log_text::escapes): control characters, the
+/// line and paragraph separators, bidirectional controls, zero-width
+/// characters, the byte order mark, the Hangul fillers), and already in
+/// Unicode normalisation form C. Checked at signup and by
 /// [`User::validate`](crate::authn::types::User::validate), so a row
 /// created by any path, or read back from a store, is held to the same
 /// terms.
+///
+/// The escaped classes are refused rather than escaped: an identifier is
+/// what two accounts are told apart by, and a character that is drawn as
+/// nothing or reorders what is drawn makes two of them look the same. The
+/// zero width joiners included, though some scripts spell them into words:
+/// an identifier that needs one is refused, the safe side of a name that
+/// can be made to read as another.
 ///
 /// `admin` and `admin\u{200B}` are different strings to a store and the
 /// same name to a person; so are a composed `\u{00E9}` and an `e` followed
@@ -226,6 +239,7 @@ pub fn normalise_identifier(raw: &str) -> Option<String> {
 /// input to NFC at its edge (browsers send NFC for typed text).
 pub fn is_acceptable_identifier(identifier: &str) -> bool {
     is_printable(identifier)
+        && !identifier.chars().any(axess_identity::log_text::escapes)
         && !identifier.chars().any(is_invisible_format_char)
         && unicode_normalization::is_nfc(identifier)
 }

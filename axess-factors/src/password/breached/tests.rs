@@ -82,7 +82,7 @@ fn a_malformed_count_or_line_is_skipped() {
 async fn the_list_answers_membership_and_the_outage_answers_an_error() {
     let list = BreachedPasswordList::new(["Password123!"]);
     assert_eq!(list.is_breached("Password123!").await, Ok(true));
-    assert_eq!(list.is_breached("Gnomes2+andmore").await, Ok(false));
+    assert_eq!(list.is_breached("Sample2+andmore").await, Ok(false));
 
     let outage = BreachCheckOutage::new("range service timed out");
     let err = outage.is_breached("anything").await.unwrap_err();
@@ -114,7 +114,7 @@ async fn a_breached_password_is_refused_by_name() {
     );
     assert_eq!(
         check_password_breached(
-            "Gnomes2+andmore",
+            "Sample2+andmore",
             &rules,
             Some(&list),
             BreachCheckUnavailable::Refuse
@@ -149,7 +149,7 @@ async fn an_unavailable_check_refuses_unless_the_policy_allows() {
     let rules = PasswordRules::default();
     assert_eq!(
         check_password_breached(
-            "Gnomes2+andmore",
+            "Sample2+andmore",
             &rules,
             Some(&outage),
             BreachCheckUnavailable::Refuse
@@ -159,7 +159,7 @@ async fn an_unavailable_check_refuses_unless_the_policy_allows() {
     );
     assert_eq!(
         check_password_breached(
-            "Gnomes2+andmore",
+            "Sample2+andmore",
             &rules,
             Some(&outage),
             BreachCheckUnavailable::Allow
@@ -195,10 +195,10 @@ async fn the_checked_hash_refuses_rules_then_breach_then_hashes() {
         hash_new_password_checked(&long, &rules, Some(&list), policy).await,
         Err(NewPasswordError::TooLong)
     );
-    let hash = hash_new_password_checked("Gnomes2+andmore", &rules, Some(&list), policy)
+    let hash = hash_new_password_checked("Sample2+andmore", &rules, Some(&list), policy)
         .await
         .unwrap();
-    assert!(verify_password("Gnomes2+andmore", &hash).is_ok());
+    assert!(verify_password("Sample2+andmore", &hash).is_ok());
 }
 
 #[tokio::test]
@@ -207,7 +207,7 @@ async fn the_checked_hash_refuses_an_outage_by_default_and_allows_on_opt_out() {
     let rules = PasswordRules::default();
     assert_eq!(
         hash_new_password_checked(
-            "Gnomes2+andmore",
+            "Sample2+andmore",
             &rules,
             Some(&outage),
             BreachCheckUnavailable::Refuse
@@ -217,7 +217,7 @@ async fn the_checked_hash_refuses_an_outage_by_default_and_allows_on_opt_out() {
     );
     assert!(
         hash_new_password_checked(
-            "Gnomes2+andmore",
+            "Sample2+andmore",
             &rules,
             Some(&outage),
             BreachCheckUnavailable::Allow

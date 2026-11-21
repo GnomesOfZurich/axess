@@ -3,7 +3,8 @@
 //! with a fresh allowance, a lost swap is retried, and an unfinished claim is
 //! a short lease.
 
-mod common;
+use axess_clock::testing::Shift;
+use axess_core::testing::fixtures as common;
 
 use axess_clock::{Clock, testing::MockClock};
 use axess_core::authn::AuditContext;
@@ -25,7 +26,7 @@ use std::sync::Arc;
 type Svc = RequestAuthnService<MockIdentityStore, MockFactorStore>;
 
 fn world(cfg: EmailOtpConfig) -> (Svc, MockFactorStore, MockClock) {
-    let clock = MockClock::now();
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
         .with_clock(clock.clone())
         .with_tenant(test_tenant())
@@ -51,7 +52,7 @@ fn world(cfg: EmailOtpConfig) -> (Svc, MockFactorStore, MockClock) {
 fn base() -> EmailOtpConfig {
     EmailOtpConfig {
         email: "alice@example.com".into(),
-        ttl_secs: 300,
+        ttl: std::time::Duration::from_secs(300),
         ..EmailOtpConfig::default()
     }
 }
@@ -95,21 +96,21 @@ async fn a_burned_code_keeps_the_cooldown_until_its_original_expiry() {
         "the cooldown outlives the burn"
     );
 
-    clock.advance(chrono::Duration::seconds(1));
+    clock.advance(axess_clock::SignedDuration::seconds(1));
     let again = svc.prepare_factor(&session).await.unwrap();
     assert!(
         matches!(again, PrepareOutcome::AlreadySent { .. }),
         "no fresh code (and so no fresh guesses) straight after a burn: {again:?}"
     );
 
-    clock.advance(chrono::Duration::seconds(301));
+    clock.advance(axess_clock::SignedDuration::seconds(301));
     let later = svc.prepare_factor(&session).await.unwrap();
     assert!(matches!(later, PrepareOutcome::SendOtp { .. }), "{later:?}");
 }
 
 #[tokio::test]
 async fn a_new_code_starts_with_a_fresh_attempt_count() {
-    let (svc, factors, _clock) = world(EmailOtpConfig {
+    let (svc, factors, _) = world(EmailOtpConfig {
         attempt_count: 4,
         ..base()
     });
@@ -122,7 +123,7 @@ async fn a_new_code_starts_with_a_fresh_attempt_count() {
 
 #[tokio::test]
 async fn a_lost_second_swap_is_retried_against_the_claim_that_is_still_ours() {
-    let (svc, factors, _clock) = world(base());
+    let (svc, factors, _) = world(base());
     let session = test_session();
     svc.begin_login("alice", "default", &session).await.unwrap();
     // The claim swap goes through; the store swap is lost once.
@@ -152,7 +153,7 @@ fn changed(
 
 #[tokio::test]
 async fn a_retry_after_a_lost_swap_keeps_a_concurrent_attempt_count() {
-    let (svc, factors, _clock) = world(base());
+    let (svc, factors, _) = world(base());
     let session = test_session();
     svc.begin_login("alice", "default", &session).await.unwrap();
     factors.arm_cas_failures_after(1, 1);
@@ -174,7 +175,7 @@ async fn a_retry_after_a_lost_swap_keeps_a_concurrent_attempt_count() {
 
 #[tokio::test]
 async fn a_retry_after_a_concurrent_address_change_delivers_nothing() {
-    let (svc, factors, _clock) = world(base());
+    let (svc, factors, _) = world(base());
     let session = test_session();
     svc.begin_login("alice", "default", &session).await.unwrap();
     factors.arm_cas_failures_after(1, 1);
@@ -206,14 +207,14 @@ async fn an_unfinished_claim_is_a_short_lease_not_the_full_ttl() {
     let claim = stored(&factors).await;
     let until = claim.pending_until.expect("the claim holds the slot");
     assert!(
-        until <= clock.now() + chrono::Duration::seconds(31),
-        "a claim blocks for a lease, not the 300 s TTL: {until}"
+        until <= axess_clock::Until::At(clock.now().plus(axess_clock::SignedDuration::seconds(31))),
+        "a claim blocks for a lease, not the 300 s TTL: {until:?}"
     );
 }
 
 #[tokio::test]
 async fn the_address_in_an_already_sent_answer_is_masked() {
-    let (svc, _factors, _clock) = world(base());
+    let (svc, _, _) = world(base());
     let session = test_session();
     svc.begin_login("alice", "default", &session).await.unwrap();
     let issued = svc.prepare_factor(&session).await.unwrap();
@@ -231,7 +232,9 @@ async fn the_address_in_an_already_sent_answer_is_masked() {
 }
 
 fn any_of_world() -> Svc {
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new()
@@ -248,6 +251,7 @@ fn any_of_world() -> Svc {
             },
         );
     AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
         .with_rng(MockRng::new(7))
         .with_kdf_executor(Arc::new(KdfExecutor::inline()))
         .build()
@@ -283,7 +287,9 @@ async fn a_choice_the_step_does_not_offer_is_refused() {
 }
 
 fn totp_or_email_world() -> Svc {
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new()
@@ -304,6 +310,7 @@ fn totp_or_email_world() -> Svc {
             },
         );
     AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
         .with_rng(MockRng::new(7))
         .with_kdf_executor(Arc::new(KdfExecutor::inline()))
         .build()
@@ -335,4 +342,33 @@ async fn the_email_code_is_checked_as_the_email_code_when_that_is_the_choice() {
         ),
         "{outcome:?}"
     );
+}
+
+/// A code's life is bounded both ways: a `ttl` under a minute or over half
+/// an hour is refused when the code is about to be issued, as is one with a
+/// fraction of a second, which the stored count of seconds cannot keep; the
+/// bounds themselves issue.
+#[tokio::test]
+async fn a_code_life_outside_the_bounds_is_refused_when_the_code_is_issued() {
+    use axess_core::authn::error::AuthnError;
+    use axess_factors::{MAX_EMAIL_OTP_TTL, MIN_EMAIL_OTP_TTL};
+    use std::time::Duration;
+    for (ttl, issues) in [
+        (MIN_EMAIL_OTP_TTL - Duration::from_secs(1), false),
+        (MIN_EMAIL_OTP_TTL, true),
+        (MAX_EMAIL_OTP_TTL, true),
+        (MAX_EMAIL_OTP_TTL + Duration::from_secs(1), false),
+        (MIN_EMAIL_OTP_TTL + Duration::from_millis(500), false),
+        (MAX_EMAIL_OTP_TTL - Duration::from_nanos(1), false),
+    ] {
+        let (svc, _, _) = world(EmailOtpConfig { ttl, ..base() });
+        let session = test_session();
+        svc.begin_login("alice", "default", &session).await.unwrap();
+        let outcome = svc.prepare_factor(&session).await;
+        match (issues, outcome) {
+            (true, Ok(PrepareOutcome::SendOtp { .. })) => {}
+            (false, Err(AuthnError::NoFlow)) => {}
+            (_, other) => panic!("ttl {ttl:?}: {other:?}"),
+        }
+    }
 }

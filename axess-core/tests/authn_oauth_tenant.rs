@@ -3,7 +3,8 @@
 //! identity-cross-checked `SessionValidator` catches mid-flight tenant
 //! tampering.
 
-mod common;
+use axess_clock::testing::Shift;
+use axess_core::testing::fixtures as common;
 
 use axess_core::authn::AuditContext;
 use axess_core::authn::{error::AuthnError, service::AuthnService};
@@ -13,8 +14,7 @@ use axess_core::testing::{
     test_session,
 };
 use axess_factors::oauth::OAuthClaims;
-use chrono::Utc;
-use common::{test_tenant, test_user_in_tenant, tid};
+use common::{start, test_tenant, test_user_in_tenant, tid};
 
 // Mirror of the (pub-crate) `axess.oauth.expected_tenant` constant: pinned
 // here so the test breaks loudly if the production constant is ever renamed
@@ -33,9 +33,9 @@ async fn stash_claim_lock(
 ) {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use sha2::{Digest, Sha256};
-    let sid = session.session_id().await;
+    let key = session.session_key().await;
     let mut hasher = Sha256::new();
-    for field in [provider.as_bytes(), subject.as_bytes(), sid.as_bytes()] {
+    for field in [provider.as_bytes(), subject.as_bytes(), key.as_bytes()] {
         hasher.update((field.len() as u64).to_be_bytes());
         hasher.update(field);
     }
@@ -87,13 +87,17 @@ fn empty_claims(subject: &str) -> OAuthClaims {
 
 #[tokio::test]
 async fn complete_oauth_login_refuses_cross_tenant_when_expected_tenant_set() {
+    let clock = common::test_clock();
     // Begin-side declared tenant t1, but the resolver returned a user from t2.
     // Library MUST refuse.
     let user = test_user_in_tenant("u1", "alice", "t2");
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(user.clone());
-    let svc = AuthnService::new(identity, MockFactorStore::new())
+    let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build()
         .with_audit_context(AuditContext::default());
     let session = test_session();
 
@@ -124,14 +128,18 @@ async fn complete_oauth_login_refuses_cross_tenant_when_expected_tenant_set() {
 /// flips, whatever the IdP said.
 #[tokio::test]
 async fn complete_oauth_login_refuses_a_suspended_tenant() {
+    let clock = common::test_clock();
     use axess_core::authn::types::{EntityState, StatusDetail};
     let user = test_user_in_tenant("u1", "alice", "t1");
     let mut tenant = test_tenant();
-    tenant.status = EntityState::Suspended(StatusDetail::administrative("hold", Utc::now()));
+    tenant.status = EntityState::Suspended(StatusDetail::administrative("hold", start()));
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(tenant)
         .with_user(user.clone());
-    let svc = AuthnService::new(identity, MockFactorStore::new())
+    let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build()
         .with_audit_context(AuditContext::default());
     let session = test_session();
     stash_claim_lock(&session, "test", "external-sub-123").await;
@@ -151,13 +159,17 @@ async fn complete_oauth_login_refuses_a_suspended_tenant() {
 /// the account-status gate does not depend on the registry being present.
 #[tokio::test]
 async fn complete_oauth_login_refuses_a_suspended_user_without_a_registry() {
+    let clock = common::test_clock();
     use axess_core::authn::types::{EntityState, StatusDetail};
     let mut user = test_user_in_tenant("u1", "alice", "t1");
-    user.status = EntityState::Suspended(StatusDetail::administrative("hold", Utc::now()));
+    user.status = EntityState::Suspended(StatusDetail::administrative("hold", start()));
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(user.clone());
-    let svc = AuthnService::new(identity, MockFactorStore::new())
+    let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build()
         .with_audit_context(AuditContext::default());
     let session = test_session();
     session
@@ -180,16 +192,32 @@ async fn complete_oauth_login_refuses_a_suspended_user_without_a_registry() {
 }
 
 /// Every status that does not allow login is refused with its own answer: a
-/// suspension as `Locked` carrying its end, any other state as `NotActive`
-/// carrying the state.
+/// suspension as `Locked`, any other state as `NotActive` carrying the
+/// state. `Locked` carries the end of a suspension by the rule of the factor
+/// steps: only for a lockout a store keeps as a state, so the answer does
+/// not say that an operator holds the account or until when.
 #[tokio::test]
 async fn complete_oauth_login_answers_each_non_active_status_with_its_own_variant() {
+    let clock = common::test_clock();
     use axess_core::authn::types::{EntityState, StatusDetail};
-    let detail = |until| StatusDetail::administrative("hold", Utc::now()).with_until(until);
-    let ends = Utc::now() + chrono::Duration::hours(1);
+    let detail = |until| StatusDetail::administrative("hold", start()).with_until(until);
+    let ends = start().plus(axess_clock::SignedDuration::hours(1));
+    let began = ends.minus(axess_clock::SignedDuration::hours(2));
+    let ending = |detail: StatusDetail| {
+        EntityState::Suspended(detail.with_until(Some(axess_clock::Until::At(ends))))
+    };
     let cases = [
         (EntityState::Suspended(detail(None)), None),
-        (EntityState::Suspended(detail(Some(ends))), Some(Some(ends))),
+        (
+            EntityState::Suspended(detail(Some(axess_clock::Until::At(ends)))),
+            None,
+        ),
+        (
+            ending(StatusDetail::lockout("too many attempts", began)),
+            Some(Some(ends)),
+        ),
+        (ending(StatusDetail::verification("pending", began)), None),
+        (ending(StatusDetail::closure("closing", began)), None),
         (EntityState::Guest, None),
         (EntityState::Candidate, None),
         (EntityState::Pending(detail(None)), None),
@@ -200,9 +228,12 @@ async fn complete_oauth_login_answers_each_non_active_status_with_its_own_varian
         let mut user = test_user_in_tenant("u1", "alice", "t1");
         user.status = status.clone();
         let identity = MockIdentityStore::new()
+            .with_clock(clock.clone())
             .with_tenant(test_tenant())
             .with_user(user.clone());
-        let svc = AuthnService::new(identity, MockFactorStore::new())
+        let svc = AuthnService::builder(identity, MockFactorStore::new())
+            .with_clock(clock.clone())
+            .build()
             .with_audit_context(AuditContext::default());
         let session = test_session();
         session
@@ -221,7 +252,9 @@ async fn complete_oauth_login_answers_each_non_active_status_with_its_own_varian
             .unwrap_err();
 
         match (locked_until, &err) {
-            (Some(until), AuthnError::Locked { until: got }) => assert_eq!(*got, until),
+            (Some(until), AuthnError::Locked { until: got }) => {
+                assert_eq!(*got, until.map(axess_clock::Until::At))
+            }
             (None, AuthnError::Locked { until: None })
                 if matches!(status, EntityState::Suspended(_)) => {}
             (None, AuthnError::NotActive(got)) if !matches!(status, EntityState::Suspended(_)) => {
@@ -235,11 +268,15 @@ async fn complete_oauth_login_answers_each_non_active_status_with_its_own_varian
 
 #[tokio::test]
 async fn complete_oauth_login_accepts_when_tenant_matches() {
+    let clock = common::test_clock();
     let user = test_user_in_tenant("u1", "alice", "t1");
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(user.clone());
-    let svc = AuthnService::new(identity, MockFactorStore::new())
+    let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build()
         .with_audit_context(AuditContext::default());
     let session = test_session();
 
@@ -259,6 +296,7 @@ async fn complete_oauth_login_accepts_when_tenant_matches() {
 
 #[tokio::test]
 async fn complete_oauth_login_unbound_session_unaffected() {
+    let clock = common::test_clock();
     // Backward compat: if EXPECTED_TENANT is not set (caller used the
     // unscoped begin_oauth_login), the tenant rail does not apply. The
     // user's own tenant must still exist and admit logins, as for every
@@ -268,10 +306,13 @@ async fn complete_oauth_login_unbound_session_unaffected() {
     other.id = tid("t2");
     other.identifier = "other".into();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_tenant(other)
         .with_user(user.clone());
-    let svc = AuthnService::new(identity, MockFactorStore::new())
+    let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build()
         .with_audit_context(AuditContext::default());
     let session = test_session();
     stash_claim_lock(&session, "test", "external-sub-123").await;
@@ -285,11 +326,15 @@ async fn complete_oauth_login_unbound_session_unaffected() {
 
 #[tokio::test]
 async fn validator_with_identity_check_invalidates_tenant_mismatch() {
+    let clock = common::test_clock();
     let user = test_user_in_tenant("u1", "alice", "t1");
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(user.clone());
-    let svc = AuthnService::new(identity, MockFactorStore::new())
+    let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build()
         .with_audit_context(AuditContext::default());
 
     let session = test_session();
@@ -318,11 +363,15 @@ async fn validator_with_identity_check_invalidates_tenant_mismatch() {
 
 #[tokio::test]
 async fn validator_with_identity_check_passes_unmodified_session() {
+    let clock = common::test_clock();
     let user = test_user_in_tenant("u1", "alice", "t1");
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(user.clone());
-    let svc = AuthnService::new(identity, MockFactorStore::new())
+    let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build()
         .with_audit_context(AuditContext::default());
     let session = test_session();
     stash_claim_lock(&session, "test", "external-sub").await;
@@ -344,6 +393,6 @@ async fn tamper_session_tenant_to(
 ) {
     let user_id = session.user_id().await.unwrap();
     session
-        .set_authenticated(user_id, tid(tenant), Utc::now())
+        .set_authenticated(user_id, tid(tenant), start())
         .await;
 }

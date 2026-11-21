@@ -17,16 +17,16 @@ The example uses `MockIdentityStore` and `MockFactorStore` because the focus is 
 
 - OIDC discovery (fetching `.well-known/openid-configuration` and JWKS), in one place: `ProviderSettings` in `src/app.rs`
 - Authorization URL generation with PKCE and state (CSRF) protection, begun for a tenant (`begin_oauth_login_in_tenant`)
-- Token exchange, ID token verification and the RFC 9207 `iss` check (`finish_oauth_login_with_iss`)
+- Token exchange, ID token verification and the RFC 9207 mix-up checks, the callback's provider and its `iss` (`finish_oauth_login`)
 - A federated-identity table: `(issuer, subject)` to local user id. The e-mail address is never the link, so the same address from a second issuer is a second user
 - Just-in-time provisioning under a tenant policy (`Provisioning::JustInTime` creates the user on first login; `LinkedOnly` refuses an identity nobody linked, and `Provisioner::invite` links one beforehand)
-- The claim lock: `complete_oauth_login` refuses claims that did not come out of this session's `finish_oauth_login_with_iss`
+- The claim lock: `complete_oauth_login` refuses claims that did not come out of this session's `finish_oauth_login`
 - `POST /auth/logout` and `POST /auth/refresh` refuse a request whose `Origin` (or `Sec-Fetch-Site`) is not the application's own, so they stay safe if the cookie is ever sent cross-site
 - Logout from both ends: `POST /auth/logout` (local, then the provider's end-session endpoint with the ID token as hint) and `POST /auth/backchannel-logout` (the provider ends a session)
 - A `/profile` that reads the axess session and the user store, not the claims
 - Refresh on demand: `POST /auth/refresh` exchanges the stored refresh token (`refresh_oauth_token` with the stored DPoP key), keeps the rotated one and asks userinfo about the same subject
 - DPoP-bound tokens wherever the IdP advertises DPoP: the login's key (`OAuthClaims::dpop_key`) is kept beside the refresh token and signs the refresh and userinfo calls
-- `private_key_jwt` instead of a secret: set `OAUTH_PRIVATE_KEY_FILE` to a PEM key (`OAUTH_PRIVATE_KEY_ALG`, default `RS256`; `OAUTH_PRIVATE_KEY_KID` optional)
+- `private_key_jwt` instead of a secret: set `OAUTH_PRIVATE_KEY_FILE` to a PEM key (`OAUTH_PRIVATE_KEY_ALG`, default `ES256`; an RSA key needs the `client-assertion-rsa` feature of `axess` on this example's `jwt-rust-crypto` backend, since that signature runs in rsa 0.9 (RUSTSEC-2023-0071); `OAUTH_PRIVATE_KEY_KID` optional)
 - `OAUTH_ID_TOKEN_ALGS` names the signature algorithms ID tokens may use (comma separated); unset, it is `RS256`, so a provider that advertises other algorithms is not trusted to choose
 
 ### Endpoints

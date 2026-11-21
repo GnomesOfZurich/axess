@@ -2,14 +2,14 @@
 
 use super::*;
 use crate::device::types::DeviceBinding;
-use chrono::TimeZone;
+use axess_clock::Timestamp;
 
 fn tenant() -> TenantId {
     crate::authn::ids::testing::tenant("tenant-1")
 }
 
-fn at() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap()
+fn at() -> Timestamp {
+    Timestamp::from_utc(2026, 6, 1, 0, 0, 0).unwrap()
 }
 
 fn unowned() -> Device {

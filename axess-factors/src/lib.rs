@@ -36,17 +36,17 @@ compile_error!(
      `allow-testing-in-release` to keep it on purpose."
 );
 
-/// Server-issued [`EmailOtpConfig`](email_otp::EmailOtpConfig): the typed
-/// challenge state for the out-of-band email factor (`email_otp` feature).
 /// RFC 7523 client assertions (`private_key_jwt`), shared by the outbound
 /// client and the user login's token requests.
 #[cfg(any(feature = "oauth", feature = "outbound-oauth"))]
 pub mod client_assertion;
+/// Server-issued [`EmailOtpConfig`]: the typed
+/// challenge state for the out-of-band email factor (`email_otp` feature).
 #[cfg(feature = "email_otp")]
 pub mod email_otp;
-/// FIDO2/WebAuthn factor data: [`Fido2Config`](fido2::Fido2Config) +
-/// [`Fido2Credential`](fido2::Fido2Credential) +
-/// [`Fido2Options`](fido2::Fido2Options) +
+/// FIDO2/WebAuthn factor data: [`Fido2Config`] +
+/// [`Fido2Credential`] +
+/// [`Fido2Options`] +
 /// re-exports of `webauthn-rs` primitives (`fido2` feature).
 #[cfg(feature = "fido2")]
 pub mod fido2;
@@ -62,19 +62,20 @@ pub mod fido2_stub;
 pub use fido2_stub as fido2;
 /// Bearer JWT workload-auth middleware. Verifies inbound
 /// `Authorization: Bearer <jwt>` headers against configured issuers and
-/// JWKS, inserts a [`WorkloadIdentity`](bearer::WorkloadIdentity) into
+/// JWKS, inserts a [`WorkloadIdentity`] into
 /// axum request extensions (`bearer` feature).
 #[cfg(feature = "bearer")]
 pub mod bearer;
-/// Where the server may connect to for a URL it was handed: the screen for
-/// tenant-supplied identity-provider URLs (`oidc` feature).
-#[cfg(feature = "oidc")]
+/// Where the server may connect to for a URL it was handed: the screen every
+/// outbound client of this crate builds its HTTP client through (`egress`
+/// feature, on with `oidc`, `social` and `outbound-oauth`).
+#[cfg(feature = "egress")]
 pub mod egress;
 /// The endpoint rule shared by the clients that send credentials or send a
 /// user to a remote endpoint.
-#[cfg(any(feature = "oidc", feature = "social"))]
+#[cfg(feature = "egress")]
 pub(crate) mod endpoint;
-/// [`FactorSecret`](factor_secret::FactorSecret): an OTP secret, plain or sealed.
+/// [`FactorSecret`]: an OTP secret, plain or sealed.
 pub mod factor_secret;
 /// Workload-identity federation. The generic
 /// [`federation::workload::WorkloadResolver`] verifies any JWT-bearer
@@ -100,15 +101,25 @@ pub mod http_body;
 /// back-channel logout.
 #[cfg(any(feature = "jwt", feature = "oidc"))]
 mod iat_window;
+
+/// The rules a P-256 public key given as a JWK is held to, shared by the
+/// DPoP verifier and the device-key proof verifier.
+#[cfg(any(feature = "oauth", feature = "key-proof"))]
+pub(crate) mod jwk_p256;
 #[cfg(feature = "jwt")]
 pub mod jwt;
-/// LDAP simple-bind verifier: [`LdapProvider`](ldap::LdapProvider)
-/// trait + [`LdapProviderConfig`](ldap::LdapProviderConfig) production
+// No outer doc comment: with one, rustdoc resolves the links of the module's
+// own `//!` docs in this scope, where none of them names anything.
+#[cfg(feature = "key-proof")]
+pub mod key_proof;
+/// LDAP simple-bind verifier: [`LdapProvider`]
+/// trait + [`LdapProviderConfig`] production
 /// impl (`ldap3`-backed) + `MockLdapProvider` (under `cfg(test)` or the
 /// `testing` feature). HealthCheck integration lives in axess-core as
 /// an extension impl.
 #[cfg(feature = "ldap")]
 pub mod ldap;
+pub mod log_text;
 /// mTLS SPIFFE X509-SVID resolver. Extracts a
 /// [`Principal::Workload`](axess_identity::Principal::Workload) from
 /// the leaf client certificate in a rustls peer-cert chain (`mtls`
@@ -125,9 +136,9 @@ pub mod oauth;
 /// that verify JWTs without taking it.
 #[cfg(feature = "oidc")]
 pub mod oidc;
-/// [`OtpAlgorithm`](otp_algorithm::OtpAlgorithm): the storage-shape HMAC
-/// algorithm tag shared by [`TotpConfig`](totp::TotpConfig) and
-/// [`HotpConfig`](hotp::HotpConfig). Gated on `totp` OR `hotp` because
+/// [`OtpAlgorithm`]: the storage-shape HMAC
+/// algorithm tag shared by [`TotpConfig`] and
+/// [`HotpConfig`]. Gated on `totp` OR `hotp` because
 /// it has no consumer outside the two OTP configs.
 #[cfg(any(feature = "totp", feature = "hotp"))]
 pub mod otp_algorithm;
@@ -152,11 +163,14 @@ pub mod pkce;
 /// endpoint, not from a signed assertion. See module docs for the
 /// full delta and when to reach for this.
 /// Recovery codes: one-time fallback credentials for a second factor,
-/// [`RecoveryCodesConfig`](recovery_code::RecoveryCodesConfig) +
+/// [`RecoveryCodesConfig`] +
 /// generation and verification (`recovery_code` feature).
 #[cfg(feature = "recovery_code")]
 pub mod recovery_code;
-/// [`ZeroizedString`](secret::ZeroizedString): secret-string primitive
+/// Text a remote party wrote, escaped and cut for an error or a log line.
+#[cfg(any(feature = "jwt", feature = "http-body"))]
+pub(crate) mod remote_text;
+/// [`ZeroizedString`]: secret-string primitive
 /// shared across factor configs and other credential-bearing types.
 /// Always on (no feature gate) because the orchestrator's OAuth token
 /// storage and delegated-credential storage hold it without the
@@ -166,6 +180,13 @@ pub mod secret;
 pub mod social;
 #[cfg(feature = "totp")]
 pub mod totp;
+#[cfg(any(
+    feature = "totp",
+    feature = "email_otp",
+    feature = "oauth",
+    feature = "outbound-oauth"
+))]
+mod whole_seconds;
 
 #[cfg(all(feature = "password", any(test, feature = "testing")))]
 pub use password::breached::BreachCheckOutage;
@@ -184,7 +205,9 @@ pub use password::{
 };
 
 #[cfg(feature = "hotp")]
-pub use hotp::{HOTP_LENGTH, HotpAlgorithm, HotpConfig, HotpThrottle, verify_hotp};
+pub use hotp::{
+    HOTP_LENGTH, HotpAlgorithm, HotpConfig, HotpThrottle, MAX_HOTP_LOOKAHEAD, verify_hotp,
+};
 
 #[cfg(feature = "totp")]
 pub use totp::{
@@ -193,7 +216,7 @@ pub use totp::{
 };
 
 #[cfg(feature = "email_otp")]
-pub use email_otp::EmailOtpConfig;
+pub use email_otp::{EmailOtpConfig, MAX_EMAIL_OTP_TTL, MIN_EMAIL_OTP_TTL};
 #[cfg(feature = "recovery_code")]
 pub use recovery_code::{
     GeneratedRecoveryCodes, PepperTooShort, RECOVERY_CODE_ALPHABET, RECOVERY_CODE_COUNT,
@@ -207,10 +230,13 @@ pub use fido2::MockFido2Provider;
 #[cfg(feature = "fido2")]
 pub use fido2::{
     AttestationCaList, AuthenticationResult, AuthenticatorAttachment, CredentialID,
-    DefaultFido2Provider, Fido2Authentication, Fido2Credential, Fido2Key, Fido2Options,
-    Fido2Provider, Fido2Registration,
+    DefaultFido2Provider, DiscoverableCredential, DiscoverablePrompt, Fido2Authentication,
+    Fido2Credential, Fido2Key, Fido2Options, Fido2Provider, Fido2Registration,
 };
-pub use fido2::{DEFAULT_FIDO2_CEREMONY, Fido2Ceremony, Fido2Config, SecurityKeyVerification};
+pub use fido2::{
+    DEFAULT_FIDO2_CEREMONY, DEFAULT_FIDO2_MAX_AUTHN_AGE, Fido2Ceremony, Fido2Config,
+    SecurityKeyVerification,
+};
 
 #[cfg(all(feature = "ldap", any(test, feature = "testing")))]
 pub use ldap::MockLdapProvider;

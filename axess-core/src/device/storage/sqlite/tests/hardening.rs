@@ -6,6 +6,7 @@ use super::*;
 use crate::device::storage::sql_common::ops::DeviceSql;
 use crate::device::storage::sqlite::statements::SqliteSql;
 use crate::device::store::{BindingsUpdate, OwnerClaim, TrustTransition};
+use axess_clock::testing::Shift;
 
 fn refresh(family: &str) -> DeviceBinding {
     DeviceBinding::Refresh {
@@ -216,7 +217,7 @@ async fn the_family_index_insert_is_idempotent() {
 #[tokio::test]
 async fn writes_to_a_missing_device_are_not_found_errors() {
     let store = fresh_store().await;
-    let (t, _u, _d) = ids();
+    let (t, _, _) = ids();
     let ghost = crate::authn::ids::testing::device("ghost");
 
     let err = store
@@ -256,7 +257,7 @@ async fn writes_to_a_missing_device_are_not_found_errors() {
 #[tokio::test]
 async fn revoked_devices_never_use_up_the_active_limit() {
     let store = fresh_store().await;
-    let (t, u, _d) = ids();
+    let (t, u, _) = ids();
     // Five revoked devices, all more recently sighted than the three
     // active ones, so a LIMIT applied first would return only revoked rows.
     for i in 0..8u8 {
@@ -265,10 +266,10 @@ async fn revoked_devices_never_use_up_the_active_limit() {
         if i < 5 {
             device.trust_level = DeviceTrustLevel::Revoked;
             device.revoked_at = Some(now_at(12, 0));
-            device.last_seen_at = now_at(12, i as u32);
+            device.last_seen_at = now_at(12, u8::try_from(i as u32).unwrap());
         } else {
             device.trust_level = DeviceTrustLevel::Seen;
-            device.last_seen_at = now_at(10, i as u32);
+            device.last_seen_at = now_at(10, u8::try_from(i as u32).unwrap());
         }
         store
             .save(&device, crate::device::test_now())
@@ -295,7 +296,7 @@ use crate::device::store::ladder::LADDER;
 #[tokio::test]
 async fn sweep_follows_the_ladder_table() {
     let store = fresh_store().await;
-    let (t, u, _d) = ids();
+    let (t, u, _) = ids();
     let now = now_at(20, 0);
     for (i, r) in LADDER.iter().enumerate() {
         let id = crate::authn::ids::testing::device(&format!("row-{i}"));
@@ -330,7 +331,7 @@ async fn sweep_stamps_the_demotion_and_counts_the_seen_window_from_it() {
     let now = now_at(20, 0);
     let mut device = build_device(&t, Some(&u), &d, 1, vec![]);
     device.trust_level = DeviceTrustLevel::Trusted;
-    device.last_seen_at = now - chrono::Duration::days(100);
+    device.last_seen_at = now.minus(axess_clock::SignedDuration::days(100));
     store
         .save(&device, crate::device::test_now())
         .await
@@ -341,10 +342,10 @@ async fn sweep_stamps_the_demotion_and_counts_the_seen_window_from_it() {
     assert_eq!(row.trust_level, DeviceTrustLevel::Seen);
     assert_eq!(row.demoted_at, Some(now));
 
-    let later = now + chrono::Duration::days(29);
+    let later = now.plus(axess_clock::SignedDuration::days(29));
     let counts = store.sweep(&t, later).await.unwrap();
     assert_eq!(counts.seen_to_revoked, 0);
-    let later = now + chrono::Duration::days(31);
+    let later = now.plus(axess_clock::SignedDuration::days(31));
     let counts = store.sweep(&t, later).await.unwrap();
     assert_eq!(counts.seen_to_revoked, 1);
     let row = store.load(&t, &d).await.unwrap().unwrap();
@@ -428,7 +429,7 @@ async fn explicit_transitions_stamp_and_clear_the_demotion() {
 #[tokio::test]
 async fn racing_owner_claims_have_exactly_one_winner() {
     let store = fresh_store().await;
-    let (t, _u, d) = ids();
+    let (t, _, d) = ids();
     let mut device = build_device(&t, None, &d, 1, vec![]);
     device.user_id = None;
     store

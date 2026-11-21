@@ -6,7 +6,8 @@
 //! [`build`](super::OAuthProviderBuilder::build) for the endpoints a setter
 //! named, and the mTLS aliases. A built provider therefore holds no endpoint
 //! that could send a secret in the clear, and the requests need not check
-//! again.
+//! again. The egress policy's screen is applied beside it at each of those
+//! places.
 
 use crate::oauth::types::OAuthError;
 

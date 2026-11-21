@@ -5,11 +5,14 @@
 //! tenant's provider, and its callback finds that provider from the tenant the
 //! server stored in the session. The helpers that follow the login (refresh,
 //! userinfo, revocation, the RP-Initiated Logout URL, DPoP proofs) take the
-//! same choice here. The by-name methods on the service stay the
-//! single-tenant form and read the global registration only; a
-//! [`ScopedOAuth`] reads the tenant's provider when it has a tenant, and the
-//! global registration otherwise.
+//! same choice here. None of them has a form on the service that takes a
+//! provider by its name alone: a name is unique only inside one tenant's
+//! providers or the global registration, and a token sent to the wrong one
+//! of two providers of a name is disclosed to it. Every helper is called on
+//! a [`ScopedOAuth`], which reads the tenant's provider when it has a
+//! tenant, and the global registration otherwise.
 
+use crate::authn::factor::FederatedProvider;
 use crate::authn::ids::{TenantId, UserId};
 use crate::authn::service::{AuthnService, RequestAuthnService};
 use crate::authn::store::{FactorStore, IdentityStore};
@@ -139,7 +142,7 @@ where
         scope: &Scope,
         name: &str,
     ) -> Result<Arc<dyn OAuthProvider>, OAuthError> {
-        let unknown = || OAuthError::UnknownProvider(name.to_string());
+        let unknown = || super::unknown_provider(name);
         if scope.source == Source::Refused {
             return Err(unknown());
         }
@@ -155,6 +158,33 @@ where
                 .get(name)
                 .cloned()
                 .ok_or_else(unknown),
+        }
+    }
+}
+
+impl<I, F> AuthnService<I, F>
+where
+    I: IdentityStore,
+    F: FactorStore<Error = I::Error>,
+{
+    /// The kind the rows and the session record for the provider `name`
+    /// under `scope`: the tenant's provider's when the scope has a tenant for
+    /// that name, the global registration's otherwise, and `Custom(name)`
+    /// under a refusing scope.
+    pub(crate) async fn scoped_provider_kind(
+        &self,
+        scope: &Scope,
+        name: &str,
+    ) -> FederatedProvider {
+        if scope.source == Source::Refused {
+            return FederatedProvider::Custom(name.to_string());
+        }
+        match scope.tenant_for(name) {
+            Some(tenant) => match &self.inner.tenant_oauth_providers {
+                Some(source) => source.provider_kind(tenant, name).await,
+                None => FederatedProvider::Custom(name.to_string()),
+            },
+            None => self.inner.oauth_providers.load().provider_kind(name),
         }
     }
 }
@@ -183,14 +213,31 @@ where
         }
     }
 
+    /// The OAuth helpers for the global registration, whatever a session
+    /// logged in through.
+    ///
+    /// Use it where there is neither a session nor a tenant: a job that
+    /// revokes a stored token of a provider every tenant shares. A request
+    /// that holds a session uses
+    /// [`oauth_for_session`](Self::oauth_for_session), which reads the
+    /// tenant's provider when the login used one; the global registration
+    /// read for such a session would send its token to another provider of
+    /// the same name. The audit rows of the helpers carry no user and no
+    /// tenant unless [`ScopedOAuth::attributed_to`] names one.
+    pub fn oauth_global(&self) -> ScopedOAuth<'_, I, F> {
+        ScopedOAuth {
+            authn: self,
+            scope: Scope::global(),
+        }
+    }
+
     /// The OAuth helpers for the provider `session` logged in through.
     ///
     /// When the session's login was begun with
     /// [`begin_oauth_login_with_tenant_provider`](crate::authn::service::AuthnService::begin_oauth_login_with_tenant_provider),
     /// the helpers resolve that provider from the tenant the server recorded
     /// at login; for a login begun with `begin_oauth_login`, or a session
-    /// that has no OAuth login, they read the global registration, as the
-    /// by-name methods on the service do.
+    /// that has no OAuth login, they read the global registration.
     ///
     /// The audit rows of the helpers name the session's user and tenant when
     /// it is authenticated.
@@ -203,13 +250,15 @@ where
     }
 }
 
-/// The by-name OAuth helpers under a tenant scope.
+/// The by-name OAuth helpers under a scope: a tenant's providers or the
+/// global registration.
 ///
 /// Obtained from
-/// [`RequestAuthnService::oauth_for_session`] or
-/// [`RequestAuthnService::oauth_in_tenant`]. Each method does what the
-/// method of the same name on the service does, with the provider resolved
-/// as described there; a name the scope cannot resolve is
+/// [`RequestAuthnService::oauth_for_session`],
+/// [`RequestAuthnService::oauth_in_tenant`] or
+/// [`RequestAuthnService::oauth_global`]. The helpers exist only here: each
+/// resolves the provider it is given by name under the scope, as described
+/// on those three methods, and a name the scope cannot resolve is
 /// [`OAuthError::UnknownProvider`].
 pub struct ScopedOAuth<'a, I, F>
 where
@@ -247,17 +296,56 @@ where
     /// refresh runs for a stored user with no session to read one from. The
     /// id must come from the server's own record of whose token this is,
     /// never from the IdP subject or a request body.
+    ///
+    /// It changes the audit rows and nothing else: the provider the helpers
+    /// reach is the scope's, whoever the rows name.
     #[must_use]
-    pub fn as_user(mut self, user: UserId) -> Self {
+    pub fn attributed_to(mut self, user: UserId) -> Self {
         self.scope.user = Some(user);
         self
     }
 
-    /// See [`RequestAuthnService::refresh_oauth_token`].
+    /// Refresh an OAuth token using a stored refresh token.
+    ///
+    /// Exchanges the refresh token at the IdP's token endpoint for new
+    /// access/ID tokens. Validates the new ID token, when the IdP sent one,
+    /// and returns it with the rotated tokens.
+    ///
+    /// # Arguments
+    ///
+    /// * `provider_name`: The provider, resolved under this scope.
+    /// * `refresh_token`: The refresh token obtained from a previous login
+    ///   (stored in [`OAuthClaims::refresh_token`](axess_factors::oauth::OAuthClaims::refresh_token)).
+    /// * `expected_subject`: The IdP subject the login recorded
+    ///   ([`OAuthClaims::subject`](axess_factors::oauth::OAuthClaims::subject)).
+    ///   A response for any other subject is refused (OIDC Core 12.2) and
+    ///   audited as a provider rejection.
+    /// * `original_nonce`: The `nonce` of the login that produced the refresh
+    ///   token ([`OAuthClaims::nonce`](axess_factors::oauth::OAuthClaims::nonce),
+    ///   stored beside the refresh token).
+    ///   A refresh ID token that carries a nonce must equal it (OIDC Core
+    ///   12.2); one without a nonce is accepted, and one with a nonce when
+    ///   this is `None` is refused.
+    /// * `dpop_key`: The key the login's tokens are bound to, for a provider
+    ///   that binds them to a DPoP key: the one the login returned in
+    ///   [`OAuthClaims::dpop_key`](axess_factors::oauth::OAuthClaims::dpop_key),
+    ///   or restored with `DpopKey::from_seed`. The refresh request carries a
+    ///   proof signed by it, and the rotated access token is bound to the
+    ///   same key. `None` for a provider that does not bind.
+    ///
+    /// # Returns
+    ///
+    /// A [`RefreshOutcome`](axess_factors::oauth::RefreshOutcome). Store its
+    /// `refresh_token` in place of the one you sent: a rotating IdP has spent
+    /// the old one even when the response carries no ID token, in which case
+    /// `id_token_claims` is `None` and the claims you already hold stand.
     ///
     /// # Errors
     ///
-    /// As the by-name method.
+    /// [`OAuthError::DpopKeyRequired`]
+    /// when the provider binds tokens and `dpop_key` is `None`, refused
+    /// before anything is sent and audited as `token_refresh_dpop_key_missing`;
+    /// the provider's own errors otherwise.
     pub async fn refresh_oauth_token(
         &self,
         provider_name: &str,
@@ -278,11 +366,38 @@ where
             .await
     }
 
-    /// See [`AuthnService::fetch_userinfo`].
+    /// Fetch additional user claims from the OIDC UserInfo endpoint.
+    ///
+    /// Calls the provider's UserInfo endpoint using the access token obtained
+    /// during login. Returns [`UserInfoClaims`](axess_factors::oauth::UserInfoClaims) with standard OIDC profile
+    /// claims plus any provider-specific claims.
+    ///
+    /// # Arguments
+    ///
+    /// * `provider_name`: The provider, resolved under this scope.
+    /// * `access_token`: The access token from [`OAuthClaims::access_token`](axess_factors::oauth::OAuthClaims::access_token).
+    /// * `expected_subject`: The `sub` of the ID token the login verified
+    ///   ([`OAuthClaims::subject`](axess_factors::oauth::OAuthClaims::subject)).
+    ///   A response for any other subject is refused (OIDC Core 5.3.2): a
+    ///   substituted token or a mis-routed proxy would otherwise hand back
+    ///   another user's profile for the caller to merge or link on.
+    /// * `dpop_key`: The key the access token is bound to, for a provider
+    ///   that binds tokens to a DPoP key: the one the login returned in
+    ///   [`OAuthClaims::dpop_key`](axess_factors::oauth::OAuthClaims::dpop_key).
+    ///   The request then uses the `DPoP` authorization scheme and carries a
+    ///   proof signed by it that names the token's hash. `None` for a
+    ///   provider that does not bind.
     ///
     /// # Errors
     ///
-    /// As the by-name method.
+    /// * [`OAuthError::DpopKeyRequired`]: the provider binds tokens to a DPoP key
+    ///   and `dpop_key` is `None`; nothing is sent.
+    /// * [`OAuthError::SubjectMismatch`]: the response is about another subject.
+    /// * [`OAuthError::NoAccessToken`]: empty access token.
+    /// * [`OAuthError::UnknownProvider`]: provider not registered.
+    /// * [`OAuthError::AccessTokenExpired`]: token expired or invalid (HTTP 401).
+    /// * [`OAuthError::InsufficientScope`]: missing required scope (HTTP 403).
+    /// * [`OAuthError::UserInfo`]: other HTTP or parse errors.
     pub async fn fetch_userinfo(
         &self,
         provider_name: &str,
@@ -301,11 +416,41 @@ where
             .await
     }
 
-    /// See [`AuthnService::revoke_oauth_token`].
+    /// Revoke an access or refresh token at the identity provider
+    /// (RFC 7009), as part of a logout or when a token must not be used
+    /// again.
+    ///
+    /// * `provider_name`: the provider, resolved under this scope.
+    /// * `token`: the access or refresh token to revoke.
+    /// * `token_type_hint`: `"access_token"` or `"refresh_token"`; optional,
+    ///   and it helps the provider find the token.
+    /// * `dpop_key`: the key the token is bound to, when the caller still
+    ///   holds it: the request then carries a proof signed by it, for an
+    ///   authorization server that wants one. A revocation issues no token,
+    ///   so it is sent with `None` too, even to a provider that binds.
+    ///
+    /// The revocation writes two `LogoutAttempt` rows naming the provider
+    /// and sharing a `request_id`: the request, a `Failure` with the reason
+    /// [`OAUTH_REVOCATION_REQUESTED_REASON`](crate::authn::service::OAUTH_REVOCATION_REQUESTED_REASON),
+    /// before the provider is asked; then the outcome, a `Success` when the
+    /// provider revoked the token, or a `Failure` with its refusal or marked
+    /// unconfirmed when it did not answer. A row the audit pipeline sheds
+    /// ([`AuditOutcome::Shed`](crate::authn::store::AuditOutcome::Shed))
+    /// counts as written, as it does in every audited flow.
     ///
     /// # Errors
     ///
-    /// As the by-name method.
+    /// [`OAuthError::UnknownProvider`] for a name the scope cannot resolve
+    /// and the source's own error when it fails, both before any row is
+    /// written; [`OAuthError::AuditStore`] when the request row cannot be
+    /// written, and nothing is sent; the provider's error when it refused
+    /// or did not answer. [`OAuthError::AuditStore`] after the provider was
+    /// asked means the outcome row could not be written, and its message
+    /// says what the provider answered: the token may be revoked. RFC 7009
+    /// answers a token already revoked as it answers a live one, so sending
+    /// the revocation again records its outcome. A provider that did not
+    /// answer ([`OAuthError::TokenEndpointTransient`]) may have revoked the
+    /// token or not; send it again.
     pub async fn revoke_oauth_token(
         &self,
         provider_name: &str,
@@ -318,9 +463,27 @@ where
             .await
     }
 
-    /// See [`AuthnService::build_end_session_url`]. Async, because resolving
-    /// a tenant's provider reads its store; `Ok(None)` is a provider with no
-    /// end-session endpoint.
+    /// Build an RP-Initiated Logout URL for the given provider.
+    ///
+    /// Returns a URL that the application should redirect the user's browser to
+    /// after invalidating the local session. The IdP will terminate its session
+    /// and redirect the user back to `post_logout_redirect_uri`.
+    ///
+    /// Returns `None` if the provider doesn't advertise an `end_session_endpoint`
+    /// in its OIDC discovery metadata. A `post_logout_redirect_uri` is
+    /// forwarded only when it matches an entry of the provider's configured
+    /// allowlist exactly; with no allowlist configured it is dropped.
+    ///
+    /// # Arguments
+    ///
+    /// * `provider_name`: The provider, resolved under this scope.
+    /// * `id_token_hint`: The raw ID token JWT from [`OAuthClaims::id_token_hint`](axess_factors::oauth::OAuthClaims::id_token_hint).
+    ///   Allows the IdP to identify the session without re-authentication.
+    /// * `post_logout_redirect_uri`: Where the IdP redirects after logout.
+    /// * `state`: Optional CSRF protection for the post-logout redirect.
+    ///
+    /// Async, because resolving a tenant's provider reads its store;
+    /// `Ok(None)` is a provider with no end-session endpoint.
     ///
     /// # Errors
     ///
@@ -340,11 +503,23 @@ where
         Ok(provider.build_end_session_url(id_token_hint, post_logout_redirect_uri, state))
     }
 
-    /// See [`AuthnService::generate_dpop_proof`].
+    /// Generate a DPoP proof JWT for an API call to a resource server.
+    ///
+    /// The proof is signed with `key`, the one key the token is bound to, so
+    /// two proofs for different URLs report the same `thumbprint`, which is
+    /// the `jkt` of the sender-constrained access token. Include the returned
+    /// JWT in the `DPoP` header. Pass `access_token` to add the `ath` claim
+    /// that ties the proof to that token.
+    ///
+    /// The 16 bytes behind the `jti` are drawn from the service's injected
+    /// [`SecureRng`](axess_rng::SecureRng), and `iat` is read from its
+    /// injected clock, so DST tests get reproducible proofs.
     ///
     /// # Errors
     ///
-    /// As the by-name method.
+    /// [`OAuthError::UnknownProvider`] for a name the scope cannot resolve;
+    /// the source's own error when it fails; the provider's error when the
+    /// proof cannot be signed.
     pub async fn generate_dpop_proof(
         &self,
         provider_name: &str,

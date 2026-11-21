@@ -96,7 +96,7 @@ let authz = Arc::new(AuthzStore::try_new(policy_store, provider, "DocApp")?);
 - `is_permitted(action, resource)` returns a boolean (for UI capability hints)
 - `batch_check(checks)` evaluates multiple (action, resource) pairs in one call
 
-**ABAC context.** For policies that check request-level attributes (MFA status, IP address), build the session from the authenticated session with `for_session()`, and read the MFA fact from that session's factor history:
+**ABAC context.** A policy set that reads `context` (here, the delete rule's `context.mfa_verified`) is never decided for a session without one: `for_user_id()` answers `AuthzError::ContextRequired` on such a store, on every route, because an empty context would switch a guarded `forbid` off. So every handler of this example begins its session with `for_user_id_with_context()`. In a service, build the session from the authenticated session with `for_session()`, and read the MFA fact from that session's factor history:
 
 ```rust
 // Never take user_id or MFA from the request: the principal and the MFA fact

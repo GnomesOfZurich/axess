@@ -6,7 +6,6 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 documentation = "https://docs.rs/axess-testing"
 readme = "README.md"
 description = """
@@ -22,6 +21,9 @@ exclude = ["tests/", "benches/"]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
+[lints]
+workspace = true
+
 [dependencies]
 # The cancellation helpers (`stall`) wait on a Notify and sleep.
 tokio = { workspace = true, features = ["sync", "time", "rt"] }
@@ -29,8 +31,17 @@ base64 = { workspace = true }
 # RUSTSEC-2023-0071 (Marvin Attack on RSA private-key operations) does not
 # apply here: the key is generated for a fixture and signs nothing a network
 # peer can time.
+# Held at 0.9 until openidconnect accepts rsa 0.10 and crypto-glue (through
+# webauthn-rs) moves from its rsa 0.10 release candidate to rsa 0.10.0.
 rsa = { version = "0.9.10", features = ["pkcs5"] }
 serde_json = { workspace = true }
+# The `Service` trait alone, for the inner service of `readiness`.
+tower-service = "0.3.3"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 wiremock = "0.6.5"
+
+[dev-dependencies]
+# `#[tokio::test]` for the stall tests; `test-util` pauses time so a bound
+# is reached without waiting it out.
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time", "test-util"] }

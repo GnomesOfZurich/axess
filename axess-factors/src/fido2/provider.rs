@@ -45,7 +45,7 @@ pub trait Fido2Provider: Send + Sync + 'static {
     ///
     /// A passkey is bound to the relying-party id it was registered under, so
     /// changing it orphans every registered credential. A live reload
-    /// (`AuthnService::reload_fido2`) compares the id of the provider it
+    /// (`RequestAuthnService::reload_fido2_as`) compares the id of the provider it
     /// replaces with the candidate's and refuses a change unless the caller
     /// acknowledged it. An implementation that cannot tell returns an empty
     /// string, which equals no real id, so a reload to or from it is refused
@@ -119,8 +119,13 @@ pub trait Fido2Provider: Send + Sync + 'static {
     /// Credential-used notification hook.
     ///
     /// Fired by the orchestrator's service layer after a successful
-    /// WebAuthn ceremony (registration or assertion) for which the
-    /// request resolved to a known device. Adopters that wire the
+    /// WebAuthn ceremony (registration or assertion) on a request that
+    /// proved its device, by the device's token or its key. `device_id` is
+    /// the device this request proved; a request that proved none (one
+    /// that presents the session cookie without the device's token keeps
+    /// the session's device only as a label) does not fire the hook, so a
+    /// ceremony performed with a copied session cookie is never recorded
+    /// against the session's device. Adopters that wire the
     /// orchestrator's device subsystem override this method to persist
     /// a `DeviceBinding::WebAuthn` row (or update `last_used_at` on an
     /// existing binding) so the device → credential relation is

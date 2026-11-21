@@ -2,7 +2,8 @@
 //! Input-boundary validation, validated-constructor surface, session-config
 //! builder rejections, and the `MemorySessionStore` auto-purge trigger.
 
-mod common;
+use axess_core::session::SessionKey;
+use axess_core::testing::fixtures as common;
 
 use axess_core::authn::AuditContext;
 use axess_core::authn::{
@@ -12,19 +13,23 @@ use axess_core::authn::{
     store::AuthMethod,
     types::{EntityState, Tenant, User},
 };
-use axess_core::testing::mock_authn::make_password_service;
+use axess_core::testing::mock_authn::make_password_service_on;
 use axess_core::testing::{
     mock_authn::{MockFactorStore, MockIdentityStore},
     test_session,
 };
-use chrono::Utc;
 use common::{password_config, test_tenant, test_user, tid, totp_config, uid, user_scope};
 
 // ── Input boundaries ────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn oversized_identifier_returns_invalid_credentials() {
-    let service = make_password_service("u1", "alice", "secret");
+    let service = make_password_service_on(
+        std::sync::Arc::new(common::test_clock()),
+        "u1",
+        "alice",
+        "secret",
+    );
     let session = test_session();
 
     // 300-byte identifier should be rejected (limit is 256).
@@ -38,7 +43,12 @@ async fn oversized_identifier_returns_invalid_credentials() {
 
 #[tokio::test]
 async fn empty_identifier_returns_invalid_credentials() {
-    let service = make_password_service("u1", "alice", "secret");
+    let service = make_password_service_on(
+        std::sync::Arc::new(common::test_clock()),
+        "u1",
+        "alice",
+        "secret",
+    );
     let session = test_session();
 
     let outcome = service.begin_login("", "t1", &session).await.unwrap();
@@ -47,7 +57,12 @@ async fn empty_identifier_returns_invalid_credentials() {
 
 #[tokio::test]
 async fn oversized_password_rejected_before_argon2() {
-    let service = make_password_service("u1", "alice", "secret");
+    let service = make_password_service_on(
+        std::sync::Arc::new(common::test_clock()),
+        "u1",
+        "alice",
+        "secret",
+    );
     let session = test_session();
 
     service.begin_login("alice", "t1", &session).await.unwrap();
@@ -69,8 +84,10 @@ async fn oversized_password_rejected_before_argon2() {
 
 #[tokio::test]
 async fn oversized_otp_code_rejected() {
+    let clock = common::test_clock();
     // Start a password+TOTP flow to get into Authenticating state with TOTP pending.
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new()
@@ -84,7 +101,10 @@ async fn oversized_otp_code_rejected() {
                 user_scope(),
             ),
         );
-    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
+    let service = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
+        .build()
+        .with_audit_context(AuditContext::default());
     let session = test_session();
 
     service
@@ -122,7 +142,7 @@ fn user_id_rejects_empty() {
 /// User::validate rejects control characters in identifier.
 #[test]
 fn user_validate_rejects_control_chars() {
-    let now = Utc::now();
+    let now = common::start();
     let user = User {
         id: uid("u1"),
         tenant_id: tid("t1"),
@@ -166,7 +186,7 @@ fn user_new_validates_and_returns_ok() {
         "Alice",
         EntityState::Active,
         UserId::system(),
-        Utc::now(),
+        common::start(),
     );
     assert!(user.is_ok());
     assert_eq!(user.unwrap().identifier.as_ref(), "alice");
@@ -182,7 +202,7 @@ fn user_new_rejects_empty_id() {
         "Alice",
         EntityState::Active,
         UserId::system(),
-        Utc::now(),
+        common::start(),
     );
     assert!(result.is_err());
 }
@@ -198,7 +218,7 @@ fn user_new_rejects_control_chars_in_identifier() {
         "Alice",
         EntityState::Active,
         UserId::system(),
-        Utc::now(),
+        common::start(),
     );
     assert!(result.is_err());
 }
@@ -212,7 +232,7 @@ fn tenant_new_validates_and_returns_ok() {
         "Test Tenant",
         EntityState::Active,
         UserId::system(),
-        Utc::now(),
+        common::start(),
     );
     assert!(tenant.is_ok());
 }
@@ -226,7 +246,7 @@ fn tenant_new_rejects_empty_identifier() {
         "Test",
         EntityState::Active,
         UserId::system(),
-        Utc::now(),
+        common::start(),
     );
     assert!(result.is_err());
 }
@@ -266,7 +286,6 @@ fn session_config_accepts_valid() {
 /// MemorySessionStore auto-purges expired sessions after many writes.
 #[tokio::test]
 async fn memory_store_auto_purges_expired_sessions() {
-    use axess_clock::testing::MockClock;
     use axess_core::session::data::SessionData;
     use axess_core::session::id::SessionId;
     use axess_core::session::store::{MemorySessionStore, SessionStore};
@@ -275,14 +294,14 @@ async fn memory_store_auto_purges_expired_sessions() {
 
     // DST shape: anchor the clock, save with a short finite TTL, then
     // advance past expiry before the auto-purge trigger fires.
-    let clock = Arc::new(MockClock::at(Utc::now()));
+    let clock = Arc::new(common::test_clock());
     let store = MemorySessionStore::new().with_clock(clock.clone());
     let rng = MockRng::new(1);
 
     let expired_id = SessionId::new(&rng);
     store
         .save(
-            &expired_id,
+            &SessionKey::of(&expired_id),
             &SessionData::default(),
             std::time::Duration::from_secs(10),
         )
@@ -299,7 +318,7 @@ async fn memory_store_auto_purges_expired_sessions() {
         let id = SessionId::new(&rng_i);
         store
             .save(
-                &id,
+                &SessionKey::of(&id),
                 &SessionData::default(),
                 std::time::Duration::from_secs(3600),
             )
@@ -307,6 +326,6 @@ async fn memory_store_auto_purges_expired_sessions() {
             .unwrap();
     }
 
-    let loaded = store.load(&expired_id).await.unwrap();
+    let loaded = store.load(&SessionKey::of(&expired_id)).await.unwrap();
     assert!(loaded.is_none(), "expired session should have been purged");
 }

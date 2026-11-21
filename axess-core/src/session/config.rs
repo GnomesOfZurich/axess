@@ -116,10 +116,10 @@ impl SessionConfig {
     }
 
     /// Absolute cap on how long an authenticated session may live, measured
-    /// from the moment it authenticated (default: 7 days; `None` means no
-    /// cap, so the sliding [`ttl`](Self::ttl) is the only bound). A session
-    /// whose authentication is older than this is ended on its next request,
-    /// however recently it was used.
+    /// from its login (default: 7 days; `None` means no cap, so the sliding
+    /// [`ttl`](Self::ttl) is the only bound). A session whose login is older
+    /// than this is ended on its next request, however recently it was used
+    /// and however recently it stepped up.
     pub fn max_authenticated_age(&self) -> Option<Duration> {
         self.max_authenticated_age
     }
@@ -365,8 +365,8 @@ impl SessionConfigBuilder {
         self
     }
 
-    /// Cap how long an authenticated session may live, however active it is
-    /// (default: 7 days). `None` lifts the cap, leaving the sliding TTL as the
+    /// Cap how long an authenticated session may live from its login, however
+    /// active it is and however often it steps up (default: 7 days). `None` lifts the cap, leaving the sliding TTL as the
     /// only bound. A cap must be non-zero.
     pub fn max_authenticated_age(mut self, max_age: Option<Duration>) -> Self {
         self.0.max_authenticated_age = max_age;

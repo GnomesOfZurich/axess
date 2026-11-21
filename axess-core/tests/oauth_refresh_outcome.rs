@@ -5,7 +5,9 @@
 
 #![cfg(all(feature = "testing", feature = "oauth"))]
 
-use axess_core::testing::oauth_provider::oauth_setup_provider;
+use axess_core::testing::fixtures as common;
+
+use axess_core::testing::oauth_provider::oauth_discover_provider;
 use axess_factors::oauth::{OAuthError, OAuthProvider, OAuthProviderConfig};
 use axess_testing::oauth_wiremock::{oauth_generate_rsa_keypair, oauth_mount_oidc_endpoints};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
@@ -26,7 +28,11 @@ async fn idp() -> Idp {
     let server = MockServer::start().await;
     let (der, jwk, kid) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &jwk).await;
-    let provider = oauth_setup_provider(&server.uri()).await;
+    let provider = oauth_discover_provider(&server.uri())
+        .await
+        .with_clock(std::sync::Arc::new(common::test_clock()))
+        .build()
+        .expect("build");
     Idp {
         server,
         der,
@@ -37,7 +43,7 @@ async fn idp() -> Idp {
 
 impl Idp {
     fn id_token(&self, nonce: Option<&str>) -> String {
-        let now = chrono::Utc::now().timestamp();
+        let now = common::start().unix_seconds();
         let mut claims = json!({
             "iss": self.server.uri(),
             "sub": "alice",
@@ -50,8 +56,7 @@ impl Idp {
         }
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(self.kid.clone());
-        axess_factors::jwt::ensure_crypto_provider();
-        jsonwebtoken::encode(&header, &claims, &EncodingKey::from_rsa_der(&self.der)).unwrap()
+        axess_factors::jwt::encode(&header, &claims, &EncodingKey::from_rsa_der(&self.der)).unwrap()
     }
 
     async fn respond(&self, body: serde_json::Value) {

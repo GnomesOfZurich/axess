@@ -9,7 +9,6 @@
 
 use super::*;
 use crate::authn::types::{EntityState, Tenant, User};
-use crate::session::data::SessionData;
 use crate::session::extractor::AuthSession;
 use crate::session::layer::{SessionHandle, SessionInner};
 use crate::session::store::{
@@ -27,25 +26,18 @@ fn fixture_tenant_id() -> crate::authn::ids::TenantId {
 }
 
 fn make_session() -> AuthSession {
-    let inner = SessionInner {
-        id: crate::session::id::SessionId::new(&axess_rng::SystemRng),
-        data: SessionData::default(),
-        modified: false,
-        needs_persist: false,
-        regenerate: false,
-        pre_cycle_id: None,
-        rng: std::sync::Arc::new(axess_rng::SystemRng),
-        pending_fingerprint: None,
-        max_custom_bytes: 64 * 1024,
-        consume: None,
-    };
+    let inner = SessionInner::detached(std::sync::Arc::new(axess_rng::SystemRng));
     AuthSession(SessionHandle(Arc::new(RwLock::new(inner))))
 }
 
 async fn authenticated_session() -> AuthSession {
     let session = make_session();
     session
-        .set_authenticated(fixture_user_id(), fixture_tenant_id(), chrono::Utc::now())
+        .set_authenticated(
+            fixture_user_id(),
+            fixture_tenant_id(),
+            axess_clock::testing::MockClock::reference_time(),
+        )
         .await;
     session
 }
@@ -62,7 +54,7 @@ fn build_user(
     user_id: &crate::authn::ids::UserId,
     tenant_id: &crate::authn::ids::TenantId,
 ) -> User {
-    let now = chrono::Utc::now();
+    let now = axess_clock::testing::MockClock::reference_time();
     User {
         id: *user_id,
         tenant_id: *tenant_id,
@@ -78,7 +70,7 @@ fn build_user(
 }
 
 fn build_tenant(id: crate::authn::ids::TenantId, identifier: &str) -> Tenant {
-    let now = chrono::Utc::now();
+    let now = axess_clock::testing::MockClock::reference_time();
     Tenant {
         id,
         identifier: identifier.into(),
@@ -91,13 +83,14 @@ fn build_tenant(id: crate::authn::ids::TenantId, identifier: &str) -> Tenant {
     }
 }
 
-/// Kills line 290 `replace -> true` / `-> false` / `delete !`:
+/// Kills the mutant `replace -> true` / `-> false` / `delete !`:
 /// non-authenticated → false.
 #[tokio::test]
 async fn unauthenticated_session_returns_false() {
     let validator = SessionValidator {
         registry: None,
         identity: None,
+        audit: Arc::new(crate::session::UnrecordedSessionEnds),
     };
     let session = make_session();
     assert!(
@@ -113,6 +106,7 @@ async fn authenticated_session_no_registry_no_identity_returns_true() {
     let validator = SessionValidator {
         registry: None,
         identity: None,
+        audit: Arc::new(crate::session::UnrecordedSessionEnds),
     };
     let session = authenticated_session().await;
     assert!(
@@ -121,13 +115,14 @@ async fn authenticated_session_no_registry_no_identity_returns_true() {
     );
 }
 
-/// Kills line 299 `delete !`: registry rejection must invalidate.
+/// Kills the mutant `delete !`: registry rejection must invalidate.
 #[tokio::test]
 async fn registry_rejection_returns_false() {
     let registry = MemorySessionRegistry::new();
     let validator = SessionValidator {
         registry: Some(registry_handle(registry)),
         identity: None,
+        audit: Arc::new(crate::session::UnrecordedSessionEnds),
     };
     let session = authenticated_session().await;
     assert!(
@@ -142,12 +137,13 @@ async fn registry_rejection_returns_false() {
 async fn registry_acceptance_returns_true() {
     let registry = MemorySessionRegistry::new();
     let session = authenticated_session().await;
-    let sid = session.session_id().await;
+    let sid = session.session_key().await;
     registry.register(&fixture_user_id(), &sid).await.unwrap();
 
     let validator = SessionValidator {
         registry: Some(registry_handle(registry)),
         identity: None,
+        audit: Arc::new(crate::session::UnrecordedSessionEnds),
     };
     assert!(
         validator.is_valid(&session).await,
@@ -155,7 +151,7 @@ async fn registry_acceptance_returns_true() {
     );
 }
 
-/// Kills line 312 match-guard `with true` / `with false` and
+/// Kills the match-guard `with true` / `with false` and
 /// `== → !=`: tenant matches → valid.
 #[tokio::test]
 async fn identity_check_tenant_matches_returns_true() {
@@ -168,6 +164,7 @@ async fn identity_check_tenant_matches_returns_true() {
     let validator = SessionValidator {
         registry: None,
         identity: Some(identity_handle(identity)),
+        audit: Arc::new(crate::session::UnrecordedSessionEnds),
     };
     let session = authenticated_session().await;
     assert!(
@@ -191,10 +188,15 @@ async fn identity_check_tenant_mismatch_returns_false() {
     let validator = SessionValidator {
         registry: None,
         identity: Some(identity_handle(identity)),
+        audit: Arc::new(crate::session::UnrecordedSessionEnds),
     };
     let session = make_session();
     session
-        .set_authenticated(user_id, session_tenant, chrono::Utc::now())
+        .set_authenticated(
+            user_id,
+            session_tenant,
+            axess_clock::testing::MockClock::reference_time(),
+        )
         .await;
     assert!(
         !validator.is_valid(&session).await,
@@ -202,7 +204,7 @@ async fn identity_check_tenant_mismatch_returns_false() {
     );
 }
 
-/// Defends the `None` arm at line 322: an authenticated session
+/// Defends the `None` arm: an authenticated session
 /// whose `user_id` is unknown to the identity store must be
 /// invalid.
 #[tokio::test]
@@ -211,6 +213,7 @@ async fn identity_check_user_not_found_returns_false() {
     let validator = SessionValidator {
         registry: None,
         identity: Some(identity_handle(identity)),
+        audit: Arc::new(crate::session::UnrecordedSessionEnds),
     };
     let session = authenticated_session().await;
     assert!(
@@ -256,84 +259,19 @@ fn oauth_providers_accessor_returns_configured_registry() {
 /// still fails the session.
 #[tokio::test(start_paused = true)]
 async fn the_registry_and_identity_checks_overlap() {
-    use crate::session::store::SessionRevoker;
     use std::time::Duration;
 
-    struct Slow(bool);
-    impl SessionRevoker for Slow {
-        fn invalidate_user<'a>(
-            &'a self,
-            _: &'a crate::authn::ids::UserId,
-        ) -> Pin<
-            Box<
-                dyn Future<Output = Result<(), crate::session::store::RevocationError>> + Send + 'a,
-            >,
-        > {
-            Box::pin(async { Ok(()) })
-        }
-        fn invalidate_session<'a>(
-            &'a self,
-            _: &'a crate::authn::ids::UserId,
-            _: &'a crate::session::id::SessionId,
-        ) -> Pin<
-            Box<
-                dyn Future<Output = Result<(), crate::session::store::RevocationError>> + Send + 'a,
-            >,
-        > {
-            Box::pin(async { Ok(()) })
-        }
-    }
-    impl SessionRegistryHandle for Slow {
-        fn is_valid<'a>(
-            &'a self,
-            _: &'a crate::authn::ids::UserId,
-            _: &'a crate::session::id::SessionId,
-        ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
-            let answer = self.0;
-            Box::pin(async move {
+    use crate::testing::registry_double::{RegistryDouble, RegistryOp, Step};
+
+    // A registry whose every answer takes 100 ms.
+    let slow = || {
+        RegistryDouble::new().before(|call, _| async move {
+            if call.op() == RegistryOp::IsValid {
                 tokio::time::sleep(Duration::from_millis(100)).await;
-                answer
-            })
-        }
-        fn liveness<'a>(
-            &'a self,
-            user_id: &'a crate::authn::ids::UserId,
-            session_id: &'a crate::session::id::SessionId,
-        ) -> Pin<Box<dyn Future<Output = crate::session::store::SessionLiveness> + Send + 'a>>
-        {
-            use crate::session::store::SessionLiveness;
-            Box::pin(async move {
-                if self.is_valid(user_id, session_id).await {
-                    SessionLiveness::Valid
-                } else {
-                    SessionLiveness::Gone
-                }
-            })
-        }
-        fn register<'a>(
-            &'a self,
-            _: &'a crate::authn::ids::UserId,
-            _: &'a crate::session::id::SessionId,
-        ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
-            Box::pin(async { true })
-        }
-        fn held_sessions<'a>(
-            &'a self,
-            _: &'a crate::authn::ids::UserId,
-        ) -> Pin<
-            Box<
-                dyn Future<
-                        Output = Result<
-                            Vec<crate::session::id::SessionId>,
-                            crate::session::store::RevocationError,
-                        >,
-                    > + Send
-                    + 'a,
-            >,
-        > {
-            Box::pin(async { Ok(Vec::new()) })
-        }
-    }
+            }
+            Step::Forward
+        })
+    };
     struct SlowIdentity;
     impl IdentityHandle for SlowIdentity {
         fn get_user_tenant<'a>(
@@ -349,16 +287,23 @@ async fn the_registry_and_identity_checks_overlap() {
     }
 
     let session = authenticated_session().await;
-    let validator = |registry_says: bool| SessionValidator {
-        registry: Some(Arc::new(Slow(registry_says))),
+    let validator = |registry: RegistryDouble| SessionValidator {
+        registry: Some(registry.handle()),
         identity: Some(Arc::new(SlowIdentity)),
+        audit: Arc::new(crate::session::UnrecordedSessionEnds),
     };
+    let holding = slow();
+    holding
+        .inner()
+        .register(&fixture_user_id(), &session.session_key().await)
+        .await
+        .unwrap();
 
-    let started = tokio::time::Instant::now();
-    assert!(validator(true).is_valid(&session).await);
+    let started = axess_testing::stopwatch::Stopwatch::start();
+    assert!(validator(holding).is_valid(&session).await);
     assert_eq!(started.elapsed(), Duration::from_millis(100));
 
-    assert!(!validator(false).is_valid(&session).await);
+    assert!(!validator(slow()).is_valid(&session).await);
 }
 
 /// The middleware that refuses a revoked session also ends it: the session
@@ -372,11 +317,12 @@ async fn require_valid_session_clears_and_rotates_a_revoked_session() {
 
     let registry = MemorySessionRegistry::new();
     let session = authenticated_session().await;
-    let old = session.session_id().await;
+    let old = session.session_key().await;
     // Registered nowhere: the registry does not hold the session.
     let validator = SessionValidator {
         registry: Some(registry_handle(registry)),
         identity: None,
+        audit: Arc::new(crate::session::UnrecordedSessionEnds),
     };
     let app = axum::Router::new()
         .route("/", axum::routing::get(|| async { "ok" }))
@@ -387,5 +333,5 @@ async fn require_valid_session_clears_and_rotates_a_revoked_session() {
 
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     assert!(!session.is_authenticated().await, "the session is cleared");
-    assert_ne!(session.session_id().await, old, "the id is rotated");
+    assert_ne!(session.session_key().await, old, "the id is rotated");
 }

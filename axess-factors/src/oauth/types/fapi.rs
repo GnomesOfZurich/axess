@@ -66,8 +66,11 @@ pub struct FapiConfig {
     /// finished with `finish_oauth_login_jarm`; the plain callback is
     /// refused.
     pub require_jarm: bool,
-    /// Maximum allowed ID token lifetime in seconds. Default: 300 (5 minutes).
-    pub max_id_token_lifetime_secs: u64,
+    /// Maximum allowed ID token lifetime, `exp - iat`. Default: five
+    /// minutes. The claims are whole seconds, and a whole count is within a
+    /// span exactly when it is within the span's whole seconds, so the cap is
+    /// read as its whole seconds.
+    pub max_id_token_lifetime: std::time::Duration,
     /// The JWS algorithms an ID token may be signed with, by their JOSE
     /// names. Default: [`FAPI_ID_TOKEN_ALGS`]. A deployment against an IdP
     /// that cannot sign with those names widens it here, knowingly: the
@@ -80,7 +83,7 @@ impl Default for FapiConfig {
         Self {
             sender_constraint: SenderConstraint::DPoP,
             require_jarm: false,
-            max_id_token_lifetime_secs: 300,
+            max_id_token_lifetime: std::time::Duration::from_secs(300),
             allowed_id_token_algs: FAPI_ID_TOKEN_ALGS
                 .iter()
                 .map(|a| (*a).to_string())
@@ -115,7 +118,11 @@ impl std::fmt::Debug for DpopSigner<'_> {
 /// The members of a verified JARM authorization response (JWT Secured
 /// Authorization Response Mode): the JWT's signature, `iss`, `aud` and `exp`
 /// have been checked, and these are its authorization-response parameters.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The `Debug` output redacts the authorization code and the `state`: the
+/// code redeems for tokens and the `state` is the ceremony's CSRF value, and
+/// an application that logs the verified response must not log either.
+#[derive(Clone, PartialEq, Eq)]
 pub struct JarmResponse {
     /// The `iss` claim, which the caller compares with the provider's issuer.
     pub iss: String,
@@ -125,6 +132,17 @@ pub struct JarmResponse {
     pub state: Option<String>,
     /// The `error` member, when the response is a refusal.
     pub error: Option<String>,
+}
+
+impl std::fmt::Debug for JarmResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JarmResponse")
+            .field("iss", &self.iss)
+            .field("code", &self.code.as_ref().map(|_| "[redacted]"))
+            .field("state", &self.state.as_ref().map(|_| "[redacted]"))
+            .field("error", &self.error)
+            .finish()
+    }
 }
 
 /// Response from a Pushed Authorization Request (RFC 9126).

@@ -2,6 +2,8 @@
 //! The family-compromise handler revokes the device and every refresh token
 //! bound to it, whatever family the token is in.
 
+use axess_core::testing::fixtures as common;
+
 use axess_core::authn::ids::testing;
 use axess_core::session::refresh::{
     IssueRequest, Refresh, RefreshError, RefreshTokenConfig, issue_refresh_token,
@@ -11,20 +13,20 @@ use axess_core::{
     Device, DeviceBinding, DeviceStore, DeviceTrustLevel, FingerprintHash, MemoryDeviceStore,
     cascade_revoke_by_refresh_family_and_tokens,
 };
-use chrono::Utc;
+use std::sync::Arc;
 
 #[tokio::test]
 async fn compromise_of_one_family_ends_the_devices_other_families() {
     let tenant = testing::tenant("t1");
     let user = testing::user("u1");
     let device_id = testing::device("dev-1");
-    let now = Utc::now();
+    let now = common::start();
     let rng = MockRng::new(4);
     let config = RefreshTokenConfig {
         rotation: true,
         ..Default::default()
     };
-    let tokens = MemoryRefreshTokenStore::new();
+    let tokens = MemoryRefreshTokenStore::new().with_clock(Arc::new(common::test_clock()));
     let mut issued = Vec::new();
     for _ in 0..2 {
         issued.push(
@@ -81,10 +83,49 @@ async fn compromise_of_one_family_ends_the_devices_other_families() {
     let stored = devices.load(&tenant, &device_id).await.unwrap().unwrap();
     assert_eq!(stored.trust_level, DeviceTrustLevel::Revoked);
     let outcome = Refresh::any_tenant(&other, |_| async { true })
+        .without_device_check()
         .run(&tokens, &config, &rng, now)
         .await;
     assert!(
         matches!(outcome, Err(RefreshError::Revoked)),
         "the device's other family still refreshes: {outcome:?}"
+    );
+}
+
+/// The device module's documentation names the handler that also revokes
+/// the tokens wherever it tells an integrator what to wire in; the
+/// device-only entry point of earlier releases, which left the tokens of a
+/// device's other families live, is removed and named nowhere.
+#[test]
+fn the_device_docs_steer_to_the_handler_that_revokes_the_tokens() {
+    let sources = [
+        ("lifecycle.rs", include_str!("../src/device/lifecycle.rs")),
+        ("types.rs", include_str!("../src/device/types.rs")),
+        ("cascade.rs", include_str!("../src/device/cascade.rs")),
+        ("device.rs", include_str!("../src/device.rs")),
+    ];
+    let device_only = "cascade_revoke_by_refresh_family";
+    let mut steered = Vec::new();
+    for (file, source) in sources {
+        for (n, line) in source.lines().enumerate() {
+            let text = line.trim_start();
+            if !(text.starts_with("///") || text.starts_with("//!")) {
+                continue;
+            }
+            let mut rest = text;
+            while let Some(at) = rest.find(device_only) {
+                let after = &rest[at + device_only.len()..];
+                if !after.starts_with('_') {
+                    steered.push(format!("{file}:{}: {text}", n + 1));
+                    break;
+                }
+                rest = after;
+            }
+        }
+    }
+    assert!(
+        steered.is_empty(),
+        "documentation names the device-only cascade as the handler:\n{}",
+        steered.join("\n")
     );
 }

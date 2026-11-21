@@ -17,9 +17,13 @@
 
 #![cfg(all(feature = "testing", feature = "oauth"))]
 
+use axess_core::testing::fixtures as common;
+
+use axess_clock::testing::MockClock;
 use axess_core::authn::AuditContext;
 use axess_core::authn::factor_secret::{FactorSecretCipher, FactorSecretError};
 use axess_core::authn::ids::TenantId;
+use axess_core::authn::service::OAuthCallbackRoute;
 use axess_core::authn::service::{AuthnService, RequestAuthnService};
 use axess_core::federation::oauth_tenant::{
     MemoryTenantOAuthProviderStore, StoredTenantOAuthProviders, TenantClientCredential, TenantDpop,
@@ -71,7 +75,6 @@ impl ClientKey {
     }
 
     fn signer(&self) -> ClientAssertionSigner {
-        axess_factors::jwt::ensure_crypto_provider();
         ClientAssertionSigner::new(
             CLIENT_ID,
             EncodingKey::from_rsa_der(&self.der),
@@ -83,16 +86,7 @@ impl ClientKey {
 
     /// The private key as the PKCS#1 PEM text a tenant record holds.
     fn pem(&self) -> String {
-        let body = base64::engine::general_purpose::STANDARD.encode(&self.der);
-        let lines: Vec<&str> = body
-            .as_bytes()
-            .chunks(64)
-            .map(|c| std::str::from_utf8(c).unwrap())
-            .collect();
-        format!(
-            "-----BEGIN RSA PRIVATE KEY-----\n{}\n-----END RSA PRIVATE KEY-----\n",
-            lines.join("\n")
-        )
+        axess_testing::oauth_wiremock::oauth_rsa_private_pem(&self.der)
     }
 }
 
@@ -171,7 +165,6 @@ impl TokenEndpoint {
                 return Err(format!("assertion header lacks {member}"));
             }
         }
-        axess_factors::jwt::ensure_crypto_provider();
         let key = DecodingKey::from_rsa_components(
             jwk["n"].as_str().unwrap(),
             jwk["e"].as_str().unwrap(),
@@ -183,7 +176,7 @@ impl TokenEndpoint {
         validation.set_required_spec_claims(&["exp", "aud", "iss", "sub"]);
         // The clock under test may be a mock.
         validation.validate_exp = false;
-        let claims = jsonwebtoken::decode::<Value>(assertion, &key, &validation)
+        let claims = axess_factors::jwt::decode::<Value>(assertion, &key, &validation)
             .map_err(|e| e.to_string())?
             .claims;
         if claims["sub"] != claims["iss"] {
@@ -374,7 +367,7 @@ impl Idp {
     /// Have the token endpoint answer the next code exchange with an ID
     /// token for `nonce`, naming `subject` and carrying `extra`.
     fn issue(&self, nonce: &str, subject: &str, extra: Value) {
-        let now = chrono::Utc::now().timestamp();
+        let now = common::start().unix_seconds();
         let mut claims = json!({
             "iss": self.issuer, "sub": subject, "aud": CLIENT_ID,
             "exp": now + 3600, "iat": now, "nonce": nonce,
@@ -384,20 +377,32 @@ impl Idp {
             .as_object_mut()
             .unwrap()
             .extend(extra.as_object().unwrap().clone());
-        axess_factors::jwt::ensure_crypto_provider();
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(self.idp_kid.clone());
-        let jwt = jsonwebtoken::encode(&header, &claims, &EncodingKey::from_rsa_der(&self.idp_der))
-            .expect("sign");
+        let jwt =
+            axess_factors::jwt::encode(&header, &claims, &EncodingKey::from_rsa_der(&self.idp_der))
+                .expect("sign");
         *self.id_token.lock().unwrap() = Some(jwt);
     }
 
     /// The builder of a provider that authenticates with `signer`, found by
     /// discovery.
-    async fn provider(&self, name: &str, signer: ClientAssertionSigner) -> OAuthProviderBuilder {
-        OAuthProviderConfig::discover_with_private_key_jwt(name, &self.issuer, signer, REDIRECT)
-            .await
-            .expect("discovery")
+    async fn provider(
+        &self,
+        clock: &MockClock,
+        name: &str,
+        signer: ClientAssertionSigner,
+    ) -> OAuthProviderBuilder {
+        OAuthProviderConfig::discover_screened_with_private_key_jwt(
+            name,
+            &self.issuer,
+            signer,
+            REDIRECT,
+            axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
+        )
+        .await
+        .expect("discovery")
+        .with_clock(Arc::new(clock.clone()))
     }
 }
 
@@ -416,14 +421,24 @@ async fn session_values(session: &axess_core::session::extractor::AuthSession) -
 }
 
 fn service() -> AuthnService<MockIdentityStore, MockFactorStore> {
-    AuthnService::builder(MockIdentityStore::new(), MockFactorStore::new()).build()
+    let clock = common::test_clock();
+    AuthnService::builder(
+        MockIdentityStore::new().with_clock(clock.clone()),
+        MockFactorStore::new(),
+    )
+    .with_clock(clock.clone())
+    .build()
 }
 
-fn global_service(provider: OAuthProviderConfig) -> Authn {
-    AuthnService::builder(MockIdentityStore::new(), MockFactorStore::new())
-        .with_oauth_provider(provider)
-        .build()
-        .with_audit_context(AuditContext::default())
+fn global_service(clock: &MockClock, provider: OAuthProviderConfig) -> Authn {
+    AuthnService::builder(
+        MockIdentityStore::new().with_clock(clock.clone()),
+        MockFactorStore::new(),
+    )
+    .with_clock(clock.clone())
+    .with_oauth_provider(provider)
+    .build()
+    .with_audit_context(AuditContext::default())
 }
 
 /// A global-provider login: begin, have the IdP issue, finish.
@@ -444,7 +459,13 @@ async fn global_login(
     // advertises the parameter (the recorded Keycloak document does) refuses
     // the plain finish.
     authn
-        .finish_oauth_login_with_iss("code-1", &csrf, Some(&idp.issuer), &session)
+        .finish_oauth_login(
+            OAuthCallbackRoute::global(name),
+            "code-1",
+            &csrf,
+            Some(&idp.issuer),
+            &session,
+        )
         .await
 }
 
@@ -452,17 +473,25 @@ async fn global_login(
 
 #[tokio::test]
 async fn the_code_exchange_is_authenticated_by_a_verified_assertion_and_no_secret() {
+    let clock = common::test_clock();
     let key = ClientKey::new();
     let idp = Idp::plain(&key).await;
     // Built with a secret, then switched: the secret must not be sent.
-    let provider =
-        OAuthProviderConfig::discover("p", &idp.issuer, CLIENT_ID, "SECRET-VALUE", REDIRECT)
-            .await
-            .expect("discovery")
-            .with_private_key_jwt(key.signer())
-            .build()
-            .expect("build");
-    let authn = global_service(provider);
+    let provider = OAuthProviderConfig::discover_screened(
+        "p",
+        &idp.issuer,
+        CLIENT_ID,
+        "SECRET-VALUE",
+        REDIRECT,
+        axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
+    )
+    .await
+    .expect("discovery")
+    .with_private_key_jwt(key.signer())
+    .with_clock(std::sync::Arc::new(clock.clone()))
+    .build()
+    .expect("build");
+    let authn = global_service(&clock, provider);
 
     let claims = global_login(&authn, &idp, "p", "alice")
         .await
@@ -484,10 +513,12 @@ async fn the_code_exchange_is_authenticated_by_a_verified_assertion_and_no_secre
 
 #[tokio::test]
 async fn a_provider_discovered_without_a_secret_logs_in_the_same_way() {
+    let clock = common::test_clock();
     let key = ClientKey::new();
     let idp = Idp::plain(&key).await;
     let authn = global_service(
-        idp.provider("p", key.signer())
+        &clock,
+        idp.provider(&clock, "p", key.signer())
             .await
             .build()
             .expect("build"),
@@ -498,11 +529,13 @@ async fn a_provider_discovered_without_a_secret_logs_in_the_same_way() {
 
 #[tokio::test]
 async fn an_assertion_signed_by_another_key_is_refused_by_the_idp() {
+    let clock = common::test_clock();
     let registered = ClientKey::new();
     let impostor = ClientKey::new();
     let idp = Idp::plain(&registered).await;
     let authn = global_service(
-        idp.provider("p", impostor.signer())
+        &clock,
+        idp.provider(&clock, "p", impostor.signer())
             .await
             .build()
             .expect("build"),
@@ -517,32 +550,34 @@ async fn an_assertion_signed_by_another_key_is_refused_by_the_idp() {
 
 #[tokio::test]
 async fn jti_and_times_come_from_the_injected_rng_and_clock() {
-    use axess_clock::testing::MockClock;
     use axess_rng::SecureRng;
     use axess_rng::testing::MockRng;
+    let clock = common::test_clock();
 
     let key = ClientKey::new();
     let idp = Idp::plain(&key).await;
-    let now = chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp(), 0).unwrap();
+    let now = common::start();
     let provider = idp
         .provider(
+            &clock,
             "p",
             key.signer()
-                .with_assertion_ttl(std::time::Duration::from_secs(25)),
+                .with_assertion_ttl(std::time::Duration::from_secs(25))
+                .expect("a whole number of seconds"),
         )
         .await
-        .with_clock(Arc::new(MockClock::at(now)))
+        .with_clock(Arc::new(clock.clone()))
         .with_rng(Arc::new(MockRng::new(11)))
         .build()
         .expect("build");
-    let authn = global_service(provider);
+    let authn = global_service(&clock, provider);
     global_login(&authn, &idp, "p", "carol")
         .await
         .expect("login");
 
     let (_, assertion) = idp.token_requests()[0].assertion.clone().unwrap();
-    assert_eq!(assertion["iat"], now.timestamp());
-    assert_eq!(assertion["exp"], now.timestamp() + 25);
+    assert_eq!(assertion["iat"], now.unix_seconds());
+    assert_eq!(assertion["exp"], now.unix_seconds() + 25);
     let mut bytes = [0u8; 16];
     MockRng::new(11).fill_bytes(&mut bytes);
     let jti = uuid::Builder::from_random_bytes(bytes)
@@ -553,10 +588,11 @@ async fn jti_and_times_come_from_the_injected_rng_and_clock() {
 
 #[tokio::test]
 async fn a_refresh_carries_its_own_fresh_assertion() {
+    let clock = common::test_clock();
     let key = ClientKey::new();
     let idp = Idp::plain(&key).await;
     let provider = Arc::new(
-        idp.provider("p", key.signer())
+        idp.provider(&clock, "p", key.signer())
             .await
             .build()
             .expect("build"),
@@ -564,7 +600,8 @@ async fn a_refresh_carries_its_own_fresh_assertion() {
     let authn = {
         // The service owns a provider; keep a second handle to call refresh.
         global_service(
-            idp.provider("p", key.signer())
+            &clock,
+            idp.provider(&clock, "p", key.signer())
                 .await
                 .build()
                 .expect("build"),
@@ -593,10 +630,11 @@ async fn a_refresh_carries_its_own_fresh_assertion() {
 
 #[tokio::test]
 async fn revocation_and_client_credentials_use_the_assertion_too() {
+    let clock = common::test_clock();
     let key = ClientKey::new();
     let idp = Idp::plain(&key).await;
     let provider = idp
-        .provider("p", key.signer())
+        .provider(&clock, "p", key.signer())
         .await
         .build()
         .expect("build");
@@ -613,6 +651,7 @@ async fn revocation_and_client_credentials_use_the_assertion_too() {
 
 #[tokio::test]
 async fn under_fapi_the_assertion_is_for_the_issuer_and_dpop_still_binds_the_token() {
+    let clock = common::test_clock();
     // FAPI wants PS256 ID tokens with `nbf`; the plain mock signs RS256, so
     // this test serves its own discovery and PAR.
     let key = ClientKey::new();
@@ -688,26 +727,31 @@ async fn under_fapi_the_assertion_is_for_the_issuer_and_dpop_still_binds_the_tok
             .await;
     }
 
-    let provider =
-        OAuthProviderConfig::discover_with_private_key_jwt("p", &issuer, key.signer(), REDIRECT)
-            .await
-            .expect("discovery")
-            .with_fapi(FapiConfig::default())
-            .build()
-            .expect("FAPI composes with private_key_jwt");
-    let authn = global_service(provider);
+    let provider = OAuthProviderConfig::discover_screened_with_private_key_jwt(
+        "p",
+        &issuer,
+        key.signer(),
+        REDIRECT,
+        axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
+    )
+    .await
+    .expect("discovery")
+    .with_fapi(FapiConfig::default())
+    .with_clock(std::sync::Arc::new(clock.clone()))
+    .build()
+    .expect("FAPI composes with private_key_jwt");
+    let authn = global_service(&clock, provider);
     let session = test_session();
     authn
         .begin_oauth_login("p", &OAuthLoginOptions::default(), &session)
         .await
         .expect("begin over PAR");
     let (nonce, csrf) = session_values(&session).await;
-    let now = chrono::Utc::now().timestamp();
-    axess_factors::jwt::ensure_crypto_provider();
+    let now = common::start().unix_seconds();
     let mut header = Header::new(Algorithm::PS256);
     header.kid = Some(idp_kid);
     *id_token.lock().unwrap() = Some(
-        jsonwebtoken::encode(
+        axess_factors::jwt::encode(
             &header,
             &json!({"iss": issuer, "sub": "erin", "aud": CLIENT_ID, "exp": now + 120,
                     "iat": now, "nbf": now - 5, "nonce": nonce}),
@@ -716,7 +760,13 @@ async fn under_fapi_the_assertion_is_for_the_issuer_and_dpop_still_binds_the_tok
         .unwrap(),
     );
     let claims = authn
-        .finish_oauth_login("code-1", &csrf, &session)
+        .finish_oauth_login(
+            OAuthCallbackRoute::global("p"),
+            "code-1",
+            &csrf,
+            None,
+            &session,
+        )
         .await
         .expect("login over FAPI with private_key_jwt");
     assert!(claims.dpop_key.is_some(), "tokens stay DPoP bound");
@@ -753,17 +803,23 @@ fn record(tenant_id: TenantId, issuer: &str, key: &ClientKey) -> TenantOAuthProv
             },
         },
         dpop: TenantDpop::Advertised,
+        kind: None,
         revision: 0,
     }
 }
 
-type Directory = StoredTenantOAuthProviders<MemoryTenantOAuthProviderStore>;
-
-fn tenant_service(directory: &Arc<Directory>) -> Authn {
-    AuthnService::builder(MockIdentityStore::new(), MockFactorStore::new())
-        .with_tenant_oauth_providers(directory.clone())
-        .build()
-        .with_audit_context(AuditContext::default())
+fn tenant_service<S: TenantOAuthProviderStore>(
+    clock: &MockClock,
+    directory: &Arc<StoredTenantOAuthProviders<S>>,
+) -> Authn {
+    AuthnService::builder(
+        MockIdentityStore::new().with_clock(clock.clone()),
+        MockFactorStore::new(),
+    )
+    .with_clock(clock.clone())
+    .with_tenant_oauth_providers(directory.clone())
+    .build()
+    .with_audit_context(AuditContext::default())
 }
 
 async fn tenant_login(
@@ -784,21 +840,30 @@ async fn tenant_login(
     let (nonce, csrf) = session_values(&session).await;
     idp.issue(&nonce, subject, json!({}));
     authn
-        .finish_oauth_login_with_iss("code-1", &csrf, Some(&idp.issuer), &session)
+        .finish_oauth_login(
+            OAuthCallbackRoute::of_tenant(tenant_id, "sso"),
+            "code-1",
+            &csrf,
+            Some(&idp.issuer),
+            &session,
+        )
         .await
 }
 
 #[tokio::test]
 async fn two_tenants_with_a_provider_of_the_same_name_log_in_against_different_issuers() {
+    let clock = common::test_clock();
     let key_a = ClientKey::new();
     let key_b = ClientKey::new();
     let idp_a = Idp::plain(&key_a).await;
     let idp_b = Idp::plain(&key_b).await;
     let directory = Arc::new(
-        StoredTenantOAuthProviders::new_unencrypted(MemoryTenantOAuthProviderStore::new())
-            .with_egress_policy(
-                axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
-            ),
+        StoredTenantOAuthProviders::new_unencrypted(
+            MemoryTenantOAuthProviderStore::new(),
+            axess_core::testing::oauth_tenant::ownership_assumed(),
+        )
+        .with_clock(Arc::new(clock.clone()))
+        .with_egress_policy(axess_factors::egress::EgressPolicy::screened_allowing_loopback_http()),
     );
     directory
         .upsert(record(tenant("acme"), &idp_a.issuer, &key_a))
@@ -808,7 +873,7 @@ async fn two_tenants_with_a_provider_of_the_same_name_log_in_against_different_i
         .upsert(record(tenant("beta"), &idp_b.issuer, &key_b))
         .await
         .unwrap();
-    let authn = tenant_service(&directory);
+    let authn = tenant_service(&clock, &directory);
 
     let a = tenant_login(&authn, &idp_a, &tenant("acme"), "alice")
         .await
@@ -831,19 +896,22 @@ async fn two_tenants_with_a_provider_of_the_same_name_log_in_against_different_i
 
 #[tokio::test]
 async fn tenant_a_cannot_reach_tenant_bs_provider_even_when_the_name_matches() {
+    let clock = common::test_clock();
     let key = ClientKey::new();
     let idp = Idp::plain(&key).await;
     let directory = Arc::new(
-        StoredTenantOAuthProviders::new_unencrypted(MemoryTenantOAuthProviderStore::new())
-            .with_egress_policy(
-                axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
-            ),
+        StoredTenantOAuthProviders::new_unencrypted(
+            MemoryTenantOAuthProviderStore::new(),
+            axess_core::testing::oauth_tenant::ownership_assumed(),
+        )
+        .with_clock(Arc::new(clock.clone()))
+        .with_egress_policy(axess_factors::egress::EgressPolicy::screened_allowing_loopback_http()),
     );
     directory
         .upsert(record(tenant("beta"), &idp.issuer, &key))
         .await
         .unwrap();
-    let authn = tenant_service(&directory);
+    let authn = tenant_service(&clock, &directory);
     let session = test_session();
     let refused = authn
         .begin_oauth_login_with_tenant_provider(
@@ -861,21 +929,27 @@ async fn tenant_a_cannot_reach_tenant_bs_provider_even_when_the_name_matches() {
 
 #[tokio::test]
 async fn a_providers_update_in_the_store_is_used_by_the_next_login_without_a_restart() {
+    let clock = common::test_clock();
     let key = ClientKey::new();
     let first = Idp::plain(&key).await;
     let second = Idp::plain(&key).await;
+    // The directory reads one handle of the store; the other stays here for
+    // the write another process makes.
+    let store = Arc::new(MemoryTenantOAuthProviderStore::new());
     let directory = Arc::new(
-        StoredTenantOAuthProviders::new_unencrypted(MemoryTenantOAuthProviderStore::new())
-            .with_egress_policy(
-                axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
-            ),
+        StoredTenantOAuthProviders::new_unencrypted(
+            store.clone(),
+            axess_core::testing::oauth_tenant::ownership_assumed(),
+        )
+        .with_clock(Arc::new(clock.clone()))
+        .with_egress_policy(axess_factors::egress::EgressPolicy::screened_allowing_loopback_http()),
     );
     let stored = directory
         .upsert(record(tenant("acme"), &first.issuer, &key))
         .await
         .unwrap();
     assert_eq!(stored.revision, 1);
-    let authn = tenant_service(&directory);
+    let authn = tenant_service(&clock, &directory);
 
     let before = tenant_login(&authn, &first, &tenant("acme"), "alice")
         .await
@@ -885,7 +959,7 @@ async fn a_providers_update_in_the_store_is_used_by_the_next_login_without_a_res
     // The operator points the tenant at another issuer. Written straight to
     // the store, as another process would: nothing tells the directory.
     let mut moved = record(tenant("acme"), &second.issuer, &key);
-    moved = directory.store().put(moved).await.unwrap();
+    moved = store.put(moved).await.unwrap();
     assert_eq!(moved.revision, 2);
 
     let after = tenant_login(&authn, &second, &tenant("acme"), "alice")
@@ -901,20 +975,23 @@ async fn a_providers_update_in_the_store_is_used_by_the_next_login_without_a_res
 
 #[tokio::test]
 async fn a_ceremony_begun_before_an_update_does_not_finish_against_the_new_issuer() {
+    let clock = common::test_clock();
     let key = ClientKey::new();
     let first = Idp::plain(&key).await;
     let second = Idp::plain(&key).await;
     let directory = Arc::new(
-        StoredTenantOAuthProviders::new_unencrypted(MemoryTenantOAuthProviderStore::new())
-            .with_egress_policy(
-                axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
-            ),
+        StoredTenantOAuthProviders::new_unencrypted(
+            MemoryTenantOAuthProviderStore::new(),
+            axess_core::testing::oauth_tenant::ownership_assumed(),
+        )
+        .with_clock(Arc::new(clock.clone()))
+        .with_egress_policy(axess_factors::egress::EgressPolicy::screened_allowing_loopback_http()),
     );
     directory
         .upsert(record(tenant("acme"), &first.issuer, &key))
         .await
         .unwrap();
-    let authn = tenant_service(&directory);
+    let authn = tenant_service(&clock, &directory);
     let session = test_session();
     authn
         .begin_oauth_login_with_tenant_provider(
@@ -932,7 +1009,15 @@ async fn a_ceremony_begun_before_an_update_does_not_finish_against_the_new_issue
         .await
         .unwrap();
     second.issue(&nonce, "alice", json!({}));
-    let refused = authn.finish_oauth_login("code-1", &csrf, &session).await;
+    let refused = authn
+        .finish_oauth_login(
+            OAuthCallbackRoute::of_tenant(&tenant("acme"), "sso"),
+            "code-1",
+            &csrf,
+            None,
+            &session,
+        )
+        .await;
     assert!(refused.is_err(), "the pinned issuer no longer matches");
     assert!(
         second.token_requests().is_empty(),
@@ -942,19 +1027,22 @@ async fn a_ceremony_begun_before_an_update_does_not_finish_against_the_new_issue
 
 #[tokio::test]
 async fn a_removed_provider_stops_resolving_and_invalidate_forces_a_rebuild() {
+    let clock = common::test_clock();
     let key = ClientKey::new();
     let idp = Idp::plain(&key).await;
     let directory = Arc::new(
-        StoredTenantOAuthProviders::new_unencrypted(MemoryTenantOAuthProviderStore::new())
-            .with_egress_policy(
-                axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
-            ),
+        StoredTenantOAuthProviders::new_unencrypted(
+            MemoryTenantOAuthProviderStore::new(),
+            axess_core::testing::oauth_tenant::ownership_assumed(),
+        )
+        .with_clock(Arc::new(clock.clone()))
+        .with_egress_policy(axess_factors::egress::EgressPolicy::screened_allowing_loopback_http()),
     );
     directory
         .upsert(record(tenant("acme"), &idp.issuer, &key))
         .await
         .unwrap();
-    let authn = tenant_service(&directory);
+    let authn = tenant_service(&clock, &directory);
     tenant_login(&authn, &idp, &tenant("acme"), "alice")
         .await
         .expect("login");
@@ -991,31 +1079,38 @@ async fn a_removed_provider_stops_resolving_and_invalidate_forces_a_rebuild() {
 
 #[tokio::test]
 async fn the_global_registration_and_a_tenants_provider_of_one_name_never_shadow_each_other() {
+    let clock = common::test_clock();
     let global_key = ClientKey::new();
     let tenant_key = ClientKey::new();
     let global_idp = Idp::plain(&global_key).await;
     let tenant_idp = Idp::plain(&tenant_key).await;
     let directory = Arc::new(
-        StoredTenantOAuthProviders::new_unencrypted(MemoryTenantOAuthProviderStore::new())
-            .with_egress_policy(
-                axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
-            ),
+        StoredTenantOAuthProviders::new_unencrypted(
+            MemoryTenantOAuthProviderStore::new(),
+            axess_core::testing::oauth_tenant::ownership_assumed(),
+        )
+        .with_clock(Arc::new(clock.clone()))
+        .with_egress_policy(axess_factors::egress::EgressPolicy::screened_allowing_loopback_http()),
     );
     directory
         .upsert(record(tenant("acme"), &tenant_idp.issuer, &tenant_key))
         .await
         .unwrap();
-    let authn = AuthnService::builder(MockIdentityStore::new(), MockFactorStore::new())
-        .with_oauth_provider(
-            global_idp
-                .provider("sso", global_key.signer())
-                .await
-                .build()
-                .expect("build"),
-        )
-        .with_tenant_oauth_providers(directory.clone())
-        .build()
-        .with_audit_context(AuditContext::default());
+    let authn = AuthnService::builder(
+        MockIdentityStore::new().with_clock(clock.clone()),
+        MockFactorStore::new(),
+    )
+    .with_clock(clock.clone())
+    .with_oauth_provider(
+        global_idp
+            .provider(&clock, "sso", global_key.signer())
+            .await
+            .build()
+            .expect("build"),
+    )
+    .with_tenant_oauth_providers(directory.clone())
+    .build()
+    .with_audit_context(AuditContext::default());
 
     let tenants = tenant_login(&authn, &tenant_idp, &tenant("acme"), "alice")
         .await
@@ -1048,19 +1143,22 @@ async fn without_a_tenant_source_a_tenant_login_names_an_unknown_provider() {
 #[tokio::test]
 async fn a_tenant_login_is_bound_to_its_tenant_at_completion() {
     use axess_core::authn::error::AuthnError;
+    let clock = common::test_clock();
     let key = ClientKey::new();
     let idp = Idp::plain(&key).await;
     let directory = Arc::new(
-        StoredTenantOAuthProviders::new_unencrypted(MemoryTenantOAuthProviderStore::new())
-            .with_egress_policy(
-                axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
-            ),
+        StoredTenantOAuthProviders::new_unencrypted(
+            MemoryTenantOAuthProviderStore::new(),
+            axess_core::testing::oauth_tenant::ownership_assumed(),
+        )
+        .with_clock(Arc::new(clock.clone()))
+        .with_egress_policy(axess_factors::egress::EgressPolicy::screened_allowing_loopback_http()),
     );
     directory
         .upsert(record(tenant("acme"), &idp.issuer, &key))
         .await
         .unwrap();
-    let authn = tenant_service(&directory);
+    let authn = tenant_service(&clock, &directory);
     let session = test_session();
     authn
         .begin_oauth_login_with_tenant_provider(
@@ -1074,7 +1172,13 @@ async fn a_tenant_login_is_bound_to_its_tenant_at_completion() {
     let (nonce, csrf) = session_values(&session).await;
     idp.issue(&nonce, "alice", json!({}));
     let claims = authn
-        .finish_oauth_login("code-1", &csrf, &session)
+        .finish_oauth_login(
+            OAuthCallbackRoute::of_tenant(&tenant("acme"), "sso"),
+            "code-1",
+            &csrf,
+            None,
+            &session,
+        )
         .await
         .expect("finish");
 
@@ -1092,7 +1196,7 @@ fn test_user(id: &str, identifier: &str, tenant_label: &str) -> axess_core::auth
         ids::UserId,
         types::{EntityState, User},
     };
-    let now = chrono::Utc::now();
+    let now = common::start();
     User {
         id: axess_core::authn::ids::testing::user(id),
         tenant_id: tenant(tenant_label),
@@ -1109,23 +1213,28 @@ fn test_user(id: &str, identifier: &str, tenant_label: &str) -> axess_core::auth
 
 // ── Credentials at rest ──────────────────────────────────────────────────────
 
-fn cipher() -> Arc<FactorSecretCipher> {
+fn cipher(clock: &MockClock) -> Arc<FactorSecretCipher> {
     let mut key = [0u8; 32];
     for (i, byte) in key.iter_mut().enumerate() {
         *byte = (i as u8).wrapping_mul(7).wrapping_add(3);
     }
-    Arc::new(FactorSecretCipher::new(key))
+    Arc::new(FactorSecretCipher::new(key).with_clock(Arc::new(clock.clone())))
 }
 
 #[tokio::test]
 async fn a_credential_is_sealed_in_the_store_and_opens_only_for_its_tenant_and_name() {
+    let clock = common::test_clock();
     let key = ClientKey::new();
     let idp = Idp::plain(&key).await;
+    let store = Arc::new(MemoryTenantOAuthProviderStore::new());
     let directory = Arc::new(
-        StoredTenantOAuthProviders::new(MemoryTenantOAuthProviderStore::new(), cipher())
-            .with_egress_policy(
-                axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
-            ),
+        StoredTenantOAuthProviders::new(
+            store.clone(),
+            cipher(&clock),
+            axess_core::testing::oauth_tenant::ownership_assumed(),
+        )
+        .with_clock(Arc::new(clock.clone()))
+        .with_egress_policy(axess_factors::egress::EgressPolicy::screened_allowing_loopback_http()),
     );
     let stored = directory
         .upsert(record(tenant("acme"), &idp.issuer, &key))
@@ -1138,15 +1247,24 @@ async fn a_credential_is_sealed_in_the_store_and_opens_only_for_its_tenant_and_n
         key_pem.is_sealed(),
         "the private key is not at rest in clear text"
     );
-    let authn = tenant_service(&directory);
+    let authn = tenant_service(&clock, &directory);
     tenant_login(&authn, &idp, &tenant("acme"), "alice")
         .await
         .expect("login with a sealed key");
 
-    // The row copied under another tenant does not open.
+    // The row copied under another tenant is refused by the store, which
+    // keeps one (issuer, client id) pair to one record; a copy under a free
+    // client id gets in, and does not open: the credential is bound to the
+    // tenant and name it was sealed for.
     let mut moved = stored.clone();
     moved.tenant_id = tenant("beta");
-    directory.store().put(moved).await.unwrap();
+    let refused = store
+        .put(moved.clone())
+        .await
+        .expect_err("the pair is another tenant's");
+    assert!(refused.is_pair_held(), "{refused}");
+    moved.client_id = "beta-client".into();
+    store.put(moved).await.unwrap();
     let refused = authn.tenant_oauth_provider(&tenant("beta"), "sso").await;
     // A cipher fault, reported as one: not a setting the caller can correct.
     assert!(
@@ -1183,6 +1301,7 @@ const ENTRA_TID: &str = "72f988bf-86f1-41af-91ab-2d7cd011db47";
 
 #[tokio::test]
 async fn entra_shaped_idp_certificate_credential_and_tid_claim() {
+    let clock = common::test_clock();
     let key = ClientKey::new();
     let jwk = key.jwk.clone();
     let idp = Idp::start(
@@ -1206,10 +1325,12 @@ async fn entra_shaped_idp_certificate_credential_and_tid_claim() {
     assert_eq!(idp.issuer, format!("{}/{ENTRA_TID}/v2.0", idp.uri()));
 
     let directory = Arc::new(
-        StoredTenantOAuthProviders::new_unencrypted(MemoryTenantOAuthProviderStore::new())
-            .with_egress_policy(
-                axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
-            ),
+        StoredTenantOAuthProviders::new_unencrypted(
+            MemoryTenantOAuthProviderStore::new(),
+            axess_core::testing::oauth_tenant::ownership_assumed(),
+        )
+        .with_clock(Arc::new(clock.clone()))
+        .with_egress_policy(axess_factors::egress::EgressPolicy::screened_allowing_loopback_http()),
     );
     let mut rec = record(tenant("acme"), &idp.issuer, &key);
     rec.scopes = vec![
@@ -1221,7 +1342,7 @@ async fn entra_shaped_idp_certificate_credential_and_tid_claim() {
     // Without the certificate thumbprint Entra would not find the credential.
     let no_thumbprint = directory.upsert(rec.clone()).await.unwrap();
     assert_eq!(no_thumbprint.revision, 1);
-    let authn = tenant_service(&directory);
+    let authn = tenant_service(&clock, &directory);
     let refused = tenant_login(&authn, &idp, &tenant("acme"), "oid-1").await;
     assert!(
         matches!(refused, Err(OAuthError::TokenExchange(_))),
@@ -1267,13 +1388,20 @@ async fn idp_login_with_tid(authn: &Authn, idp: &Idp) -> OAuthClaims {
         }),
     );
     authn
-        .finish_oauth_login("code-1", &csrf, &session)
+        .finish_oauth_login(
+            OAuthCallbackRoute::of_tenant(&tenant("acme"), "sso"),
+            "code-1",
+            &csrf,
+            None,
+            &session,
+        )
         .await
         .expect("login")
 }
 
 #[tokio::test]
 async fn keycloak_shaped_idp_private_key_jwt_with_the_issuer_or_token_endpoint_as_audience() {
+    let clock = common::test_clock();
     let key = ClientKey::new();
     let jwk = key.jwk.clone();
     let idp = Idp::start(
@@ -1296,16 +1424,18 @@ async fn keycloak_shaped_idp_private_key_jwt_with_the_issuer_or_token_endpoint_a
     )
     .await;
     let directory = Arc::new(
-        StoredTenantOAuthProviders::new_unencrypted(MemoryTenantOAuthProviderStore::new())
-            .with_egress_policy(
-                axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
-            ),
+        StoredTenantOAuthProviders::new_unencrypted(
+            MemoryTenantOAuthProviderStore::new(),
+            axess_core::testing::oauth_tenant::ownership_assumed(),
+        )
+        .with_clock(Arc::new(clock.clone()))
+        .with_egress_policy(axess_factors::egress::EgressPolicy::screened_allowing_loopback_http()),
     );
     directory
         .upsert(record(tenant("acme"), &idp.issuer, &key))
         .await
         .unwrap();
-    let authn = tenant_service(&directory);
+    let authn = tenant_service(&clock, &directory);
     let claims = tenant_login(&authn, &idp, &tenant("acme"), "alice")
         .await
         .expect("login");
@@ -1356,7 +1486,37 @@ async fn store_contract<S: TenantOAuthProviderStore>(store: &S) {
     // issuer no longer finds it).
     let mut shared = record(b, "https://idp.example/two", &key);
     shared.name = "shared".into();
+    shared.client_id = "another-client".into();
     store.put(shared).await.unwrap();
+
+    // One (issuer, client id) pair belongs to one record: a second record of
+    // tenant a's pair, under another tenant or another name, is refused by
+    // the store itself, whether written whole or at a revision; the record
+    // that holds the pair keeps writing it.
+    let mut copy = record(b, "https://idp.example/two", &key);
+    copy.name = "copy".into();
+    let refused = store
+        .put(copy)
+        .await
+        .expect_err("a pair another record holds is refused by the store");
+    assert!(refused.is_pair_held(), "{refused}");
+    let mut moved = store.get(&b, "shared").await.unwrap().expect("stored");
+    moved.client_id = CLIENT_ID.into();
+    let refused = store
+        .put_if_revision(moved, 1)
+        .await
+        .expect_err("a pair another record holds is refused at a revision too");
+    assert!(refused.is_pair_held(), "{refused}");
+    assert_eq!(
+        store
+            .put(record(a, "https://idp.example/two", &key))
+            .await
+            .unwrap()
+            .revision,
+        3,
+        "the holder of the pair writes it again"
+    );
+    assert!(store.get(&b, "copy").await.unwrap().is_none());
     let found: Vec<_> = store
         .list_by_issuer("https://idp.example/two")
         .await
@@ -1397,7 +1557,7 @@ async fn the_memory_store_keeps_its_contract() {
     store_contract(&MemoryTenantOAuthProviderStore::new()).await;
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(any(feature = "sqlite", feature = "sqlite-unbundled"))]
 mod sqlite {
     use super::*;
     use axess_core::federation::oauth_tenant::SqliteTenantOAuthProviderStore;
@@ -1420,13 +1580,146 @@ mod sqlite {
         store_contract(&store).await;
     }
 
+    /// The table as the release before the unique index created it, with
+    /// `rows` written straight into it, as another process would have.
+    async fn table_of_an_earlier_release(rows: &[TenantOAuthProviderRecord]) -> sqlx::SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        sqlx::query(
+            "CREATE TABLE tenant_oauth_providers (
+                tenant_id TEXT NOT NULL, name TEXT NOT NULL, revision INTEGER NOT NULL,
+                record TEXT NOT NULL,
+                issuer TEXT GENERATED ALWAYS AS (json_extract(record, '$.issuer')) VIRTUAL,
+                PRIMARY KEY (tenant_id, name))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for row in rows {
+            sqlx::query(
+                "INSERT INTO tenant_oauth_providers (tenant_id, name, revision, record) \
+                 VALUES (?1, ?2, 1, ?3)",
+            )
+            .bind(row.tenant_id.to_string())
+            .bind(&row.name)
+            .bind(serde_json::to_string(row).unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        pool
+    }
+
+    /// Two processes over one table: the first registers through its
+    /// directory, the second's write reaches the table after its own check
+    /// saw a free pair (here: written straight through the store, as a
+    /// process whose check ran before the first commit would), and the
+    /// table's unique index refuses it.
+    #[tokio::test]
+    async fn a_write_past_the_directorys_check_is_refused_by_the_table() {
+        let (store, _) = store().await;
+        let key = ClientKey::new();
+        let idp = Idp::plain(&key).await;
+        let first = StoredTenantOAuthProviders::new_unencrypted(
+            store.clone(),
+            axess_core::testing::oauth_tenant::ownership_assumed(),
+        )
+        .with_clock(Arc::new(common::test_clock()))
+        .with_egress_policy(axess_factors::egress::EgressPolicy::screened_allowing_loopback_http());
+
+        first
+            .upsert(record(tenant("acme"), &idp.issuer, &key))
+            .await
+            .expect("the first registration takes the pair");
+        let refused = store
+            .put(record(tenant("beta"), &idp.issuer, &key))
+            .await
+            .expect_err("the second process's write is refused by the table");
+
+        assert!(refused.is_pair_held(), "{refused}");
+        assert!(store.get(&tenant("beta"), "sso").await.unwrap().is_none());
+        assert!(
+            store.get(&tenant("acme"), "sso").await.unwrap().is_some(),
+            "the holder's record stays"
+        );
+    }
+
+    /// A table an earlier release created gets the column and the index, and
+    /// rows that already collide are reported by name instead of indexed over
+    /// or dropped.
+    #[tokio::test]
+    async fn an_earlier_tables_colliding_rows_are_reported_at_open() {
+        let key = ClientKey::new();
+        let clean = table_of_an_earlier_release(&[
+            record(tenant("acme"), "https://idp.example/a", &key),
+            record(tenant("beta"), "https://idp.example/b", &key),
+        ])
+        .await;
+        SqliteTenantOAuthProviderStore::new(clean.clone())
+            .init_schema()
+            .await
+            .expect("an earlier table without collisions is brought up");
+        let indexes: Vec<(i64, String, i64)> =
+            sqlx::query_as("PRAGMA index_list(tenant_oauth_providers)")
+                .fetch_all(&clean)
+                .await
+                .unwrap();
+        assert!(
+            indexes.iter().any(
+                |(_, name, unique)| name == "tenant_oauth_providers_issuer_client" && *unique == 1
+            ),
+            "{indexes:?}"
+        );
+
+        let colliding = table_of_an_earlier_release(&[
+            record(tenant("acme"), "https://idp.example/shared", &key),
+            record(tenant("beta"), "https://idp.example/shared", &key),
+        ])
+        .await;
+        let refused = SqliteTenantOAuthProviderStore::new(colliding.clone())
+            .init_schema()
+            .await
+            .expect_err("rows that already collide are reported, not indexed over");
+        let text = refused.to_string();
+        assert!(
+            text.contains("https://idp.example/shared") && text.contains(CLIENT_ID),
+            "{text}"
+        );
+        let indexes: Vec<(i64, String, i64)> =
+            sqlx::query_as("PRAGMA index_list(tenant_oauth_providers)")
+                .fetch_all(&colliding)
+                .await
+                .unwrap();
+        assert!(
+            !indexes
+                .iter()
+                .any(|(_, name, _)| name == "tenant_oauth_providers_issuer_client"),
+            "no index was created over colliding rows: {indexes:?}"
+        );
+        let (rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM tenant_oauth_providers")
+            .fetch_one(&colliding)
+            .await
+            .unwrap();
+        assert_eq!(rows, 2, "no row was dropped");
+    }
+
     #[tokio::test]
     async fn a_sealed_credential_never_reaches_the_table_in_clear_text() {
+        let clock = common::test_clock();
         let (store, pool) = store().await;
         let key = ClientKey::new();
         let idp = Idp::plain(&key).await;
         let directory = Arc::new(
-            StoredTenantOAuthProviders::new(store, cipher()).with_egress_policy(
+            StoredTenantOAuthProviders::new(
+                store,
+                cipher(&clock),
+                axess_core::testing::oauth_tenant::ownership_assumed(),
+            )
+            .with_clock(Arc::new(clock.clone()))
+            .with_egress_policy(
                 axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
             ),
         );
@@ -1442,10 +1735,14 @@ mod sqlite {
         assert!(!raw.contains("BEGIN RSA PRIVATE KEY"), "{raw}");
         assert!(raw.contains("ciphertext"));
 
-        let authn = AuthnService::builder(MockIdentityStore::new(), MockFactorStore::new())
-            .with_tenant_oauth_providers(directory.clone())
-            .build()
-            .with_audit_context(AuditContext::default());
+        let authn = AuthnService::builder(
+            MockIdentityStore::new().with_clock(clock.clone()),
+            MockFactorStore::new(),
+        )
+        .with_clock(clock.clone())
+        .with_tenant_oauth_providers(directory.clone())
+        .build()
+        .with_audit_context(AuditContext::default());
         tenant_login(&authn, &idp, &tenant("acme"), "alice")
             .await
             .expect("login from a row read back out of SQLite");
@@ -1461,20 +1758,24 @@ mod sqlite {
 #[tokio::test]
 async fn a_tenant_login_row_is_the_tenants_and_names_no_user_from_the_subject() {
     use axess_core::authn::event::{AuthEventStatus, AuthEventType};
+    let clock = common::test_clock();
     let key = ClientKey::new();
     let idp = Idp::plain(&key).await;
     let directory = Arc::new(
-        StoredTenantOAuthProviders::new_unencrypted(MemoryTenantOAuthProviderStore::new())
-            .with_egress_policy(
-                axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
-            ),
+        StoredTenantOAuthProviders::new_unencrypted(
+            MemoryTenantOAuthProviderStore::new(),
+            axess_core::testing::oauth_tenant::ownership_assumed(),
+        )
+        .with_clock(Arc::new(clock.clone()))
+        .with_egress_policy(axess_factors::egress::EgressPolicy::screened_allowing_loopback_http()),
     );
     directory
         .upsert(record(tenant("acme"), &idp.issuer, &key))
         .await
         .unwrap();
-    let identity = MockIdentityStore::new();
+    let identity = MockIdentityStore::new().with_clock(clock.clone());
     let authn = AuthnService::builder(identity.clone(), MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_tenant_oauth_providers(directory.clone())
         .build()
         .with_audit_context(AuditContext::default());
@@ -1515,20 +1816,24 @@ async fn a_tenant_login_row_is_the_tenants_and_names_no_user_from_the_subject() 
 #[tokio::test]
 async fn a_scoped_refresh_row_names_the_tenant_and_user_it_was_given() {
     use axess_core::authn::event::{AuthEventStatus, AuthEventType, AuthFailureReason};
+    let clock = common::test_clock();
     let key = ClientKey::new();
     let idp = Idp::plain(&key).await;
     let directory = Arc::new(
-        StoredTenantOAuthProviders::new_unencrypted(MemoryTenantOAuthProviderStore::new())
-            .with_egress_policy(
-                axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
-            ),
+        StoredTenantOAuthProviders::new_unencrypted(
+            MemoryTenantOAuthProviderStore::new(),
+            axess_core::testing::oauth_tenant::ownership_assumed(),
+        )
+        .with_clock(Arc::new(clock.clone()))
+        .with_egress_policy(axess_factors::egress::EgressPolicy::screened_allowing_loopback_http()),
     );
     directory
         .upsert(record(tenant("acme"), &idp.issuer, &key))
         .await
         .unwrap();
-    let identity = MockIdentityStore::new();
+    let identity = MockIdentityStore::new().with_clock(clock.clone());
     let authn = AuthnService::builder(identity.clone(), MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_tenant_oauth_providers(directory.clone())
         .build()
         .with_audit_context(AuditContext::default());
@@ -1541,7 +1846,7 @@ async fn a_scoped_refresh_row_names_the_tenant_and_user_it_was_given() {
 
     authn
         .oauth_in_tenant(&tenant("acme"))
-        .as_user(alice)
+        .attributed_to(alice)
         .refresh_oauth_token("sso", refresh, &mallory.to_string(), None, None)
         .await
         .expect("refresh");
@@ -1565,7 +1870,7 @@ async fn a_scoped_refresh_row_names_the_tenant_and_user_it_was_given() {
     // A failure under the scope is the tenant's too.
     authn
         .oauth_in_tenant(&tenant("acme"))
-        .as_user(alice)
+        .attributed_to(alice)
         .refresh_oauth_token("sso", "", &mallory.to_string(), None, None)
         .await
         .expect_err("an empty token is refused");
@@ -1584,20 +1889,24 @@ async fn a_scoped_refresh_row_names_the_tenant_and_user_it_was_given() {
 #[tokio::test]
 async fn a_tenant_provider_gone_at_the_callback_is_audited_and_clears_the_ceremony() {
     use axess_core::authn::event::AuthFailureReason;
+    let clock = common::test_clock();
     let key = ClientKey::new();
     let idp = Idp::plain(&key).await;
     let directory = Arc::new(
-        StoredTenantOAuthProviders::new_unencrypted(MemoryTenantOAuthProviderStore::new())
-            .with_egress_policy(
-                axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
-            ),
+        StoredTenantOAuthProviders::new_unencrypted(
+            MemoryTenantOAuthProviderStore::new(),
+            axess_core::testing::oauth_tenant::ownership_assumed(),
+        )
+        .with_clock(Arc::new(clock.clone()))
+        .with_egress_policy(axess_factors::egress::EgressPolicy::screened_allowing_loopback_http()),
     );
     directory
         .upsert(record(tenant("acme"), &idp.issuer, &key))
         .await
         .unwrap();
-    let identity = MockIdentityStore::new();
+    let identity = MockIdentityStore::new().with_clock(clock.clone());
     let authn = AuthnService::builder(identity.clone(), MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_tenant_oauth_providers(directory.clone())
         .build()
         .with_audit_context(AuditContext::default());
@@ -1618,7 +1927,13 @@ async fn a_tenant_provider_gone_at_the_callback_is_audited_and_clears_the_ceremo
     );
 
     let err = authn
-        .finish_oauth_login("code", &csrf, &session)
+        .finish_oauth_login(
+            OAuthCallbackRoute::of_tenant(&tenant("acme"), "sso"),
+            "code",
+            &csrf,
+            None,
+            &session,
+        )
         .await
         .expect_err("no provider to finish against");
     assert!(matches!(err, OAuthError::UnknownProvider(_)), "{err:?}");

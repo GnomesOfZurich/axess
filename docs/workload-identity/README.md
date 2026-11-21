@@ -2,9 +2,8 @@
 
 A workload in axess is a non-human caller: a service in your service
 mesh, a Kubernetes pod, a CI/CD runner, a batch job, a serverless
-function. Workloads need to authenticate against your application
-the same way users do, but the credentials, the lifetimes, and the
-operational characteristics are different. This part of the book
+function. Workloads authenticate against your application as users do, but with
+different credentials, lifetimes and operational characteristics. This part of the book
 covers how axess models workload identity, how it resolves credentials
 into a typed `Principal::Workload`, and how the Cedar policy layer
 authorises workloads through the same rules it uses for human users.
@@ -16,12 +15,12 @@ logged-in user and for a SPIFFE-identified payment service without
 branching. The chapters in this part cover the specific resolvers
 that turn each credential kind into a `Principal::Workload`.
 
-The cookbook chapters are siblings of this overview. Read them in
-the order that matches your deployment: SPIFFE-based deployments
+Read the chapters that match your deployment: SPIFFE-based deployments
 read *Inbound: JWT-SVID* and *Inbound: mTLS-SVID*; cloud-platform
 deployments read *Inbound: federation* and *Cloud STS exchange*;
 applications that call downstream services on a workload's behalf
-read *Outbound: OAuth* and *Outbound: mTLS*. A caller that can do none
+read *Outbound: OAuth* and *Outbound: mTLS*; workloads on a node with
+a SPIRE agent read *SPIRE Workload API client*. A caller that can do none
 of this, and can only be given a string, reads *Shared secrets: the
 last resort*, which also says why it is the last resort.
 
@@ -35,9 +34,9 @@ Every inbound request that carries a workload credential runs
 through a `PrincipalResolver`. The resolver inspects the credential
 (a bearer JWT in a header, a client certificate from the TLS
 handshake, a projected service-account token), validates it, and
-returns a `Principal::Workload` if the validation succeeds. The same
-trait is implemented for every credential kind axess supports, and
-applications wire only the resolvers their deployment needs.
+returns a `Principal::Workload` if the validation succeeds. Axess
+implements the same trait for every credential kind it supports, and an
+application wires only the resolvers it needs.
 
 ```text
         ┌──────────────────────┐
@@ -77,7 +76,7 @@ Two SPIFFE resolvers ship, plus a generic third for everything else:
   formats.
 
 For the generic one the adopter supplies a small claim parser and
-mapping closure per issuer they care about; `examples/workload-identity/`
+mapping closure per issuer; `examples/workload-identity/`
 has ready-made recipes for GitHub Actions and Kubernetes service
 accounts. The human
 side has its own `SessionResolver` covered in Part II. A
@@ -98,9 +97,9 @@ the application evolves.
 Unifying on `Principal` removes the duplication. The Cedar policy
 quoted above works for a human and a workload because the policy
 matches on a tenant id, which both variants carry. If the policy
-later needs to discriminate between the two (a rule that demands
-human-completed MFA for an action, but admits any workload), the
-discrimination is expressed in one rule:
+later needs to tell the two apart (a rule that demands
+human-completed MFA for an action, but admits any workload), one rule
+expresses it:
 
 ```cedar,ignore
 permit (
@@ -110,17 +109,17 @@ permit (
 ) when {
     resource.tenant_id == principal.tenant_id
     && (
-        principal has Workload  // workloads bypass MFA requirement
+        principal is axess::Workload  // workloads bypass MFA requirement
         || (
-            principal has Human
-            && "Fido2" in principal.factors_completed
+            principal is axess::Human
+            && context.assurance has fido2
         )
     )
 };
 ```
 
-The discrimination is local, readable, and lives in the policy file
-rather than scattered across handlers.
+The distinction lives in one place, the policy file, rather than
+scattered across handlers.
 
 ## The credential kinds
 
@@ -135,7 +134,7 @@ vocabulary. The two terms worth knowing up front:
 A *SPIFFE ID* is a URI of the form
 `spiffe://<trust_domain>/<path>`. The trust domain is the federation
 namespace (`prod.example.com`, say); the path identifies a specific
-workload within that domain (`/svc/billing/tenant-acme`). The
+workload within that domain (`/billing/acme`). The
 combination uniquely names the workload across the federation.
 
 An *SVID* (SPIFFE Verifiable Identity Document) is the credential
@@ -151,14 +150,14 @@ issuance, key rotation, and trust-domain federation. Axess does not
 replace SPIRE; SPIRE issues, axess validates. The two are designed
 to compose.
 
-A SPIRE Workload API client is on the ROADMAP under feature `spire`:
-it would talk to a local SPIRE agent socket directly, fetching fresh
-SVIDs on demand and maintaining their rotation, rather than relying on
-adopters to mount them into the filesystem. It lands when an adopter
-needs an axess-shaped wrapper around it. Until then, adopters mount
-short-lived SVIDs into pod filesystems and configure axess against
-them, or drive the upstream `spire-workload` / `spire-api` crates
-directly; *Inbound: JWT-SVID* has the fetch-side recipe.
+The `spire` feature is the client side of that composition:
+`SpireClient` talks to a local SPIRE agent's socket, fetches the
+workload's X.509 and JWT SVIDs and the trust bundles, and keeps them
+current as the agent rotates them, so nothing has to be mounted into
+the filesystem. What it fetches goes to the rest of axess: the X.509
+SVID to outbound mTLS, a JWT SVID to the outbound paths that present
+a token, the bundles to the verifiers. *SPIRE Workload API client*
+is its chapter.
 
 ### Federation
 
@@ -186,11 +185,11 @@ the rules.
 External-issuer is the non-SPIFFE case. The credential is not a
 SVID at all (a Kubernetes service-account token, a GitHub Actions
 OIDC token, an Azure AD workload token). All of these go through
-the single generic `WorkloadResolver`: the adopter supplies a
-claim parser + mapping closure that names the service and tenant slug
-from whichever claims the issuer's JWT carries, from which the resolver
-synthesises a SPIFFE-shape `WorkloadId` under its own trust domain. The
-synthesis is what lets the rest of the system work uniformly: by the
+the single generic `WorkloadResolver`. The adopter supplies a claim
+parser and mapping closure that name the service and tenant slug from
+whichever claims the issuer's JWT carries, and the resolver synthesises
+from them a SPIFFE-shape `WorkloadId` under its own trust domain. The
+synthesis lets the rest of the system work uniformly: by the
 time the policy evaluator sees it, the external workload looks like any
 other workload, and the audit rows you write about it carry the same
 shape of identity. Axess writes none of those rows itself on these
@@ -199,8 +198,8 @@ paths; *Inbound: federation* says what that leaves you.
 ### Cloud STS exchange
 
 A workload that needs to call AWS, GCP, or Azure APIs can exchange
-its workload identity for short-lived cloud credentials. The
-mechanism is implemented by all three cloud providers under
+its workload identity for short-lived cloud credentials. All three
+cloud providers implement the mechanism under
 similar names (AWS STS AssumeRoleWithWebIdentity, GCP Workload
 Identity Federation, Azure Federated Identity Credentials), and
 axess provides adapters that bridge a validated workload identity
@@ -209,8 +208,8 @@ to each of them.
 The walkthroughs *Azure* and *AWS* follow one request from a pipeline job
 through a service to a cloud secret store, step by step. The chapter *Cloud
 STS exchange* covers the configuration and the
-credential lifecycle. The benefit is that no long-lived cloud keys
-ever live on the workload's filesystem; the credentials are minted
+credential lifecycle. With the exchange, no long-lived cloud keys
+live on the workload's filesystem; the credentials are minted
 on demand from the workload identity, used briefly, and discarded.
 
 ### Outbound
@@ -219,27 +218,26 @@ Axess is not only an inbound authenticator. When a service
 authenticates *to* a downstream service, it uses the same identity
 shape it would accept inbound. The chapters *Outbound: OAuth* and
 *Outbound: mTLS* cover the two ways this works: the workload
-presents an mTLS client certificate to the downstream's TLS server,
-or the workload exchanges its identity for a bearer token through
-an OAuth flow.
+exchanges its identity for a bearer token through an OAuth flow, or
+presents an mTLS client certificate to the downstream's TLS server.
 
-The pattern matters because it lets one identity (the workload's
-SVID, or its federated equivalent) carry through an entire chain of
-service calls, so an audit trail written at each hop names the same
+One identity (the workload's SVID, or its federated equivalent) then
+carries through an entire chain of service calls, so an audit trail written at each hop names the same
 identity throughout, and revocation at the issuing authority propagates
 to every call that was about to use it.
 
 ## Feature flags
 
-The resolvers are individually feature-gated so a deployment only
-pays the compile cost for the credential kinds it actually uses.
+Each resolver has its own feature, so a deployment pays the compile
+cost only for the credential kinds it uses.
 
 | Feature | Resolver | Purpose |
 |---|---|---|
 | `jwt-svid` | `JwtSvidResolver` | Inbound SPIFFE JWT-SVID (spec-bound) |
 | `mtls` | `MtlsResolver` | Inbound SPIFFE X.509-SVID via mTLS |
-| `jwt` (pulled by `jwt-svid` etc.; name `jwt-aws-lc` or `jwt-rust-crypto` beside it; the module is `axess::jwt` since 0.7.0, not `axess::federation::jwt`) | `WorkloadResolver` | Generic JWT-bearer workload identity for *every* non-SPIFFE issuer (GitHub Actions, k8s SA, GitLab CI, Okta, Azure AD, Auth0, `LocalIdP`, …) via adopter-supplied claim parser + mapping closure. No per-company features; see `examples/workload-identity/` |
+| `jwt` (pulled in by `jwt-svid` and others; enable `jwt-aws-lc` or `jwt-rust-crypto` beside it; the module is `axess::jwt`, not `axess::federation::jwt`) | `WorkloadResolver` | Generic JWT-bearer workload identity for *every* non-SPIFFE issuer (GitHub Actions, k8s SA, GitLab CI, Okta, Azure AD, Auth0, `LocalIdP`, …) via an adopter-supplied claim parser and mapping closure. No per-company features; see `examples/workload-identity/` |
 | `outbound-mtls` | (client side) | Outbound mTLS with workload SVID |
+| `spire` | (client side) | `SpireClient`: SVIDs and trust bundles from a local SPIRE agent, kept current; in no umbrella |
 | `outbound-oauth` | (client side) | Outbound OAuth client |
 | `aws-sts`, `gcp-wif`, `azure-fic` | (cloud STS) | Exchange workload identity for cloud credentials |
 | `workload-id` | umbrella | SPIFFE adapters + outbound + mTLS bundle |
@@ -249,7 +247,8 @@ pays the compile cost for the credential kinds it actually uses.
 Three concerns are intentionally outside scope.
 
 The SPIRE Agent and Server implementations are not part of axess.
-Axess validates SVIDs; SPIRE issues them. The two are designed to
+Axess validates SVIDs and, with `spire`, fetches them from an agent;
+SPIRE issues them. The two are designed to
 be independent so deployments can use any SPIFFE-compliant issuer
 (SPIRE, an in-house implementation, a managed service like AWS IAM
 Roles Anywhere) without changing the axess side.
@@ -268,9 +267,11 @@ the rest of the system understands.
 
 ## Further reading
 
-The cookbook chapters in this part each cover one resolver in
-detail. Start with the one matching the credential kind your
-deployment uses; the others are useful background for the
+The cookbook chapters in this part cover the three inbound resolvers
+(JWT-SVID, mTLS-SVID, federation), the cloud STS exchange and its two
+walkthroughs, the two outbound paths, the SPIRE Workload API client and
+shared secrets. Start with the inbound chapter matching the credential
+kind your deployment uses; the others are useful background for the
 federation and outbound scenarios. *Cedar policy fundamentals*
 covers how the policy engine handles workload principals. *The
 principal model* in Part II covers the unified `Principal` type

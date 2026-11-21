@@ -1,11 +1,12 @@
 use super::*;
+use crate::session::id::{SessionId, SessionKey};
 use crate::testing::mock_random::MockRng;
 
 const ISS: &str = "https://idp.example.com";
 const OTHER: &str = "https://other.example.com";
 
-fn at(secs: i64) -> DateTime<Utc> {
-    DateTime::from_timestamp(1_700_000_000 + secs, 0).unwrap()
+fn at(secs: i64) -> Timestamp {
+    Timestamp::from_unix_seconds(1_700_000_000 + secs).unwrap()
 }
 
 fn user(label: &str) -> UserId {
@@ -21,21 +22,21 @@ fn put(
     map: &SidMap,
     key: SidKey,
     user: UserId,
-    session: SessionId,
-    at: DateTime<Utc>,
+    session: SessionKey,
+    at: Timestamp,
 ) -> Option<SidEntry> {
     map.insert(key, &user.to_string(), None, user, session, at)
 }
 
 /// Register a session of a user whose IdP subject is their local id.
-fn reg(map: &SidMap, issuer: &str, user: UserId, session: SessionId) {
+fn reg(map: &SidMap, issuer: &str, user: UserId, session: SessionKey) {
     map.register_subject_session(issuer, &user.to_string(), None, user, session);
 }
 
 /// End every session of `subject` under `issuer` the way the back-channel
 /// handler does once the registry has ended them: read the sessions, then
 /// drop each one's mappings.
-fn end_subject(map: &SidMap, issuer: &str, subject: &str) -> Vec<(UserId, SessionId)> {
+fn end_subject(map: &SidMap, issuer: &str, subject: &str) -> Vec<(UserId, SessionKey)> {
     let sessions = map.subject_sessions(issuer, subject);
     for (_, session) in &sessions {
         map.remove_session(session);
@@ -43,15 +44,15 @@ fn end_subject(map: &SidMap, issuer: &str, subject: &str) -> Vec<(UserId, Sessio
     sessions
 }
 
-/// A deterministic stream of session ids.
+/// A deterministic stream of session keys.
 struct Sessions(MockRng);
 
 impl Sessions {
     fn new() -> Self {
         Self(MockRng::new(11))
     }
-    fn next(&self) -> SessionId {
-        SessionId::new(&self.0)
+    fn next(&self) -> SessionKey {
+        SessionKey::of(&SessionId::new(&self.0))
     }
 }
 
@@ -70,7 +71,7 @@ fn assert_consistent(map: &SidMap) {
         state.by_subject, expected,
         "subject index must mirror the entries"
     );
-    let mut sessions: HashMap<SessionId, HashSet<SidKey>> = HashMap::new();
+    let mut sessions: HashMap<SessionKey, HashSet<SidKey>> = HashMap::new();
     for (key, stored) in &state.entries {
         sessions
             .entry(stored.session)
@@ -125,7 +126,7 @@ fn ending_a_subject_ends_only_that_subject_under_that_issuer() {
     put(&map, key(OTHER, "1"), alice, a_other, at(2));
     put(&map, key(ISS, "3"), bob, b1, at(3));
 
-    let mut taken: Vec<SessionId> = end_subject(&map, ISS, &alice.to_string())
+    let mut taken: Vec<SessionKey> = end_subject(&map, ISS, &alice.to_string())
         .into_iter()
         .map(|(_, session)| session)
         .collect();
@@ -320,7 +321,7 @@ fn subject_sessions_are_per_issuer_and_user() {
     assert_eq!(map.subject_len(), 4, "a repeated registration counts once");
 
     let sub = |u: &UserId| u.to_string();
-    let mut taken: Vec<SessionId> = end_subject(&map, ISS, &sub(&alice))
+    let mut taken: Vec<SessionKey> = end_subject(&map, ISS, &sub(&alice))
         .into_iter()
         .map(|(_, session)| session)
         .collect();
@@ -396,7 +397,7 @@ fn the_sweep_rotates_through_live_triples_and_skips_forgotten_ones() {
     let map = SidMap::new();
     let s = Sessions::new();
     let alice = user("alice");
-    let ids: Vec<SessionId> = (0..4).map(|_| s.next()).collect();
+    let ids: Vec<SessionKey> = (0..4).map(|_| s.next()).collect();
     for id in &ids {
         reg(&map, ISS, alice, *id);
     }
@@ -404,7 +405,7 @@ fn the_sweep_rotates_through_live_triples_and_skips_forgotten_ones() {
 
     let first = map.sweep_subject_candidates(2);
     let second = map.sweep_subject_candidates(2);
-    let mut seen: Vec<SessionId> = first.iter().chain(&second).map(|t| t.2).collect();
+    let mut seen: Vec<SessionKey> = first.iter().chain(&second).map(|t| t.2).collect();
     seen.sort_by_key(|id| id.to_string());
     seen.dedup();
     assert_eq!(
@@ -481,7 +482,7 @@ fn a_subject_logout_returns_its_sessions_in_a_fixed_order() {
     let u = user("u");
     let s = Sessions::new();
     let sessions: Vec<_> = (0..16).map(|_| s.next()).collect();
-    let mut expected: Vec<(UserId, SessionId)> = sessions.iter().map(|x| (u, *x)).collect();
+    let mut expected: Vec<(UserId, SessionKey)> = sessions.iter().map(|x| (u, *x)).collect();
     expected.sort_unstable();
     // Fresh maps get fresh hasher keys; the output must not depend on them.
     for _ in 0..8 {
@@ -585,4 +586,158 @@ fn a_restored_mapping_keeps_its_tenant() {
     map.remove_session(&sb);
     assert!(map.restore_if_vacant(key(ISS, "x"), displaced));
     assert!(map.get_in(&key(ISS, "x"), Some(&acme)).is_some());
+}
+
+/// A session is one login: registered again under another subject record it
+/// leaves the first. Each part of the record (issuer, subject, tenant, user)
+/// moves it on its own.
+#[test]
+fn a_session_registered_under_another_subject_record_leaves_the_first() {
+    let s = Sessions::new();
+    let (alice, bob) = (user("alice"), user("bob"));
+    let (acme, beta) = (
+        axess_identity::testing::tenant("acme"),
+        axess_identity::testing::tenant("beta"),
+    );
+
+    let map = SidMap::new();
+    let id = s.next();
+    map.register_subject_session(ISS, "sub", Some(acme), alice, id);
+    map.register_subject_session(OTHER, "sub", Some(acme), alice, id);
+    assert!(map.subject_sessions(ISS, "sub").is_empty(), "the issuer");
+    assert_eq!(map.subject_sessions(OTHER, "sub"), vec![(alice, id)]);
+    assert_eq!(map.subject_len(), 1);
+
+    let map = SidMap::new();
+    map.register_subject_session(ISS, "sub", Some(acme), alice, id);
+    map.register_subject_session(ISS, "other-sub", Some(acme), alice, id);
+    assert!(map.subject_sessions(ISS, "sub").is_empty(), "the subject");
+    assert_eq!(map.subject_sessions(ISS, "other-sub"), vec![(alice, id)]);
+
+    let map = SidMap::new();
+    map.register_subject_session(ISS, "sub", Some(acme), alice, id);
+    map.register_subject_session(ISS, "sub", Some(beta), alice, id);
+    assert!(
+        map.subject_sessions_in(ISS, "sub", Some(&acme)).is_empty(),
+        "the tenant"
+    );
+    assert_eq!(
+        map.subject_sessions_in(ISS, "sub", Some(&beta)),
+        vec![(alice, id)]
+    );
+
+    let map = SidMap::new();
+    map.register_subject_session(ISS, "sub", Some(acme), alice, id);
+    map.register_subject_session(ISS, "sub", Some(acme), bob, id);
+    assert_eq!(
+        map.subject_sessions(ISS, "sub"),
+        vec![(bob, id)],
+        "the user"
+    );
+}
+
+/// A session registered again under the record it already has adds nothing:
+/// the sweep queue holds it once, so it does not take a second place in a
+/// sweep from a session behind it.
+#[test]
+fn registering_a_session_again_under_the_same_record_adds_nothing() {
+    let map = SidMap::new();
+    let s = Sessions::new();
+    let alice = user("alice");
+    let acme = axess_identity::testing::tenant("acme");
+    let (first, second) = (s.next(), s.next());
+    map.register_subject_session(ISS, "sub", Some(acme), alice, first);
+    map.register_subject_session(ISS, "sub", Some(acme), alice, first);
+    map.register_subject_session(ISS, "sub", Some(acme), alice, second);
+
+    assert_eq!(map.lock().subject_order.len(), 2);
+    let swept: Vec<SessionKey> = map
+        .sweep_subject_candidates(2)
+        .into_iter()
+        .map(|triple| triple.2)
+        .collect();
+    assert_eq!(swept, vec![first, second]);
+}
+
+/// The sweep queue is compacted when it holds more than twice the registry
+/// plus the slack, and not one item sooner. Compaction keeps the item of
+/// each live record and drops the rest, the item a moved session left under
+/// its first issuer among them.
+#[test]
+fn the_sweep_queue_is_compacted_past_twice_the_registry_plus_the_slack() {
+    let map = SidMap::new();
+    let s = Sessions::new();
+    let alice = user("alice");
+    let queued = |map: &SidMap| map.lock().subject_order.len();
+
+    let live: Vec<SessionKey> = (0..3).map(|_| s.next()).collect();
+    for id in &live {
+        reg(&map, ISS, alice, *id);
+    }
+    reg(&map, OTHER, alice, live[0]);
+    assert_eq!(queued(&map), 4, "three sessions and the move's stale item");
+
+    // Sessions that come and go: each leaves a dead item. While one is
+    // registered the registry holds four records.
+    let bound = 2 * 4 + QUEUE_SLACK;
+    for _ in 0..bound - 4 {
+        let gone = s.next();
+        reg(&map, ISS, alice, gone);
+        map.forget_subject_session(ISS, &alice, &gone);
+    }
+    assert_eq!(queued(&map), bound, "at the bound nothing is dropped");
+
+    let stays = s.next();
+    reg(&map, ISS, alice, stays);
+    assert_eq!(
+        queued(&map),
+        4,
+        "past the bound the queue holds one item per live record"
+    );
+    let mut swept: Vec<(String, SessionKey)> = map
+        .sweep_subject_candidates(8)
+        .into_iter()
+        .map(|(issuer, _, session)| (issuer, session))
+        .collect();
+    swept.sort();
+    let mut expected = vec![
+        (OTHER.to_string(), live[0]),
+        (ISS.to_string(), live[1]),
+        (ISS.to_string(), live[2]),
+        (ISS.to_string(), stays),
+    ];
+    expected.sort();
+    assert_eq!(swept, expected);
+}
+
+/// Two sessions whose keys share their first eight characters, and so print
+/// alike in a log line, are two sessions to the map: removing one leaves the
+/// other's mapping and subject record.
+#[test]
+fn two_keys_that_log_alike_are_two_sessions() {
+    let map = SidMap::new();
+    let mut second_bytes = [0x5c; 32];
+    second_bytes[31] = 0x5d;
+    let (first, second) = (
+        SessionKey::from_bytes([0x5c; 32]),
+        SessionKey::from_bytes(second_bytes),
+    );
+    assert_eq!(first.prefix().to_string(), second.prefix().to_string());
+    let alice = user("alice");
+    for (sid, session) in [("sid-1", first), ("sid-2", second)] {
+        reg(&map, ISS, alice, session);
+        put(&map, key(ISS, sid), alice, session, at(0));
+    }
+    let mut both = vec![(alice, first), (alice, second)];
+    both.sort();
+    assert_eq!(map.subject_sessions(ISS, &alice.to_string()), both);
+
+    assert_eq!(map.remove_session(&first), 1, "ending one ends one mapping");
+    assert_eq!(
+        map.subject_sessions(ISS, &alice.to_string()),
+        vec![(alice, second)],
+        "the other session is still the subject's"
+    );
+    assert_eq!(map.get(&key(ISS, "sid-2")).map(|e| e.1), Some(second));
+    assert_consistent(&map);
 }

@@ -1,0 +1,22 @@
+# cargo-nextest configuration for the axess workspace.
+#
+# The `mutants` profile is the one the mutation sweep tests every mutant
+# with: `.cargo/mutants.toml` selects it, and the baseline job of
+# `.github/workflows/mutants.yml` runs the unmutated suite under it, so the
+# suite each mutant is judged by is one that passed there. A plain
+# `cargo nextest run` uses nextest's default profile, which this file
+# leaves as nextest ships it.
+#
+# One failing test is enough to catch a mutant, so the profile stops at the
+# first one: no further test starts, and the tests still running are ended
+# at once instead of being waited for.
+#
+# A test that runs past the slow timeout (`period` times `terminate-after`)
+# is ended and counts as failed, so a mutant that makes a test hang is
+# caught when that test is ended rather than when cargo-mutants' own test
+# timeout ends the whole run. The bound must stay above the slowest test of
+# the unmutated suite on ubuntu-latest: the baseline job runs this profile
+# too, and fails when it ends a test that would have passed.
+[profile.mutants]
+fail-fast = { max-fail = 1, terminate = "immediate" }
+slow-timeout = { period = "60s", terminate-after = 5 }

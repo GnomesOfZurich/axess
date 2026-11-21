@@ -1,7 +1,10 @@
 //! Dyn-safe handles over a session registry: revocation, liveness and
 //! registration, plus the adapter that erases a concrete registry.
 
-use crate::session::{id::SessionId, store::SessionRegistry};
+use crate::session::{
+    id::SessionKey,
+    store::{CutOff, MoveOutcome, SessionRegistry},
+};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -11,9 +14,14 @@ use std::pin::Pin;
 // the full registry surface used by `AuthnService`. Error handling is
 // baked in: `is_valid` fails closed, `invalidate_*` report a failed
 // revocation as a [`RevocationError`], `register` returns `bool`,
-// `held_sessions` returns the registry's error, and `active_sessions`, built
-// on it, fails open with `vec![]`. The concurrent-session limit does not use
-// `active_sessions`: with a cap set, a login whose listing fails is refused.
+// `held_sessions` returns the registry's error, and so does
+// `active_sessions`, which is built on it. With a concurrent-session cap
+// set, a login whose listing fails is refused.
+
+/// What [`SessionRegistryHandle::invalidate_other_sessions`] answers: the
+/// registry's [`CutOff`], which names the sessions that were ended and
+/// whether the session to keep was among them.
+pub type OtherSessionsEnded = Result<CutOff, RevocationError>;
 
 /// A revocation the registry could not carry out.
 ///
@@ -61,8 +69,26 @@ pub trait SessionRevoker: Send + Sync + 'static {
     fn invalidate_session<'a>(
         &'a self,
         user_id: &'a crate::authn::ids::UserId,
-        session_id: &'a SessionId,
+        session: &'a SessionKey,
     ) -> Pin<Box<dyn Future<Output = Result<(), RevocationError>> + Send + 'a>>;
+
+    /// The key the session once under `session` is under now:
+    /// [`SessionRegistry::current_key`]. `Ok(None)` when the registry holds
+    /// no live session under it and no record of a move from it.
+    ///
+    /// Required: a logout that holds a key from before a rotation finds the
+    /// session by it, and a handle that answered `None` for every key would
+    /// let that session stay signed in.
+    ///
+    /// # Errors
+    ///
+    /// [`RevocationError`] when the registry backend failed, so nothing is
+    /// known.
+    fn current_key<'a>(
+        &'a self,
+        user_id: &'a crate::authn::ids::UserId,
+        session: &'a SessionKey,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<SessionKey>, RevocationError>> + Send + 'a>>;
 }
 
 /// What the registry can say about one session.
@@ -85,7 +111,7 @@ pub trait SessionRegistryHandle: SessionRevoker {
     fn is_valid<'a>(
         &'a self,
         user_id: &'a crate::authn::ids::UserId,
-        session_id: &'a SessionId,
+        session: &'a SessionKey,
     ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
 
     /// Three-way liveness of a session: [`SessionLiveness::Gone`] only when
@@ -100,7 +126,7 @@ pub trait SessionRegistryHandle: SessionRevoker {
     fn liveness<'a>(
         &'a self,
         user_id: &'a crate::authn::ids::UserId,
-        session_id: &'a SessionId,
+        session: &'a SessionKey,
     ) -> Pin<Box<dyn Future<Output = SessionLiveness> + Send + 'a>>;
 
     /// Register a session under the user. Returns `true` on success,
@@ -110,8 +136,26 @@ pub trait SessionRegistryHandle: SessionRevoker {
     fn register<'a>(
         &'a self,
         user_id: &'a crate::authn::ids::UserId,
-        session_id: &'a SessionId,
+        session: &'a SessionKey,
     ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
+
+    /// Move the session under `old` to `new` in one step of the registry:
+    /// [`SessionRegistry::move_session`].
+    ///
+    /// Required: a handle has no one-step form to fall back on, and a
+    /// registration followed by a removal would hold both keys between the
+    /// two.
+    ///
+    /// # Errors
+    ///
+    /// [`RevocationError`] when the registry backend failed, so the session
+    /// may still be under `old`, or already under `new`.
+    fn move_session<'a>(
+        &'a self,
+        user_id: &'a crate::authn::ids::UserId,
+        old: &'a SessionKey,
+        new: &'a SessionKey,
+    ) -> Pin<Box<dyn Future<Output = Result<MoveOutcome, RevocationError>> + Send + 'a>>;
 
     /// The sessions the registry holds for the user, oldest first, or the
     /// error when it could not answer. The paths that must know whose a
@@ -125,7 +169,40 @@ pub trait SessionRegistryHandle: SessionRevoker {
     fn held_sessions<'a>(
         &'a self,
         user_id: &'a crate::authn::ids::UserId,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<SessionId>, RevocationError>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<SessionKey>, RevocationError>> + Send + 'a>>;
+
+    /// End every session of the user but `keep` in one step of the store:
+    /// [`SessionRegistry::invalidate_other_sessions`].
+    /// `Ok(CutOff::NotHeld)` when the registry holds no session under
+    /// `keep` for the user and no record of a move from it, with nothing
+    /// ended; `Ok(CutOff::KeptNone(..))` when another request had moved
+    /// that session, which is then ended with the rest.
+    ///
+    /// The provided body refuses: a handle that is not built over a
+    /// [`SessionRegistry`] has no one-step form to call, and ending the
+    /// sessions one by one would report a cut-off that was not made.
+    /// [`SessionRegistryAdapter`] forwards to the registry.
+    ///
+    /// # Errors
+    ///
+    /// [`RevocationError`] when the registry backend failed, so the other
+    /// sessions may still be valid.
+    fn invalidate_other_sessions<'a>(
+        &'a self,
+        user_id: &'a crate::authn::ids::UserId,
+        keep: &'a SessionKey,
+    ) -> Pin<Box<dyn Future<Output = OtherSessionsEnded> + Send + 'a>> {
+        Box::pin(async move {
+            tracing::error!(
+                user_id = %user_id,
+                session_id = %keep.prefix(),
+                "this registry handle cannot end a user's other sessions in one step"
+            );
+            Err(RevocationError(
+                "the registry handle has no one-step form of ending the other sessions".to_owned(),
+            ))
+        })
+    }
 
     /// The same list as [`held_sessions`](Self::held_sessions), under the name
     /// admin session lists use. A registry that cannot answer returns the
@@ -134,7 +211,7 @@ pub trait SessionRegistryHandle: SessionRevoker {
     fn active_sessions<'a>(
         &'a self,
         user_id: &'a crate::authn::ids::UserId,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<SessionId>, RevocationError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<SessionKey>, RevocationError>> + Send + 'a>> {
         self.held_sessions(user_id)
     }
 }
@@ -164,11 +241,11 @@ impl<T: SessionRegistry + 'static> SessionRevoker for SessionRegistryAdapter<T> 
     fn invalidate_session<'a>(
         &'a self,
         user_id: &'a crate::authn::ids::UserId,
-        session_id: &'a SessionId,
+        session: &'a SessionKey,
     ) -> Pin<Box<dyn Future<Output = Result<(), RevocationError>> + Send + 'a>> {
         Box::pin(async move {
             self.0
-                .invalidate_session(user_id, session_id)
+                .invalidate_session(user_id, session)
                 .await
                 .map_err(|e| {
                     tracing::warn!(
@@ -180,16 +257,34 @@ impl<T: SessionRegistry + 'static> SessionRevoker for SessionRegistryAdapter<T> 
                 })
         })
     }
+
+    fn current_key<'a>(
+        &'a self,
+        user_id: &'a crate::authn::ids::UserId,
+        session: &'a SessionKey,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<SessionKey>, RevocationError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            self.0.current_key(user_id, session).await.map_err(|e| {
+                tracing::warn!(
+                    user_id = %user_id,
+                    error = %e,
+                    "session registry current_key failed; the session's current key is unknown"
+                );
+                RevocationError(e.to_string())
+            })
+        })
+    }
 }
 
 impl<T: SessionRegistry + 'static> SessionRegistryHandle for SessionRegistryAdapter<T> {
     fn liveness<'a>(
         &'a self,
         user_id: &'a crate::authn::ids::UserId,
-        session_id: &'a SessionId,
+        session: &'a SessionKey,
     ) -> Pin<Box<dyn Future<Output = SessionLiveness> + Send + 'a>> {
         Box::pin(async move {
-            match self.0.is_valid(user_id, session_id).await {
+            match self.0.is_valid(user_id, session).await {
                 Ok(true) => SessionLiveness::Valid,
                 Ok(false) => SessionLiveness::Gone,
                 Err(e) => {
@@ -207,10 +302,10 @@ impl<T: SessionRegistry + 'static> SessionRegistryHandle for SessionRegistryAdap
     fn is_valid<'a>(
         &'a self,
         user_id: &'a crate::authn::ids::UserId,
-        session_id: &'a SessionId,
+        session: &'a SessionKey,
     ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
         Box::pin(async move {
-            match self.0.is_valid(user_id, session_id).await {
+            match self.0.is_valid(user_id, session).await {
                 Ok(valid) => valid,
                 Err(e) => {
                     tracing::warn!(
@@ -227,10 +322,10 @@ impl<T: SessionRegistry + 'static> SessionRegistryHandle for SessionRegistryAdap
     fn register<'a>(
         &'a self,
         user_id: &'a crate::authn::ids::UserId,
-        session_id: &'a SessionId,
+        session: &'a SessionKey,
     ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
         Box::pin(async move {
-            match self.0.register(user_id, session_id).await {
+            match self.0.register(user_id, session).await {
                 Ok(()) => true,
                 Err(e) => {
                     tracing::warn!(
@@ -245,10 +340,29 @@ impl<T: SessionRegistry + 'static> SessionRegistryHandle for SessionRegistryAdap
         })
     }
 
+    fn move_session<'a>(
+        &'a self,
+        user_id: &'a crate::authn::ids::UserId,
+        old: &'a SessionKey,
+        new: &'a SessionKey,
+    ) -> Pin<Box<dyn Future<Output = Result<MoveOutcome, RevocationError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.0.move_session(user_id, old, new).await.map_err(|e| {
+                tracing::warn!(
+                    user_id = %user_id,
+                    error = %e,
+                    "session registry move_session failed; the session may be under \
+                     either key"
+                );
+                RevocationError(e.to_string())
+            })
+        })
+    }
+
     fn held_sessions<'a>(
         &'a self,
         user_id: &'a crate::authn::ids::UserId,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<SessionId>, RevocationError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<SessionKey>, RevocationError>> + Send + 'a>> {
         Box::pin(async move {
             self.0
                 .active_sessions(user_id)
@@ -256,4 +370,28 @@ impl<T: SessionRegistry + 'static> SessionRegistryHandle for SessionRegistryAdap
                 .map_err(|e| RevocationError(e.to_string()))
         })
     }
+
+    fn invalidate_other_sessions<'a>(
+        &'a self,
+        user_id: &'a crate::authn::ids::UserId,
+        keep: &'a SessionKey,
+    ) -> Pin<Box<dyn Future<Output = OtherSessionsEnded> + Send + 'a>> {
+        Box::pin(async move {
+            self.0
+                .invalidate_other_sessions(user_id, keep)
+                .await
+                .map_err(|e| {
+                    tracing::warn!(
+                        user_id = %user_id,
+                        error = %e,
+                        "session registry invalidate_other_sessions failed; the user's \
+                         other sessions may remain active"
+                    );
+                    RevocationError(e.to_string())
+                })
+        })
+    }
 }
+
+#[cfg(test)]
+mod tests;

@@ -1,0 +1,14 @@
+# The resolver takes no crate version published less than seven days ago
+# (cargo 1.100 and later read this key). A version that new is taken only to
+# fix an advisory: run the cargo command that changes the lockfile with
+# CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow, and end the message of the
+# commit that changes the lockfile with one trailer per crate so taken:
+#
+#   Cooldown-Exempt: <advisory id> <crate>
+#
+# where the id is a RUSTSEC-, GHSA- or CVE- id. A message that only mentions
+# an advisory admits nothing. scripts/check-lock-age.sh reads every tracked
+# Cargo.lock and refuses an entry younger than this age that no such trailer
+# admits; it reads the age from this file.
+[registry]
+global-min-publish-age = "7 days"

@@ -1,0 +1,30 @@
+:root {
+  color-scheme: light dark;
+  font: 16px/1.5 system-ui, sans-serif;
+}
+
+main {
+  max-width: 46rem;
+  margin: 2rem auto;
+  padding: 0 1rem;
+}
+
+h1 { font-size: 1.5rem; }
+h2 { font-size: 1.25rem; margin-top: 2rem; }
+h3 { font-size: 1rem; margin-top: 1.5rem; }
+
+label { display: block; margin: 0.5rem 0; }
+input { display: block; width: 100%; max-width: 20rem; padding: 0.4rem; font: inherit; }
+button { padding: 0.45rem 0.8rem; font: inherit; cursor: pointer; }
+
+.row { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0.75rem 0; }
+.hint { color: GrayText; font-size: 0.9rem; }
+
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: 0.3rem 0.6rem 0.3rem 0; border-bottom: 1px solid GrayText; }
+
+#log { font: 0.85rem/1.4 ui-monospace, monospace; padding-left: 1.5rem; }
+#log .refused { color: #b3261e; }
+
+dialog { border: 1px solid GrayText; border-radius: 0.4rem; padding: 1rem 1.25rem; }
+dialog::backdrop { background: rgb(0 0 0 / 40%); }

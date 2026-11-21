@@ -7,19 +7,17 @@ infrastructure. Password (Argon2id) and TOTP (RFC 6238) are the common
 pairing, and the pattern they illustrate generalises to every other
 factor in the library.
 
-The feature flags `password`, `totp`, `hotp`, `email_otp` are all on
-by default in `axess-factors`. No `Cargo.toml` change is needed to
-use them.
+The feature flags `password`, `totp`, `hotp` and `email_otp` are on
+by default in `axess-factors`, so using them needs no `Cargo.toml` change.
 
 ## Password (Argon2id)
 
 The password factor verifies a user-supplied secret against a stored
 Argon2id hash. The choice of Argon2id rather than bcrypt or PBKDF2 is
-the standard one for new systems built today; the parameter tuning is
-the operational lever you reach for first.
+the standard one for new systems built today; its cost, set on the
+service builder, is the operational lever you reach for first.
 
-The configuration struct is `PasswordConfig`, and it is smaller than
-you might expect:
+The configuration struct is `PasswordConfig`:
 
 ```rust,ignore
 pub struct PasswordConfig {
@@ -32,9 +30,9 @@ pub struct PasswordConfig {
 }
 ```
 
-There are no Argon2 parameters to set, and no pepper. Hashing is
+There are no Argon2 parameters in the config, and no pepper. Hashing is
 `generate_password_hash` / `verify_password` from `axess-factors`, which
-hash with Argon2id under a fixed parameter set (19 MiB of memory, two
+hash with Argon2id under a pinned parameter set (19 MiB of memory, two
 passes, one lane; the constants `ARGON2_M_COST_KIB`, `ARGON2_T_COST` and
 `ARGON2_P_COST`), draw a fresh 16-byte salt per hash, and encode the
 parameter set into the stored hash itself, in PHC string format (the
@@ -42,14 +40,33 @@ Password Hashing Competition's `$argon2id$v=19$m=...` encoding). The
 parameters are written out in the crate rather than inherited from a
 dependency's defaults, so a dependency release cannot change them.
 Verification reads the parameters back out of the stored hash, so raising
-the cost later is a matter of changing the constants and rehashing on
-next login. Old hashes keep verifying against the parameters they were
-made with.
+the cost later is a matter of naming a higher one with
+`AuthnServiceBuilder::with_argon2_cost(Argon2Cost::new(m_cost_kib, t_cost, p_cost)?)`
+and letting each next login rehash. `Argon2Cost::new` refuses memory
+below the pinned 19 MiB (`Argon2CostError::BelowFloor`), and a security
+profile raises the cost to its own floor (64 MiB under
+`SecurityProfile::Strict`). Old hashes keep verifying against the
+parameters they were made with. Until an account's next successful login its wrong passwords
+are checked at the old parameters, so a service with a previous cost
+(`AuthnServiceBuilder::with_previous_argon2_cost`) spends the same work on
+every refusal on the form: one run at the current cost and one at the
+previous cost, each its own executor job. An unknown identifier runs both against dummy hashes. A wrong
+password against a current hash runs its check and a dummy run at the
+previous cost. A wrong password against a previous hash runs its check and
+a dummy run at the current cost, matching the rehash a right password earns. A dormant
+account answers in the same work as an unknown identifier. The previous
+cost defaults to the library's pinned cost whenever the service's cost
+differs from it (a deployment that raised it, a security profile included),
+and to none while it is the pinned one. Name it when the hashes came from
+another cost, or call `without_previous_argon2_cost` when every hash is
+current, which brings a refusal back to one run. A hash under a third cost
+costs its own check on top of both runs, and is logged once at `warn`,
+naming the method.
 
 The rehash is done for you. After a password verifies, the service asks
-`password_needs_rehash` whether the stored hash was made under another
+`password_needs_rehash_for` whether the stored hash was made under another
 algorithm, version, memory cost, iteration count or parallelism than the
-pinned ones, and if so hashes the password again (fresh salt from the
+service's cost, and if so hashes the password again (fresh salt from the
 injected RNG, on the KDF executor) and replaces the row with a
 compare-and-swap against the config the password was checked against, so
 a password changed in the meantime is never overwritten with the old
@@ -57,11 +74,10 @@ one. The new config carries the password's identity in `password_id`
 (for a row without one, a digest of the hash it replaced), and the login
 flow's credential epoch covers that identity rather than the hash, so
 every half-finished login of the user, on every instance, carries on. A
-new password is written with `password_id: None` and so is a change. A
-hash inherited from a
-tenant or global scope is not the user's to rewrite and is left alone, and
-a failure to hash or store is logged and does not fail the login (the old
-hash still verifies, and the next login tries again).
+new or changed password is written with `password_id: None`. A hash
+inherited from a tenant or system scope is not the user's to rewrite and is
+left alone. A failure to hash or store is logged and does not fail the login
+(the old hash still verifies, and the next login tries again).
 
 The service takes the salt from its injected `SecureRng` and runs every
 hash and verification on a blocking pool, so a burst of logins does not
@@ -71,11 +87,8 @@ hold the async runtime's workers. Both are configurable:
 `KdfExecutor::inline` runs them on the calling task and counts them, for
 deterministic tests).
 
-That also means the cost is not yours to tune from axess, and the
-answer to "can I use a pepper" is that you would have to apply it
-yourself before calling `generate_password_hash`, storing the result in
-`hash`. Nothing in the type stops you; nothing in the type helps you
-either.
+A pepper is yours to apply before calling `generate_password_hash`,
+storing the result in `hash`; the type neither stops nor helps you.
 
 `generate_password_hash` checks nothing. To hash a password a person has
 just chosen (signup, enrolment), call `hash_new_password(password, &rules)`:
@@ -88,7 +101,7 @@ run the rules and the check with the service's own policy.
 `PasswordRules::accepts` is the rules alone without the hashing, for a form
 that wants to show its own message first.
 
-What *is* configurable is the strength rules:
+What `PasswordConfig` does carry is the strength rules:
 
 ```rust,ignore
 pub struct PasswordRules {
@@ -102,9 +115,8 @@ pub struct PasswordRules {
 }
 ```
 
-So axess does enforce complexity, and the defaults are stricter than
-the habitual eight-character minimum: twelve characters with upper,
-lower and a digit. `require_special` is off by default because the
+The defaults are stricter than the common eight-character minimum:
+twelve characters with upper, lower and a digit. `require_special` is off by default because the
 character-class requirement that most reliably produces `Password1!` is
 the one that demands punctuation.
 
@@ -122,10 +134,12 @@ Rules are resolved per tenant, through
 it; a deployment that sells a stricter tier can override it per tenant
 without touching the login path.
 
-There is no maximum length in the rules. You should want one, because
-Argon2id is deliberately expensive and an unbounded password field is a
-cheap way to burn server CPU. Impose it at the
-edge, where the request is parsed, before the value reaches the hasher.
+There is no maximum length in the rules. The library's cap is
+`MAX_PASSWORD_BYTES` (1024 bytes): `PasswordRules::accepts` and
+`hash_new_password` refuse a longer password, and `verify_factor`
+refuses one without checking it against the stored hash. Bound the
+field at the edge as well, where the request is parsed, so an oversized
+body is refused before it reaches the service.
 
 ## Breached passwords
 
@@ -157,7 +171,7 @@ and the application carries a copy of neither. Both answer
 `NewPasswordError::Breached`, whose `Display` is a sentence fit for the
 form. Without a check nothing is screened, and `build` logs a warning once
 saying so. The password is sent to the check only after the rules have
-passed, so a password that fails them never leaves the host; the reset
+passed, so a password that fails them never leaves the host. The reset
 asks the check after the token has been checked and before it is spent, so
 an unauthenticated caller cannot make the server call the check and a
 refused password keeps the link usable.
@@ -167,7 +181,7 @@ with `NewPasswordError::BreachCheckUnavailable` (the reset audits
 `breach_check_unavailable`): an outage of the check does not admit a
 password nobody screened. A deployment that would rather accept an
 unscreened password than turn signups and resets away while the check is
-down says so by name, `allow_unchecked_when_breach_check_unavailable()`
+down calls `allow_unchecked_when_breach_check_unavailable()`
 on the builder; each such acceptance is logged at `warn` with the check's
 sentence. The same choice is the `BreachCheckUnavailable` argument of the
 free function `hash_new_password_checked(password, &rules, check, policy)`,
@@ -212,11 +226,12 @@ impl BreachedPasswordCheck for RangeLookup {
 common case for a password not in the corpus, and `Some(0)` for the
 padding rows a padded answer carries, so test `n > 0`, not whether an
 answer came back at all.
+
 `BreachedPasswordList::new([..])` is a fixed deny-list, compared exactly:
 the passwords a deployment knows to refuse (the most common ones, its own
 product names) and a floor under the range lookup, not a substitute for it.
-The SQLite example screens with six and shows the refusal on its signup
-page. `BreachCheckOutage`, under the `testing` feature, is a check that
+The SQLite example screens with a list of six passwords and shows the
+refusal on its signup page. `BreachCheckOutage`, under the `testing` feature, is a check that
 never answers, for tests of what a deployment does while its check is down.
 
 ## TOTP (RFC 6238)
@@ -230,9 +245,9 @@ The configuration struct is `TotpConfig`:
 
 ```rust,ignore
 pub struct TotpConfig {
-    pub secret: ZeroizedString,      // raw bytes; base32 for provisioning URIs
+    pub secret: FactorSecret,        // Plain (base32 text) or Sealed
     pub digits: u8,                  // default 6
-    pub period_secs: u32,            // default 30
+    pub period: Duration,            // default 30 s; stored as period_secs
     pub algorithm: OtpAlgorithm,     // Sha1 | Sha256 | Sha512, default Sha1
     pub past_window: u32,            // default 1
     pub future_window: u32,          // default 1
@@ -240,13 +255,11 @@ pub struct TotpConfig {
 }
 ```
 
-Two fields there are not decoration. The drift window is *two* numbers,
-not one: `past_window` for a client behind the server and
+The drift window is *two* numbers, not one: `past_window` for a client behind the server and
 `future_window` for one ahead of it. Both default to 1, because a
-phone's clock runs ahead as often as behind. NTP-synced devices drift
-forward across time-zone changes, and a handset's OS clock is commonly
-a few hundred milliseconds early, so a one-sided window rejects valid
-codes from those users.
+phone's clock runs ahead as often as behind. A handset's OS clock is
+commonly a few hundred milliseconds early, so a one-sided window
+rejects valid codes from those users near a step boundary.
 
 `last_step` is the replay defence. It records the counter of the last
 code accepted, so a code that already worked cannot be used again
@@ -255,24 +268,44 @@ not just configuration: your factor store must persist the updated
 value after a successful verification, or the same intercepted code
 stays usable for the rest of its window.
 
-`secret` is zeroized in memory on drop. It holds the raw bytes, twenty
-cryptographically random ones from `SecureRng`; base32 is the encoding
-applied when the secret goes into a provisioning URI for a QR code or a
-manual key, not how it is stored. Adopters serialise it to and from
-their factor store however the store's encryption envelope prefers.
+The write is `FactorStore::compare_and_save_factor`: replace the row
+only if it is still what this request loaded. Two requests carrying one
+code both verify against the same stored step, and the swap lets one of
+them through. The loser is answered `Ok(false)`, which the service reads
+as a replay. The same swap spends an HOTP counter and a recovery code.
+Two things break it in a store of your own. A read followed by a write
+lets both requests through. A read and a write inside a transaction that
+takes its write lock late (a deferred transaction in SQLite) answers the
+loser a lock error, and the service turns a store error into a failed
+login where the contract says replay. Make it one guarded `UPDATE`, as
+the `sqlite` example does, and run
+`axess::testing::store_contract::assert_compare_and_save_factor_contract`
+against the store in its tests, on a multi-thread runtime and opened the
+way production opens it (the same file, journal mode and pool size; a
+pool of one connection cannot race itself). The check races sixteen
+swaps on one stored value for each of a TOTP step, an HOTP counter with
+its attempt count and a recovery code's spent mark, and fails a store
+that answers more than one `true` or any error.
 
-`digits` is six in line with every TOTP authenticator in production
+`secret` is a `FactorSecret`. Plain, it holds the base32 text of twenty
+cryptographically random bytes (`generate_totp_secret` draws them from a
+`SecureRng`), zeroized in memory on drop, and the verifier decodes it at
+each check; the same text goes into the provisioning URI for a QR code or
+a manual key. Sealed, it holds that text encrypted; "Where the OTP secret
+sits" below covers both forms and how to seal them.
+
+`digits` is six, in line with every TOTP authenticator in production
 use. RFC 6238 admits up to eight, but no widely deployed TOTP app
 generates eight-digit codes, so the field exists for symmetry rather
 than for variability.
 
-`period_secs` is the time window each code is valid for. Thirty is
+`period` is the time window each code is valid for, a whole number of
+seconds (`verify_totp` refuses a fraction or none). Thirty seconds is
 the RFC default and what every authenticator app expects. Increasing
 the period (to sixty seconds, say) reduces the chance that a user
 typing slowly enters a code that has just expired, at the cost of
-doubling the window an intercepted code remains valid. The
-recommendation is to keep this at thirty unless you have a specific
-reason to change it.
+doubling how long an intercepted code remains valid. Keep it at thirty
+unless you have a specific reason to change it.
 
 `algorithm` is an `OtpAlgorithm`: `Sha1`, `Sha256` or `Sha512`. SHA-1
 is the RFC 6238 default and the only one guaranteed to interoperate.
@@ -293,19 +326,20 @@ deployments.
 A method that combines password and TOTP is two `FactorStep`s:
 
 ```rust,ignore
-use axess::{FactorKind, FactorStep, Method};
+use axess::authn::{AuthMethod, FactorKind, FactorStep};
 
-let password_plus_totp = Method {
+let password_plus_totp = AuthMethod {
     name: "password-then-totp".into(),
     steps: vec![
         FactorStep::Required(FactorKind::Password),
         FactorStep::Required(FactorKind::Totp),
     ],
+    scope,
 };
 ```
 
-The method is stored at whatever scope the deployment wants (Global
-default, Tenant override, User override; see *Scope hierarchy*). At
+The method is stored at tenant or user scope (a tenant default, a
+user override; see *Scope hierarchy*). At
 `begin_login` time the resolver loads the method, the session
 transitions to `Authenticating` with `remaining = [Password, Totp]`,
 and the login flow walks the two factors in order.
@@ -313,14 +347,15 @@ and the login flow walks the two factors in order.
 The application's login page renders the password prompt while the
 session is in `Authenticating` with `remaining[0] == Password`, and
 the TOTP prompt while in `Authenticating` with `remaining[0] == Totp`.
-A successful TOTP verification calls `advance_factor`, which returns
-`Completed`, and the orchestrator transitions the session to
+The application submits each credential with `verify_factor`. After the
+password it answers `FactorOutcome::FactorRequired(FactorKind::Totp)`; after a right
+TOTP code it answers `FactorOutcome::Authenticated`, and the session is
 `Authenticated`. The user is logged in.
 
 A common variant offers TOTP plus another second factor as a choice:
 
 ```rust,ignore
-let password_plus_2fa_choice = Method {
+let password_plus_2fa_choice = AuthMethod {
     name: "password-then-2fa-choice".into(),
     steps: vec![
         FactorStep::Required(FactorKind::Password),
@@ -330,6 +365,7 @@ let password_plus_2fa_choice = Method {
             FactorKind::EmailOtp,
         ]),
     ],
+    scope,
 };
 ```
 
@@ -341,8 +377,7 @@ credential; on success, the session is authenticated.
 
 Enrolment is a separate ceremony from login. The user is already
 authenticated (often immediately after signup), and the application
-walks them through registering a TOTP device. The shape is uniform
-across deployments.
+walks them through registering a TOTP device.
 
 The server generates a new TOTP secret through `SecureRng`. It
 serialises the secret as a base32 string and as an
@@ -359,8 +394,8 @@ will succeed.
 
 Two operational details matter at enrolment.
 
-The first is that the verification at enrolment must succeed before
-the secret is persisted. A user who scans the QR code but mistypes
+First, the verification at enrolment must succeed before the secret
+is persisted. A user who scans the QR code but mistypes
 the verification code (or scans into the wrong app) should not be
 left with a stored secret that they cannot reproduce. The standard
 pattern is: generate the secret in memory, display the QR code, hold
@@ -445,15 +480,15 @@ to mint codes only the attacker has seen, and tell the user it happened.
 `RecoveryCodesConfig::remaining` gives the count of unspent codes for a
 settings page; prompt the user to regenerate when it runs low.
 
-The `sqlite` example issues codes at TOTP enrollment, offers them on its
+The `sqlite` example issues codes at TOTP enrolment, offers them on its
 TOTP page, and has a test that drives the whole flow through the router:
-enroll, sign in with a code, see the same code refused.
+enrol, sign in with a code, see the same code refused.
 
 ## HOTP and email OTP, briefly
 
 The HOTP factor is the counter-based variant of TOTP. Instead of
 deriving the code from the current time window, the verifier derives
-it from a monotonically-increasing counter that advances on every
+it from a monotonically increasing counter that advances on every
 successful verification. HOTP is the right choice for hardware tokens
 that have no clock (some YubiKey configurations, for instance). The
 configuration mirrors `TotpConfig` with a counter field instead of a
@@ -464,14 +499,22 @@ successful code clears the lock. The counter never moves on a
 failure, so the token stays in sync and the code it shows next
 verifies once the lock has run out; an earlier throttle advanced the
 counter past the lookahead window instead, which let anyone who knew
-the password desynchronise the user's token.
+the password desynchronise the user's token. The config's values are
+bounded, because a stored row can hold anything. `max_attempts` is read
+as at most ten, RFC 4226 §7.4's ceiling, and zero reads as the default
+of five. `lookahead_window` may be at most
+`axess_factors::MAX_HOTP_LOOKAHEAD` (100) steps, above which the factor
+verifies nothing until the row is corrected, since every step is one
+more code a guess can match and one more HMAC per verify.
 
 The email OTP factor verifies a six-digit code delivered to the user
 out of band, typically by email. The configuration carries the code
-length, the validity window (default fifteen minutes), and the count
-of allowed attempts before the code is revoked. The delivery is the
-application's responsibility; axess provides the verification side,
-the application provides the email send. The chapter *Audit events*
+length (4 to 8 digits), the validity window `ttl`, a `Duration` (default
+five minutes, a whole number of seconds between `MIN_EMAIL_OTP_TTL` (60 s)
+and `MAX_EMAIL_OTP_TTL` (1800 s), outside which, or with a fraction of a
+second, `prepare_factor` refuses to issue a code; stored as `ttl_secs`), and the count of allowed attempts before the code is
+revoked (at most ten). The application
+sends the email; axess verifies the code. The chapter *Audit events*
 covers the events emitted at email-OTP issuance and verification.
 
 ## Threat model
@@ -497,10 +540,8 @@ different origin.
 
 For applications where real-time phishing is a credible threat
 (financial services, healthcare, anything that handles regulated
-data), the recommendation is to offer FIDO2 as the second factor
-and treat TOTP as a fallback for users who do not yet have a
-passkey. The combination is what most regulators are asking for
-today.
+data), offer FIDO2 as the second factor and treat TOTP as a fallback for users who do not yet have a
+passkey.
 
 ## Where the OTP secret sits
 
@@ -595,29 +636,29 @@ them.
 
 ## Troubleshooting
 
-A few failures recur often enough to be worth naming.
-
 If TOTP verification fails consistently, the most likely cause is
-clock skew between the server and the authenticator app. The
-`drift_window` config accommodates a few seconds; larger drift
-points to a misconfigured NTP setup on either side. Logging the
-generated and accepted windows at `debug` level surfaces the offset
-quickly.
+clock skew between the server and the authenticator app. At the
+defaults, `past_window` and `future_window` accept one thirty-second
+step on each side; larger drift points to a misconfigured NTP setup on
+either side. A window above two steps is clamped to two and logged at
+`warn`. The verifier logs no offset, so compare both clocks against a
+reference time source.
 
 If TOTP verification fails for some users but not others, the
 likely cause is that the affected users scanned the QR code into an
 app that defaults to SHA-256 (some less common authenticators do),
-while the server defaults to SHA-1. The fix is to either align the
-server to SHA-256 (and re-enrol users), or to ensure the QR code
-URI explicitly specifies SHA-1.
+while the server defaults to SHA-1. Either align the server to SHA-256 (and re-enrol users), or make the
+QR code URI specify SHA-1 explicitly.
 
-If password verification is slow under load, the Argon2id
-parameters are probably set higher than the server class can
-support at the offered concurrency. The fix is to either lower the
-memory cost or to add CPU. Lower the memory cost first; below
-sixty-four megabytes you are out of the modern recommendation, and
-sixty-four megabytes is what current guidance suggests as a
-minimum.
+If password verification is slow under load, the service's Argon2id
+cost is probably higher than the server class can support at the
+offered concurrency. The default `KdfExecutor` runs at most one hash
+per CPU and lets sixteen jobs per CPU wait for one; a login beyond that
+is answered `AuthnError::Busy` (a `503` with `Retry-After`). The fix is to add CPU or to lower the
+cost with `with_argon2_cost`. The cost cannot go below the pinned 19 MiB,
+and under a security profile it cannot go below the profile's floor
+(64 MiB under `SecurityProfile::Strict`) unless that floor is waived
+with `waive_profile_floor(ProfileSetting::Argon2Cost)`.
 
 If password verification is fast but logins occasionally take
 multiple seconds, the bottleneck is somewhere else (the factor

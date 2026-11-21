@@ -6,7 +6,7 @@ use crate::authn::service::AuthnService;
 use crate::session::{MemorySessionRegistry, store::SessionRegistry};
 use crate::testing::{
     mock_authn::{MockFactorStore, MockIdentityStore},
-    tenant_record, test_session, user_record,
+    tenant_record_at, test_session, user_record_at,
 };
 use axess_clock::testing::MockClock;
 use axess_factors::oauth::{OAuthClaims, types::keys as oauth_keys};
@@ -42,12 +42,19 @@ fn harness(capacity: usize) -> Harness {
 }
 
 fn harness_with(capacity: usize, sinks: crate::metrics::MetricSinks) -> Harness {
-    let user = user_record("u1", "t1");
+    let user = user_record_at(
+        "u1",
+        "t1",
+        axess_clock::testing::MockClock::reference_time(),
+    );
     let identity = MockIdentityStore::new()
-        .with_tenant(tenant_record("t1"))
+        .with_tenant(tenant_record_at(
+            "t1",
+            axess_clock::testing::MockClock::reference_time(),
+        ))
         .with_user(user.clone());
     let registry = MemorySessionRegistry::new();
-    let clock = MockClock::now();
+    let clock = MockClock::at_reference();
     let svc = AuthnService::builder(identity, MockFactorStore::new())
         .with_registry(registry.clone())
         .with_clock(clock.clone())
@@ -196,12 +203,19 @@ async fn the_service_hands_out_the_map_it_fills() {
 /// forgotten.
 #[tokio::test]
 async fn a_service_without_a_registry_records_nothing() {
-    let user = user_record("u1", "t1");
+    let user = user_record_at(
+        "u1",
+        "t1",
+        axess_clock::testing::MockClock::reference_time(),
+    );
     let identity = MockIdentityStore::new()
-        .with_tenant(tenant_record("t1"))
+        .with_tenant(tenant_record_at(
+            "t1",
+            axess_clock::testing::MockClock::reference_time(),
+        ))
         .with_user(user.clone());
     let svc = AuthnService::builder(identity, MockFactorStore::new())
-        .with_clock(MockClock::now())
+        .with_clock(MockClock::at_reference())
         .build();
     for n in 0..5 {
         let session = test_session();
@@ -217,4 +231,38 @@ async fn a_service_without_a_registry_records_nothing() {
     }
     assert!(svc.sid_map().is_empty());
     assert_eq!(svc.sid_map().subject_len(), 0);
+}
+
+/// The longest `sid` the map records, in bytes.
+const LONGEST_RECORDED_SID: usize = 256;
+
+/// A `sid` one byte over the cap is not recorded. The login stands, its
+/// session is live and its subject entry is kept, so a logout by `sub`
+/// still finds it.
+#[tokio::test]
+async fn a_sid_over_the_cap_is_not_recorded() {
+    let h = harness(10);
+    let over = "s".repeat(LONGEST_RECORDED_SID + 1);
+
+    h.login(&over).await;
+
+    let map = h.svc.sid_map();
+    assert!(map.is_empty(), "no mapping is kept for an oversized `sid`");
+    assert_eq!(map.subject_len(), 1, "the subject entry is kept");
+    assert_eq!(h.live_sessions().await, 1);
+}
+
+/// A `sid` exactly as long as the cap is recorded: the cap is the longest
+/// `sid` kept, not the first one dropped.
+#[tokio::test]
+async fn a_sid_exactly_at_the_cap_is_recorded() {
+    let h = harness(10);
+    let longest = "s".repeat(LONGEST_RECORDED_SID);
+
+    h.login(&longest).await;
+
+    let map = h.svc.sid_map();
+    assert_eq!(map.len(), 1);
+    assert!(map.contains_key(&("test".to_string(), longest)));
+    assert_eq!(h.live_sessions().await, 1);
 }

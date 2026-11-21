@@ -103,10 +103,9 @@ async fn a_name_that_resolves_to_loopback_is_not_connected_to() {
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
     let client = EgressPolicy::screened()
-        .client_builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .build()
-        .unwrap();
+        .build_client(|settings| settings.timeout(std::time::Duration::from_secs(3)))
+        .unwrap()
+        .into_inner();
 
     // `check_url` is not consulted: this is the connect-time screen.
     let res = client.get(format!("http://localhost:{port}/")).send().await;
@@ -123,10 +122,9 @@ async fn the_opt_in_connects_to_loopback() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let client = EgressPolicy::screened_allowing_loopback_http()
-        .client_builder()
-        .timeout(std::time::Duration::from_millis(500))
-        .build()
-        .unwrap();
+        .build_client(|settings| settings.timeout(std::time::Duration::from_millis(500)))
+        .unwrap()
+        .into_inner();
 
     let _ = client.get(format!("http://localhost:{port}/")).send().await;
 

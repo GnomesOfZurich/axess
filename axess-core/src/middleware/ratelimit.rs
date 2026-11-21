@@ -20,7 +20,7 @@
 //! against a per-username lockout DoS: an attacker rotating IPs (or a
 //! botnet) can issue 5 wrong-password POSTs per known username and lock
 //! the legitimate user out. Always pair `PeerIp` with
-//! [`KeyExtractor::LoginIdentifier`](crate::middleware::ratelimit::KeyExtractor::LoginIdentifier) on `/login`-class routes:
+//! [`KeyExtractor::LoginIdentifier`] on `/login`-class routes:
 //!
 //! A layer runs before the handler it wraps, so the identifier has to be
 //! put on the request by a layer **outside** the limiter, not by the login
@@ -110,9 +110,11 @@
 //! the budget shares the prefix's overflow bucket (limited together), so an
 //! allocation holding millions of /64s cannot starve a client elsewhere.
 //! And once the table is three quarters full, a login identifier with no
-//! bucket yet is folded into an overflow bucket of its origin (the IPv4
-//! address or IPv6 /48), so unauthenticated callers inventing identifiers
-//! cannot take the remaining room. Neither bound uses wall-clock time beyond
+//! bucket yet is folded into one of 1,024 login overflow buckets, chosen by
+//! a SHA-256 digest of the identifier rather than by its origin, so
+//! unauthenticated callers inventing identifiers cannot take the remaining
+//! room, cannot choose which bucket the next identifier lands in, and every
+//! origin that names one account draws on the same budget. Neither bound uses wall-clock time beyond
 //! the sweep: a bucket whose window starts in the future (the clock stepped
 //! back) is re-anchored at the next sweep and ages out normally.
 //!
@@ -156,8 +158,6 @@ use std::{
 };
 use zeroize::Zeroizing;
 
-#[cfg(test)]
-use chrono::{DateTime, Utc};
 use tower::{Layer, Service};
 
 mod keys;
@@ -200,8 +200,11 @@ pub enum KeyExtractor {
     /// peer address instead.
     UserId,
     /// Rate limit by tenant (reads the [`RateLimitTenantId`] request
-    /// extension the auth layer injects). Falls back to the request's
-    /// own peer address (and logs a warning) if the extension is absent.
+    /// extension the auth layer injects). A request without the extension is
+    /// answered 500 and logged as an error (the layer that inserts it is
+    /// missing or runs after the limiter);
+    /// [`RateLimitConfigBuilder::allow_shared_bucket`] limits it on its own
+    /// peer address instead.
     TenantId,
     /// Rate limit by the **login identifier** (username/email submitted to a
     /// login route). Reads the [`RateLimitLoginIdentifier`] request extension
@@ -539,6 +542,12 @@ fn should_warn_very_long_window(window: std::time::Duration) -> bool {
 // ── Tower Layer / Service ────────────────────────────────────────────────────
 
 /// Tower layer that adds token-bucket rate limiting.
+///
+/// Clones share one bucket table: every route a clone of this layer is
+/// installed on (`.route_layer(layer.clone())` on two routes, say) draws
+/// from the same per-key budget, so one client's requests to both routes
+/// count against one limit. Call [`RateLimitLayer::new`] once per route
+/// that needs a budget of its own.
 #[derive(Clone)]
 pub struct RateLimitLayer {
     store: BucketStore,

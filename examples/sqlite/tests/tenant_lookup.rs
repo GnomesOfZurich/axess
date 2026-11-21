@@ -2,8 +2,8 @@
 //! tenant column alone, which is all the session validator's per-request
 //! cross-check needs.
 
-use axess::SystemClock;
 use axess::authn::{IdentityLookup, TenantId, UserId};
+use axess_clock::testing::MockClock;
 use axess_example_sqlite::models::backend::{OurBackend, seed};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::str::FromStr;
@@ -11,7 +11,7 @@ use std::str::FromStr;
 const ALICE: &str = "00000000-0000-0000-0000-000000000010";
 const TENANT: &str = "00000000-0000-0000-0000-000000000001";
 
-async fn pool() -> sqlx::SqlitePool {
+async fn pool(clock: &MockClock) -> sqlx::SqlitePool {
     let opts = SqliteConnectOptions::from_str("sqlite::memory:")
         .expect("in-memory url")
         .create_if_missing(true);
@@ -22,9 +22,10 @@ async fn pool() -> sqlx::SqlitePool {
         .expect("connect in-memory sqlite");
     sqlx::migrate!().run(&pool).await.expect("migrations");
     seed(
-        &SystemClock,
+        clock,
         &pool,
-        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF"),
+        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF")
+            .with_clock(std::sync::Arc::new(clock.clone())),
     )
     .await
     .expect("seed");
@@ -33,8 +34,9 @@ async fn pool() -> sqlx::SqlitePool {
 
 #[tokio::test]
 async fn the_tenant_is_read_without_loading_the_user() {
-    let pool = pool().await;
-    let backend = OurBackend::new(pool.clone());
+    let clock = MockClock::at_reference();
+    let pool = pool(&clock).await;
+    let backend = OurBackend::new(pool.clone()).with_clock(std::sync::Arc::new(clock.clone()));
     let alice = UserId::try_new(ALICE).expect("user id");
     let tenant = TenantId::try_new(TENANT).expect("tenant id");
 

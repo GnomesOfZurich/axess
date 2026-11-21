@@ -128,8 +128,8 @@ async fn copied_headers_do_not_inherit_a_trusted_device() {
         user_id: None,
         trust_level: DeviceTrustLevel::Trusted,
         fingerprint_hash: fingerprint,
-        first_seen_at: Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap(),
-        last_seen_at: Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap(),
+        first_seen_at: Timestamp::from_utc(2025, 1, 1, 0, 0, 0).unwrap(),
+        last_seen_at: Timestamp::from_utc(2025, 1, 1, 0, 0, 0).unwrap(),
         revoked_at: None,
         demoted_at: None,
         bindings: Vec::new(),
@@ -234,7 +234,7 @@ async fn a_guest_presenting_a_valid_cookie_is_recognised_without_a_write() {
     let guest = LifecycleDeviceResolver::new(
         DefaultFingerprintExtractor::new(fixed_pepper()),
         user_resolver.lifecycle.clone(),
-        MockClock::at(Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).unwrap()),
+        MockClock::at(Timestamp::from_utc(2026, 3, 1, 0, 0, 0).unwrap()),
     );
     let parts = with_cookie(req_with(Some("UA"), Some(tenant()), None), &value);
     assert_eq!(
@@ -275,7 +275,7 @@ async fn a_valid_cookie_does_not_open_another_users_device() {
     let bob = LifecycleDeviceResolver::new(
         DefaultFingerprintExtractor::new(fixed_pepper()),
         alice.lifecycle.clone(),
-        MockClock::at(Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap()),
+        MockClock::at(Timestamp::from_utc(2026, 1, 2, 0, 0, 0).unwrap()),
     )
     .with_user_fn(|_| Some(user("bob")));
     let parts = with_cookie(req_with(Some("UA"), Some(tenant()), None), &value);
@@ -305,7 +305,12 @@ async fn a_revoked_device_is_not_recognised_by_its_token() {
     resolver
         .lifecycle
         .store()
-        .set_trust_level(&tenant(), &id, DeviceTrustLevel::Revoked, Utc::now())
+        .set_trust_level(
+            &tenant(),
+            &id,
+            DeviceTrustLevel::Revoked,
+            axess_clock::testing::MockClock::reference_time(),
+        )
         .await
         .unwrap();
 
@@ -320,23 +325,25 @@ async fn a_revoked_device_is_not_recognised_by_its_token() {
 }
 
 /// A cross-site navigation sends the session cookie and not the strict
-/// device cookie: the device the session already had is kept.
+/// device cookie: the device the session already had is kept, as a device
+/// the request did not prove.
 #[tokio::test]
-async fn the_session_device_is_kept_when_no_token_is_presented() {
+async fn the_session_device_is_kept_unproven_when_no_token_is_presented() {
     let resolver = resolver_for(Some("alice"));
     let first = req_with(Some("UA"), Some(tenant()), None);
-    let id = resolver
-        .resolve(&first)
-        .await
-        .unwrap()
-        .expect("created")
-        .id();
+    let created = resolver.resolve(&first).await.unwrap().expect("created");
+    assert!(
+        matches!(created, BoundDevice::Proven(_)),
+        "the request a device is created on holds its token: {created:?}"
+    );
+    let id = created.id();
 
     let mut parts = req_with(Some("UA"), Some(tenant()), None);
     parts.extensions.insert(SessionDevice(id));
     assert_eq!(
-        resolver.resolve(&parts).await.unwrap().map(|b| b.id()),
-        Some(id)
+        resolver.resolve(&parts).await.unwrap(),
+        Some(BoundDevice::Unproven(id)),
+        "kept, and not proven by a request that presented no token"
     );
     assert!(issued(&parts).is_none());
     assert_eq!(resolver.lifecycle.store().len(), 1, "no second device");
@@ -351,7 +358,7 @@ async fn the_session_device_of_another_user_is_not_kept() {
     let bob = LifecycleDeviceResolver::new(
         DefaultFingerprintExtractor::new(fixed_pepper()),
         alice.lifecycle.clone(),
-        MockClock::at(Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap()),
+        MockClock::at(Timestamp::from_utc(2026, 1, 2, 0, 0, 0).unwrap()),
     )
     .with_user_fn(|_| Some(user("bob")));
     let mut parts = req_with(Some("UA"), Some(tenant()), None);

@@ -6,13 +6,14 @@
 //!
 //! - `identity` ; `IdentityLookup`, `IdentityAuthnLog`, `IdentityAdmin`
 //! - `factors`  ; `FactorStore`
-//! - `audit`    ; `AuditQuery`
+//! - `audit`    ; `AuditQuery`, answering the events read and the count of
+//!   the rows it could not read
 //! - `refresh`  ; `RefreshTokenStore`
 //! - [`seed`]     ; first-boot data: a default tenant + alice/bob test users
 
 use axess::authn::{EntityState, StatusCause, StatusDetail, Tenant, TenantId, User, UserId};
 use axess::{Clock, SystemClock};
-use chrono::{DateTime, Utc};
+use axess::{Timestamp, Until};
 use sqlx::{Row, SqlitePool};
 use std::sync::Arc;
 
@@ -36,7 +37,7 @@ pub struct OurBackend {
     // Source of `now` for audit timestamps, lock-expiry checks, and every
     // other time-of-write decision in the trait impls. Defaults to
     // `SystemClock`; swap in a `MockClock` to run DST tests against this
-    // backend without monkey-patching `chrono`.
+    // backend without touching the system clock.
     clock: Arc<dyn Clock>,
 }
 
@@ -194,16 +195,25 @@ pub(super) fn tenant_from_row(
 /// by the application use RFC 3339. Accept either; on parse failure fall
 /// back to "now" rather than panic; corrupt audit timestamps shouldn't
 /// take the service down.
-pub(super) fn parse_db_datetime(clock: &dyn Clock, s: &str) -> DateTime<Utc> {
-    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        return dt.into();
+pub(super) fn parse_db_datetime(clock: &dyn Clock, s: &str) -> Timestamp {
+    if let Ok(dt) = Timestamp::parse_rfc3339(s) {
+        return dt;
     }
-    // SQLite default format: "YYYY-MM-DD HH:MM:SS" in UTC.
-    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
-        return dt.and_utc();
+    if let Some(dt) = sqlite_default_datetime(s) {
+        return dt;
     }
     tracing::warn!(value = %s, "unparseable timestamp in DB row; falling back to now");
     clock.now()
+}
+
+/// SQLite's default timestamp text, `YYYY-MM-DD HH:MM:SS`, which is in UTC
+/// and names no zone: 19 characters with a space after the date. With a `Z`
+/// for the zone it is text the RFC 3339 reader takes.
+pub(super) fn sqlite_default_datetime(s: &str) -> Option<Timestamp> {
+    if s.len() != 19 || s.as_bytes().get(10) != Some(&b' ') {
+        return None;
+    }
+    Timestamp::parse_rfc3339(&format!("{s}Z")).ok()
 }
 
 /// Map the DB status string (and optional `locked_until` datetime) to [`EntityState`].
@@ -236,14 +246,14 @@ pub(super) fn entity_state_from_db(
 
     // A locked_until in the future takes priority over the status column.
     if let Some(until_str) = locked_until {
-        let until: DateTime<Utc> = DateTime::parse_from_rfc3339(until_str)
-            .map_err(|e| {
-                BackendError::Backend(format!(
-                    "users.locked_until is not an RFC 3339 timestamp: {e}"
-                ))
-            })?
-            .into();
-        if until > now {
+        // The column holds the reading an end is stored as; the latest
+        // reading stands for an end that never comes.
+        let until = Until::from_timestamp(Timestamp::parse_rfc3339(until_str).map_err(|e| {
+            BackendError::Backend(format!(
+                "users.locked_until is not an RFC 3339 timestamp: {e}"
+            ))
+        })?);
+        if until > Until::At(now) {
             // `locked_until` is written by `suspend_user` alone: a timed
             // suspension, with the cause the caller gave.
             return Ok(EntityState::Suspended(StatusDetail {

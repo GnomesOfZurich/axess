@@ -14,6 +14,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHECK="$SCRIPT_DIR/check-release-version.sh"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/axess-release-version.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
+# shellcheck source=lib/case_harness.sh
+. "$SCRIPT_DIR/lib/case_harness.sh"
 
 passed=0
 failed=0
@@ -45,16 +47,10 @@ case_() {
   printf '%s\n' "$man" > "$dir/Cargo.toml"
   printf '%s\n' "$log" > "$dir/CHANGELOG.md"
   local out status
-  out="$("$CHECK" --root "$dir" "$@" 2>&1)"
+  out="$("$CHECK" --root "$dir" "$@" 2>"$WORK/stderr")"
   status=$?
   rm -rf "$dir"
-  if [ "$status" -eq "$want" ] && printf '%s' "$out" | grep -qF -- "$fragment"; then
-    passed=$((passed + 1))
-  else
-    failed=$((failed + 1))
-    echo "FAIL: $name: wanted exit $want with '$fragment', got exit $status:" >&2
-    printf '%s\n' "$out" | sed 's/^/    /' >&2
-  fi
+  judge "$name" "$want" "$fragment" "$status" "$out"
 }
 
 M="$(manifest 0.18.0)"

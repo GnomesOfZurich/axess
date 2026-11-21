@@ -16,6 +16,8 @@ pub use hardening::DEFAULT_MAX_PASSWORD_RESET_TTL;
 mod account_limits;
 mod hardening;
 pub(crate) use hardening::AccountHardening;
+mod profile_floor;
+pub use profile_floor::{AuthnBuildError, ProfileSetting};
 mod breached_password;
 mod removers;
 use removers::{RefreshStoreRevoker, RowRemover};
@@ -80,6 +82,10 @@ where
     /// Password hashing cost, password reset lifetime and cap, and the
     /// impersonation recency rule; see the setters in `hardening`.
     pub(crate) hardening: AccountHardening,
+    /// The security profile the builder was put under, the settings waived
+    /// by name and, once built, the ones held below the profile's floor;
+    /// see `profile_floor`.
+    pub(crate) profile: profile_floor::ProfileRecord,
     /// Where a locked account's own devices are looked up; see
     /// [`with_device_store`](Self::with_device_store).
     #[cfg(feature = "device")]
@@ -97,6 +103,10 @@ where
     /// address because `client_ip::layer` is not installed, so the fault is
     /// logged once per service and not per guess.
     pub(crate) throttle_address_unknown_reported: std::sync::atomic::AtomicBool,
+    /// Whether a tenant's lockout policy past one of its bounds has been
+    /// reported; once per service, so the log names the fault without
+    /// repeating it on every request.
+    pub(crate) lockout_policy_fault_reported: std::sync::atomic::AtomicBool,
     /// The session store, when the application handed it over so that a
     /// revocation can delete the rows as well as the registry entries.
     pub(crate) session_rows: Option<Arc<dyn SessionRowRemover>>,
@@ -142,8 +152,7 @@ where
     /// Capacity cap for [`sid_map`](Self::sid_map). When at/over this
     /// count, `maintain_oidc_sid_map` evicts a batch of oldest entries.
     /// High-throughput OAuth deployments raise this via
-    /// [`with_sid_map_capacity`](AuthnServiceBuilder::with_sid_map_capacity); the
-    /// default matches the historical hardcoded value.
+    /// [`with_sid_map_capacity`](AuthnServiceBuilder::with_sid_map_capacity).
     #[cfg(feature = "oauth")]
     pub(crate) sid_map_capacity: usize,
     /// Interval of the JWKS refresh loop started by `build`, if requested.
@@ -224,11 +233,13 @@ where
             max_live_reset_tokens: DEFAULT_MAX_LIVE_RESET_TOKENS,
             impersonated_credential_changes: false,
             hardening: AccountHardening::default(),
+            profile: profile_floor::ProfileRecord::default(),
             reveal_lockout_on_begin: false,
             #[cfg(feature = "device")]
             known_devices: None,
             preserved_custom_keys: Vec::new(),
             throttle_address_unknown_reported: std::sync::atomic::AtomicBool::new(false),
+            lockout_policy_fault_reported: std::sync::atomic::AtomicBool::new(false),
             session_rows: None,
             recovery_peppers: Default::default(),
             factor_secret_cipher: None,
@@ -362,6 +373,17 @@ where
         self
     }
 
+    /// The FIDO2 options the service will be built with: what
+    /// [`with_fido2_options`](Self::with_fido2_options) set, or the
+    /// defaults. A caller that changes one field (the security profile sets
+    /// the passkey-change recency) reads them here, changes the field and
+    /// passes them back, so the rest stays as configured.
+    #[cfg(feature = "fido2")]
+    #[must_use]
+    pub fn fido2_options(&self) -> &crate::authn::factor::Fido2Options {
+        &self.fido2_options
+    }
+
     /// Attach a session registry for forced-logout support.
     pub fn with_registry(mut self, registry: impl SessionRegistry + 'static) -> Self {
         self.registry = Some(Arc::new(SessionRegistryAdapter(registry)));
@@ -403,24 +425,28 @@ where
     /// When a user authenticates and already has this many active sessions,
     /// the oldest session is evicted. Not calling this (the default) means
     /// unlimited. The cap is a [`NonZeroUsize`](std::num::NonZeroUsize): a cap
-    /// of 0 cannot hold a session that has just logged in, and used to behave
-    /// as 1 without saying so.
+    /// of 0 cannot hold a session that has just logged in, and the type
+    /// leaves no such value to be read as 1 without saying so.
     pub fn with_max_sessions_per_user(mut self, max: std::num::NonZeroUsize) -> Self {
         self.max_sessions_per_user = Some(max.get());
         self
     }
 
-    /// Attach the refresh token store, so that changing a user's credentials
-    /// also revokes the user's refresh tokens.
+    /// Attach the refresh token store, so that the service's own credential
+    /// changes also revoke the user's refresh tokens.
     ///
     /// Session registry invalidation reaches registered cookie sessions
     /// only. A refresh token is a separate credential that mints a new
     /// authenticated session, so without this a refresh token stolen before
-    /// a password reset keeps working after it. With it,
-    /// `complete_password_reset` and the `suspend_user` family call
+    /// a password reset keeps working after it. With it, these call
     /// [`RefreshTokenStore::revoke_user_tokens`](crate::session::refresh::RefreshTokenStore::revoke_user_tokens)
-    /// and return an error when that fails, after the change itself has been
-    /// made and audited. Pass the same store the application issues tokens
+    /// and report when that fails: `complete_password_reset` and the
+    /// `suspend_user` family, after the change itself has been made and
+    /// audited; the `delete_user` family, before the user is erased; and
+    /// [`invalidate_other_sessions`](crate::authn::RequestAuthnService::invalidate_other_sessions),
+    /// the call an application makes after a credential change of its own.
+    /// A credential the application changes without one of these calls
+    /// revokes nothing. Pass the same store the application issues tokens
     /// into (a clone or a shared handle).
     pub fn with_refresh_store(
         mut self,
@@ -521,6 +547,32 @@ where
         self
     }
 
+    /// [`with_device_store`](Self::with_device_store) for a deployment that
+    /// requires device keys
+    /// ([`KeyBindingPolicy::Require`](crate::device_key::KeyBindingPolicy)):
+    /// the lockout exempts a device the account has used only when the
+    /// request proved it by a signature of its key
+    /// ([`DeviceProof::Key`](crate::device_key::DeviceProof::Key)).
+    ///
+    /// With `with_device_store` a device that has a key is already exempt
+    /// only by that key, where the session layer enforces keys; a device
+    /// without one is exempt by its token, which whoever copied the cookie
+    /// store also holds. This form closes that: no key, no exemption. Use
+    /// it where every client is expected to hold a key, or a locked-out
+    /// owner on a browser without one waits out the lock like anyone else.
+    #[cfg(feature = "device-keys")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "device-keys")))]
+    #[must_use]
+    pub fn with_key_proven_device_store<D: crate::device::DeviceStore>(
+        mut self,
+        devices: D,
+    ) -> Self {
+        self.known_devices = Some(Arc::new(super::known_device::KeyProvenKnownDevices(
+            devices,
+        )));
+        self
+    }
+
     /// Answer `begin_signup` for an identifier that is already taken with
     /// [`SignupOutcome::AlreadyExists`](crate::authn::service::SignupOutcome::AlreadyExists),
     /// for a form that must say so at once.
@@ -528,17 +580,19 @@ where
     /// By default a taken identifier gets
     /// [`SignupOutcome::Started`](crate::authn::service::SignupOutcome::Started)
     /// like a free one, so the response is not a way to find out who has an
-    /// account: nothing is created, the session is left as it was,
-    /// anonymous, and the refusal is audited with its reason. The
-    /// application tells the two apart where the caller cannot see it: after
-    /// `Started`, a session with no user means the identifier was taken, and
-    /// the address on file gets a "you already have an account" mail where a
-    /// new signup gets the verification link. Answer the client the same
-    /// either way, and do the mail off the request path, since creating an
-    /// account takes longer than declining to (the hidden answer skips the
-    /// `create_user` write, and that difference is measurable by a caller
-    /// timing the response). Revealing the conflict trades that away for a
-    /// form that can say "taken" on the spot.
+    /// account: nothing is created, the session is left pending a signup as
+    /// a free identifier leaves it, and the refusal is audited with its
+    /// reason. The application tells the two apart where the caller cannot
+    /// see it: a `Started` that carries no verification secret means the
+    /// identifier was taken (the session names a pending user in both cases,
+    /// so it tells nothing), and the address on file gets a "you already
+    /// have an account" mail where a new signup gets the verification link.
+    /// Answer the client the same either way, and do the mail off the
+    /// request path, since creating an account takes longer than declining
+    /// to (the hidden answer skips the `create_user` write, and that
+    /// difference is measurable by a caller timing the response). Revealing
+    /// the conflict trades that away for a form that can say "taken" on the
+    /// spot.
     pub fn with_signup_conflicts_revealed(mut self) -> Self {
         self.reveal_signup_conflicts = true;
         self
@@ -607,14 +661,44 @@ where
 
     /// Share the collaborators and return the handle.
     ///
+    /// [`try_build`](Self::try_build) for the start-up path, where a
+    /// configuration that cannot stand stops the process.
+    ///
+    /// # Panics
+    ///
+    /// With the [`AuthnBuildError`] `try_build` would return: a default
+    /// password reset lifetime above the cap, or a setting looser than the
+    /// security profile the builder was put under and not waived by name.
+    pub fn build(self) -> AuthnService<I, F> {
+        match self.try_build() {
+            Ok(service) => service,
+            Err(refused) => panic!("the AuthnService cannot be built: {refused}"),
+        }
+    }
+
+    /// Share the collaborators and return the handle, or refuse a
+    /// configuration that cannot stand.
+    ///
     /// Logs a warning when no session registry was attached: without one,
     /// suspending a user, resetting a password and an administrator's kick
     /// end no existing session, which then lives until its TTL. Logs another
     /// when no breached-password check was attached: without one, a reset or
     /// a signup accepts a password from a public breach corpus when it meets
-    /// the rules.
-    pub fn build(self) -> AuthnService<I, F> {
+    /// the rules. A builder under a security profile logs the profile once,
+    /// and at `warn` each setting it holds below the profile by a named
+    /// waiver.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthnBuildError::PasswordResetTtlAboveCap`] when the default reset
+    /// lifetime is above the cap on reset lifetimes, and
+    /// [`AuthnBuildError::BelowProfileFloor`] when a setting is looser than
+    /// the security profile the builder was put under and was not waived
+    /// with [`waive_profile_floor`](Self::waive_profile_floor). See
+    /// [`validate`](Self::validate) to ask without building.
+    pub fn try_build(self) -> Result<AuthnService<I, F>, AuthnBuildError> {
         let mut this = self;
+        this.settle_profile()?;
         #[cfg(feature = "oauth")]
         this.report_duplicate_providers();
         if this.registry.is_none() {
@@ -640,8 +724,8 @@ where
         });
         #[cfg(feature = "oauth")]
         let this = this.with_jwks_refresh_started();
-        AuthnService {
+        Ok(AuthnService {
             inner: Arc::new(this),
-        }
+        })
     }
 }

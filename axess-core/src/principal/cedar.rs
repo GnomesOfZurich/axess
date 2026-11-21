@@ -20,7 +20,8 @@
 //! `axess::Human`:
 //! - `user_id`: string
 //! - `tenant_id`: string
-//! - `session_id`: string (only present when the principal carries one)
+//! - `session_id`: string, the 64 hexadecimal characters of the session's
+//!   key (only present when the principal carries one)
 //! - `impersonator`: string, the administrator's user id (only present for
 //!   the principal of an impersonated session)
 //! - any extra keys from [`HumanPrincipal::attributes`] map onto Cedar
@@ -129,10 +130,10 @@ impl ToCedarEntity for HumanPrincipal {
             "tenant_id".to_string(),
             RestrictedExpression::new_string(self.tenant_id.to_string()),
         );
-        if let Some(sid) = &self.session_id {
+        if let Some(key) = &self.session_id {
             attrs.insert(
                 "session_id".to_string(),
-                RestrictedExpression::new_string(sid.to_string()),
+                RestrictedExpression::new_string(key.to_string()),
             );
         }
         if let Some(admin) = &self.impersonator {

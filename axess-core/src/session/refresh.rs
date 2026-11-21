@@ -10,14 +10,16 @@
 //!   the plaintext is returned exactly once at issuance.
 //! - **Token rotation:** Each use of a refresh token invalidates the old one
 //!   and issues a new one, making stolen tokens single-use.
-//! - **Device binding:** Optional device fingerprint is stored with the token
-//!   and checked on refresh to detect cross-device replay.
+//! - **Device binding:** A digest of an optional device string is stored
+//!   with the token and checked on refresh to detect cross-device replay.
 //! - **Per-user cap:** A configurable maximum number of active tokens per user
 //!   prevents unbounded accumulation; the oldest tokens are auto-revoked.
 
 mod device_binding;
 #[cfg(feature = "device")]
 mod device_check;
+#[cfg(feature = "device-keys")]
+mod key_check;
 mod rotation;
 mod store;
 mod types;
@@ -27,7 +29,7 @@ use crate::authn::ids::{TenantId, UserId};
 #[cfg(test)]
 use crate::session::data::{AuthState, SessionData};
 #[cfg(test)]
-use chrono::{DateTime, Duration, Utc};
+use axess_clock::{SignedDuration, Timestamp};
 #[cfg(all(test, feature = "device"))]
 use rotation::collect_family_device_targets;
 #[cfg(test)]
@@ -149,11 +151,14 @@ mod refresh_unit_tests {
     #[test]
     fn default_config_has_safe_defaults() {
         let cfg = RefreshTokenConfig::default();
-        assert_eq!(cfg.ttl, Duration::days(30));
+        assert_eq!(cfg.ttl, std::time::Duration::from_hours(30 * 24));
         assert_eq!(cfg.max_per_user, 10);
         assert!(cfg.rotation, "rotation must be on by default");
         assert!(cfg.hash_pepper.is_none(), "no pepper by default");
-        assert_eq!(cfg.max_lifetime, Some(Duration::days(90)));
+        assert_eq!(
+            cfg.max_lifetime,
+            Some(std::time::Duration::from_hours(90 * 24))
+        );
         assert!(!cfg.allow_unkeyed_hashes);
     }
 
@@ -171,6 +176,17 @@ mod refresh_unit_tests {
             (RefreshError::AccountInactive, "not active"),
             (RefreshError::DeviceRevoked, "device revoked"),
             (RefreshError::DeviceStore("down".into()), "device store"),
+            (
+                RefreshError::KeyProofRequired {
+                    challenge: "c".into(),
+                },
+                "current challenge",
+            ),
+            (RefreshError::KeyProofInvalid, "without its device key"),
+            (
+                RefreshError::KeyCheckMissing,
+                "not given the device-key service",
+            ),
             (
                 RefreshError::InvalidConfig("max_per_user"),
                 "invalid refresh",

@@ -1,5 +1,5 @@
-//! `validation_tests`: extracted from `validation.rs` per the
-//! 200-LoC inline-test rule in AGENTS.md.
+//! `validation_tests`: the unit tests of `validation.rs`, kept beside it per the
+//! 200-line inline-test rule in AGENTS.md.
 
 use super::*;
 
@@ -300,10 +300,16 @@ fn identifiers_with_invisible_format_characters_are_refused() {
     assert!(!is_acceptable_identifier("ad\u{202E}min"), "bidi override");
     assert!(!is_acceptable_identifier("admin\u{FEFF}"));
     assert!(!is_acceptable_identifier("admin\u{FDD0}"), "noncharacter");
-    // Spelled-in joiners of ordinary words stay.
-    assert!(is_acceptable_identifier(
+    // The joiners too, though some scripts spell them into ordinary words:
+    // they are among the classes the log-text predicate escapes, and an
+    // identifier refuses every one of those.
+    assert!(!is_acceptable_identifier(
         "\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}"
     ));
+    assert!(
+        !is_acceptable_identifier("ad\u{200D}min"),
+        "zero width joiner"
+    );
 }
 
 #[test]
@@ -343,9 +349,9 @@ fn normalise_identifier_folds_case_invisibles_and_whitespace() {
 }
 
 /// Every code point of Unicode general category Cf (Unicode 16.0, 170 code
-/// points), as ranges. The zero width non-joiner and joiner (U+200C, U+200D)
-/// are spelled into ordinary words in several scripts and are the one pair
-/// the validator lets through.
+/// points), as ranges. The validator refuses every one: the zero width
+/// non-joiner and joiner (U+200C, U+200D) as characters the log-text
+/// predicate escapes, the rest as invisible format characters.
 const UNICODE_CF_RANGES: &[(u32, u32)] = &[
     (0x00AD, 0x00AD),
     (0x0600, 0x0605),
@@ -371,17 +377,13 @@ const UNICODE_CF_RANGES: &[(u32, u32)] = &[
 ];
 
 #[test]
-fn every_format_character_but_the_joiners_is_refused_in_an_identifier() {
+fn every_format_character_is_refused_in_an_identifier() {
     let mut seen = 0;
     let mut accepted = Vec::new();
     for &(lo, hi) in UNICODE_CF_RANGES {
         for cp in lo..=hi {
             let c = char::from_u32(cp).expect("a scalar value");
             seen += 1;
-            if matches!(c, '\u{200C}' | '\u{200D}') {
-                assert!(is_acceptable_identifier(&format!("ab{c}cd")), "{cp:04X}");
-                continue;
-            }
             if is_acceptable_identifier(&format!("ab{c}cd")) {
                 accepted.push(format!("U+{cp:04X}"));
             }

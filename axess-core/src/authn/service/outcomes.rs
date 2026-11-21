@@ -18,8 +18,11 @@ pub enum LoginOutcome {
     /// as an unknown identifier does, so the lock is not observable before
     /// any proof. The audit row says `Locked` either way.
     Locked {
-        /// Wall-clock instant at which the lockout expires, or `None` for an indefinite lockout.
-        until: Option<chrono::DateTime<chrono::Utc>>,
+        /// When the lockout ends: at a reading of the clock, never
+        /// ([`Until::Forever`](axess_clock::Until::Forever), for a lockout
+        /// duration that runs past the range of a reading), or `None` for
+        /// an indefinite lockout.
+        until: Option<axess_clock::Until>,
     },
     /// Bad credentials. Deliberately vague: do NOT distinguish user-not-found
     /// from wrong-password to prevent user enumeration.
@@ -94,9 +97,15 @@ pub enum PrepareOutcome {
         /// must not learn the address behind it.
         destination: Arc<str>,
     },
-    /// A FIDO2/WebAuthn challenge was generated (placeholder for future use).
+    /// A FIDO2/WebAuthn authentication ceremony was started for the step.
+    /// Pass `challenge` to the browser's `navigator.credentials.get()`, and
+    /// the assertion it returns to `verify_factor` as
+    /// [`FactorCredential::Fido2Assertion`](crate::authn::factor::FactorCredential::Fido2Assertion).
+    /// The ceremony's state stays in the session until the step is verified
+    /// or the ceremony times out (`Fido2Options::ceremony_timeout`, with the
+    /// `fido2` feature).
     Fido2Challenge {
-        /// Opaque challenge data to forward to the browser's WebAuthn API.
+        /// The `RequestChallengeResponse` as JSON, for the browser's WebAuthn API.
         challenge: serde_json::Value,
     },
 }
@@ -246,8 +255,11 @@ pub enum FactorOutcome {
     InvalidCredential,
     /// Too many failed attempts: the account is now locked.
     Locked {
-        /// Wall-clock instant at which the lockout expires, or `None` for an indefinite lockout.
-        until: Option<chrono::DateTime<chrono::Utc>>,
+        /// When the lockout ends: at a reading of the clock, never
+        /// ([`Until::Forever`](axess_clock::Until::Forever), for a lockout
+        /// duration that runs past the range of a reading), or `None` for
+        /// an indefinite lockout.
+        until: Option<axess_clock::Until>,
     },
     /// Consecutive wrong guesses under this key (the account and the
     /// client address, by the tenant's
@@ -270,7 +282,7 @@ pub enum FactorOutcome {
 #[derive(Clone)]
 pub struct SignupVerification {
     pub(crate) secret: zeroize::Zeroizing<String>,
-    pub(crate) expires_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) expires_at: axess_clock::Until,
 }
 
 impl SignupVerification {
@@ -279,8 +291,9 @@ impl SignupVerification {
         &self.secret
     }
 
-    /// When `complete_signup` stops accepting the secret.
-    pub fn expires_at(&self) -> chrono::DateTime<chrono::Utc> {
+    /// When `complete_signup` stops accepting the secret: never, for a
+    /// configured lifetime that runs past the range of a reading.
+    pub fn expires_at(&self) -> axess_clock::Until {
         self.expires_at
     }
 }
@@ -301,12 +314,14 @@ pub enum SignupOutcome {
     /// The application should now send a verification email or similar.
     ///
     /// With the default hidden conflicts this is also the answer for an
-    /// identifier that was already taken: nothing was created and the session
-    /// stays anonymous. So `Started` alone does not mean an account was made.
-    /// Read [`AuthSession::pending_user_id`](crate::session::AuthSession::pending_user_id):
-    /// `None` means the identifier was taken, and the handler must not send a
-    /// verification mail or say anything the caller could tell apart from a
-    /// success (the same page, the same timing as far as it can).
+    /// identifier that was already taken: nothing was created, and the
+    /// session is left pending a signup as a free identifier leaves it. So
+    /// `Started` alone does not mean an account was made, and neither does
+    /// [`AuthSession::pending_user_id`](crate::session::AuthSession::pending_user_id),
+    /// which is `Some` in both cases. Read the payload: `None` means the
+    /// identifier was taken, and the handler must not send a verification
+    /// mail or say anything the caller could tell apart from a success (the
+    /// same page, the same timing as far as it can).
     ///
     /// The payload is the verification secret of the signup now in flight:
     /// `Some` when an account is pending (a new one, or this session's own

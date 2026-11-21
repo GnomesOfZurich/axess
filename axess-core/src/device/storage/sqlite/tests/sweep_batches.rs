@@ -6,13 +6,14 @@ use crate::device::storage::sql_common::SweepCutoffs;
 use crate::device::storage::sql_common::ops::sweep_in_batches;
 use crate::device::storage::sqlite::statements::SqliteSql;
 use crate::device::store::SweepConfig;
+use axess_clock::testing::Shift;
 
-async fn save_idle_trusted(store: &SqliteDeviceStore, t: &TenantId, n: usize, now: DateTime<Utc>) {
+async fn save_idle_trusted(store: &SqliteDeviceStore, t: &TenantId, n: usize, now: Timestamp) {
     for i in 0..n {
         let d = crate::authn::ids::testing::device(&format!("batch-{i}"));
         let mut device = build_device(t, None, &d, 0x30, vec![]);
         device.trust_level = DeviceTrustLevel::Trusted;
-        device.last_seen_at = now - chrono::Duration::days(200);
+        device.last_seen_at = now.minus(axess_clock::SignedDuration::days(200));
         device.first_seen_at = device.last_seen_at;
         store
             .save(&device, crate::device::test_now())

@@ -3,6 +3,7 @@
 use super::test_support::{fixture_tenant, fixture_user, now, store, test_config};
 use super::*;
 use crate::testing::mock_random::MockRng;
+use axess_clock::testing::Shift;
 use std::sync::Arc;
 use zeroize::Zeroizing;
 
@@ -41,10 +42,12 @@ async fn an_empty_pepper_is_refused_before_anything_is_stored() {
     assert!(store.active_tokens(&user).await.unwrap().is_empty());
 
     let refreshed = Refresh::any_tenant("anything", |_| async { true })
+        .without_device_check()
         .run(&store, &config, &MockRng::new(2), now())
         .await;
     assert!(matches!(refreshed, Err(RefreshError::InvalidConfig(_))));
     let checked = Refresh::any_tenant("anything", |_| async { true })
+        .without_device_check()
         .run(&store, &config, &MockRng::new(3), now())
         .await;
     assert!(matches!(checked, Err(RefreshError::InvalidConfig(_))));
@@ -77,23 +80,28 @@ async fn a_cap_of_zero_revokes_nothing_and_issues_nothing() {
     assert_eq!(active[0].id, kept.id);
 }
 
-/// A ttl of zero or less issues tokens that are born expired.
+/// A ttl of no time issues tokens that are born expired. A lifetime cannot
+/// run backwards, so no time at all is the one value to refuse.
 #[test]
-fn validate_refuses_a_ttl_that_is_not_positive() {
-    for ttl in [chrono::Duration::zero(), chrono::Duration::seconds(-1)] {
-        let config = RefreshTokenConfig {
-            ttl,
-            ..RefreshTokenConfig::default()
-        };
-        assert!(config.validate().is_err(), "ttl {ttl} must be refused");
-    }
+fn validate_refuses_a_ttl_of_no_time() {
+    let none = RefreshTokenConfig {
+        ttl: std::time::Duration::ZERO,
+        ..RefreshTokenConfig::default()
+    };
+    assert_eq!(none.validate(), Err("ttl must be positive"));
+    // The shortest lifetime there is passes.
+    let shortest = RefreshTokenConfig {
+        ttl: std::time::Duration::from_nanos(1),
+        ..RefreshTokenConfig::default()
+    };
+    assert_eq!(shortest.validate(), Ok(()));
 }
 
 #[test]
 fn validate_accepts_the_defaults_and_a_keyed_config() {
     assert_eq!(RefreshTokenConfig::default().validate(), Ok(()));
     let keyed = RefreshTokenConfig {
-        hash_pepper: Some(Zeroizing::new(b"pepper".to_vec())),
+        hash_pepper: Some(Zeroizing::new(b"a pepper of thirty-two bytes....".to_vec())),
         ..RefreshTokenConfig::default()
     };
     assert_eq!(keyed.validate(), Ok(()));
@@ -113,7 +121,9 @@ async fn concurrent_issues_for_one_user_never_exceed_the_cap() {
             let (store, user, tenant, config) = (store.clone(), user, tenant, config.clone());
             tasks.push(tokio::spawn(async move {
                 let rng = MockRng::new(1000 * round + n);
-                let at = now() + chrono::Duration::milliseconds(i64::try_from(n).unwrap());
+                let at = now().plus(axess_clock::SignedDuration::milliseconds(
+                    i64::try_from(n).unwrap(),
+                ));
                 issue_refresh_token(request(&user, &tenant), &config, &*store, &rng, at)
                     .await
                     .unwrap();
@@ -137,7 +147,7 @@ async fn concurrent_issues_for_one_user_never_exceed_the_cap() {
 fn the_default_caps_a_family_at_ninety_days() {
     assert_eq!(
         RefreshTokenConfig::default().max_lifetime,
-        Some(Duration::days(90))
+        Some(std::time::Duration::from_hours(90 * 24))
     );
 }
 
@@ -172,6 +182,7 @@ async fn a_refresh_presenting_a_device_string_without_a_pepper_is_an_invalid_con
     let config = RefreshTokenConfig::default();
     let result = Refresh::any_tenant("any-token", |_| async { true })
         .device_info(Some("laptop"))
+        .without_device_check()
         .run(&store(), &config, &MockRng::new(4), now())
         .await;
     assert!(
@@ -185,7 +196,7 @@ async fn allow_unkeyed_hashes_and_a_pepper_each_permit_a_device_string() {
     for config in [
         RefreshTokenConfig::default().allow_unkeyed_hashes(),
         RefreshTokenConfig {
-            hash_pepper: Some(Zeroizing::new(b"pepper".to_vec())),
+            hash_pepper: Some(Zeroizing::new(b"a pepper of thirty-two bytes....".to_vec())),
             ..RefreshTokenConfig::default()
         },
     ] {
@@ -212,4 +223,33 @@ fn with_max_lifetime_none_lifts_the_cap() {
     let config = RefreshTokenConfig::default().with_max_lifetime(None);
     assert_eq!(config.max_lifetime, None);
     assert_eq!(config.validate(), Ok(()));
+}
+
+/// A pepper shorter than the HMAC output is refused by name, the bound
+/// itself passes, and a shorter previous pepper is still accepted so a
+/// deployment can rotate away from one.
+#[test]
+fn a_short_pepper_is_refused_and_the_bound_passes() {
+    let short = RefreshTokenConfig {
+        hash_pepper: Some(Zeroizing::new(vec![
+            7u8;
+            RefreshTokenConfig::MIN_PEPPER_LEN - 1
+        ])),
+        ..RefreshTokenConfig::default()
+    };
+    let why = short.validate().expect_err("a short pepper is refused");
+    assert!(why.contains("32 bytes"), "{why}");
+    let at_bound = RefreshTokenConfig {
+        hash_pepper: Some(Zeroizing::new(vec![
+            7u8;
+            RefreshTokenConfig::MIN_PEPPER_LEN
+        ])),
+        ..RefreshTokenConfig::default()
+    };
+    assert_eq!(at_bound.validate(), Ok(()));
+    let rotating_away = RefreshTokenConfig {
+        previous_hash_pepper: Some(PreviousPepper::keyed(b"short")),
+        ..at_bound
+    };
+    assert_eq!(rotating_away.validate(), Ok(()));
 }

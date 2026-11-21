@@ -1,10 +1,11 @@
-//! `tests`: extracted from `workload.rs` per the
-//! 200-LoC inline-test rule in AGENTS.md.
+//! `tests`: the unit tests of `workload.rs`, kept beside it per the
+//! 200-line inline-test rule in AGENTS.md.
 
 use super::*;
+use crate::jwt::encode;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use jsonwebtoken::jwk::JwkSet;
-use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use rsa::RsaPrivateKey;
 use rsa::pkcs1::EncodeRsaPrivateKey;
 use rsa::traits::PublicKeyParts;
@@ -51,11 +52,6 @@ fn rsa_keypair() -> (Vec<u8>, JwkSet, String) {
 }
 
 fn sign(claims: &serde_json::Value, kid: &str, der: &[u8]) -> String {
-    // Signing needs the same crypto provider verification does, and under
-    // `--all-features` `jsonwebtoken` has no default. Verification installs
-    // one itself; a signer asks, and a test that signs before anything has
-    // verified would otherwise panic on the order tests happened to run in.
-    crate::jwt::ensure_crypto_provider();
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some(kid.to_string());
     let key = EncodingKey::from_rsa_der(der);
@@ -65,32 +61,35 @@ fn sign(claims: &serde_json::Value, kid: &str, der: &[u8]) -> String {
 fn build_verifier(jwks: JwkSet) -> Arc<JwtVerifier> {
     Arc::new(
         JwtVerifier::new(Arc::new(RwLock::new(jwks)))
-            .with_issuer("https://gnomes.okta.com")
+            .with_clock(std::sync::Arc::new(
+                axess_clock::testing::MockClock::at_reference(),
+            ))
+            .with_issuer("https://idp.example.com")
             .with_audience("axess-platform"),
     )
 }
 
 fn now_secs() -> i64 {
-    chrono::Utc::now().timestamp()
+    axess_clock::testing::MockClock::reference_time().unix_seconds()
 }
 
 fn okta_claims() -> serde_json::Value {
     let now = now_secs();
     serde_json::json!({
-        "iss": "https://gnomes.okta.com",
+        "iss": "https://idp.example.com",
         "sub": "okta-user-id-1",
         "aud": "axess-platform",
         "exp": now + 3600,
         "iat": now,
         "azp": "feed-worker",
         "service": "feed-worker",
-        "organization": "gnomes",
+        "organization": "acme",
     })
 }
 
-/// The adopter's slug-to-tenant registry: only `gnomes` is known.
+/// The adopter's slug-to-tenant registry: only `acme` is known.
 fn tenant_lookup() -> impl Fn(&str) -> Option<TenantId> + Send + Sync + 'static {
-    |slug: &str| (slug == "gnomes").then(sample_tenant)
+    |slug: &str| (slug == "acme").then(sample_tenant)
 }
 
 fn okta_mapper()
@@ -115,7 +114,7 @@ fn okta_mapper()
 async fn valid_token_resolves_via_custom_mapper() {
     let (der, jwks, kid) = rsa_keypair();
     let token = sign(&okta_claims(), &kid, &der);
-    let trust = TrustDomain::new("okta.gnomes.local").unwrap();
+    let trust = TrustDomain::new("idp.example.org").unwrap();
 
     let resolver = WorkloadResolver::new(
         build_verifier(jwks),
@@ -131,13 +130,13 @@ async fn valid_token_resolves_via_custom_mapper() {
         Principal::Workload(w) => {
             assert_eq!(
                 w.workload_id.as_str(),
-                "spiffe://okta.gnomes.local/feed-worker/gnomes"
+                "spiffe://idp.example.org/feed-worker/acme"
             );
             assert_eq!(w.trust_domain, trust);
             assert_eq!(w.issuer, Issuer::OAuth);
             assert_eq!(w.tenant_id, sample_tenant());
             assert_eq!(w.service_name, "feed-worker");
-            assert_eq!(w.tenant_slug, "gnomes");
+            assert_eq!(w.tenant_slug, "acme");
             assert_eq!(
                 w.attributes.get("azp"),
                 Some(&serde_json::json!("feed-worker"))
@@ -161,12 +160,12 @@ async fn wrong_iss_rejected_by_verifier() {
             "iat": now,
             "azp": "feed-worker",
             "service": "feed-worker",
-            "organization": "gnomes",
+            "organization": "acme",
         }),
         &kid,
         &der,
     );
-    let trust = TrustDomain::new("okta.gnomes.local").unwrap();
+    let trust = TrustDomain::new("idp.example.org").unwrap();
     let resolver = WorkloadResolver::new(
         build_verifier(jwks),
         trust.clone(),
@@ -201,7 +200,7 @@ async fn the_workload_id_carries_the_resolvers_trust_domain() {
         Principal::Workload(w) => {
             assert_eq!(
                 w.workload_id.as_str(),
-                "spiffe://pinned.example/feed-worker/gnomes"
+                "spiffe://pinned.example/feed-worker/acme"
             );
             assert_eq!(w.trust_domain, trust);
         }
@@ -215,7 +214,7 @@ async fn the_workload_id_carries_the_resolvers_trust_domain() {
 async fn an_unknown_tenant_slug_is_refused() {
     let (der, jwks, kid) = rsa_keypair();
     let token = sign(&okta_claims(), &kid, &der);
-    let trust = TrustDomain::new("okta.gnomes.local").unwrap();
+    let trust = TrustDomain::new("idp.example.org").unwrap();
     let resolver = WorkloadResolver::new(
         build_verifier(jwks),
         trust,
@@ -235,7 +234,7 @@ async fn an_unknown_tenant_slug_is_refused() {
 async fn claim_mapper_error_propagated() {
     let (der, jwks, kid) = rsa_keypair();
     let token = sign(&okta_claims(), &kid, &der);
-    let trust = TrustDomain::new("okta.gnomes.local").unwrap();
+    let trust = TrustDomain::new("idp.example.org").unwrap();
 
     // Mapper rejects every token unconditionally; simulates a
     // mapping precondition failure (missing required scope, etc.).
@@ -245,7 +244,7 @@ async fn claim_mapper_error_propagated() {
         tenant_lookup(),
         Issuer::OAuth,
         token,
-        |_claims: &VerifiedClaims<OktaStyleClaims>| {
+        |_: &VerifiedClaims<OktaStyleClaims>| {
             Err(IdentityError::InvalidComponent(
                 "missing required scope".to_string(),
             ))
@@ -270,18 +269,18 @@ async fn custom_claim_deser_failure_rejected() {
     // verifier; surfaces as NotAuthenticated.
     let token = sign(
         &serde_json::json!({
-            "iss": "https://gnomes.okta.com",
+            "iss": "https://idp.example.com",
             "sub": "u1",
             "aud": "axess-platform",
             "exp": now + 3600,
             "iat": now,
             "azp": "feed-worker",
-            "organization": "gnomes",
+            "organization": "acme",
         }),
         &kid,
         &der,
     );
-    let trust = TrustDomain::new("okta.gnomes.local").unwrap();
+    let trust = TrustDomain::new("idp.example.org").unwrap();
     let resolver = WorkloadResolver::new(
         build_verifier(jwks),
         trust.clone(),
@@ -313,14 +312,29 @@ fn issuer_oauth_wire_string_is_stable() {
 async fn a_verifier_without_an_audience_or_issuer_pin_is_refused() {
     let (der, jwks, kid) = rsa_keypair();
     let token = sign(&okta_claims(), &kid, &der);
-    let trust = TrustDomain::new("okta.gnomes.local").unwrap();
+    let trust = TrustDomain::new("idp.example.org").unwrap();
     let handle = || Arc::new(RwLock::new(jwks.clone()));
     let unpinned: [Arc<JwtVerifier>; 3] = [
-        Arc::new(JwtVerifier::new(handle()).with_issuer("https://gnomes.okta.com")),
-        Arc::new(JwtVerifier::new(handle()).with_audience("axess-platform")),
         Arc::new(
             JwtVerifier::new(handle())
-                .with_issuer("https://gnomes.okta.com")
+                .with_clock(std::sync::Arc::new(
+                    axess_clock::testing::MockClock::at_reference(),
+                ))
+                .with_issuer("https://idp.example.com"),
+        ),
+        Arc::new(
+            JwtVerifier::new(handle())
+                .with_clock(std::sync::Arc::new(
+                    axess_clock::testing::MockClock::at_reference(),
+                ))
+                .with_audience("axess-platform"),
+        ),
+        Arc::new(
+            JwtVerifier::new(handle())
+                .with_clock(std::sync::Arc::new(
+                    axess_clock::testing::MockClock::at_reference(),
+                ))
+                .with_issuer("https://idp.example.com")
                 .allow_any_audience(),
         ),
     ];

@@ -2,8 +2,9 @@
 
 By the end you have a running Axum application that logs a user in with
 a password, holds the session in a signed cookie, and refuses a
-protected route until the login completes. No database: the in-memory
-backend is a one-trait swap away from SQLite, covered at the end and in
+protected route until the login completes. No database: the backend and
+the session store live in memory, and replacing them with SQLite ones is
+covered at the end and in
 [`examples/sqlite/`](https://github.com/GnomesOfZurich/axess/tree/main/examples/sqlite).
 
 **Already have an Axum application?** Add the dependencies in
@@ -17,10 +18,10 @@ example.
 You need Rust 1.95.0 or later on the stable channel (the workspace MSRV),
 Axum 0.8.x, and a Tokio runtime in your binary (`#[tokio::main]` is
 fine). Axess does not depend on system libraries, message brokers, or
-external IdPs by default. The defaults are deliberately zero-infra: the
-in-memory session store, the in-memory backend, and the password, TOTP,
-HOTP, and email-OTP factors all work out of the box for development and
-tests.
+external IdPs by default. The defaults need no infrastructure: the
+password, TOTP, HOTP, and email-OTP factors work out of the box, and the
+in-memory session store and backend for development and tests need only
+the `memory` and `testing` features (see *Dependencies*).
 
 ## Dependencies
 
@@ -28,22 +29,22 @@ The shortest functional `Cargo.toml` looks like this.
 
 ```toml
 [dependencies]
-axess = "0.19"             # facade -- depend on this, never on the internal crates
+axess = "0.20"             # facade -- depend on this, never on the internal crates
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tower = "0.5"             # transitively from axum, but listed for clarity
 ```
 
 The defaults of the `axess` facade enable `authz` and `device`.
-Everything else is opt-in via features. For this chapter we will also
-turn on `memory` for the in-memory session store and `testing` for
+Everything else is opt-in via features. This chapter also
+turns on `memory` for the in-memory session store and `testing` for
 `InMemoryBackend`. Both are development conveniences; a deployment with a
 real database needs neither, and a release build with `testing` on
 refuses to compile (see *Test doubles in a release build* in the security
 posture chapter).
 
 ```toml
-axess = { version = "0.19.0", features = ["memory", "testing"] }
+axess = { version = "0.20.0", features = ["memory", "testing"] }
 ```
 
 The complete feature reference lives in the
@@ -65,13 +66,13 @@ Four moving pieces, in the order you wire them:
 Two Tower layers sit on top. `SessionLayer` reads the cookie at the start
 of every request, hydrates the session, and writes it back on response.
 `client_ip::layer` works out the client's address once, from the TCP peer
-and the proxies you say you trust, so that nothing downstream has to read
-a header and guess. Serve the router with
-`into_make_service_with_connect_info::<SocketAddr>()` or there is no peer
-for it to work from.
+and the proxies you configure as trusted, so that nothing downstream has
+to read a header and guess. Serve the router with
+`into_make_service_with_connect_info::<SocketAddr>()`; without it the
+layer has no peer address.
 
-Here is the whole thing in one file. We will walk through each line
-right after.
+The whole wiring fits in one file; the next section walks through each
+line.
 
 ```rust,ignore
 {{#include ../../examples/minimal/src/main.rs:wiring}}
@@ -88,29 +89,34 @@ section.
 configurations, and authentication-attempt logs in memory. The
 convenience method `with_default_tenant` registers the tenant `default`, which a
 login names and looks up, and `with_user_password` seeds one user (`alice`, in
-that tenant, with the Argon2id-hashed password `Gnomes2+`).
+that tenant, with the Argon2id-hashed password `Sample2+`).
 Production replaces this with a real backend that implements
 `IdentityStore` and `FactorStore` against your database. The trait
 surface is identical.
 
-`MemorySessionStore::new()` is the trivial session backend. Session
-data lives in a `HashMap` behind an `RwLock`, and disappears on
+`MemorySessionStore::new()` is the simplest session backend. Session
+data lives in a `HashMap` behind an `RwLock` and disappears on
 process exit. The first replacement is
 `axess::backends::sqlite::SessionStore` (with the `sqlite` feature),
 covered in *Backends*.
 
-`AuthnService::new(backend.clone(), backend)` takes two arguments
-because the identity store and the factor store can be different
-types. In the in-memory case they are the same object, hence the
-clone. In production they typically remain the same struct (a single
-backend implementing both traits), again with a clone.
+`AuthnService::builder_from_backend(backend)` starts a service whose
+identity store and factor store are the same object: it is shorthand for
+`AuthnService::builder(backend.clone(), backend)`. The two can be
+different types, but in production they are typically the same struct
+(a single backend implementing both traits). `.with_registry` hands the
+service the session registry it records logins in.
 
-`SessionLayer::new(store, key, registry)` constructs the Tower layer; the
-registry is the one the service records logins in, so a password reset or
-a forced logout ends the session on every route. The
-chained `.with_ttl(86_400)` sets a one-day session lifetime, and
-`.with_secure(false)` permits HTTP cookies for local development. See
-*Cookie security* below for the production setting.
+`SessionLayer::new(store, key, registry, audit)` constructs the Tower
+layer. The registry is the one the service records logins in, so a password
+reset or a forced logout ends the session on every route. The audit sink
+is the service's `session_end_audit()`, which writes an audit row for each
+session the layer ends by itself. The
+chained `.with_ttl` sets a 15-minute idle lifetime,
+`.with_max_session_age` ends an authenticated session ten hours after its
+login (the library defaults are 24 hours idle and 7 days from login), and `.with_secure` keeps
+the `Secure` cookie attribute on unless `AXESS_DEV_INSECURE_COOKIES=1` is
+set. See *Cookie security* below.
 
 `AuthSession` is an Axum extractor. Receiving it as a handler argument
 hydrates the session for the current request, and `is_authenticated()`
@@ -125,11 +131,14 @@ single-factor method called `password`. A login is two HTTP requests.
 The first is `POST /login` with a JSON body carrying the username and
 password. Axess transitions the session from `Guest` to
 `Authenticating`, verifies the password, and on success transitions to
-`Authenticated`. Every request after that carries the cookie that
+`Authenticated`. The second, and every request after it, carries the cookie that
 identifies the session, and `AuthSession` reads `Authenticated`.
 
 ```rust,ignore
-use axess::authn::{AuditContext, AuthnService, FactorCredential, FactorOutcome, LoginOutcome};
+use axess::authn::{
+    AuditContext, AuthnService, FactorCredential, FactorOutcome, LoginOutcome,
+    RequestAuthnService,
+};
 use axess::{AuthSession, InMemoryBackend};
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::Deserialize;
@@ -138,8 +147,7 @@ use std::sync::Arc;
 {{#include ../../examples/minimal/src/main.rs:login}}
 ```
 
-Two different outcome types appear there, and the difference is the
-point.
+The handler meets two outcome types, and the difference matters.
 
 `begin_login` returns a `LoginOutcome`: the answer to "can this
 identifier start a login at all, and what does it need first?"
@@ -152,11 +160,17 @@ password prompt for an account that is locked or does not exist.
 `InvalidCredentials`, as an unknown identifier does, so nothing is
 learned about the account before any proof.)
 
-Each of those early refusals first calls `burn_password_check`, which
-spends one Argon2id verification against a fixed dummy hash. Without it
-an unknown username is answered in about a millisecond and a real one in
-tens, and the difference tells a guesser which usernames exist.
+Before each of those early refusals the handler calls
+`burn_password_check`, which spends one Argon2id verification against a
+fixed dummy hash. Without it an unknown username is answered in about a
+millisecond and a real one in tens of milliseconds, and the difference tells a guesser which usernames exist.
 `login_with_password` makes both calls and does this for you.
+
+A refused attempt also ends the login it began: `login` clears the session
+on every answer that is not a success. Otherwise, after a wrong password, the session would say which usernames
+exist: `begin_login` opens a login in the session for a username that
+exists and leaves the session untouched for one that does not, and the
+session layer sets a cookie for a changed session. `login_with_password` clears on every refusal too.
 
 `verify_factor` returns a `FactorOutcome`: the answer to "did this one
 credential check out, and are we done?" `Authenticated` is the terminal
@@ -169,12 +183,11 @@ password, and `Locked` is the lockout policy firing on this attempt.
 Both calls take the session, but in different positions:
 `begin_login(identifier, tenant, session)` and
 `verify_factor(credential, session)`. The credential comes first
-because it is the subject of the verb. Neither takes a client address:
+because it is what the verb acts on. Neither takes a client address:
 that rides on the handle, resolved once by `client_ip::layer`.
 
-The branching is the whole point of the explicit state machine. There
-is no version of "logged in" that means "we believe one factor, you
-can let them in". `is_authenticated()` returns true only when every
+This branching is why the state machine is explicit: no variant means
+"logged in after one factor of several". `is_authenticated()` returns true only when every
 required factor has passed.
 
 ## Wiring the login route
@@ -196,7 +209,7 @@ log in, hold the cookie, `curl` again to reach `/dashboard`.
 ```bash
 $ curl -c jar -X POST http://127.0.0.1:3000/login \
        -H 'content-type: application/json' \
-       -d '{"username":"alice","password":"Gnomes2+"}'
+       -d '{"username":"alice","password":"Sample2+"}'
 logged in
 
 $ curl -b jar http://127.0.0.1:3000/dashboard
@@ -205,8 +218,8 @@ welcome
 
 ## What just happened
 
-A full request walks the following path. The numbers correspond to
-the wiring steps from *The minimum viable wiring*.
+A full request walks the following path. The numbers are those of the
+numbered comments in the example's wiring.
 
 The browser sends the request with a `Cookie:` header carrying the
 session id. `SessionLayer` (5) extracts the cookie, verifies its HMAC
@@ -229,8 +242,9 @@ state machine or the backend.
 The first walkthrough ends with a user who typed a password. Many
 applications never ask for one: the user signs in at an identity provider
 (Entra, Google, Keycloak) and the application accepts its word. The login ends
-in the same place, an `Authenticated` session behind the same cookie, but
-something has to decide which local user the provider's answer means.
+in the same place (an `Authenticated` session behind the same cookie), but
+the application has to decide which local user the provider's answer
+names.
 [`examples/oauth/`](https://github.com/GnomesOfZurich/axess/tree/main/examples/oauth)
 is that path from the redirect to a profile page. It needs the `oauth` and
 `jwt-rust-crypto` features on the facade.
@@ -239,18 +253,20 @@ The login is three calls, and the middle one is yours:
 
 1. `begin_oauth_login_in_tenant` sends the browser to the provider. Naming
    the tenant here makes `complete_oauth_login` refuse a user from any other.
-2. `finish_oauth_login_with_iss` runs when the browser comes back. It checks
-   the state, the PKCE verifier, the ID token's signature, issuer, audience,
-   nonce and expiry, and the `iss` parameter of the response (RFC 9207), and
+2. `finish_oauth_login` runs when the browser comes back. It checks
+   that the callback arrived on the route of the provider the login began
+   with (`OAuthCallbackRoute::global(name)` here), and it checks the
+   state, the PKCE verifier, the ID token's signature, issuer, audience,
+   nonce and expiry, and the `iss` parameter of the response (RFC 9207). It
    returns the claims. It also leaves a claim lock in the session, a value
    derived from this provider, this subject and this session.
 3. `complete_oauth_login` takes a local `User` and those claims, checks the
    lock, and makes the session `Authenticated`. Claims that did not come out
-   of step 2 for this very session do not pass.
+   of step 2 for this session do not pass.
 
 Between 2 and 3 the application turns claims into a user. The example keeps a
 **federated-identity table** of `(issuer, subject)` to local user id, and
-nothing else is ever the link. The e-mail address is not: it changes hands,
+nothing else is ever the link. The email address is not: it changes hands,
 and one provider lets users type it while another verifies it. The same
 address from a second issuer is a second identity, and a second user.
 
@@ -283,19 +299,18 @@ provider needs registered.
 
 The example draws a fresh random 32-byte signing key each time it
 starts, so a restart signs everyone out. That is fine for a
-five-minute demonstration. It is not fine for anything else.
+five-minute demonstration and for nothing else.
 
 In production the signing key is a 32-byte random value loaded from a
 secrets manager (AWS Secrets Manager, GCP Secret Manager, HashiCorp
 Vault, sealed Kubernetes secrets, or your platform's equivalent). The
-key must be stable across process restarts; the HMAC of an existing
-session cookie is computed with this key, and if the key changes
-underneath, every existing session becomes invalid on the next
-request.
+key must stay the same across process restarts: every session cookie's
+HMAC is computed with it, so a changed key invalidates every existing
+session on its next request.
 
-Rotating the signing key is supported via
-`SessionLayer::with_previous_signing_key`, which keeps the old key
-available for a transitional period so sessions signed with the
+To rotate the signing key, use
+`SessionLayer::with_previous_signing_key`: it keeps the old key
+available for a transition period, so sessions signed with the
 previous key continue to validate while new sessions sign with the new
 one. (`SessionCrypto` has a similarly named `with_previous_key` for the
 at-rest envelope; they rotate different keys.)
@@ -304,10 +319,11 @@ detail.
 
 ## Cookie security
 
-Setting `.with_secure(false)` in the example permits the cookie to be
-sent over HTTP, which is necessary for `localhost` development. In
-production, you terminate TLS at the edge and call `.with_secure(true)`.
-The cookie will then only be sent over HTTPS. The other defaults are
+The example turns `Secure` off only when `AXESS_DEV_INSECURE_COOKIES=1`
+is set, which permits the cookie over plain HTTP for `localhost`
+development. In production you terminate TLS at the edge and leave
+`Secure` on, as it is by default (`.with_secure(true)`). The cookie is
+then sent only over HTTPS. The other defaults are
 already production-shaped: `HttpOnly` is on, `SameSite=Lax` is set,
 and the cookie path is the application root.
 
@@ -319,10 +335,9 @@ interpreted, and the `SameSite=Strict` trade-off.
 
 ## Going further
 
-This chapter is deliberately the minimum. The real
+This chapter is the minimum. The
 [`examples/sqlite/`](https://github.com/GnomesOfZurich/axess/tree/main/examples/sqlite)
-extends the same shape with everything you will actually want in
-production:
+extends the same shape with what a production deployment needs:
 
 - A real SQLite backend: `OurBackend` implements `IdentityStore` and
   `FactorStore` over a `sqlx::SqlitePool`.
@@ -334,11 +349,10 @@ production:
 - A background interval task that purges expired sessions.
 
 Read the
-example, run it, compare its `app.rs` to the snippet in this chapter.
-The shape is the same; there are simply more pieces wired in.
+example, run it, and compare its `app.rs` with this chapter's snippet:
+the shape is the same, with more pieces wired in.
 
-After that, the order in which you read the rest of the book depends
-on your goal.
+After that, choose the next chapter by goal.
 
 | Goal | Next chapter |
 |---|---|
@@ -347,14 +361,13 @@ on your goal.
 | Switch the session store to Postgres, MySQL, or Valkey | *Backends: SQLite, Postgres, MySQL, Valkey* |
 | Add authorisation policies | *Cedar policy fundamentals* |
 | Run multiple tenants | *Multi-tenancy* |
-| Federated login (Google, Okta, Azure AD) | *OAuth 2.0 and OIDC* |
+| Federated login (Google, Okta, Entra ID) | *OAuth 2.0 and OIDC* |
 | Workload identity for non-human callers | *Workload identity overview* |
 | Production deployment | *Operations runbook* |
 
 ## Common stumbling points
 
-A handful of failures bite first-time integrators. They are worth
-naming up front so the chapter that solves them is easy to find.
+These failures are common in a first integration.
 
 If your handler cannot see `AuthSession`, the extractor needs the
 layer to populate request extensions. Add `use axess::AuthSession;`
@@ -364,24 +377,25 @@ If `begin_login` returns `InvalidCredentials` for a user you are sure
 exists, check the tenant. The example seeds `alice` in tenant `default`,
 and naming a different tenant gives the same `InvalidCredentials` as a
 wrong password: axess does not tell a caller that a user exists
-elsewhere, or that they exist at all. That makes this particular typo
-quiet to debug, which is the cost of not leaking tenant membership.
+elsewhere, or that they exist at all. A wrong tenant is therefore hard to spot; that is the cost of not
+leaking tenant membership.
 
 If sessions disappear on process restart, that is correct for
-`MemorySessionStore`. Use `SqliteSessionStore`,
-`PostgresSessionStore`, or `ValkeySessionStore` (with their
-respective features) for persistence. See *Backends*.
+`MemorySessionStore`. Use `axess::backends::sqlite::SessionStore`,
+`axess::backends::postgres::SessionStore`,
+`axess::backends::mysql::SessionStore`, or
+`axess::backends::valkey::SessionStore` (each behind the feature of the
+same name) for persistence. See *Backends*.
 
 If you need to attach application data to a session, `SessionData` has
-a `custom` field for that. The size cap is 64 KiB to keep oversize
-cookies from becoming a DoS surface. See *Session lifecycle and
-crypto envelope* §"Custom session data".
+a `custom` field for that. Its serialised size is capped at 64 KiB by
+default (`SessionLayer::with_max_custom_bytes` changes it), so a session
+cannot grow without bound. See *The session state machine* §"Custom
+session data".
 
-If the user logs out, `AuthSession::clear()` or
-`service.logout(&session).await` resets the state to `Guest`, rotates
+To log a user out, call `AuthSession::clear()` or
+`service.logout(&session).await`; either resets the state to `Guest`, rotates
 the session id (defeating fixation), and clears the cookie on
 response.
 
-Each of these has a dedicated chapter or section later in the book.
-The goal here was to get you running, not to be complete. You are
-running. The rest is detail.
+Each of these has a chapter or section later in the book.

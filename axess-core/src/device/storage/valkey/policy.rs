@@ -1,6 +1,6 @@
 //! Pure retention decisions: native key TTLs and the sweep ladder.
 
-use chrono::{DateTime, Utc};
+use axess_clock::Timestamp;
 
 use crate::device::store::SweepConfig;
 use crate::device::types::{Device, DeviceTrustLevel};
@@ -25,8 +25,8 @@ use crate::device::types::{Device, DeviceTrustLevel};
 /// already-late key still exists briefly. Windows so long that the expiry
 /// cannot be represented mean the row never expires natively (`None`), as
 /// an `Unknown` row does; the sweep still walks it.
-pub(super) fn ttl_seconds(cfg: &SweepConfig, device: &Device, now: DateTime<Utc>) -> Option<i64> {
-    let (from, windows): (DateTime<Utc>, &[chrono::Duration]) = match device.trust_level {
+pub(super) fn ttl_seconds(cfg: &SweepConfig, device: &Device, now: Timestamp) -> Option<i64> {
+    let (from, windows): (Timestamp, &[std::time::Duration]) = match device.trust_level {
         DeviceTrustLevel::Unknown => return None,
         DeviceTrustLevel::Trusted => (
             device.last_seen_at,
@@ -35,15 +35,15 @@ pub(super) fn ttl_seconds(cfg: &SweepConfig, device: &Device, now: DateTime<Utc>
         DeviceTrustLevel::Seen => (seen_clock(device), &[cfg.seen_idle, cfg.revoked_grace]),
         DeviceTrustLevel::Revoked => (device.revoked_at.unwrap_or(now), &[cfg.revoked_grace]),
     };
-    let expiry = windows
-        .iter()
-        .try_fold(from, |at, window| at.checked_add_signed(*window))?;
-    Some(expiry.signed_duration_since(now).num_seconds().max(1))
+    let expiry = windows.iter().try_fold(from, |at, window| {
+        at.checked_add(axess_clock::SignedDuration::try_from(*window).ok()?)
+    })?;
+    Some(expiry.since(now).whole_seconds().max(1))
 }
 
 /// The instant a `Seen` row's idle window runs from: the later of its last
 /// sighting and its demotion from `Trusted`.
-fn seen_clock(device: &Device) -> DateTime<Utc> {
+fn seen_clock(device: &Device) -> Timestamp {
     device
         .demoted_at
         .map_or(device.last_seen_at, |d| d.max(device.last_seen_at))
@@ -77,7 +77,7 @@ pub(super) enum SweepStep {
 /// purged once `revoked_grace` has passed since `revoked_at`; a row revoked
 /// by this very pass is not purged. `Unknown` rows and `Revoked` rows are
 /// never moved to a less-revoked level.
-pub(super) fn plan_sweep(device: &Device, cfg: &SweepConfig, now: DateTime<Utc>) -> SweepStep {
+pub(super) fn plan_sweep(device: &Device, cfg: &SweepConfig, now: Timestamp) -> SweepStep {
     if device.trust_level == DeviceTrustLevel::Revoked {
         return match device.revoked_at {
             Some(r) if cfg.purge_due(r, now) => SweepStep::Purge,
@@ -113,8 +113,8 @@ pub(super) fn plan_sweep(device: &Device, cfg: &SweepConfig, now: DateTime<Utc>)
 pub(super) fn revocation_stamp(
     current: &Device,
     level: DeviceTrustLevel,
-    now: DateTime<Utc>,
-) -> Option<DateTime<Utc>> {
+    now: Timestamp,
+) -> Option<Timestamp> {
     if level != DeviceTrustLevel::Revoked {
         return None;
     }

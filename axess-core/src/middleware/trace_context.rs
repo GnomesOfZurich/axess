@@ -1,0 +1,308 @@
+//! W3C Trace Context middleware for Axess.
+//!
+//! Implements the [W3C Trace Context](https://www.w3.org/TR/trace-context/) `traceparent`
+//! header for distributed tracing. Every request gets a new trace context; an
+//! inbound `traceparent` is ignored unless the layer is told to trust it.
+//!
+//! An inbound header is the caller's claim: its trace id can collide with or
+//! poison another trace, and its sampled flag can force sampling of every
+//! request. A service that sits behind an edge that already vetted the header
+//! (an internal hop) opts in with `TraceContextLayer::trust_inbound(true)`,
+//! and then a valid inbound `traceparent` is propagated as a child span.
+//!
+//! The context is put in the request's extensions, where a handler reads it
+//! with `TraceContext::from_request` and the audit context takes its trace
+//! id from it, so an audit row can be matched to the trace of its request.
+//! The layer opens no `tracing` span and records no span field.
+//!
+//! # Usage
+//!
+//! ```text
+//! let app = Router::new()
+//!     .route("/api", get(handler))
+//!     .layer(TraceContextLayer::default());
+//! ```
+//!
+//! # Header format
+//!
+//! `traceparent: {version}-{trace-id}-{parent-id}-{flags}`
+//!
+//! Example: `traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01`
+//!
+//! # Alternative
+//!
+//! For request ID generation (not distributed tracing), consider
+//! [`tower_http::request_id`](https://docs.rs/tower-http/latest/tower_http/request_id/)
+//! which provides `SetRequestId` + `PropagateRequestId`.
+
+use axess_rng::SecureRng;
+use axum::{
+    body::Body,
+    extract::Request,
+    http::{HeaderValue, header::HeaderName},
+    response::Response,
+};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{Arc, LazyLock},
+    task::{Context, Poll},
+};
+use tower::{Layer, Service};
+
+static TRACEPARENT: LazyLock<HeaderName> = LazyLock::new(|| HeaderName::from_static("traceparent"));
+
+// ── TraceContext ──────────────────────────────────────────────────────────────
+
+/// A parsed W3C traceparent value.
+///
+/// Held in request extensions so handlers can access the trace ID.
+#[derive(Clone, Debug)]
+pub struct TraceContext {
+    /// The full traceparent header value.
+    pub traceparent: String,
+    /// The 128-bit trace ID as a hex string (32 chars).
+    pub trace_id: String,
+    /// The 64-bit parent span ID as a hex string (16 chars).
+    pub parent_id: String,
+    /// Whether this trace is sampled.
+    pub sampled: bool,
+}
+
+impl TraceContext {
+    /// Generate a new trace context with a trace ID and span ID drawn from
+    /// `rng`.
+    fn new_root(rng: &dyn SecureRng) -> Self {
+        let mut trace_bytes = [0u8; 16];
+        let mut span_bytes = [0u8; 8];
+        rng.fill_bytes(&mut trace_bytes);
+        rng.fill_bytes(&mut span_bytes);
+        let trace_id = axess_rng::hex::encode(trace_bytes);
+        let parent_id = axess_rng::hex::encode(span_bytes);
+        let traceparent = format!("00-{trace_id}-{parent_id}-01");
+        Self {
+            traceparent,
+            trace_id,
+            parent_id,
+            sampled: true,
+        }
+    }
+
+    /// Parse from a traceparent header value and create a child span.
+    /// The child's span ID is drawn from `rng`. Returns `None` if the header
+    /// is invalid.
+    ///
+    /// W3C format: `{version:2}-{trace-id:32}-{parent-id:16}-{flags:2}`
+    fn from_header(value: &str, rng: &dyn SecureRng) -> Option<Self> {
+        let parts: Vec<&str> = value.trim().split('-').collect();
+        if parts.len() != 4 {
+            return None;
+        }
+        let version = parts[0];
+        let trace_id = parts[1];
+        let flags = parts[3];
+
+        // Validate field lengths and hex content.
+        if version.len() != 2 || trace_id.len() != 32 || parts[2].len() != 16 || flags.len() != 2 {
+            return None;
+        }
+        // W3C Trace Context §3.2: every field is lowercase hex, version `ff`
+        // is invalid, and an all-zero trace-id or parent-id is invalid.
+        let lower_hex = |s: &str| {
+            s.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        };
+        if !lower_hex(version) || !lower_hex(trace_id) || !lower_hex(parts[2]) || !lower_hex(flags)
+        {
+            return None;
+        }
+        if version == "ff"
+            || trace_id.bytes().all(|b| b == b'0')
+            || parts[2].bytes().all(|b| b == b'0')
+        {
+            return None;
+        }
+
+        let sampled = u8::from_str_radix(flags, 16).ok()? & 0x01 == 0x01;
+
+        // Generate a new parent-id for the child span.
+        let mut span_bytes = [0u8; 8];
+        rng.fill_bytes(&mut span_bytes);
+        let parent_id = axess_rng::hex::encode(span_bytes);
+
+        let traceparent = format!("00-{trace_id}-{parent_id}-{flags}");
+        Some(Self {
+            traceparent,
+            trace_id: trace_id.to_string(),
+            parent_id,
+            sampled,
+        })
+    }
+}
+
+// ── TraceContextMiddleware ───────────────────────────────────────────────────
+
+/// Tower service that propagates or generates W3C `traceparent` headers.
+///
+/// - By default an inbound `traceparent` is ignored and a new root trace is generated.
+/// - With [`trust_inbound(true)`](TraceContextLayer::trust_inbound), a valid inbound
+///   `traceparent` gets a child span and is propagated; one that is absent or
+///   invalid generates a new root trace.
+/// - The `traceparent` is set on both the request (for downstream handlers) and the response.
+/// - A [`TraceContext`] is inserted into request extensions for handler access.
+#[derive(Clone)]
+pub struct TraceContextMiddleware<S> {
+    inner: S,
+    rng: Arc<dyn SecureRng>,
+    trust_inbound: bool,
+}
+
+impl<S: std::fmt::Debug> std::fmt::Debug for TraceContextMiddleware<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TraceContextMiddleware")
+            .field("inner", &self.inner)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S> Service<Request<Body>> for TraceContextMiddleware<S>
+where
+    S: Service<Request<Body>, Response = Response<Body>> + Send + Clone + 'static,
+    S::Future: Send + 'static,
+    S::Error: Send + 'static,
+{
+    type Response = Response<Body>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: Request<Body>) -> Self::Future {
+        // Parse or generate trace context.
+        let rng = &*self.rng;
+        let inbound = if self.trust_inbound {
+            req.headers().get(&*TRACEPARENT)
+        } else {
+            None
+        };
+        let ctx = inbound
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| TraceContext::from_header(v, rng))
+            .unwrap_or_else(|| TraceContext::new_root(rng));
+
+        // Set traceparent on the request for downstream middleware/handlers.
+        if let Ok(hv) = HeaderValue::from_str(&ctx.traceparent) {
+            req.headers_mut().insert(TRACEPARENT.clone(), hv);
+        }
+
+        // Insert TraceContext into extensions for handler access.
+        req.extensions_mut().insert(ctx.clone());
+
+        let mut inner = self.inner.clone();
+        std::mem::swap(&mut inner, &mut self.inner);
+
+        let traceparent_value = ctx.traceparent.clone();
+        Box::pin(async move {
+            let mut res = inner.call(req).await?;
+
+            // Propagate traceparent to the response.
+            if let Ok(hv) = HeaderValue::from_str(&traceparent_value) {
+                res.headers_mut().insert(TRACEPARENT.clone(), hv);
+            }
+
+            Ok(res)
+        })
+    }
+}
+
+// ── TraceContextLayer ────────────────────────────────────────────────────────
+
+/// Tower layer for [`TraceContextMiddleware`].
+///
+/// Adds W3C Trace Context propagation to your Axum router:
+///
+/// ```text
+/// let app = Router::new()
+///     .route("/api", get(handler))
+///     .layer(TraceContextLayer::default());
+/// ```
+#[derive(Clone)]
+pub struct TraceContextLayer {
+    rng: Arc<dyn SecureRng>,
+    trust_inbound: bool,
+}
+
+impl std::fmt::Debug for TraceContextLayer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TraceContextLayer").finish_non_exhaustive()
+    }
+}
+
+impl Default for TraceContextLayer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TraceContextLayer {
+    /// Construct a `TraceContextLayer` that draws trace and span IDs from
+    /// [`SystemRng`](axess_rng::SystemRng).
+    pub fn new() -> Self {
+        Self {
+            rng: Arc::new(axess_rng::SystemRng),
+            trust_inbound: false,
+        }
+    }
+
+    /// Whether an inbound `traceparent` is adopted (`true`) or ignored, so
+    /// every request starts a new trace (the default, `false`).
+    ///
+    /// An inbound header is the caller's claim: its trace id can collide with
+    /// or poison another trace, and its sampled flag can force sampling of
+    /// every request. Leave this off on an internet-facing edge, and turn it
+    /// on for a service that sits behind one that already vetted the header
+    /// (an internal hop that should join its caller's trace).
+    #[must_use]
+    pub fn trust_inbound(mut self, trust: bool) -> Self {
+        self.trust_inbound = trust;
+        self
+    }
+
+    /// Draw trace and span IDs from `rng` instead, so a seeded RNG makes
+    /// the IDs reproducible.
+    pub fn with_rng(mut self, rng: impl SecureRng) -> Self {
+        self.rng = Arc::new(rng);
+        self
+    }
+}
+
+impl<S> Layer<S> for TraceContextLayer {
+    type Service = TraceContextMiddleware<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        TraceContextMiddleware {
+            inner,
+            rng: self.rng.clone(),
+            trust_inbound: self.trust_inbound,
+        }
+    }
+}
+
+// ── Axum extractor ───────────────────────────────────────────────────────────
+
+/// Extract the [`TraceContext`] from the request extensions.
+///
+/// Returns `None` if `TraceContextLayer` is not installed.
+impl TraceContext {
+    /// Retrieve from request extensions (for use in handlers without the extractor).
+    pub fn from_request(req: &Request<Body>) -> Option<&TraceContext> {
+        req.extensions().get::<TraceContext>()
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests;

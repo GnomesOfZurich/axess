@@ -11,7 +11,7 @@
 //!
 //! let backend = InMemoryBackend::new()
 //!     .with_default_tenant("default", "Default Tenant")
-//!     .with_user_password("alice", "default", "Gnomes2+")
+//!     .with_user_password("alice", "default", "Sample2+")
 //!     .with_user_password("bob", "default", "s3cret!");
 //! ```
 //!
@@ -305,7 +305,7 @@ impl crate::authn::store::IdentityAuthnLog for InMemoryBackend {
     async fn failed_attempts(
         &self,
         user_id: &UserId,
-    ) -> Result<(u32, Option<chrono::DateTime<chrono::Utc>>), Self::Error> {
+    ) -> Result<(u32, Option<axess_clock::Timestamp>), Self::Error> {
         self.identity.failed_attempts(user_id).await
     }
 
@@ -338,7 +338,7 @@ impl crate::authn::store::IdentityAuthnLog for InMemoryBackend {
     async fn record_last_login(
         &self,
         user_id: &UserId,
-        at: chrono::DateTime<chrono::Utc>,
+        at: axess_clock::Timestamp,
     ) -> Result<(), Self::Error> {
         self.identity.record_last_login(user_id, at).await
     }
@@ -367,7 +367,8 @@ impl crate::authn::store::IdentityAdmin for InMemoryBackend {
 
     /// Erase the user from the identity store (row, identifier index, failed
     /// attempts, password history, pending reset token), from the factor
-    /// store (every factor config and auth method), and, when a registry is
+    /// store (every factor config, passkey credential-id claim and auth
+    /// method), and, when a registry is
     /// linked with [`with_session_registry`](Self::with_session_registry),
     /// invalidate its sessions. A missing user is `NotFound`.
     async fn delete_user(&self, user_id: &UserId) -> Result<(), Self::Error> {
@@ -384,7 +385,7 @@ impl crate::authn::store::IdentityAdmin for InMemoryBackend {
 
     async fn delete_candidates_created_before(
         &self,
-        before: chrono::DateTime<chrono::Utc>,
+        before: axess_clock::Timestamp,
         limit: usize,
     ) -> Result<Vec<User>, Self::Error> {
         let deleted = self
@@ -490,6 +491,31 @@ impl FactorStore for InMemoryBackend {
     ) -> Result<bool, Self::Error> {
         self.factors.set_method_enabled(scope, name, enabled).await
     }
+
+    /// Decided under the factor store's one lock, so of two registrations
+    /// racing for one id exactly one claims it and the other is told who
+    /// did.
+    async fn claim_fido2_credential(
+        &self,
+        tenant_id: &TenantId,
+        user_id: &UserId,
+        credential_id: &[u8],
+    ) -> Result<crate::authn::store::Fido2CredentialClaim, Self::Error> {
+        self.factors
+            .claim_fido2_credential(tenant_id, user_id, credential_id)
+            .await
+    }
+
+    async fn release_fido2_credential(
+        &self,
+        tenant_id: &TenantId,
+        user_id: &UserId,
+        credential_id: &[u8],
+    ) -> Result<(), Self::Error> {
+        self.factors
+            .release_fido2_credential(tenant_id, user_id, credential_id)
+            .await
+    }
 }
 
 #[cfg(test)]
@@ -500,8 +526,8 @@ impl crate::authn::store::IdentityPasswordReset for InMemoryBackend {
         &self,
         user_id: &UserId,
         token_hash: &str,
-        expires_at: chrono::DateTime<chrono::Utc>,
-        now: chrono::DateTime<chrono::Utc>,
+        expires_at: axess_clock::Timestamp,
+        now: axess_clock::Timestamp,
         max_live: usize,
     ) -> Result<bool, Self::Error> {
         self.identity
@@ -513,7 +539,7 @@ impl crate::authn::store::IdentityPasswordReset for InMemoryBackend {
         &self,
         user_id: &UserId,
         token_hash: &str,
-        now: chrono::DateTime<chrono::Utc>,
+        now: axess_clock::Timestamp,
     ) -> Result<bool, Self::Error> {
         self.identity
             .verify_reset_token(user_id, token_hash, now)
@@ -524,7 +550,7 @@ impl crate::authn::store::IdentityPasswordReset for InMemoryBackend {
         &self,
         user_id: &UserId,
         token_hash: &str,
-        now: chrono::DateTime<chrono::Utc>,
+        now: axess_clock::Timestamp,
     ) -> Result<bool, Self::Error> {
         self.identity
             .check_reset_token(user_id, token_hash, now)

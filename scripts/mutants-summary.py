@@ -4,8 +4,8 @@
 The weekly sweep runs as N shards (`cargo mutants --shard k/N`), each of
 which writes its own `outcomes.json`. This script reads all of them, writes
 one per-file kill-rate table, and fails when the sweep did not see what it
-was asked to see. A sweep that measured nothing used to pass with a warning
-for months; here that is an error, by name:
+was asked to see. A sweep that measured nothing is an error, by name, not a
+pass with a warning:
 
   * a shard directory or its `outcomes.json` is missing or unreadable;
   * a shard's run did not finish (`end_time` is null, which is what an
@@ -14,12 +14,25 @@ for months; here that is an error, by name:
   * the shards together tested a different number of mutants than the
     plan listed (`--expected-total`), or none at all on a full sweep.
 
-Exit status: 0 when the sweep is whole; 1 when it is blind in any of the
-ways above; 2 when it is whole but `--fail-on-missed` is set and a mutant
-survived or timed out (the pull-request gate).
+A shard that did not finish is lost, and a lost shard is not a missed
+mutant: the verdict names each lost shard and says that the sweep did not
+finish, apart from any mutant it found missed. The workflow runs every
+lost shard once more in the same run; `--retry DIR2` reads that second
+run, shaped like DIR, and a shard whose second run finished counts as
+finished. `--lost` prints the lost shards of DIR as a JSON list, for the
+job that runs them again, and judges nothing.
+
+The counts go with every verdict: shards planned, finished (and how many
+on the second run), lost; mutants caught, missed, unviable, timed out.
+
+Exit status: 0 when the sweep is whole; 1 when a shard is lost or the
+sweep is blind in another of the ways above; 2 when it is whole but
+`--fail-on-missed` is set and a mutant survived or timed out (the
+pull-request gate).
 
 Usage:
-  mutants-summary.py --shards N --expected-total T [--fail-on-missed] DIR
+  mutants-summary.py --shards N --expected-total T [--retry DIR2] [--fail-on-missed] DIR
+  mutants-summary.py --shards N --lost DIR
   mutants-summary.py --self-test
 
 DIR holds one sub-directory per shard, `mutants-shard-<k>` for k in 0..N-1,
@@ -88,23 +101,59 @@ def read_shard(shard_dir: pathlib.Path) -> list[dict]:
     return outcomes
 
 
-def merge(root: pathlib.Path, shards: int, expected_total: int | None) -> list[dict]:
+class Sweep:
+    """The shards of one sweep, each finished in the first run, finished in
+    the second, or lost with the reason of each run."""
+
+    def __init__(self, shards: int):
+        self.shards = shards
+        self.outcomes: list[dict] = []
+        self.second: list[int] = []
+        self.lost: dict[int, str] = {}
+
+
+def gather(root: pathlib.Path, shards: int, retry: pathlib.Path | None) -> Sweep:
     if shards < 1:
         raise Blind(f"--shards must be at least 1, got {shards}")
-    merged: list[dict] = []
-    errors: list[str] = []
+    sweep = Sweep(shards)
     for k in range(shards):
         try:
-            merged.extend(read_shard(root / f"mutants-shard-{k}"))
+            sweep.outcomes.extend(read_shard(root / f"mutants-shard-{k}"))
+            continue
         except Blind as err:
-            errors.append(str(err))
-    if errors:
-        raise Blind("; ".join(errors))
-    if expected_total is None and not merged:
+            first = str(err)
+        if retry is None:
+            sweep.lost[k] = first
+            continue
+        try:
+            sweep.outcomes.extend(read_shard(retry / f"mutants-shard-{k}"))
+            sweep.second.append(k)
+        except Blind as err:
+            sweep.lost[k] = f"{first}; run again: {err}"
+    return sweep
+
+
+def merge(root: pathlib.Path, shards: int, expected_total: int | None,
+          retry: pathlib.Path | None = None) -> Sweep:
+    """The sweep, whole: Blind when a shard is lost or the count is off."""
+    sweep = gather(root, shards, retry)
+    if sweep.lost:
+        return sweep
+    if expected_total is None and not sweep.outcomes:
         raise Blind("the shards tested no mutants and no plan said that was expected")
-    if expected_total is not None and len(merged) != expected_total:
-        raise Blind(f"the shards tested {len(merged)} mutants; the plan listed {expected_total}")
-    return merged
+    if expected_total is not None and len(sweep.outcomes) != expected_total:
+        raise Blind(f"the shards tested {len(sweep.outcomes)} mutants; the plan listed {expected_total}")
+    return sweep
+
+
+def counts(sweep: Sweep) -> str:
+    """The counts every verdict carries."""
+    found = collections.Counter(BUCKETS.get(o.get("summary", ""), "other") for o in sweep.outcomes)
+    lost = ", ".join(str(k) for k in sorted(sweep.lost)) or "none"
+    return (f"Shards: {sweep.shards} planned, {sweep.shards - len(sweep.lost)} finished "
+            f"({len(sweep.second)} on the second run), {len(sweep.lost)} lost ({lost}). "
+            f"Mutants: {found['caught']} caught, {found['missed']} missed, "
+            f"{found['unviable']} unviable, {found['timeout']} timed out.")
 
 
 def per_file(outcomes: list[dict]) -> dict[str, dict[str, int]]:
@@ -127,7 +176,7 @@ def kill_rate(row: dict[str, int]) -> float:
     return (row["caught"] / denom) * 100.0 if denom else 100.0
 
 
-def render(outcomes: list[dict], shards: int) -> str:
+def render(outcomes: list[dict], shards: int, line: str = "") -> str:
     table = per_file(outcomes)
     totals = collections.Counter()
     for row in table.values():
@@ -137,6 +186,8 @@ def render(outcomes: list[dict], shards: int) -> str:
         "",
         f"{len(outcomes)} mutants over {shards} shard(s): {totals['caught']} caught, "
         f"{totals['missed']} missed, {totals['timeout']} timeout, {totals['unviable']} unviable.",
+        "",
+        line,
         "",
         "| Kill rate | File | caught | missed | timeout | unviable | total |",
         "|----------:|------|-------:|-------:|--------:|---------:|------:|",
@@ -154,23 +205,43 @@ def render(outcomes: list[dict], shards: int) -> str:
     return "\n".join(lines) + "\n"
 
 
-def run(root: pathlib.Path, shards: int, expected_total: int | None, fail_on_missed: bool) -> int:
-    try:
-        outcomes = merge(root, shards, expected_total)
-    except Blind as err:
-        print(f"::error::mutation sweep is blind: {err}")
-        return 1
-    report = render(outcomes, shards)
+def publish(report: str) -> None:
     print(report)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a", encoding="utf-8") as f:
             f.write(report)
-    (root / "outcomes-merged.json").write_text(json.dumps({"outcomes": outcomes}, indent=1))
-    survivors = sum(1 for o in outcomes if o.get("summary") in (MISSED, TIMEOUT))
+
+
+def run(root: pathlib.Path, shards: int, expected_total: int | None, fail_on_missed: bool,
+        retry: pathlib.Path | None = None) -> int:
+    try:
+        sweep = merge(root, shards, expected_total, retry)
+    except Blind as err:
+        print(f"::error::mutation sweep is blind: {err}")
+        return 1
+    survivors = sum(1 for o in sweep.outcomes if o.get("summary") in (MISSED, TIMEOUT))
+    if sweep.lost:
+        # Not a kill rate: the mutants of a lost shard were never judged.
+        publish("## cargo-mutants: the sweep did not finish\n\n" + counts(sweep) + "\n\n"
+                + "".join(f"- shard {k}: {why}\n" for k, why in sorted(sweep.lost.items())))
+        names = ", ".join(str(k) for k in sorted(sweep.lost))
+        print(f"::error::the sweep did not finish: shard(s) {names} lost in both runs, so their "
+              f"mutants were not judged. This is not a missed mutant"
+              + (f"; apart from it, {survivors} mutant(s) survived or timed out." if survivors else "."))
+        return 1
+    publish(render(sweep.outcomes, shards, counts(sweep)))
+    (root / "outcomes-merged.json").write_text(json.dumps({"outcomes": sweep.outcomes}, indent=1))
     if fail_on_missed and survivors:
-        print(f"::error::{survivors} mutant(s) survived or timed out; see the Survivors list.")
+        print(f"::error::{survivors} mutant(s) were missed or timed out: a test is weak, every "
+              f"shard finished; see the Survivors list.")
         return 2
+    return 0
+
+
+def lost_list(root: pathlib.Path, shards: int) -> int:
+    """The lost shards of the first run, as a JSON list for a matrix."""
+    print(json.dumps(sorted(gather(root, shards, None).lost)))
     return 0
 
 
@@ -192,8 +263,8 @@ def self_test() -> int:
 
     cases = []
 
-    def case(name, build, shards, expected, fail_on_missed, want):
-        cases.append((name, build, shards, expected, fail_on_missed, want))
+    def case(name, build, shards, expected, fail_on_missed, want, fragment="", retry=None):
+        cases.append((name, build, shards, expected, fail_on_missed, want, fragment, retry))
 
     case("whole sweep", lambda r: (shard(r, 0, [mutant(CAUGHT)]), shard(r, 1, [mutant(UNVIABLE)])), 2, 2, False, 0)
     case("missing shard", lambda r: shard(r, 0, [mutant(CAUGHT)]), 2, None, False, 1)
@@ -205,25 +276,64 @@ def self_test() -> int:
     case("survivor, gated", lambda r: shard(r, 0, [mutant(MISSED)]), 1, 1, True, 2)
     case("timeout, gated", lambda r: shard(r, 0, [mutant(TIMEOUT)]), 1, 1, True, 2)
     case("empty diff", lambda r: shard(r, 0, []), 1, 0, True, 0)
+    # A lost shard, run again once: a second run that finished stands in
+    # for it; one that did not leaves the sweep unfinished, named apart
+    # from a missed mutant.
+    second = lambda r, k, outcomes, **kw: shard(r / "retry", k, outcomes, **kw)
+    case("lost shard, finished on the second run", lambda r: (
+        shard(r, 0, [mutant(CAUGHT)]), second(r, 1, [mutant(MISSED)])), 2, 2, False, 0,
+        "Shards: 2 planned, 2 finished (1 on the second run), 0 lost (none). "
+        "Mutants: 1 caught, 1 missed, 0 unviable, 0 timed out.", "retry")
+    case("lost shard, lost again", lambda r: (
+        shard(r, 0, [mutant(CAUGHT)]), second(r, 1, [mutant(CAUGHT)], end_time=None)), 2, 2, False, 1,
+        "the sweep did not finish: shard(s) 1 lost in both runs", "retry")
+    case("lost shard, not run again", lambda r: shard(r, 0, [mutant(CAUGHT)]), 2, 2, False, 1,
+        "artifact was not uploaded); run again: mutants-shard-1: no outcomes.json", "retry")
+    case("lost shard and a missed mutant, gated", lambda r: shard(r, 0, [mutant(MISSED)]), 2, 2, True, 1,
+        "This is not a missed mutant; apart from it, 1 mutant(s) survived or timed out.", "retry")
+    case("missed mutant in a whole sweep, gated", lambda r: shard(r, 0, [mutant(MISSED)]), 1, 1, True, 2,
+        "were missed or timed out: a test is weak, every shard finished")
+    case("counts of a whole sweep", lambda r: shard(r, 0, [mutant(CAUGHT), mutant(UNVIABLE), mutant(TIMEOUT)]),
+         1, 3, False, 0, "Shards: 1 planned, 1 finished (0 on the second run), 0 lost (none). "
+         "Mutants: 1 caught, 0 missed, 1 unviable, 1 timed out.")
 
     failed = 0
     saved = os.environ.pop("GITHUB_STEP_SUMMARY", None)
     try:
-        for name, build, shards, expected, fail_on_missed, want in cases:
+        for name, build, shards, expected, fail_on_missed, want, fragment, retry in cases:
             # The fixture runs print their reports and `::error::` lines to
             # stdout; on GitHub those lines would become annotations on a
             # passing step, so the self-test keeps them to itself.
-            with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+            with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()) as out:
                 root = pathlib.Path(tmp)
                 build(root)
-                got = run(root, shards, expected, fail_on_missed)
-            verdict = "ok" if got == want else "FAILED"
-            failed += got != want
-            print(f"self-test {verdict}: {name}: exit {got}, want {want}", file=sys.stderr)
+                got = run(root, shards, expected, fail_on_missed, root / retry if retry else None)
+            said = fragment in out.getvalue()
+            verdict = "ok" if got == want and said else "FAILED"
+            failed += verdict != "ok"
+            print(f"self-test {verdict}: {name}: exit {got}, want {want}"
+                  + ("" if said else f", output lacks {fragment!r}"), file=sys.stderr)
+        failed += lost_self_test(mutant, shard)
     finally:
         if saved is not None:
             os.environ["GITHUB_STEP_SUMMARY"] = saved
     return 1 if failed else 0
+
+
+def lost_self_test(mutant, shard) -> int:
+    """`--lost` lists a missing, an interrupted and a short shard, and no
+    whole one."""
+    with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()) as out:
+        root = pathlib.Path(tmp)
+        shard(root, 0, [mutant(CAUGHT)])
+        shard(root, 2, [mutant(CAUGHT)], end_time=None)
+        shard(root, 3, [mutant(CAUGHT)], total=2)
+        shard(root, 4, [mutant(MISSED)])
+        lost_list(root, 5)
+    got = out.getvalue().strip()
+    ok = got == "[1, 2, 3]"
+    print(f"self-test {'ok' if ok else 'FAILED'}: --lost: {got}, want [1, 2, 3]", file=sys.stderr)
+    return 0 if ok else 1
 
 
 def main() -> int:
@@ -232,13 +342,17 @@ def main() -> int:
     parser.add_argument("--shards", type=int)
     parser.add_argument("--expected-total", type=int)
     parser.add_argument("--fail-on-missed", action="store_true")
+    parser.add_argument("--retry", type=pathlib.Path)
+    parser.add_argument("--lost", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if args.self_test:
         return self_test()
     if args.root is None or args.shards is None:
         parser.error("DIR and --shards are required")
-    return run(args.root, args.shards, args.expected_total, args.fail_on_missed)
+    if args.lost:
+        return lost_list(args.root, args.shards)
+    return run(args.root, args.shards, args.expected_total, args.fail_on_missed, args.retry)
 
 
 if __name__ == "__main__":

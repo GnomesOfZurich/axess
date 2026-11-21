@@ -1,11 +1,11 @@
 # Live policy reload
 
 A running service can replace its Cedar policy text and compiled schema
-without a restart. Before this, `PolicyStore` was immutable after
-construction: role, group and ownership state were live per request through
-the entity provider, but a change to the policies themselves waited for the
-next deploy. This page is the design: what holds, the API, the invariants,
-how it fails, and what an adopter changes (nothing, unless they call it).
+without a restart. Role, group and ownership state already reach each
+request live through the entity provider; a reload means a change to the
+policies themselves does not wait for the next deploy either. This page
+covers the guarantees, the API, the invariants, how it fails, and what an
+adopter changes (nothing, unless they call it).
 
 ## What you get
 
@@ -29,9 +29,9 @@ decision against that snapshot, and drops it. A reload builds the new
 evaluator off to the side and stores it with one atomic pointer write.
 
 `arc-swap` is chosen over an `RwLock<Arc<..>>` because the request path must
-not take a lock: a writer waiting on a read lock stalls every new reader on
-some lock implementations, and a policy reload is exactly the moment the
-service is under an operator's attention and traffic. `arc-swap` is already
+not take a lock: on some lock implementations a writer waiting for the lock stalls
+every new reader, and a policy reload is the moment the service is
+under both traffic and an operator's attention. `arc-swap` is already
 in the dependency tree (`fred` carries it), so this adds a direct dependency
 on a crate the `valkey` feature already compiled; it is not a new crate in
 the lockfile.
@@ -42,9 +42,9 @@ test and a `PolicyStore` in production live in the same slot, and
 
 ## Route gates
 
-`require_authz!` reads an `Arc<PolicyStore>` from the request extensions. The
-usual wiring builds one `Arc<PolicyStore>`, installs it as that extension and
-hands it to `AuthzStore::try_new`. A reload keeps that object the one that
+`require_authz!` decides with the `Arc<PolicyStore>` its `AuthzInstallation`
+holds. The usual wiring builds one `Arc<PolicyStore>` and hands it to both
+`AuthzInstallation::new` and `AuthzStore::try_new`. A reload keeps that object the one that
 decides: the new set is built beside it, validated, and the original
 `PolicyStore` is pointed at it with one atomic write (`PolicyEvaluator::adopt`).
 Every holder of the `Arc`, the gate and the store alike, decides on the next
@@ -53,10 +53,20 @@ pointer is always from the original to the newest set, never a chain, so a
 thousand reloads leave one hop. `PolicyStore::digest()`, `schema()` and
 `mentions_context()` follow a reload, as do `PolicyEvaluator::digest()`,
 `AuthzStore::policy_digest()` and `PolicyEvaluator::schema()`; `original_digest()` and
-`original_schema()` name the text the object was built from. A gate wired with a different `PolicyStore` than the one handed to the
-store has its own set and is not reloaded; use one `Arc` for both. An
+`original_schema()` name the text the object was built from. Use one `Arc` for both: a gate wired with a different `PolicyStore` from
+the one handed to the store has its own set and is not reloaded. An
 evaluator that is not a `PolicyStore` (a mock, your own) is replaced in the
-swap slot as before.
+swap slot instead.
+
+`AuthzInstallation::new` checks the context provider against the policies in
+force when it runs: a store that reads `context` is refused without one. A
+reload is not checked that way, because the store does not know which
+installations hold it. An installation built with `None` whose store is
+reloaded to a set that reads `context` therefore fails closed at the gate:
+every gated request is answered 500 with an error log naming the
+installation, until a reload takes the read out again. Give the installation
+a context provider from the start when policies are reloaded; a provider is
+accepted whether or not the first set reads `context`.
 
 ## The reload entry point
 
@@ -179,7 +189,7 @@ highest generation it applied and refuses a bundle below it, logging and
 counting the refusal, so a stale replica or cache that serves an older, looser
 set cannot undo a tightening an instance already applied. A bundle with the
 same generation or a higher one applies when its digest differs; a bundle with
-no generation applies whenever its digest differs, as before (the default
+no generation applies whenever its digest differs (the default
 `load_versioned` returns none).
 
 **A local reload on a following instance.** `reload_policies` on an instance
@@ -223,11 +233,12 @@ decided by a set that was not valid.
 ## Observability
 
 - A successful reload emits `tracing::info!` on target
-  `axess::authz::reload` with the `digest`, the `previous_digest`, and
-  `cache_invalidated` / `announced`. A refusal emits `warn!` with the error
-  name; a follower application emits the same with `origin = "notice"` or
-  `"poll"`.
-- `AuthzCacheMetrics` gains `authz_policy_reloaded()` and
+  `axess::authz::reload` with the `origin`, the `digest`, the
+  `previous_digest`, and `cache_invalidated` / `announced`. A refusal emits
+  `warn!` on the same target with the `origin` and the error. `origin` is
+  `"local"` for a call to `reload_policies`, and `"notice"` or `"poll"` for
+  a reload by a follower.
+- `AuthzCacheMetrics` has `authz_policy_reloaded()` and
   `authz_policy_reload_refused()`, both no-op by default, wired with
   `AuthzStore::with_metrics(MetricSinks)`, which reads the authorization sink.
 
@@ -242,4 +253,5 @@ defaulted `digest()` and `adopt()` methods, and `schema()` returns the schema by
 Reloading authentication providers (OAuth, FIDO2, LDAP) is on its own page,
 [live provider reload](../authentication/live-provider-reload.md). It reuses
 `ReloadCoordinator` on a channel of its own (`{prefix}:provider-reloaded`), so
-a policy notice never wakes a provider follower and the reverse.
+a policy notice never wakes a provider follower, nor a provider notice a
+policy follower.

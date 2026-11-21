@@ -4,7 +4,11 @@
 //! credential change, a password reset revokes refresh tokens, and the
 //! combined password entry point spends one hash on every path.
 
-mod common;
+mod hotp_code;
+mod totp_code;
+use axess_clock::testing::Shift;
+use axess_core::testing::fixtures as common;
+use totp_code::generate_totp_code;
 
 use axess_clock::{Clock, testing::MockClock};
 use axess_core::authn::AuditContext;
@@ -22,8 +26,8 @@ use axess_core::testing::{
     test_session,
 };
 use common::{
-    generate_totp_code, password_config, password_method, password_totp_method, test_tenant,
-    test_user, totp_config, uid, user_scope,
+    password_config, password_method, password_totp_method, test_tenant, test_user, totp_config,
+    uid, user_scope,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,8 +49,7 @@ fn policy() -> LockoutPolicy {
     }
 }
 
-fn rig_with(user_status: EntityState, totp: bool) -> Rig {
-    let clock = MockClock::now();
+fn rig_with(clock: &MockClock, user_status: EntityState, totp: bool) -> Rig {
     let mut user = test_user("u1", "alice");
     user.status = user_status;
     let identity = MockIdentityStore::new()
@@ -54,7 +57,7 @@ fn rig_with(user_status: EntityState, totp: bool) -> Rig {
         .with_tenant(test_tenant())
         .with_user(user)
         .with_lockout_policy(policy());
-    let mut factors = MockFactorStore::new().with_factor(user_scope(), password_config("Gnomes2+"));
+    let mut factors = MockFactorStore::new().with_factor(user_scope(), password_config("Sample2+"));
     if totp {
         factors = factors
             .with_factor(user_scope(), totp_config(SECRET))
@@ -72,13 +75,13 @@ fn rig_with(user_status: EntityState, totp: bool) -> Rig {
     Rig {
         svc,
         identity,
-        clock,
+        clock: clock.clone(),
         kdf,
     }
 }
 
-fn rig() -> Rig {
-    rig_with(EntityState::Active, false)
+fn rig(clock: &MockClock) -> Rig {
+    rig_with(clock, EntityState::Active, false)
 }
 
 fn pw(p: &str) -> FactorCredential {
@@ -105,7 +108,8 @@ async fn attempt(r: &Rig, password: &str) -> String {
 
 #[tokio::test]
 async fn lockout_is_enforced_before_the_verifier_and_expires() {
-    let r = rig();
+    let clock = common::test_clock();
+    let r = rig(&clock);
     // A flow begun before the lock, to prove the verify gate (not only
     // begin_login) refuses.
     let early = test_session();
@@ -114,9 +118,9 @@ async fn lockout_is_enforced_before_the_verifier_and_expires() {
     // Each guess waits out the delay the one before it earned, so the lock
     // and not the throttle answers the third.
     assert_eq!(attempt(&r, "wrong1").await, "InvalidCredential");
-    r.clock.advance(chrono::Duration::seconds(1));
+    r.clock.advance(axess_clock::SignedDuration::seconds(1));
     assert_eq!(attempt(&r, "wrong2").await, "InvalidCredential");
-    r.clock.advance(chrono::Duration::seconds(2));
+    r.clock.advance(axess_clock::SignedDuration::seconds(2));
     assert_eq!(attempt(&r, "wrong3").await, "locked:true");
     assert_eq!(r.identity.failed_attempts_for("u1"), 3);
 
@@ -126,8 +130,8 @@ async fn lockout_is_enforced_before_the_verifier_and_expires() {
     // default; the verify gate, reached only by a flow begun before the
     // lock, names it.
     let jobs = r.kdf.jobs_started();
-    assert_eq!(attempt(&r, "Gnomes2+").await, "begin:InvalidCredentials");
-    let outcome = r.svc.verify_factor(&pw("Gnomes2+"), &early).await.unwrap();
+    assert_eq!(attempt(&r, "Sample2+").await, "begin:InvalidCredentials");
+    let outcome = r.svc.verify_factor(&pw("Sample2+"), &early).await.unwrap();
     assert!(
         matches!(outcome, FactorOutcome::Locked { until: Some(_) }),
         "{outcome:?}"
@@ -137,20 +141,21 @@ async fn lockout_is_enforced_before_the_verifier_and_expires() {
     assert!(!early.is_authenticated().await);
 
     // Past `until` the correct password works and clears the counter.
-    r.clock.advance(chrono::Duration::minutes(16));
-    assert_eq!(attempt(&r, "Gnomes2+").await, "Authenticated");
+    r.clock.advance(axess_clock::SignedDuration::minutes(16));
+    assert_eq!(attempt(&r, "Sample2+").await, "Authenticated");
     assert_eq!(r.identity.failed_attempts_for("u1"), 0);
 }
 
 #[tokio::test]
 async fn a_zero_max_attempts_policy_does_not_lock_everyone() {
-    let r = rig();
+    let clock = common::test_clock();
+    let r = rig(&clock);
     let identity = r.identity.clone().with_lockout_policy(LockoutPolicy {
         max_attempts: 0,
         ..policy()
     });
     let factors = MockFactorStore::new()
-        .with_factor(user_scope(), password_config("Gnomes2+"))
+        .with_factor(user_scope(), password_config("Sample2+"))
         .with_method(&uid("u1"), password_method());
     let svc = AuthnService::builder(identity, factors)
         .with_clock(r.clock.clone())
@@ -174,14 +179,17 @@ async fn a_zero_max_attempts_policy_does_not_lock_everyone() {
 
 #[test]
 fn derived_lockout_rules() {
-    use chrono::Utc;
-    let now = Utc::now();
+    let now = common::start();
     let p = policy();
     assert!(p.derived_lockout(2, Some(now), now).is_none());
     assert!(p.derived_lockout(3, Some(now), now).is_some());
     assert!(
-        p.derived_lockout(3, Some(now - chrono::Duration::minutes(16)), now)
-            .is_none()
+        p.derived_lockout(
+            3,
+            Some(now.minus(axess_clock::SignedDuration::minutes(16))),
+            now
+        )
+        .is_none()
     );
     // No timestamp from the store: stay locked rather than guess.
     assert_eq!(p.derived_lockout(9, None, now).unwrap().until, None);
@@ -191,7 +199,11 @@ fn derived_lockout_rules() {
     };
     assert_eq!(
         forever
-            .derived_lockout(3, Some(now - chrono::Duration::days(30)), now)
+            .derived_lockout(
+                3,
+                Some(now.minus(axess_clock::SignedDuration::days(30))),
+                now
+            )
             .unwrap()
             .until,
         None
@@ -202,8 +214,10 @@ fn derived_lockout_rules() {
 
 #[tokio::test]
 async fn a_pending_account_is_not_distinguishable_at_begin_login() {
+    let clock = common::test_clock();
     let r = rig_with(
-        EntityState::Pending(StatusDetail::verification("review", chrono::Utc::now())),
+        &clock,
+        EntityState::Pending(StatusDetail::verification("review", common::start())),
         false,
     );
     let outcome = r
@@ -221,18 +235,21 @@ async fn a_pending_account_is_not_distinguishable_at_begin_login() {
 
 #[tokio::test]
 async fn a_locked_known_user_makes_the_same_store_calls_as_an_unknown_one() {
-    async fn calls_for(identifier: &str, locked: bool) -> Vec<&'static str> {
+    let clock = common::test_clock();
+    async fn calls_for(clock: &MockClock, identifier: &str, locked: bool) -> Vec<&'static str> {
         let log = CallLog::new();
         let mut user = test_user("u1", "alice");
         if locked {
             user.status =
-                EntityState::Suspended(StatusDetail::administrative("hold", chrono::Utc::now()));
+                EntityState::Suspended(StatusDetail::administrative("hold", common::start()));
         }
         let identity = MockIdentityStore::new()
+            .with_clock(clock.clone())
             .with_call_log(&log)
             .with_tenant(test_tenant())
             .with_user(user);
         let svc = AuthnService::builder(identity, MockFactorStore::new().with_call_log(&log))
+            .with_clock(clock.clone())
             .with_kdf_executor(Arc::new(KdfExecutor::inline()))
             .allow_plaintext_factor_secrets()
             .build()
@@ -243,8 +260,8 @@ async fn a_locked_known_user_makes_the_same_store_calls_as_an_unknown_one() {
         log.calls()
     }
     assert_eq!(
-        calls_for("alice", true).await,
-        calls_for("nobody", false).await
+        calls_for(&clock, "alice", true).await,
+        calls_for(&clock, "nobody", false).await
     );
 }
 
@@ -252,7 +269,8 @@ async fn a_locked_known_user_makes_the_same_store_calls_as_an_unknown_one() {
 
 #[tokio::test]
 async fn a_flow_at_the_second_factor_does_not_survive_a_password_reset() {
-    let r = rig_with(EntityState::Active, true);
+    let clock = common::test_clock();
+    let r = rig_with(&clock, EntityState::Active, true);
     let session = test_session();
     r.svc
         .begin_login("alice", "default", &session)
@@ -260,7 +278,7 @@ async fn a_flow_at_the_second_factor_does_not_survive_a_password_reset() {
         .unwrap();
     let next = r
         .svc
-        .verify_factor(&pw("Gnomes2+"), &session)
+        .verify_factor(&pw("Sample2+"), &session)
         .await
         .unwrap();
     assert!(
@@ -281,7 +299,7 @@ async fn a_flow_at_the_second_factor_does_not_survive_a_password_reset() {
             .unwrap()
     );
 
-    let code = generate_totp_code(SECRET, r.clock.now().into());
+    let code = generate_totp_code(SECRET, r.clock.now().try_into().unwrap());
     let res = r
         .svc
         .verify_factor(&FactorCredential::OtpCode(code.into()), &session)
@@ -292,28 +310,30 @@ async fn a_flow_at_the_second_factor_does_not_survive_a_password_reset() {
 
 #[tokio::test]
 async fn an_idle_flow_expires_after_the_flow_ttl() {
-    let r = rig();
+    let clock = common::test_clock();
+    let r = rig(&clock);
     let session = test_session();
     r.svc
         .begin_login("alice", "default", &session)
         .await
         .unwrap();
-    r.clock.advance(chrono::Duration::minutes(11));
-    let res = r.svc.verify_factor(&pw("Gnomes2+"), &session).await;
+    r.clock.advance(axess_clock::SignedDuration::minutes(11));
+    let res = r.svc.verify_factor(&pw("Sample2+"), &session).await;
     assert!(matches!(res, Err(AuthnError::NoFlow)), "{res:?}");
     assert!(!session.is_authenticated().await);
 }
 
 #[tokio::test]
 async fn a_flow_started_by_an_earlier_release_has_no_stamp_and_is_refused() {
-    let r = rig();
+    let clock = common::test_clock();
+    let r = rig(&clock);
     let session = test_session();
     r.svc
         .begin_login("alice", "default", &session)
         .await
         .unwrap();
     session.remove_custom("axess.login.flow").await;
-    let res = r.svc.verify_factor(&pw("Gnomes2+"), &session).await;
+    let res = r.svc.verify_factor(&pw("Sample2+"), &session).await;
     assert!(matches!(res, Err(AuthnError::NoFlow)), "{res:?}");
 }
 
@@ -324,8 +344,8 @@ async fn a_password_reset_revokes_the_users_refresh_tokens() {
     use axess_core::session::refresh::*;
     use axess_core::testing::{MemoryRefreshTokenStore, MockRng};
 
-    let clock = MockClock::now();
-    let store = MemoryRefreshTokenStore::new();
+    let clock = common::test_clock();
+    let store = MemoryRefreshTokenStore::new().with_clock(std::sync::Arc::new(clock.clone()));
     let config = RefreshTokenConfig::default();
     let rng = MockRng::new(5);
     let user = uid("u1");
@@ -351,7 +371,7 @@ async fn a_password_reset_revokes_the_users_refresh_tokens() {
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new()
-        .with_factor(user_scope(), password_config("Gnomes2+"))
+        .with_factor(user_scope(), password_config("Sample2+"))
         .with_method(&uid("u1"), password_method());
     let svc = AuthnService::builder(identity, factors)
         .with_clock(clock.clone())
@@ -373,6 +393,7 @@ async fn a_password_reset_revokes_the_users_refresh_tokens() {
     );
 
     let refreshed = Refresh::any_tenant(&plaintext, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, clock.now())
         .await;
     assert!(
@@ -385,7 +406,8 @@ async fn a_password_reset_revokes_the_users_refresh_tokens() {
 
 #[tokio::test]
 async fn a_refused_reset_leaves_a_failed_audit_row() {
-    let r = rig();
+    let clock = common::test_clock();
+    let r = rig(&clock);
     let refused = r
         .svc
         .complete_password_reset(&uid("u1"), "not-the-token", "A-long-new-passphrase-9!")
@@ -406,11 +428,14 @@ async fn a_refused_reset_leaves_a_failed_audit_row() {
 
 #[tokio::test]
 async fn an_unknown_user_is_resolved_before_the_status_is_read() {
+    let clock = common::test_clock();
     let log = CallLog::new();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_call_log(&log)
         .with_tenant(test_tenant());
     let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
         .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());
@@ -428,7 +453,8 @@ async fn an_unknown_user_is_resolved_before_the_status_is_read() {
 
 #[tokio::test]
 async fn a_reset_in_another_tenant_answers_like_an_unknown_user() {
-    let r = rig();
+    let clock = common::test_clock();
+    let r = rig(&clock);
     let token = r
         .svc
         .begin_password_reset("alice", "default", Duration::from_secs(300))
@@ -458,7 +484,8 @@ async fn a_reset_in_another_tenant_answers_like_an_unknown_user() {
 
 #[tokio::test]
 async fn login_with_password_spends_exactly_one_hash_on_every_path() {
-    let r = rig();
+    let clock = common::test_clock();
+    let r = rig(&clock);
     let one = |outcome: Result<FactorOutcome, AuthnError<_>>| format!("{outcome:?}");
 
     let before = r.kdf.jobs_started();
@@ -478,7 +505,7 @@ async fn login_with_password_spends_exactly_one_hash_on_every_path() {
     // Lock the account, then try the right password. Each wrong guess waits
     // out the delay the one before it earned, so each is counted.
     for delay in [1, 2] {
-        r.clock.advance(chrono::Duration::seconds(delay));
+        r.clock.advance(axess_clock::SignedDuration::seconds(delay));
         let _ = r
             .svc
             .login_with_password("alice", "default", "wrong", &test_session())
@@ -487,7 +514,7 @@ async fn login_with_password_spends_exactly_one_hash_on_every_path() {
     let before = r.kdf.jobs_started();
     let locked = one(r
         .svc
-        .login_with_password("alice", "default", "Gnomes2+", &test_session())
+        .login_with_password("alice", "default", "Sample2+", &test_session())
         .await);
     assert_eq!(r.kdf.jobs_started() - before, 1);
 
@@ -496,10 +523,10 @@ async fn login_with_password_spends_exactly_one_hash_on_every_path() {
     assert_eq!(wrong, "Ok(InvalidCredential)");
 
     // And the right password still works for an unlocked account.
-    let r2 = rig();
+    let r2 = rig(&clock);
     let ok = r2
         .svc
-        .login_with_password("alice", "default", "Gnomes2+", &test_session())
+        .login_with_password("alice", "default", "Sample2+", &test_session())
         .await
         .unwrap();
     assert!(matches!(ok, FactorOutcome::Authenticated), "{ok:?}");
@@ -509,7 +536,8 @@ async fn login_with_password_spends_exactly_one_hash_on_every_path() {
 
 #[tokio::test]
 async fn step_up_asks_an_authenticated_session_for_another_factor() {
-    let r = rig_with(EntityState::Active, true);
+    let clock = common::test_clock();
+    let r = rig_with(&clock, EntityState::Active, true);
     // A password-only session: log in with the password method, then add TOTP.
     let session = test_session();
     session
@@ -535,8 +563,8 @@ async fn step_up_asks_an_authenticated_session_for_another_factor() {
         "{wrong:?}"
     );
 
-    r.clock.advance(chrono::Duration::seconds(60));
-    let code = generate_totp_code(SECRET, r.clock.now().into());
+    r.clock.advance(axess_clock::SignedDuration::seconds(60));
+    let code = generate_totp_code(SECRET, r.clock.now().try_into().unwrap());
     let done = r
         .svc
         .verify_factor(&FactorCredential::OtpCode(code.into()), &session)
@@ -551,11 +579,59 @@ async fn step_up_asks_an_authenticated_session_for_another_factor() {
     );
 }
 
+/// A session is fresh while its last authentication is no older than the
+/// window: at the window's edge it still is and a second past it is not. A
+/// session nobody is signed in on, and one whose authentication is dated
+/// after `now`, are never fresh.
+#[tokio::test]
+async fn authenticated_within_measures_the_age_of_the_last_authentication() {
+    let clock = common::test_clock();
+    let r = rig(&clock);
+    let session = test_session();
+    let window = Duration::from_secs(300);
+    assert!(
+        !session.authenticated_within(window, r.clock.now()).await,
+        "nobody is signed in"
+    );
+
+    let signed_in_at = r.clock.now();
+    session
+        .set_authenticated(uid("u1"), common::tid("t1"), signed_in_at)
+        .await;
+    assert!(session.authenticated_within(window, signed_in_at).await);
+    assert!(
+        session
+            .authenticated_within(Duration::ZERO, signed_in_at)
+            .await,
+        "an authentication at this instant is inside any window"
+    );
+    r.clock.advance(axess_clock::SignedDuration::seconds(300));
+    assert!(
+        session.authenticated_within(window, r.clock.now()).await,
+        "at the window's edge"
+    );
+    r.clock.advance(axess_clock::SignedDuration::seconds(1));
+    assert!(
+        !session.authenticated_within(window, r.clock.now()).await,
+        "a second past the window"
+    );
+    assert!(
+        !session
+            .authenticated_within(
+                window,
+                signed_in_at.minus(axess_clock::SignedDuration::seconds(1))
+            )
+            .await,
+        "an authentication dated after now proves nothing fresh"
+    );
+}
+
 /// A factor is as fresh as its own verification: fresh inside the window,
 /// stale outside it, and never fresh for a factor that was not completed.
 #[tokio::test]
 async fn completed_factor_within_measures_the_factors_own_age() {
-    let r = rig_with(EntityState::Active, true);
+    let clock = common::test_clock();
+    let r = rig_with(&clock, EntityState::Active, true);
     let session = test_session();
     session
         .set_authenticated(uid("u1"), common::tid("t1"), r.clock.now())
@@ -564,8 +640,8 @@ async fn completed_factor_within_measures_the_factors_own_age() {
         .begin_step_up(&session, vec![FactorKind::Totp])
         .await
         .unwrap();
-    r.clock.advance(chrono::Duration::seconds(60));
-    let code = generate_totp_code(SECRET, r.clock.now().into());
+    r.clock.advance(axess_clock::SignedDuration::seconds(60));
+    let code = generate_totp_code(SECRET, r.clock.now().try_into().unwrap());
     let done = r
         .svc
         .verify_factor(&FactorCredential::OtpCode(code.into()), &session)
@@ -583,7 +659,7 @@ async fn completed_factor_within_measures_the_factors_own_age() {
         }
     };
     assert!(within(5).await, "a fresh factor is inside the window");
-    r.clock.advance(chrono::Duration::seconds(600));
+    r.clock.advance(axess_clock::SignedDuration::seconds(600));
     assert!(!within(5).await, "a stale factor is outside it");
     assert!(within(3600).await);
     assert!(
@@ -594,12 +670,13 @@ async fn completed_factor_within_measures_the_factors_own_age() {
     );
 }
 
-/// A step-up for a factor the user has not enrolled used to move the
-/// session into `Authenticating` with a step nothing could ever satisfy:
-/// the session lost its access and had no way to finish.
+/// A step-up for a factor the user has not enrolled is refused. Moving the
+/// session into `Authenticating` with a step nothing could ever satisfy
+/// would cost the session its access and leave it no way to finish.
 #[tokio::test]
 async fn step_up_refuses_a_factor_the_user_has_not_enrolled() {
-    let r = rig_with(EntityState::Active, false);
+    let clock = common::test_clock();
+    let r = rig_with(&clock, EntityState::Active, false);
     let session = test_session();
     session
         .set_authenticated(uid("u1"), common::tid("t1"), r.clock.now())
@@ -620,7 +697,8 @@ async fn step_up_refuses_a_factor_the_user_has_not_enrolled() {
 /// first enrolled one is the answer.
 #[tokio::test]
 async fn step_up_keeps_only_the_enrolled_alternatives() {
-    let r = rig_with(EntityState::Active, true);
+    let clock = common::test_clock();
+    let r = rig_with(&clock, EntityState::Active, true);
     let session = test_session();
     session
         .set_authenticated(uid("u1"), common::tid("t1"), r.clock.now())
@@ -633,7 +711,7 @@ async fn step_up_keeps_only_the_enrolled_alternatives() {
         .unwrap();
     assert_eq!(first, FactorKind::Totp, "HOTP is not enrolled");
 
-    let code = generate_totp_code(SECRET, r.clock.now().into());
+    let code = generate_totp_code(SECRET, r.clock.now().try_into().unwrap());
     let done = r
         .svc
         .verify_factor(&FactorCredential::OtpCode(code.into()), &session)
@@ -642,11 +720,39 @@ async fn step_up_keeps_only_the_enrolled_alternatives() {
     assert!(matches!(done, FactorOutcome::Authenticated), "{done:?}");
 }
 
+/// With several enrolled alternatives any one of them finishes the step-up,
+/// not only the one the answer names first.
+#[tokio::test]
+async fn step_up_is_finished_by_any_enrolled_alternative() {
+    let clock = common::test_clock();
+    let r = rig_with(&clock, EntityState::Active, true);
+    let session = test_session();
+    session
+        .set_authenticated(uid("u1"), common::tid("t1"), r.clock.now())
+        .await;
+
+    let first = r
+        .svc
+        .begin_step_up(&session, vec![FactorKind::Totp, FactorKind::Password])
+        .await
+        .unwrap();
+    assert_eq!(first, FactorKind::Totp);
+
+    let done = r
+        .svc
+        .verify_factor(&pw("Sample2+"), &session)
+        .await
+        .unwrap();
+    assert!(matches!(done, FactorOutcome::Authenticated), "{done:?}");
+    assert!(session.has_completed_factor(&FactorKind::Password).await);
+}
+
 /// A step-up is stamped like a login: a password replaced while the step
 /// is open drops it, as it drops a half-finished login.
 #[tokio::test]
 async fn step_up_is_dropped_by_a_password_change() {
-    let r = rig_with(EntityState::Active, true);
+    let clock = common::test_clock();
+    let r = rig_with(&clock, EntityState::Active, true);
     let session = test_session();
     session
         .set_authenticated(uid("u1"), common::tid("t1"), r.clock.now())
@@ -668,7 +774,7 @@ async fn step_up_is_dropped_by_a_password_change() {
             .unwrap()
     );
 
-    let code = generate_totp_code(SECRET, r.clock.now().into());
+    let code = generate_totp_code(SECRET, r.clock.now().try_into().unwrap());
     let res = r
         .svc
         .verify_factor(&FactorCredential::OtpCode(code.into()), &session)
@@ -678,7 +784,8 @@ async fn step_up_is_dropped_by_a_password_change() {
 
 #[tokio::test]
 async fn step_up_requires_an_authenticated_session() {
-    let r = rig();
+    let clock = common::test_clock();
+    let r = rig(&clock);
     let res = r
         .svc
         .begin_step_up(&test_session(), vec![FactorKind::Totp])
@@ -690,10 +797,11 @@ async fn step_up_requires_an_authenticated_session() {
 
 #[tokio::test]
 async fn impersonation_requires_the_session_to_be_the_admin_and_marks_the_result() {
-    let clock = MockClock::now();
+    let clock = common::test_clock();
     let admin = common::test_user("admin", "ops");
     let target = common::test_user("u2", "bob");
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(admin.clone())
         .with_user(target.clone());
@@ -728,9 +836,9 @@ async fn impersonation_requires_the_session_to_be_the_admin_and_marks_the_result
 
     // The admin's own session impersonates, keeps the admin's auth time and
     // carries the marker.
-    clock.advance(chrono::Duration::hours(2));
+    clock.advance(axess_clock::SignedDuration::hours(2));
     let session = test_session();
-    let admin_login = clock.now() - chrono::Duration::hours(2);
+    let admin_login = clock.now().minus(axess_clock::SignedDuration::hours(2));
     session
         .set_authenticated(admin.id, admin.tenant_id, admin_login)
         .await;
@@ -750,12 +858,15 @@ async fn impersonation_requires_the_session_to_be_the_admin_and_marks_the_result
 
 #[tokio::test]
 async fn a_candidate_is_not_resumed_by_a_different_session() {
+    let clock = common::test_clock();
     let mut candidate = test_user("u9", "carol");
     candidate.status = EntityState::Candidate;
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(candidate.clone());
     let svc = AuthnService::builder(identity.clone(), MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_signup_conflicts_revealed()
         .allow_plaintext_factor_secrets()
         .build()
@@ -789,7 +900,8 @@ async fn a_candidate_is_not_resumed_by_a_different_session() {
 
 #[tokio::test]
 async fn a_token_store_outage_answers_none_for_a_known_identifier_too() {
-    let r = rig();
+    let clock = common::test_clock();
+    let r = rig(&clock);
     r.identity.arm_store_reset_token_failure();
     let known = r
         .svc
@@ -807,7 +919,8 @@ async fn a_token_store_outage_answers_none_for_a_known_identifier_too() {
 
 #[tokio::test]
 async fn an_oversized_reset_identifier_is_answered_as_unknown() {
-    let r = rig();
+    let clock = common::test_clock();
+    let r = rig(&clock);
     let huge = "x".repeat(10_000);
     let res = r
         .svc
@@ -823,21 +936,24 @@ async fn an_oversized_reset_identifier_is_answered_as_unknown() {
 #[tokio::test]
 async fn a_logout_cancelled_during_the_audit_write_leaves_a_guest() {
     use axess_core::session::store::{MemorySessionRegistry, SessionRegistry};
+    let clock = common::test_clock();
 
-    let registry = MemorySessionRegistry::new();
+    let registry = MemorySessionRegistry::new().with_clock(std::sync::Arc::new(clock.clone()));
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let svc = AuthnService::builder(identity.clone(), MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_registry(registry.clone())
         .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());
     let session = test_session();
     session
-        .set_authenticated(uid("u1"), common::tid("t1"), chrono::Utc::now())
+        .set_authenticated(uid("u1"), common::tid("t1"), common::start())
         .await;
-    let sid = session.session_id().await;
+    let sid = session.session_key().await;
     registry.register(&uid("u1"), &sid).await.unwrap();
     assert!(session.is_authenticated().await);
 
@@ -849,6 +965,87 @@ async fn a_logout_cancelled_during_the_audit_write_leaves_a_guest() {
         !session.is_authenticated().await,
         "the session must be cleared before the audit write is awaited"
     );
-    assert_ne!(session.session_id().await, sid, "and its id rotated");
+    assert_ne!(session.session_key().await, sid, "and its id rotated");
     assert!(!registry.is_valid(&uid("u1"), &sid).await.unwrap());
+}
+
+/// An open step-up and a login in progress are both a session waiting for a
+/// factor; `step_up_pending` tells them apart, so a route that finishes a
+/// step-up never verifies a factor for a login.
+#[tokio::test]
+async fn step_up_pending_is_true_for_an_open_step_up_and_for_nothing_else() {
+    let clock = common::test_clock();
+    let r = rig_with(&clock, EntityState::Active, true);
+
+    let guest = test_session();
+    assert!(!guest.step_up_pending().await, "a guest");
+
+    let login = test_session();
+    r.svc.begin_login("alice", "default", &login).await.unwrap();
+    assert!(login.authenticating_state().await.is_some());
+    assert!(!login.step_up_pending().await, "a login in progress");
+
+    let session = test_session();
+    session
+        .set_authenticated(uid("u1"), common::tid("t1"), r.clock.now())
+        .await;
+    assert!(!session.step_up_pending().await, "a signed-in session");
+    r.svc
+        .begin_step_up(&session, vec![FactorKind::Totp])
+        .await
+        .unwrap();
+    assert!(session.step_up_pending().await, "an open step-up");
+
+    r.clock.advance(axess_clock::SignedDuration::seconds(60));
+    let code = generate_totp_code(SECRET, r.clock.now().try_into().unwrap());
+    let done = r
+        .svc
+        .verify_factor(&FactorCredential::OtpCode(code.into()), &session)
+        .await
+        .unwrap();
+    assert!(matches!(done, FactorOutcome::Authenticated), "{done:?}");
+    assert!(!session.step_up_pending().await, "a finished step-up");
+}
+
+/// No method name is reserved. A stored method called what a step-up is
+/// labelled is an ordinary login method: it begins a login, the login is not
+/// read as a step-up, and the right password finishes it.
+#[tokio::test]
+async fn a_stored_method_named_as_a_step_up_is_labelled_is_an_ordinary_login_method() {
+    let clock = common::test_clock();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant())
+        .with_user(test_user("u1", "alice"));
+    let factors = MockFactorStore::new()
+        .with_factor(user_scope(), password_config("Sample2+"))
+        .with_method(
+            &uid("u1"),
+            axess_core::authn::store::AuthMethod::sequential(
+                "step-up",
+                vec![FactorKind::Password],
+                user_scope(),
+            ),
+        );
+    let svc = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
+        .with_kdf_executor(Arc::new(KdfExecutor::inline()))
+        .build()
+        .with_audit_context(AuditContext::default());
+
+    let session = test_session();
+    let begun = svc.begin_login("alice", "default", &session).await.unwrap();
+    assert!(
+        matches!(begun, LoginOutcome::FactorRequired(FactorKind::Password)),
+        "{begun:?}"
+    );
+    assert!(session.authenticating_state().await.is_some());
+    assert!(
+        !session.step_up_pending().await,
+        "a login is a login whatever its method is called"
+    );
+
+    let done = svc.verify_factor(&pw("Sample2+"), &session).await.unwrap();
+    assert!(matches!(done, FactorOutcome::Authenticated), "{done:?}");
+    assert!(session.is_authenticated().await);
 }

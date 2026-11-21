@@ -36,25 +36,25 @@ impl OAuthProvider for Counting {
     }
     fn refresh_token_unchecked<'a>(
         &'a self,
-        _refresh_token: &'a str,
-        _original_nonce: Option<&'a str>,
-        _dpop: Option<DpopSigner<'a>>,
+        _: &'a str,
+        _: Option<&'a str>,
+        _: Option<DpopSigner<'a>>,
     ) -> Pin<Box<dyn Future<Output = Result<RefreshOutcome, OAuthError>> + Send + 'a>> {
         Box::pin(async { Err(OAuthError::Config("counting".into())) })
     }
     fn exchange_code<'a>(
         &'a self,
-        _code: &'a str,
-        _pkce_verifier: String,
-        _nonce: String,
-        _dpop: Option<DpopSigner<'a>>,
+        _: &'a str,
+        _: String,
+        _: String,
+        _: Option<DpopSigner<'a>>,
     ) -> Pin<Box<dyn Future<Output = Result<OAuthClaims, OAuthError>> + Send + 'a>> {
         Box::pin(async { Err(OAuthError::Config("counting".into())) })
     }
     fn fetch_userinfo_unchecked<'a>(
         &'a self,
-        _access_token: &'a str,
-        _dpop: Option<DpopSigner<'a>>,
+        _: &'a str,
+        _: Option<DpopSigner<'a>>,
     ) -> Pin<Box<dyn Future<Output = Result<UserInfoClaims, OAuthError>> + Send + 'a>> {
         Box::pin(async { Err(OAuthError::Config("counting".into())) })
     }
@@ -87,7 +87,7 @@ async fn a_stall_across_five_intervals_is_followed_by_one_run_not_five() {
         gate: gate.clone(),
     });
     let interval = Duration::from_secs(10);
-    let _loop = spawn_refresh_loop(move || vec![provider.clone()], interval);
+    let refresh_loop = spawn_refresh_loop(move || vec![provider.clone()], interval);
 
     tokio::time::sleep(interval + Duration::from_millis(1)).await;
     assert_eq!(
@@ -124,4 +124,5 @@ async fn a_stall_across_five_intervals_is_followed_by_one_run_not_five() {
         3,
         "the next run is one interval later"
     );
+    drop(refresh_loop);
 }

@@ -24,6 +24,17 @@ pub(crate) fn is_issuer_url_acceptable(issuer_url: &str) -> bool {
     crate::oidc::discovery::require_https_or_loopback(issuer_url).is_ok()
 }
 
+/// A URL the policy refused is a configuration error that names the setting
+/// and the range; anything else went wrong fetching or reading the document.
+fn refused_or_discovery(e: crate::oidc::OidcError) -> OAuthError {
+    match e {
+        crate::oidc::OidcError::EgressRefused { setting, range } => {
+            OAuthError::Config(format!("{setting} refused: {range}"))
+        }
+        other => OAuthError::Discovery(format!("{other}")),
+    }
+}
+
 impl OAuthProviderConfig {
     /// Discover a provider by OIDC discovery and return its builder.
     ///
@@ -38,10 +49,19 @@ impl OAuthProviderConfig {
     /// the caller, and [`without_dpop`](OAuthProviderBuilder::without_dpop)
     /// for deployments whose resource servers take only Bearer tokens.
     ///
+    /// Discovery runs under the default egress policy,
+    /// [`EgressPolicy::screened`](crate::egress::EgressPolicy::screened): the
+    /// issuer URL, every endpoint the document names and the addresses each
+    /// request connects to must be HTTPS to a host outside the reserved
+    /// ranges. An identity provider on the deployment's own network, or a
+    /// mock on loopback in development, is discovered through
+    /// [`discover_screened`](Self::discover_screened) with the policy named.
+    ///
     /// # Errors
     ///
     /// [`OAuthError::Config`] for an issuer or redirect URL that is not
-    /// acceptable, or an advertised endpoint that is not HTTPS;
+    /// acceptable, a URL the policy refuses (naming the setting and the
+    /// range, never the URL), or an advertised endpoint that is not HTTPS;
     /// [`OAuthError::Discovery`] when the document or the key set cannot be
     /// fetched or read.
     pub async fn discover(
@@ -57,7 +77,7 @@ impl OAuthProviderConfig {
             client_id,
             Some(ClientSecret::new(client_secret.to_string())),
             redirect_url,
-            crate::egress::EgressPolicy::unscreened(),
+            crate::egress::EgressPolicy::default(),
         )
         .await
     }
@@ -85,21 +105,23 @@ impl OAuthProviderConfig {
             &client_id,
             None,
             redirect_url,
-            crate::egress::EgressPolicy::unscreened(),
+            crate::egress::EgressPolicy::default(),
         )
         .await?
         .with_private_key_jwt(signer))
     }
 
-    /// As [`discover`](Self::discover) for an issuer URL a tenant supplied:
-    /// `policy` screens the issuer URL, every endpoint the discovery document
-    /// names, and the addresses each request connects to, so the server is
-    /// not made a request proxy into the loopback interface or the private
-    /// network. See [`EgressPolicy`](crate::egress::EgressPolicy) for the
-    /// policies and the named opt-out.
-    ///
-    /// [`discover`](Self::discover) itself takes a URL the operator wrote and
-    /// applies only the transport rule (HTTPS, or loopback HTTP).
+    /// As [`discover`](Self::discover), under `policy` instead of the
+    /// default: it screens the issuer URL, every endpoint the discovery
+    /// document names, and the addresses each request connects to, so the
+    /// server is not made a request proxy into the loopback interface or
+    /// the private network. See [`EgressPolicy`](crate::egress::EgressPolicy)
+    /// for the policies: the default is the one [`discover`](Self::discover)
+    /// runs under; [`EgressPolicy::unscreened`](crate::egress::EgressPolicy::unscreened)
+    /// is the named opt-out for an identity provider on the deployment's own
+    /// network, and
+    /// [`EgressPolicy::screened_allowing_loopback_http`](crate::egress::EgressPolicy::screened_allowing_loopback_http)
+    /// reaches a mock on loopback in development.
     ///
     /// # Errors
     ///
@@ -175,9 +197,7 @@ impl OAuthProviderConfig {
         // exchange, JWKS fetch). This is distinct from `ceremony_timeout` which
         // bounds the entire OAuth redirect flow (default 10 min).
         let http_client = policy
-            .client_builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
+            .build_client(|settings| settings.timeout(std::time::Duration::from_secs(30)))
             .map_err(|e| OAuthError::Config(format!("HTTP client build failed: {e}")))?;
 
         // One fetch of the discovery document. The shared OIDC primitive
@@ -185,24 +205,25 @@ impl OAuthProviderConfig {
         // the key set's transport; the typed metadata is parsed from the
         // same bytes, so the endpoints the provider calls and the optional
         // endpoints read below cannot come from two answers that differ.
-        let extras = crate::oidc::discovery::DiscoveryDocument::fetch_screened(
-            issuer_url,
-            &http_client,
-            policy,
-        )
-        .await
-        .map_err(|e| match e {
-            crate::oidc::OidcError::EgressRefused { setting, range } => {
-                OAuthError::Config(format!("{setting} refused: {range}"))
-            }
-            other => OAuthError::Discovery(format!("{other}")),
-        })?;
-        let metadata: CoreProviderMetadata = serde_json::from_value(extras.raw.clone())
-            .map_err(|e| OAuthError::Discovery(format!("discovery document: {e}")))?;
+        let extras = crate::oidc::discovery::DiscoveryDocument::fetch(issuer_url, &http_client)
+            .await
+            .map_err(refused_or_discovery)?;
+        let metadata: CoreProviderMetadata =
+            serde_json::from_value(extras.raw.clone()).map_err(|e| {
+                OAuthError::Discovery(format!(
+                    "discovery document: {}",
+                    crate::remote_text::parse_error(&e)
+                ))
+            })?;
         if metadata.issuer().as_str() != issuer.as_str() {
+            // The issuer is the document's text, so it is quoted escaped
+            // and cut, as every other remote text.
             return Err(OAuthError::Discovery(format!(
                 "discovery document names issuer {} but was fetched from {issuer_url}",
-                metadata.issuer().as_str()
+                crate::log_text::log_safe(
+                    metadata.issuer().as_str(),
+                    crate::remote_text::PARSE_ERROR_LOG_BYTES
+                )
             )));
         }
 
@@ -215,7 +236,7 @@ impl OAuthProviderConfig {
         let jwks_uri = metadata.jwks_uri().url().to_string();
         let jwks_cache = JwksCache::fetch(jwks_uri, &http_client)
             .await
-            .map_err(|e| OAuthError::Discovery(format!("{e}")))?;
+            .map_err(refused_or_discovery)?;
 
         // The optional endpoints are not part of the typed metadata:
         // `CoreProviderMetadata` carries an empty "additional metadata" type,
@@ -266,7 +287,8 @@ impl OAuthProviderConfig {
             client_assertion: None,
             rng: std::sync::Arc::new(axess_rng::SystemRng),
             redirect_url: redirect,
-            http_client,
+            http_client: http_client.into_inner(),
+            egress: policy,
             jwks_cache,
             device_authorization_endpoint: None,
             end_session_endpoint,
@@ -326,12 +348,13 @@ mod discovery_fetch_tests {
             .mount(&server)
             .await;
 
-        let provider = OAuthProviderConfig::discover(
+        let provider = OAuthProviderConfig::discover_screened(
             "test",
             &issuer,
             "client-id",
             "client-secret",
             "https://rp.example/callback",
+            crate::egress::EgressPolicy::screened_allowing_loopback_http(),
         )
         .await
         .expect("discovery")

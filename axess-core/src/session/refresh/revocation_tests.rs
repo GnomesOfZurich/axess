@@ -4,12 +4,13 @@
 use super::test_support::{fixture_tenant, fixture_user, now, store, test_config};
 use super::*;
 use crate::testing::mock_random::MockRng;
+use axess_clock::testing::Shift;
 
 async fn issue(
     store: &crate::testing::MemoryRefreshTokenStore,
     config: &RefreshTokenConfig,
     rng: &MockRng,
-    at: DateTime<Utc>,
+    at: Timestamp,
 ) -> (String, RefreshToken) {
     issue_refresh_token(
         IssueRequest {
@@ -37,25 +38,26 @@ async fn issue(
 async fn max_lifetime_caps_a_family_that_rotates_before_its_ttl() {
     let store = store();
     let config = RefreshTokenConfig {
-        max_lifetime: Some(Duration::days(60)),
+        max_lifetime: Some(std::time::Duration::from_hours(60 * 24)),
         ..test_config()
     };
     let rng = MockRng::new(11);
     let start = now();
-    let end = start + Duration::days(60);
+    let end = start.plus(SignedDuration::days(60));
     let (mut plaintext, first) = issue(&store, &config, &rng, start).await;
-    assert!(first.expires_at <= end);
+    assert!(first.expires_at <= axess_clock::Until::At(end));
 
     for day in [20, 40] {
-        let at = start + Duration::days(day);
+        let at = start.plus(SignedDuration::days(day));
         let (_, next) = Refresh::any_tenant(&plaintext, |_| async { true })
+            .without_device_check()
             .run(&store, &config, &rng, at)
             .await
             .unwrap();
         let (next_plain, record) = next.unwrap();
         assert!(
-            record.expires_at <= end,
-            "day {day}: expires_at {} passes the cap {end}",
+            record.expires_at <= axess_clock::Until::At(end),
+            "day {day}: expires_at {:?} passes the cap {end}",
             record.expires_at
         );
         plaintext = next_plain;
@@ -67,9 +69,10 @@ async fn max_lifetime_caps_a_family_that_rotates_before_its_ttl() {
         .await
         .map(|r| ((), r.unwrap()))
         .unwrap();
-    assert_eq!(last.expires_at, end);
+    assert_eq!(last.expires_at, axess_clock::Until::At(end));
 
     let at_cap = Refresh::any_tenant(&plaintext, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, end)
         .await;
     assert!(matches!(at_cap, Err(RefreshError::Expired)), "{at_cap:?}");
@@ -80,18 +83,19 @@ async fn max_lifetime_caps_a_family_that_rotates_before_its_ttl() {
 async fn max_lifetime_is_enforced_on_the_status_checked_path() {
     let store = store();
     let config = RefreshTokenConfig {
-        max_lifetime: Some(Duration::days(30)),
+        max_lifetime: Some(std::time::Duration::from_hours(30 * 24)),
         ..test_config()
     };
     let rng = MockRng::new(12);
     let (plaintext, mut record) = issue(&store, &config, &rng, now()).await;
     // A row written before the cap existed: its own expiry is later.
-    record.expires_at = now() + Duration::days(90);
+    record.expires_at = axess_clock::Until::At(now().plus(SignedDuration::days(90)));
     store.store_token(&record).await.unwrap();
-    let at = now() + Duration::days(31);
+    let at = now().plus(SignedDuration::days(31));
     let result = Refresh::any_tenant(&plaintext, |_| async {
         panic!("the predicate must not run for an expired family")
     })
+    .without_device_check()
     .run(&store, &config, &rng, at)
     .await;
     assert!(matches!(result, Err(RefreshError::Expired)), "{result:?}");
@@ -100,17 +104,17 @@ async fn max_lifetime_is_enforced_on_the_status_checked_path() {
 #[test]
 fn max_lifetime_below_ttl_or_zero_is_refused() {
     let below = RefreshTokenConfig {
-        max_lifetime: Some(Duration::days(29)),
+        max_lifetime: Some(std::time::Duration::from_hours(29 * 24)),
         ..test_config()
     };
     assert!(below.validate().is_err());
     let zero = RefreshTokenConfig {
-        max_lifetime: Some(Duration::zero()),
+        max_lifetime: Some(std::time::Duration::ZERO),
         ..test_config()
     };
     assert!(zero.validate().is_err());
     let ok = RefreshTokenConfig {
-        max_lifetime: Some(Duration::days(30)),
+        max_lifetime: Some(std::time::Duration::from_hours(30 * 24)),
         ..test_config()
     };
     assert!(ok.validate().is_ok());
@@ -130,12 +134,19 @@ async fn an_evicted_token_is_refused_without_a_family_revocation() {
     };
     let rng = MockRng::new(13);
     let (old_plain, old) = issue(&store, &config, &rng, now()).await;
-    let (_new_plain, newer) = issue(&store, &config, &rng, now() + Duration::seconds(1)).await;
+    let (_, newer) = issue(
+        &store,
+        &config,
+        &rng,
+        now().plus(SignedDuration::seconds(1)),
+    )
+    .await;
 
     let evicted = store.find_token(&old.token_hash).await.unwrap().unwrap();
     assert_eq!(evicted.revoked_reason, Some(RevocationReason::Evicted));
 
     let result = Refresh::any_tenant(&old_plain, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, now())
         .await;
     assert!(matches!(result, Err(RefreshError::Revoked)), "{result:?}");
@@ -152,6 +163,7 @@ async fn a_logged_out_token_reused_does_not_revoke_its_family() {
     let rng = MockRng::new(14);
     let (plaintext, _) = issue(&store, &config, &rng, now()).await;
     let (_, rotated) = Refresh::any_tenant(&plaintext, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, now())
         .await
         .unwrap();
@@ -169,6 +181,7 @@ async fn a_logged_out_token_reused_does_not_revoke_its_family() {
 
     let (other_plain, other) = issue(&store, &config, &rng, now()).await;
     let again = Refresh::any_tenant(&child_plain, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, now())
         .await;
     assert!(matches!(again, Err(RefreshError::Revoked)));
@@ -176,6 +189,7 @@ async fn a_logged_out_token_reused_does_not_revoke_its_family() {
     assert!(!still.revoked, "an unrelated family is untouched");
     assert!(
         Refresh::any_tenant(&other_plain, |_| async { true })
+            .without_device_check()
             .run(&store, &config, &rng, now())
             .await
             .is_ok()
@@ -188,19 +202,21 @@ async fn a_logged_out_token_reused_does_not_revoke_its_family() {
 async fn reuse_inside_the_grace_window_is_concurrent_and_outside_is_theft() {
     let store = store();
     let config = RefreshTokenConfig {
-        reuse_grace: Duration::seconds(5),
+        reuse_grace: std::time::Duration::from_secs(5),
         ..test_config()
     };
     let rng = MockRng::new(15);
     let (plaintext, _) = issue(&store, &config, &rng, now()).await;
     let (_, next) = Refresh::any_tenant(&plaintext, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, now())
         .await
         .unwrap();
     let (_, child) = next.unwrap();
 
-    let soon = now() + Duration::seconds(2);
+    let soon = now().plus(SignedDuration::seconds(2));
     let parallel = Refresh::any_tenant(&plaintext, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, soon)
         .await;
     assert!(
@@ -210,8 +226,9 @@ async fn reuse_inside_the_grace_window_is_concurrent_and_outside_is_theft() {
     let child_row = store.find_token(&child.token_hash).await.unwrap().unwrap();
     assert!(!child_row.revoked, "nothing was revoked inside the grace");
 
-    let late = now() + Duration::seconds(30);
+    let late = now().plus(SignedDuration::seconds(30));
     let theft = Refresh::any_tenant(&plaintext, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, late)
         .await;
     assert!(matches!(theft, Err(RefreshError::Revoked)), "{theft:?}");
@@ -226,14 +243,15 @@ async fn reuse_inside_the_grace_window_is_concurrent_and_outside_is_theft() {
 async fn reuse_inside_the_grace_window_is_concurrent_when_the_rotation_is_stamped_ahead() {
     let store = store();
     let config = RefreshTokenConfig {
-        reuse_grace: Duration::seconds(5),
+        reuse_grace: std::time::Duration::from_secs(5),
         ..test_config()
     };
     let rng = MockRng::new(17);
     let (plaintext, _) = issue(&store, &config, &rng, now()).await;
     // The other node, 3 s ahead, rotates the token.
-    let ahead = now() + Duration::seconds(3);
+    let ahead = now().plus(SignedDuration::seconds(3));
     let (_, next) = Refresh::any_tenant(&plaintext, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, ahead)
         .await
         .unwrap();
@@ -243,6 +261,7 @@ async fn reuse_inside_the_grace_window_is_concurrent_when_the_rotation_is_stampe
 
     // This node, at its own `now`, sees the rotation 3 s in the future.
     let parallel = Refresh::any_tenant(&plaintext, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, now())
         .await;
     assert!(
@@ -253,8 +272,9 @@ async fn reuse_inside_the_grace_window_is_concurrent_when_the_rotation_is_stampe
     assert!(!child_row.revoked, "nothing was revoked: skew is not theft");
 
     // Beyond the window in that direction it is theft, as it is behind.
-    let far_ahead = now() - Duration::seconds(30);
+    let far_ahead = now().minus(SignedDuration::seconds(30));
     let theft = Refresh::any_tenant(&plaintext, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, far_ahead)
         .await;
     assert!(matches!(theft, Err(RefreshError::Revoked)), "{theft:?}");
@@ -268,11 +288,13 @@ async fn default_grace_treats_an_immediate_reuse_as_theft() {
     let rng = MockRng::new(16);
     let (plaintext, _) = issue(&store, &config, &rng, now()).await;
     let (_, next) = Refresh::any_tenant(&plaintext, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, now())
         .await
         .unwrap();
     let (_, child) = next.unwrap();
     let again = Refresh::any_tenant(&plaintext, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, now())
         .await;
     assert!(matches!(again, Err(RefreshError::Revoked)));
@@ -315,6 +337,7 @@ async fn reuse_of_a_family_less_token_revokes_its_descendants() {
     store.store_token(&legacy).await.unwrap();
 
     let (_, next) = Refresh::any_tenant(&plaintext, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, now())
         .await
         .unwrap();
@@ -326,6 +349,7 @@ async fn reuse_of_a_family_less_token_revokes_its_descendants() {
     );
 
     let reuse = Refresh::any_tenant(&plaintext, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, now())
         .await;
     assert!(matches!(reuse, Err(RefreshError::Revoked)));
@@ -353,6 +377,7 @@ async fn refresh_in_tenant_refuses_a_foreign_token_without_rotating() {
     let other = axess_identity::testing::tenant("tenant-2");
 
     let foreign = Refresh::new(&plaintext, &other, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, now())
         .await;
     assert!(
@@ -365,11 +390,13 @@ async fn refresh_in_tenant_refuses_a_foreign_token_without_rotating() {
     let status_checked = Refresh::new(&plaintext, &other, |_| async {
         panic!("the predicate must not run for a foreign tenant")
     })
+    .without_device_check()
     .run(&store, &config, &rng, now())
     .await;
     assert!(matches!(status_checked, Err(RefreshError::NotFound)));
 
     let own = Refresh::new(&plaintext, &fixture_tenant(), |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, now())
         .await;
     assert!(own.is_ok());
@@ -384,6 +411,7 @@ async fn any_tenant_refreshes_a_token_of_whichever_tenant_issued_it() {
     let rng = MockRng::new(19);
     let (plaintext, _) = issue(&store, &config, &rng, now()).await;
     let refreshed = Refresh::any_tenant(&plaintext, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, now())
         .await;
     assert!(refreshed.is_ok(), "{refreshed:?}");

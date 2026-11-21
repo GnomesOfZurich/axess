@@ -119,7 +119,7 @@ use super::replay_log::{LogoutReplayLog, Recorded};
 use super::sid_store::SidStore;
 use crate::authn::ids::{TenantId, UserId};
 use crate::metrics::SessionMetrics;
-use crate::session::id::SessionId;
+use crate::session::id::SessionKey;
 use crate::session::store::SessionRevoker;
 use axess_clock::Clock;
 use axess_factors::oauth::OAuthProvider;
@@ -178,25 +178,44 @@ pub struct BackChannelLogoutHandler {
     tenants: Option<Arc<dyn TenantOAuthProviders>>,
 }
 
+/// What [`ActingOn::finish`] means to do with the pair.
+#[derive(Clone, Copy)]
+enum Outcome {
+    /// The token was acted on: the pair stays, spent, so a resend is a replay.
+    Settle,
+    /// The action failed: the pair is forgotten, so a resend is acted on.
+    Forget,
+}
+
 /// The pair of a token being acted on. [`finish`](Self::finish) settles it as
 /// spent, or forgets it when the action failed. Dropped without finishing (the
-/// request was cancelled), it forgets the pair on a task of its own, so the
-/// resend is acted on.
+/// request was cancelled), it repeats the chosen outcome on a task of its own:
+/// forgetting the pair while the token was still being acted on, so the
+/// resend is acted on; settling it once `finish` chose to, so a cancellation
+/// after the log committed cannot undo the settle and reopen the token.
 struct ActingOn {
     log: Arc<dyn LogoutReplayLog>,
     issuer: String,
     jti: String,
+    /// `Some` from the moment `finish` chose, before the log is asked.
+    outcome: Option<Outcome>,
     done: bool,
 }
 
 impl ActingOn {
     async fn finish(mut self, acted: bool) {
-        // `done` follows the await it guards: a request cancelled while the
-        // log is taking the outcome still has its pair forgotten by `Drop`.
-        let result = if acted {
-            self.log.settle(&self.issuer, &self.jti).await
+        // The outcome is recorded before the await it guards and `done`
+        // after it: a request cancelled while the log is taking the outcome
+        // has `Drop` repeat that same outcome, never the other one.
+        let outcome = if acted {
+            Outcome::Settle
         } else {
-            self.log.forget(&self.issuer, &self.jti).await
+            Outcome::Forget
+        };
+        self.outcome = Some(outcome);
+        let result = match outcome {
+            Outcome::Settle => self.log.settle(&self.issuer, &self.jti).await,
+            Outcome::Forget => self.log.forget(&self.issuer, &self.jti).await,
         };
         self.done = true;
         if let Err(e) = result {
@@ -219,9 +238,13 @@ impl Drop for ActingOn {
             std::mem::take(&mut self.issuer),
             std::mem::take(&mut self.jti),
         );
+        let outcome = self.outcome.unwrap_or(Outcome::Forget);
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                let _ = log.forget(&issuer, &jti).await;
+                let _ = match outcome {
+                    Outcome::Settle => log.settle(&issuer, &jti).await,
+                    Outcome::Forget => log.forget(&issuer, &jti).await,
+                };
             });
         }
     }
@@ -238,7 +261,7 @@ fn addressed_to(unverified: &serde_json::Value, client_id: &str) -> bool {
 /// The negative cache a handler starts with.
 fn default_unknown_issuers() -> Arc<unknown_issuers::UnknownIssuers> {
     Arc::new(unknown_issuers::UnknownIssuers::new(
-        chrono::Duration::seconds(unknown_issuers::DEFAULT_TTL_SECS),
+        std::time::Duration::from_secs(unknown_issuers::DEFAULT_TTL_SECS),
     ))
 }
 
@@ -394,11 +417,7 @@ impl BackChannelLogoutHandler {
     /// writes, is found once the interval has passed.
     #[must_use]
     pub fn with_unknown_issuer_memory(mut self, ttl: std::time::Duration) -> Self {
-        self.unknown_issuers = Arc::new(unknown_issuers::UnknownIssuers::new(
-            // A TTL past chrono's range remembers for as long as chrono can
-            // count, not for no time at all.
-            chrono::Duration::from_std(ttl).unwrap_or(chrono::Duration::MAX),
-        ));
+        self.unknown_issuers = Arc::new(unknown_issuers::UnknownIssuers::new(ttl));
         self
     }
 
@@ -449,7 +468,7 @@ impl BackChannelLogoutHandler {
 
     /// Tell the audit hook, if any, that a session ended. A failure is
     /// logged: the session is already gone and the token already spent.
-    async fn report_ended(&self, iss: &str, user_id: &UserId, session_id: &SessionId) {
+    async fn report_ended(&self, iss: &str, user_id: &UserId, session_id: &SessionKey) {
         let Some(audit) = &self.audit else {
             return;
         };
@@ -512,6 +531,7 @@ impl BackChannelLogoutHandler {
             log: Arc::clone(&handler.replay),
             issuer: claims.iss.clone(),
             jti: jti.clone(),
+            outcome: None,
             done: false,
         };
         let outcome = handler.act_on(&claims).await;
@@ -596,7 +616,7 @@ impl BackChannelLogoutHandler {
     /// that the replay log has no room to record or could not be asked
     /// (retryable); record it otherwise.
     ///
-    /// The log forgets entries older than `JTI_RETENTION_SECS` (the full
+    /// The log forgets entries older than `JTI_RETENTION` (the full
     /// span over which one token's `iat` is accepted). The in-process log
     /// holds [`JTI_CACHE_MAX`] live entries per issuer and refuses its new
     /// pair at that bound; it never forgets a live one to make room, and

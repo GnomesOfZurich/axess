@@ -3,7 +3,7 @@
 //! These are thin, auth-focused structs, not the application's domain models.
 //! Application data (preferences, profile) lives in the app's own storage.
 
-use chrono::{DateTime, Utc};
+use axess_clock::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};
 
@@ -39,14 +39,15 @@ pub struct User {
     /// self-service accounts.
     pub created_by: UserId,
     /// Wall-clock time of creation (from an injected `Clock`, not
-    /// `Utc::now`, so deterministic-simulation tests control the value).
-    pub created_at: DateTime<Utc>,
+    /// the system clock, so deterministic-simulation tests control the
+    /// value).
+    pub created_at: Timestamp,
     /// Actor that last updated this row. Equals `created_by` immediately
     /// after creation; mutated by account-lifecycle operations.
     pub updated_by: UserId,
     /// Timestamp of the last update. Equals `created_at` immediately
     /// after creation.
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 impl User {
@@ -63,7 +64,7 @@ impl User {
         display_name: impl Into<Arc<str>>,
         status: EntityState,
         created_by: UserId,
-        created_at: DateTime<Utc>,
+        created_at: Timestamp,
     ) -> Result<Self, String> {
         let user = Self {
             id: UserId::try_new(id).map_err(|e: IdError| format!("User.id: {e}"))?,
@@ -115,8 +116,12 @@ impl User {
         if self.identifier.is_empty() {
             return Err("User.identifier must be non-empty".to_string());
         }
-        if self.identifier.contains(|c: char| c.is_control()) {
-            return Err("User.identifier contains control characters".to_string());
+        if self.identifier.contains(axess_identity::log_text::escapes) {
+            return Err(
+                "User.identifier contains a control, line separator, bidirectional, zero-width, \
+                 byte order mark or filler character"
+                    .to_string(),
+            );
         }
         if !crate::validation::is_acceptable_identifier(&self.identifier) {
             return Err(
@@ -159,11 +164,11 @@ pub struct Tenant {
     /// tenants it is [`UserId::system()`].
     pub created_by: UserId,
     /// Wall-clock time of creation.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// Actor that last updated this row.
     pub updated_by: UserId,
     /// Timestamp of the last update.
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 impl Tenant {
@@ -174,7 +179,7 @@ impl Tenant {
         display_name: impl Into<Arc<str>>,
         status: EntityState,
         created_by: UserId,
-        created_at: DateTime<Utc>,
+        created_at: Timestamp,
     ) -> Result<Self, String> {
         let tenant = Self {
             id: TenantId::try_new(id).map_err(|e: IdError| format!("Tenant.id: {e}"))?,
@@ -215,8 +220,15 @@ impl Tenant {
         if self.identifier.is_empty() {
             return Err("Tenant.identifier must be non-empty".to_string());
         }
-        if self.identifier.contains(|c: char| c.is_control()) {
-            return Err("Tenant.identifier contains control characters".to_string());
+        // The classes the one log-text predicate escapes are refused here,
+        // on a row read back as on one being created: a tenant identifier
+        // holding one can be made to look like another tenant's.
+        if self.identifier.contains(axess_identity::log_text::escapes) {
+            return Err(
+                "Tenant.identifier contains a control, line separator, bidirectional, \
+                 zero-width, byte order mark or filler character"
+                    .to_string(),
+            );
         }
         Ok(())
     }
@@ -257,8 +269,8 @@ impl EntityState {
         matches!(self, EntityState::Active)
     }
 
-    /// Return `true` if the account is `Suspended`, whatever the cause
-    /// (`is_locked` until 0.16.0, a name that read as the counter's lockout). A
+    /// Return `true` if the account is `Suspended`, whatever the cause: the
+    /// name does not say `locked`, which would read as the counter's lockout. A
     /// login refuses such an account as `Locked`; an eligibility check asks
     /// [`is_administratively_disabled`](Self::is_administratively_disabled)
     /// or [`can_self_recover`](Self::can_self_recover) instead.
@@ -307,14 +319,14 @@ impl EntityState {
     ///
     /// ```
     /// use axess_core::authn::types::{EntityState, StatusDetail};
-    /// use chrono::Utc;
+    /// use axess_clock::Timestamp;
     ///
     /// /// The eligibility rail of a self-service second-factor reset.
-    /// fn may_start_recovery(status: EntityState, now: chrono::DateTime<Utc>) -> bool {
+    /// fn may_start_recovery(status: EntityState, now: Timestamp) -> bool {
     ///     status.effective_at(now).can_self_recover()
     /// }
     ///
-    /// let now = Utc::now();
+    /// let now = axess_clock::Clock::now(&axess_clock::SystemClock);
     /// assert!(may_start_recovery(EntityState::Active, now));
     /// // A store that keeps its lockout as a state: recovery is for them.
     /// assert!(may_start_recovery(
@@ -352,11 +364,11 @@ impl EntityState {
     /// so the services read a user's status through this method with their
     /// injected clock.
     #[must_use]
-    pub fn effective_at(self, now: DateTime<Utc>) -> Self {
+    pub fn effective_at(self, now: Timestamp) -> Self {
         match self {
             EntityState::Suspended(StatusDetail {
                 until: Some(until), ..
-            }) if until <= now => EntityState::Active,
+            }) if until <= axess_clock::Until::At(now) => EntityState::Active,
             other => other,
         }
     }
@@ -589,9 +601,11 @@ impl Default for LockoutPolicy {
 /// A lockout derived from the failure counter and the policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DerivedLockout {
-    /// When the lockout ends; `None` means it lasts until an administrator
-    /// resets the counter.
-    pub until: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the lockout ends: at a reading of the clock, or never
+    /// ([`Until::Forever`](axess_clock::Until::Forever)) for a duration
+    /// that runs past the range of a reading. `None` means it lasts until an
+    /// administrator resets the counter.
+    pub until: Option<axess_clock::Until>,
 }
 
 impl LockoutPolicy {
@@ -606,10 +620,9 @@ impl LockoutPolicy {
     }
 
     /// The failure threshold in force: `max_attempts`, with zero read as the
-    /// default of five. Zero used to lock an account on its first failure
-    /// (and, once the lockout is derived from the counter, would lock every
-    /// account before any failure), where the OTP attempt limits already
-    /// read zero as the default.
+    /// default of five, as the OTP attempt limits read it. Zero taken at its
+    /// word would lock an account on its first failure (and, with the lockout
+    /// derived from the counter, every account before any failure).
     pub fn effective_max_attempts(&self) -> u32 {
         if self.max_attempts == 0 {
             Self::default().max_attempts
@@ -628,14 +641,19 @@ impl LockoutPolicy {
     /// (`None`) cannot have a timed lockout expire, so it stays locked:
     /// the safe reading of a missing timestamp.
     ///
+    /// The end is [`Until::after`](axess_clock::Until::after) the last
+    /// failure, so a lockout too long to hold never ends
+    /// ([`Until::Forever`](axess_clock::Until::Forever)), as
+    /// [`lockout_until`](Self::lockout_until) gives for the same policy.
+    ///
     /// `attempt_window` is not consulted here. It bounds how long failures
     /// accumulate, which is the store's job when it increments; it must not
     /// unlock an account whose lockout is longer than the window.
     pub fn derived_lockout(
         &self,
         failed_attempts: u32,
-        last_failure_at: Option<chrono::DateTime<chrono::Utc>>,
-        now: chrono::DateTime<chrono::Utc>,
+        last_failure_at: Option<axess_clock::Timestamp>,
+        now: axess_clock::Timestamp,
     ) -> Option<DerivedLockout> {
         if failed_attempts < self.effective_max_attempts() {
             return None;
@@ -646,20 +664,21 @@ impl LockoutPolicy {
         let Some(last) = last_failure_at else {
             return Some(DerivedLockout { until: None });
         };
-        let until = chrono::Duration::from_std(duration)
-            .ok()
-            .and_then(|d| last.checked_add_signed(d));
-        match until {
-            Some(until) if now >= until => None,
-            Some(until) => Some(DerivedLockout { until: Some(until) }),
-            // A duration too large to represent never ends.
-            None => Some(DerivedLockout { until: None }),
+        // A duration that runs past the range of a reading never ends.
+        let until = axess_clock::Until::after(last, duration);
+        if axess_clock::Until::At(now) >= until {
+            None
+        } else {
+            Some(DerivedLockout { until: Some(until) })
         }
     }
 }
 
 mod ip_policy;
 pub use ip_policy::IpPolicy;
+
+mod lockout_policy;
+pub use lockout_policy::LockoutPolicyError;
 
 mod throttle;
 pub use throttle::{Throttle, ThrottleKey, ThrottleState, ThrottleSubject};
@@ -673,7 +692,7 @@ mod new_identifier_tests {
 
     #[test]
     fn a_new_user_refuses_what_a_stored_one_still_reads() {
-        let now = chrono::Utc::now();
+        let now = axess_clock::testing::MockClock::reference_time();
         let make = |ident: &str| {
             User::new(
                 "1f0a7b2e-4c91-4e3f-9b2a-8d0123456789",
@@ -696,6 +715,86 @@ mod new_identifier_tests {
 }
 
 #[cfg(test)]
+mod escaped_class_identifier_tests {
+    use super::*;
+
+    /// One character of each class the log-text predicate escapes.
+    const CLASSES: [char; 9] = [
+        '\n', '\u{2028}', '\u{202E}', '\u{061C}', '\u{200B}', '\u{200D}', '\u{FEFF}', '\u{3164}',
+        '\u{115F}',
+    ];
+
+    fn user(identifier: &str) -> User {
+        let mut user = User::new(
+            "1f0a7b2e-4c91-4e3f-9b2a-8d0123456789",
+            "2f0a7b2e-4c91-4e3f-9b2a-8d0123456789",
+            "alice@example.org",
+            "Name",
+            EntityState::Active,
+            UserId::system(),
+            axess_clock::testing::MockClock::reference_time(),
+        )
+        .expect("a plain identifier");
+        user.identifier = identifier.into();
+        user
+    }
+
+    fn tenant(identifier: &str) -> Tenant {
+        let mut tenant = Tenant::new(
+            "2f0a7b2e-4c91-4e3f-9b2a-8d0123456789",
+            "acme",
+            "Tenant",
+            EntityState::Active,
+            UserId::system(),
+            axess_clock::testing::MockClock::reference_time(),
+        )
+        .expect("a plain identifier");
+        tenant.identifier = identifier.into();
+        tenant
+    }
+
+    /// An identifier holding any class the one predicate escapes is refused
+    /// where it is created and where it is read back, for a user and a
+    /// tenant alike, and by the signup check.
+    #[test]
+    fn every_escaped_class_is_refused_in_an_identifier() {
+        for c in CLASSES {
+            let identifier = format!("ali{c}ce");
+            assert!(
+                user(&identifier).validate().is_err(),
+                "user U+{:04X}",
+                u32::from(c)
+            );
+            assert!(
+                user(&identifier).validate_new().is_err(),
+                "new user U+{:04X}",
+                u32::from(c)
+            );
+            assert!(
+                tenant(&identifier).validate().is_err(),
+                "tenant U+{:04X}",
+                u32::from(c)
+            );
+            assert!(
+                tenant(&identifier).validate_new().is_err(),
+                "new tenant U+{:04X}",
+                u32::from(c)
+            );
+            assert!(
+                !crate::validation::is_acceptable_identifier(&identifier),
+                "signup U+{:04X}",
+                u32::from(c)
+            );
+        }
+        assert!(user("alice@example.org").validate().is_ok());
+        assert!(tenant("acme").validate().is_ok());
+        assert!(crate::validation::is_acceptable_identifier(
+            "alice@example.org"
+        ));
+    }
+}
+
+#[cfg(test)]
 mod new_tenant_identifier_tests {
     use super::*;
 
@@ -706,7 +805,7 @@ mod new_tenant_identifier_tests {
             "Tenant",
             EntityState::Active,
             UserId::system(),
-            chrono::Utc::now(),
+            axess_clock::testing::MockClock::reference_time(),
         )
     }
 

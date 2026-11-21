@@ -2,7 +2,8 @@
 // embeds it is reserved too, and EgressPolicy::check_url refuses it.
 // Drives the real public API: axess_factors::egress::{ReservedRange, EgressPolicy}
 // (module is behind axess-factors' `oidc` feature).
-// While the gap is open it finds NAT64 / 6to4 / IPv4-compatible forms.
+// Every form that carries an IPv4 address is listed, Teredo and the
+// IPv4-translated form included.
 #![no_main]
 
 use axess_factors::egress::{EgressPolicy, ReservedRange};
@@ -30,6 +31,14 @@ fn embeddings(v4: Ipv4Addr, salt: u16) -> Vec<(&'static str, Ipv6Addr)> {
         (
             "6to4 2002:aabb:ccdd::/48",
             Ipv6Addr::new(0x2002, hi, lo, salt, 0, 0, 0, 1),
+        ),
+        (
+            "ipv4-translated ::ffff:0:a.b.c.d",
+            Ipv6Addr::new(0, 0, 0, 0, 0xffff, 0, hi, lo),
+        ),
+        (
+            "teredo 2001::/32, client inverted",
+            Ipv6Addr::new(0x2001, 0, salt, 0x0201, 0x8000, salt, !hi, !lo),
         ),
     ]
 }

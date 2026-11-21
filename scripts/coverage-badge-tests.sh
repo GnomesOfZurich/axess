@@ -10,6 +10,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TOOL="$SCRIPT_DIR/coverage-badge.sh"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/axess-coverage-badge.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
+# shellcheck source=lib/case_harness.sh
+. "$SCRIPT_DIR/lib/case_harness.sh"
 BADGE="$WORK/coverage.svg"
 
 passed=0
@@ -19,15 +21,9 @@ failed=0
 case_() {
   local name="$1" want="$2" fragment="$3" out status
   shift 3
-  out="$("$TOOL" --badge "$BADGE" "$@" 2>&1)"
+  out="$("$TOOL" --badge "$BADGE" "$@" 2>"$WORK/stderr")"
   status=$?
-  if [ "$status" -eq "$want" ] && printf '%s' "$out" | grep -qF -- "$fragment"; then
-    passed=$((passed + 1))
-  else
-    failed=$((failed + 1))
-    echo "FAIL: $name: wanted exit $want with '$fragment', got exit $status:" >&2
-    printf '%s\n' "$out" | sed 's/^/    /' >&2
-  fi
+  judge "$name" "$want" "$fragment" "$status" "$out"
 }
 
 case_ "check without a badge refused" 1 "no coverage badge" check 80

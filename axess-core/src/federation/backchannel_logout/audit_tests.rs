@@ -2,10 +2,9 @@
 //! token that ends nothing, and a failing sink does not undo the logout.
 
 use super::*;
-use crate::session::id::SessionId;
+use crate::session::id::{SessionId, SessionKey};
 use crate::session::store::{MemorySessionRegistry, SessionRegistry, SessionRegistryAdapter};
 use crate::testing::mock_random::MockRng;
-use axess_clock::SystemClock;
 use axess_factors::oauth::MockOAuthProvider;
 use axess_factors::oidc::logout_token::BACKCHANNEL_LOGOUT_EVENT;
 use axum::extract::{Form, State};
@@ -40,7 +39,7 @@ fn token(extra: serde_json::Value) -> String {
     let mut payload = serde_json::json!({
         "iss": ISS,
         "aud": "client-a",
-        "iat": chrono::Utc::now().timestamp(),
+        "iat": axess_clock::testing::MockClock::reference_time().unix_seconds(),
         "events": { BACKCHANNEL_LOGOUT_EVENT: {} },
     });
     payload
@@ -55,7 +54,9 @@ fn token(extra: serde_json::Value) -> String {
     )
 }
 
-async fn run(fail: bool) -> (Vec<IdpSessionEnded>, bool, StatusCode) {
+/// What the sink was told, whether both sessions ended, the answer, and the
+/// two sessions' keys.
+async fn run(fail: bool) -> (Vec<IdpSessionEnded>, bool, StatusCode, [SessionKey; 2]) {
     let registry = MemorySessionRegistry::new();
     let sid_map = SidMap::new();
     let providers: Vec<Arc<dyn OAuthProvider>> = vec![Arc::new(
@@ -71,13 +72,16 @@ async fn run(fail: bool) -> (Vec<IdpSessionEnded>, bool, StatusCode) {
         &providers,
         Arc::new(SessionRegistryAdapter(registry.clone())),
         sid_map.clone(),
-        Arc::new(SystemClock),
+        Arc::new(axess_clock::testing::MockClock::at_reference()),
     )
     .expect("handler")
     .with_audit(sink.clone());
 
     let rng = MockRng::new(5);
-    let (x, y) = (SessionId::new(&rng), SessionId::new(&rng));
+    let (x, y) = (
+        SessionKey::of(&SessionId::new(&rng)),
+        SessionKey::of(&SessionId::new(&rng)),
+    );
     let user = axess_identity::testing::user("user-1");
     for s in [&x, &y] {
         registry.register(&user, s).await.unwrap();
@@ -96,22 +100,28 @@ async fn run(fail: bool) -> (Vec<IdpSessionEnded>, bool, StatusCode) {
     let both_ended = !registry.is_valid(&user, &x).await.unwrap()
         && !registry.is_valid(&user, &y).await.unwrap();
     let reported = sink.ended.lock().unwrap().clone();
-    (reported, both_ended, status)
+    (reported, both_ended, status, [x, y])
 }
 
 #[tokio::test]
 async fn every_session_a_logout_ends_is_reported_once() {
-    let (reported, both_ended, status) = run(false).await;
+    let (reported, both_ended, status, mut keys) = run(false).await;
     assert_eq!(status, StatusCode::OK);
     assert!(both_ended);
     assert_eq!(reported.len(), 2, "one report per session");
     assert!(reported.iter().all(|e| e.iss == ISS));
-    assert_ne!(reported[0].session_id, reported[1].session_id);
+    let mut named: Vec<SessionKey> = reported.iter().map(|e| e.session_id).collect();
+    named.sort();
+    keys.sort();
+    assert_eq!(
+        named, keys,
+        "each report names the key the registry was asked to end"
+    );
 }
 
 #[tokio::test]
 async fn a_failing_sink_does_not_undo_the_logout() {
-    let (reported, both_ended, status) = run(true).await;
+    let (reported, both_ended, status, _) = run(true).await;
     assert_eq!(status, StatusCode::OK, "the IdP is not told to retry");
     assert!(
         both_ended,
@@ -128,12 +138,18 @@ async fn the_service_hook_writes_a_session_invalidated_row() {
     use crate::authn::service::AuthnService;
     use crate::testing::mock_authn::{MockFactorStore, MockIdentityStore};
 
-    let record = crate::testing::user_record("u1", "t1");
+    let record = crate::testing::user_record_at(
+        "u1",
+        "t1",
+        axess_clock::testing::MockClock::reference_time(),
+    );
     let user = record.id;
     let identity = MockIdentityStore::new().with_user(record);
-    let authn = AuthnService::new(identity.clone(), MockFactorStore::new());
+    let authn = AuthnService::builder(identity.clone(), MockFactorStore::new())
+        .with_clock(axess_clock::testing::MockClock::at_reference())
+        .build();
     let rng = MockRng::new(9);
-    let session_id = SessionId::new(&rng);
+    let session_id = SessionKey::of(&SessionId::new(&rng));
 
     authn
         .backchannel_logout_audit()

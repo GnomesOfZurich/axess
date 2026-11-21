@@ -4,10 +4,10 @@
 /// Deletes one stored session row, behind a trait object so the service does
 /// not take the session store's type as a parameter.
 pub(crate) trait SessionRowRemover: Send + Sync {
-    /// Delete the row of `id`. The error is its text.
+    /// Delete the row stored under `key`. The error is its text.
     fn delete_row<'a>(
         &'a self,
-        id: &'a crate::session::id::SessionId,
+        key: &'a crate::session::id::SessionKey,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
 }
 
@@ -16,9 +16,9 @@ pub(super) struct RowRemover<S>(pub(super) S);
 impl<S: crate::session::store::SessionStore> SessionRowRemover for RowRemover<S> {
     fn delete_row<'a>(
         &'a self,
-        id: &'a crate::session::id::SessionId,
+        key: &'a crate::session::id::SessionKey,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
-        Box::pin(async move { self.0.delete(id).await.map_err(|e| e.to_string()) })
+        Box::pin(async move { self.0.delete(key).await.map_err(|e| e.to_string()) })
     }
 }
 

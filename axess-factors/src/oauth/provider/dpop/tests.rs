@@ -83,9 +83,9 @@ fn deterministic_thumbprint_from_seed() {
     assert_eq!(proof_a1.thumbprint.len(), 43);
 }
 
-/// Regression test for the lex-ordering rail. Hardcodes the SHA-256
-/// thumbprint expected for a known seed, so any future regression that
-/// reorders JWK members (or accidentally adds a field) flips the digest.
+/// Pins the lex-ordering rail. Hardcodes the SHA-256 thumbprint expected
+/// for a known seed, so a change that reorders JWK members (or adds a
+/// field) flips the digest.
 #[test]
 fn known_seed_yields_known_thumbprint() {
     let seed = [
@@ -194,14 +194,14 @@ fn a_generated_proof_verifies_and_reports_the_keys_thumbprint() {
         JTI,
     )
     .unwrap();
-    let now = chrono::DateTime::from_timestamp(IAT, 0).unwrap();
+    let now = axess_clock::Timestamp::from_unix_seconds(IAT).unwrap();
     let verified = verify_dpop_proof(
         DpopVerifyRequest {
             proof_jwt: &proof.proof_jwt,
             htm: "POST",
             htu: "https://as.example/token",
             access_token: Some("tok"),
-            max_iat_skew_secs: 60,
+            max_iat_skew: std::time::Duration::from_secs(60),
             jti_cache: &MemoryJtiCache::new(),
         },
         now,
@@ -228,5 +228,64 @@ fn htu_drops_the_query_and_the_fragment() {
     assert_eq!(
         decode_part(&proof.proof_jwt, 1)["htu"],
         "https://rs.example.com/resource"
+    );
+}
+
+/// A proof of `key(0x66)` for a token request at `IAT`.
+fn token_request_proof() -> String {
+    generate_dpop_proof(
+        &key(0x66),
+        "POST",
+        "https://as.example/token",
+        Some("tok"),
+        IAT,
+        JTI,
+    )
+    .expect("a proof")
+    .proof_jwt
+}
+
+/// The proof `token_request_proof` makes verifies as the resource server
+/// checks it.
+fn verifies(proof: &str) {
+    use crate::oauth::provider::dpop_verify::{
+        DpopVerifyRequest, MemoryJtiCache, verify_dpop_proof,
+    };
+    let verified = verify_dpop_proof(
+        DpopVerifyRequest {
+            proof_jwt: proof,
+            htm: "POST",
+            htu: "https://as.example/token",
+            access_token: Some("tok"),
+            max_iat_skew: std::time::Duration::from_secs(60),
+            jti_cache: &MemoryJtiCache::new(),
+        },
+        axess_clock::Timestamp::from_unix_seconds(IAT).unwrap(),
+    )
+    .expect("verifies");
+    assert_eq!(verified.thumbprint, key(0x66).thumbprint().unwrap());
+}
+
+/// The client's proof is the first operation of a process: the provider is
+/// settled before it signs (`crate::jwt::provider_tests`).
+#[test]
+fn a_dpop_proof_settles_the_provider_before_it_signs() {
+    crate::jwt::provider_tests::first_in_process(
+        module_path!(),
+        "a_dpop_proof_settles_the_provider_before_it_signs",
+        String::new,
+        |_| verifies(&token_request_proof()),
+    );
+}
+
+/// The resource server's check is the first operation of a process: the
+/// provider is settled before it verifies.
+#[test]
+fn a_dpop_verification_settles_the_provider_first() {
+    crate::jwt::provider_tests::first_in_process(
+        module_path!(),
+        "a_dpop_verification_settles_the_provider_first",
+        token_request_proof,
+        verifies,
     );
 }

@@ -5,17 +5,18 @@
 //! `jwks_handle` / `jwks_json` / `algorithm` / `issuer` / `max_ttl`
 //! accessors.
 
+use axess_clock::testing::Shift;
 use std::sync::Arc;
 
 use super::super::*;
 use super::support::CustomClaims;
 use crate::testing::MockClock;
+use axess_clock::{SignedDuration, Timestamp};
 use axess_factors::jwt::verifier::JwtVerifier;
-use chrono::{Duration, Utc};
 use jsonwebtoken::Header;
 
-fn one_hour_from_now() -> chrono::DateTime<Utc> {
-    Utc::now() + Duration::hours(1)
+fn one_hour_from_now() -> Timestamp {
+    axess_clock::testing::MockClock::reference_time().plus(SignedDuration::hours(1))
 }
 
 /// Fallible key store that always errors on `load_all`. Used to
@@ -40,29 +41,33 @@ impl LocalIdpKeyStore for FailingKeyStore {
         Err(LoadFailure)
     }
 
-    async fn retire(&self, _key_id: &str) -> Result<bool, Self::Error> {
+    async fn retire(&self, _: &str) -> Result<bool, Self::Error> {
         Err(LoadFailure)
     }
 }
 
+#[cfg(feature = "local-idp-rsa")]
 #[tokio::test]
 async fn from_key_store_rsa_mint_roundtrips_through_verifier() {
+    let clock = MockClock::at_reference();
     let key = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-1");
     let store = MemoryLocalIdpKeyStore::with_current(key);
     let idp = LocalIdp::from_key_store("https://idp.local", store)
         .await
-        .expect("load");
+        .expect("load")
+        .with_clock(Arc::new(clock.clone()));
 
     let token = idp
         .mint(
             &MintClaims::new("worker-1", one_hour_from_now())
                 .with_audience("https://api")
-                .with_issued_at(Utc::now()),
+                .with_issued_at(axess_clock::testing::MockClock::reference_time()),
         )
         .await
         .expect("mint");
 
     let verifier = JwtVerifier::new(idp.jwks_handle().await)
+        .with_clock(Arc::new(clock.clone()))
         .with_issuer("https://idp.local")
         .with_audience("https://api")
         .with_algorithms(idp.verifier_algorithms().await);
@@ -76,22 +81,25 @@ async fn from_key_store_rsa_mint_roundtrips_through_verifier() {
 
 #[tokio::test]
 async fn from_key_store_es256_mint_roundtrips_through_verifier() {
+    let clock = MockClock::at_reference();
     let key = LocalIdpSigningKey::generate_es256().with_key_id("ec-1");
     let store = MemoryLocalIdpKeyStore::with_current(key);
     let idp = LocalIdp::from_key_store("https://idp.local", store)
         .await
-        .expect("load");
+        .expect("load")
+        .with_clock(Arc::new(clock.clone()));
 
     let token = idp
         .mint(
             &MintClaims::new("worker-2", one_hour_from_now())
                 .with_audience("https://api")
-                .with_issued_at(Utc::now()),
+                .with_issued_at(axess_clock::testing::MockClock::reference_time()),
         )
         .await
         .expect("mint");
 
     let verifier = JwtVerifier::new(idp.jwks_handle().await)
+        .with_clock(Arc::new(clock.clone()))
         .with_audience("https://api")
         .allow_any_issuer()
         .with_algorithms(idp.verifier_algorithms().await);
@@ -116,46 +124,80 @@ async fn key_store_load_failure_surfaces_as_issuance_error_keystore() {
 
 #[tokio::test]
 async fn mint_exceeding_max_ttl_returns_error_does_not_panic() {
-    let key = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-1");
+    let clock = MockClock::at_reference();
+    let key = LocalIdpSigningKey::generate_es256().with_key_id("key-1");
     let idp = LocalIdp::from_key_store(
         "https://idp.local",
         MemoryLocalIdpKeyStore::with_current(key),
     )
     .await
     .expect("load")
-    .with_max_ttl(Duration::minutes(5));
+    .with_max_ttl(std::time::Duration::from_mins(5))
+    .with_clock(Arc::new(clock.clone()));
 
-    let now = Utc::now();
+    let now = axess_clock::testing::MockClock::reference_time();
     let result = idp
         .mint(
-            &MintClaims::new("worker-1", now + Duration::hours(2))
+            &MintClaims::new("worker-1", now.plus(SignedDuration::hours(2)))
                 .with_audience("https://api")
                 .with_issued_at(now),
         )
         .await;
     match result {
         Err(IssuanceError::LifetimeExceedsCap { observed, max }) => {
-            assert_eq!(max, Duration::minutes(5));
-            assert!(observed > max, "observed {observed} must exceed cap {max}");
+            assert_eq!(max, std::time::Duration::from_mins(5));
+            assert!(
+                observed.unsigned_abs() > max,
+                "observed {observed:?} must exceed cap {max:?}"
+            );
         }
         other => panic!("expected LifetimeExceedsCap, got {other:?}"),
     }
 }
 
+/// The refusal names the lifetime and the cap as counts of seconds in the
+/// ISO 8601 form, the text earlier releases printed for the two spans.
+#[test]
+fn the_cap_refusal_prints_the_lifetime_and_the_cap_as_seconds() {
+    let refusal = |observed, max| -> String {
+        IssuanceError::<LoadFailure>::LifetimeExceedsCap { observed, max }.to_string()
+    };
+    assert_eq!(
+        refusal(SignedDuration::hours(2), std::time::Duration::from_mins(5)),
+        "token lifetime PT7200S exceeds configured max-TTL PT300S"
+    );
+    assert_eq!(
+        refusal(
+            SignedDuration::milliseconds(90_500),
+            std::time::Duration::from_millis(1_250)
+        ),
+        "token lifetime PT90.5S exceeds configured max-TTL PT1.25S"
+    );
+    // A cap past the longest signed span is over no lifetime; as text it is
+    // the longest span.
+    assert_eq!(
+        refusal(SignedDuration::MAX, std::time::Duration::MAX),
+        "token lifetime PT9223372036854775807.999999999S exceeds configured max-TTL \
+         PT9223372036854775807.999999999S"
+    );
+}
+
 #[tokio::test]
 async fn mint_within_max_ttl_succeeds() {
-    let key = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-1");
+    let clock = MockClock::at_reference();
+    let key = LocalIdpSigningKey::generate_es256().with_key_id("key-1");
     let idp = LocalIdp::from_key_store(
         "https://idp.local",
         MemoryLocalIdpKeyStore::with_current(key),
     )
     .await
     .expect("load")
-    .with_max_ttl(Duration::minutes(10));
+    .with_max_ttl(std::time::Duration::from_mins(10))
+    .with_clock(Arc::new(clock.clone()));
 
-    let now = Utc::now();
+    let now = axess_clock::testing::MockClock::reference_time();
     idp.mint(
-        &MintClaims::new("worker-1", now + Duration::minutes(5))
+        &MintClaims::new("worker-1", now.plus(SignedDuration::minutes(5)))
             .with_audience("https://api")
             .with_issued_at(now),
     )
@@ -165,18 +207,20 @@ async fn mint_within_max_ttl_succeeds() {
 
 #[tokio::test]
 async fn mint_at_exact_max_ttl_boundary_succeeds() {
-    let key = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-1");
+    let clock = MockClock::at_reference();
+    let key = LocalIdpSigningKey::generate_es256().with_key_id("key-1");
     let idp = LocalIdp::from_key_store(
         "https://idp.local",
         MemoryLocalIdpKeyStore::with_current(key),
     )
     .await
     .expect("load")
-    .with_max_ttl(Duration::minutes(10));
+    .with_max_ttl(std::time::Duration::from_mins(10))
+    .with_clock(Arc::new(clock.clone()));
 
-    let now = Utc::now();
+    let now = axess_clock::testing::MockClock::reference_time();
     idp.mint(
-        &MintClaims::new("worker-1", now + Duration::minutes(10))
+        &MintClaims::new("worker-1", now.plus(SignedDuration::minutes(10)))
             .with_audience("https://api")
             .with_issued_at(now),
     )
@@ -186,7 +230,8 @@ async fn mint_at_exact_max_ttl_boundary_succeeds() {
 
 #[tokio::test]
 async fn mint_fires_issuance_listener_with_event_fields_populated() {
-    let key = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-1");
+    let clock = MockClock::at_reference();
+    let key = LocalIdpSigningKey::generate_es256().with_key_id("key-1");
     let recorder = Arc::new(MockIssuanceListener::new());
     let idp = LocalIdp::from_key_store(
         "https://idp.local",
@@ -194,11 +239,12 @@ async fn mint_fires_issuance_listener_with_event_fields_populated() {
     )
     .await
     .expect("load")
-    .with_issuance_listener(recorder.clone());
+    .with_issuance_listener(recorder.clone())
+    .with_clock(Arc::new(clock.clone()));
 
-    let now = Utc::now();
+    let now = axess_clock::testing::MockClock::reference_time();
     idp.mint(
-        &MintClaims::new("worker-1", now + Duration::hours(1))
+        &MintClaims::new("worker-1", now.plus(SignedDuration::hours(1)))
             .with_audience("https://api")
             .with_issued_at(now)
             .with_jwt_id("jti-prod-1"),
@@ -211,14 +257,15 @@ async fn mint_fires_issuance_listener_with_event_fields_populated() {
     let e = &events[0];
     assert_eq!(e.subject, "worker-1");
     assert_eq!(e.issuer, "https://idp.local");
-    assert_eq!(e.key_id, "rsa-1");
+    assert_eq!(e.key_id, "key-1");
     assert_eq!(e.audience, vec!["https://api".to_string()]);
     assert_eq!(e.jwt_id.as_deref(), Some("jti-prod-1"));
 }
 
 #[tokio::test]
 async fn issuance_listener_does_not_fire_when_max_ttl_violated() {
-    let key = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-1");
+    let clock = MockClock::at_reference();
+    let key = LocalIdpSigningKey::generate_es256().with_key_id("key-1");
     let recorder = Arc::new(MockIssuanceListener::new());
     let idp = LocalIdp::from_key_store(
         "https://idp.local",
@@ -226,13 +273,14 @@ async fn issuance_listener_does_not_fire_when_max_ttl_violated() {
     )
     .await
     .expect("load")
-    .with_max_ttl(Duration::minutes(5))
-    .with_issuance_listener(recorder.clone());
+    .with_max_ttl(std::time::Duration::from_mins(5))
+    .with_issuance_listener(recorder.clone())
+    .with_clock(Arc::new(clock.clone()));
 
-    let now = Utc::now();
+    let now = axess_clock::testing::MockClock::reference_time();
     let _ = idp
         .mint(
-            &MintClaims::new("worker-1", now + Duration::hours(2))
+            &MintClaims::new("worker-1", now.plus(SignedDuration::hours(2)))
                 .with_audience("https://api")
                 .with_issued_at(now),
         )
@@ -246,7 +294,8 @@ async fn issuance_listener_does_not_fire_when_max_ttl_violated() {
 
 #[tokio::test]
 async fn mint_with_header_fires_issuance_listener_and_returns_token() {
-    let key = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-1");
+    let clock = MockClock::at_reference();
+    let key = LocalIdpSigningKey::generate_es256().with_key_id("key-1");
     let recorder = Arc::new(MockIssuanceListener::new());
     let idp = LocalIdp::from_key_store(
         "https://idp.local",
@@ -254,16 +303,17 @@ async fn mint_with_header_fires_issuance_listener_and_returns_token() {
     )
     .await
     .expect("load")
-    .with_issuance_listener(recorder.clone());
+    .with_issuance_listener(recorder.clone())
+    .with_clock(Arc::new(clock.clone()));
 
-    let now = Utc::now();
+    let now = axess_clock::testing::MockClock::reference_time();
     let header = Header {
         typ: Some("custom-typ".to_string()),
         ..Header::default()
     };
     let token = idp
         .mint_with_header(
-            &MintClaims::new("worker-1", now + Duration::hours(1))
+            &MintClaims::new("worker-1", now.plus(SignedDuration::hours(1)))
                 .with_audience("https://api")
                 .with_issued_at(now),
             header,
@@ -274,7 +324,7 @@ async fn mint_with_header_fires_issuance_listener_and_returns_token() {
 
     let decoded = jsonwebtoken::decode_header(&token).expect("decode header");
     assert_eq!(decoded.typ.as_deref(), Some("custom-typ"));
-    assert_eq!(decoded.kid.as_deref(), Some("rsa-1"));
+    assert_eq!(decoded.kid.as_deref(), Some("key-1"));
     assert_eq!(recorder.count(), 1);
 }
 
@@ -283,13 +333,15 @@ async fn mint_with_header_fires_issuance_listener_and_returns_token() {
 /// `jwk` and `x5c` never reach the token.
 #[tokio::test]
 async fn mint_with_header_drops_key_location_headers() {
-    let key = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-1");
+    let clock = MockClock::at_reference();
+    let key = LocalIdpSigningKey::generate_es256().with_key_id("key-1");
     let idp = LocalIdp::from_key_store(
         "https://idp.local",
         MemoryLocalIdpKeyStore::with_current(key),
     )
     .await
-    .expect("load");
+    .expect("load")
+    .with_clock(Arc::new(clock.clone()));
 
     let header = Header {
         jku: Some("https://evil.example/jwks".to_string()),
@@ -299,10 +351,10 @@ async fn mint_with_header_drops_key_location_headers() {
         typ: Some("custom-typ".to_string()),
         ..Header::default()
     };
-    let now = Utc::now();
+    let now = axess_clock::testing::MockClock::reference_time();
     let token = idp
         .mint_with_header(
-            &MintClaims::new("worker-1", now + Duration::hours(1))
+            &MintClaims::new("worker-1", now.plus(SignedDuration::hours(1)))
                 .with_audience("https://api")
                 .with_issued_at(now),
             header,
@@ -324,12 +376,10 @@ async fn mint_with_header_drops_key_location_headers() {
 
 #[tokio::test]
 async fn with_clock_drives_max_ttl_reference_when_iat_unset() {
-    let key = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-1");
+    let key = LocalIdpSigningKey::generate_es256().with_key_id("key-1");
     // Stable clock anchored in the past so the test does not depend on
     // wall-clock progress.
-    let anchor = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let anchor = axess_clock::Timestamp::parse_rfc3339("2026-01-01T00:00:00Z").unwrap();
     let clock = Arc::new(MockClock::at(anchor));
     let idp = LocalIdp::from_key_store(
         "https://idp.local",
@@ -337,20 +387,24 @@ async fn with_clock_drives_max_ttl_reference_when_iat_unset() {
     )
     .await
     .expect("load")
-    .with_max_ttl(Duration::minutes(10))
+    .with_max_ttl(std::time::Duration::from_mins(10))
     .with_clock(clock);
 
     // No iat: the production code uses now-from-clock as reference.
     // exp = anchor + 5 min → lifetime = 5 min ≤ 10 min cap → mint OK.
     idp.mint(
-        &MintClaims::new("worker-1", anchor + Duration::minutes(5)).with_audience("https://api"),
+        &MintClaims::new("worker-1", anchor.plus(SignedDuration::minutes(5)))
+            .with_audience("https://api"),
     )
     .await
     .expect("mint within injected-clock TTL");
 
     // exp = anchor + 30 min → lifetime = 30 min > 10 min cap → error.
     let result = idp
-        .mint(&MintClaims::new("worker-1", anchor + Duration::minutes(30)))
+        .mint(&MintClaims::new(
+            "worker-1",
+            anchor.plus(SignedDuration::minutes(30)),
+        ))
         .await;
     assert!(
         matches!(result, Err(IssuanceError::LifetimeExceedsCap { .. })),
@@ -358,6 +412,7 @@ async fn with_clock_drives_max_ttl_reference_when_iat_unset() {
     );
 }
 
+#[cfg(feature = "local-idp-rsa")]
 #[tokio::test]
 async fn verifier_algorithms_returns_current_then_historical() {
     let rsa = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-1");
@@ -373,6 +428,7 @@ async fn verifier_algorithms_returns_current_then_historical() {
     assert_eq!(algs.len(), 2, "deduplicated");
 }
 
+#[cfg(feature = "local-idp-rsa")]
 #[tokio::test]
 async fn jwks_handle_returns_current_and_historical_kids() {
     let rsa = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-1");
@@ -394,6 +450,7 @@ async fn jwks_handle_returns_current_and_historical_kids() {
     assert_eq!(jwks.keys.len(), 2);
 }
 
+#[cfg(feature = "local-idp-rsa")]
 #[tokio::test]
 async fn jwks_json_is_well_formed_and_omits_private_material() {
     let key = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-1");
@@ -417,11 +474,12 @@ async fn jwks_json_is_well_formed_and_omits_private_material() {
 
 #[tokio::test]
 async fn local_idp_clone_shares_state_across_handles() {
+    let clock = MockClock::at_reference();
     // LocalIdp is Arc-shared internally. Cloning it then minting from
     // both handles must produce two tokens that verify against the
     // *same* JWKS, and the listener (if installed on one handle) must
     // see mints from the cloned handle too.
-    let key = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-1");
+    let key = LocalIdpSigningKey::generate_es256().with_key_id("key-1");
     let recorder = Arc::new(MockIssuanceListener::new());
     let idp_a = LocalIdp::from_key_store(
         "https://idp.local",
@@ -429,11 +487,12 @@ async fn local_idp_clone_shares_state_across_handles() {
     )
     .await
     .expect("load")
-    .with_issuance_listener(recorder.clone());
+    .with_issuance_listener(recorder.clone())
+    .with_clock(Arc::new(clock.clone()));
     let idp_b = idp_a.clone();
 
-    let now = Utc::now();
-    let claims = MintClaims::new("worker-1", now + Duration::hours(1))
+    let now = axess_clock::testing::MockClock::reference_time();
+    let claims = MintClaims::new("worker-1", now.plus(SignedDuration::hours(1)))
         .with_audience("https://api")
         .with_issued_at(now);
 
@@ -461,7 +520,7 @@ async fn algorithm_accessor_returns_current_signing_alg() {
 
 #[tokio::test]
 async fn issuer_accessor_returns_configured_string() {
-    let key = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-1");
+    let key = LocalIdpSigningKey::generate_es256().with_key_id("key-1");
     let idp = LocalIdp::from_key_store(
         "https://idp.local",
         MemoryLocalIdpKeyStore::with_current(key),
@@ -473,7 +532,7 @@ async fn issuer_accessor_returns_configured_string() {
 
 #[tokio::test]
 async fn max_ttl_accessor_returns_the_default_cap_and_value_after_set() {
-    let key = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-1");
+    let key = LocalIdpSigningKey::generate_es256().with_key_id("key-1");
     let idp = LocalIdp::from_key_store(
         "https://idp.local",
         MemoryLocalIdpKeyStore::with_current(key),
@@ -489,11 +548,12 @@ async fn max_ttl_accessor_returns_the_default_cap_and_value_after_set() {
     .await
     .expect("load");
 
-    let idp = idp.with_max_ttl(Duration::minutes(15));
-    assert_eq!(idp.max_ttl(), Some(Duration::minutes(15)));
+    let idp = idp.with_max_ttl(std::time::Duration::from_mins(15));
+    assert_eq!(idp.max_ttl(), Some(std::time::Duration::from_mins(15)));
 }
 
-async fn es256_idp() -> LocalIdp<MemoryLocalIdpKeyStore> {
+/// An ES256 IdP on the test's clock.
+async fn es256_idp(clock: &MockClock) -> LocalIdp<MemoryLocalIdpKeyStore> {
     LocalIdp::from_key_store(
         "https://idp.local",
         MemoryLocalIdpKeyStore::with_current(
@@ -502,19 +562,21 @@ async fn es256_idp() -> LocalIdp<MemoryLocalIdpKeyStore> {
     )
     .await
     .expect("load")
+    .with_clock(Arc::new(clock.clone()))
 }
 
 #[tokio::test]
 async fn a_new_idp_caps_lifetime_at_one_hour_until_told_otherwise() {
-    let now = Utc::now();
-    let claims = MintClaims::new("w", now + Duration::days(30)).with_audience("api");
-    let capped = es256_idp().await;
+    let clock = MockClock::at_reference();
+    let now = axess_clock::testing::MockClock::reference_time();
+    let claims = MintClaims::new("w", now.plus(SignedDuration::days(30))).with_audience("api");
+    let capped = es256_idp(&clock).await;
     assert!(matches!(
         capped.mint(&claims).await,
         Err(IssuanceError::LifetimeExceedsCap { .. })
     ));
     assert!(
-        es256_idp()
+        es256_idp(&clock)
             .await
             .without_max_ttl()
             .mint(&claims)
@@ -525,14 +587,18 @@ async fn a_new_idp_caps_lifetime_at_one_hour_until_told_otherwise() {
 
 #[tokio::test]
 async fn a_mint_without_an_audience_is_refused_unless_allowed() {
-    let claims = MintClaims::new("w", Utc::now() + Duration::minutes(5));
-    let strict = es256_idp().await;
+    let clock = MockClock::at_reference();
+    let claims = MintClaims::new(
+        "w",
+        axess_clock::testing::MockClock::reference_time().plus(SignedDuration::minutes(5)),
+    );
+    let strict = es256_idp(&clock).await;
     assert!(matches!(
         strict.mint(&claims).await,
         Err(IssuanceError::MissingAudience)
     ));
     assert!(
-        es256_idp()
+        es256_idp(&clock)
             .await
             .allow_no_audience()
             .mint(&claims)
@@ -551,20 +617,22 @@ async fn a_mint_without_an_audience_is_refused_unless_allowed() {
 /// default audience requirement it is refused like a missing `aud`.
 #[tokio::test]
 async fn an_empty_string_audience_is_refused_as_no_audience() {
+    let clock = MockClock::at_reference();
     let idp = LocalIdp::from_key_store(
         "https://idp.local",
         MemoryLocalIdpKeyStore::with_current(LocalIdpSigningKey::generate_es256()),
     )
     .await
-    .expect("load");
-    let now = Utc::now();
+    .expect("load")
+    .with_clock(Arc::new(clock.clone()));
+    let now = axess_clock::testing::MockClock::reference_time();
     for audiences in [
         vec![String::new()],
         vec!["https://api".to_owned(), String::new()],
     ] {
         let outcome = idp
             .mint(
-                &MintClaims::new("worker-1", now + Duration::hours(1))
+                &MintClaims::new("worker-1", now.plus(SignedDuration::hours(1)))
                     .with_audiences(audiences.clone())
                     .with_issued_at(now),
             )
@@ -579,8 +647,12 @@ async fn an_empty_string_audience_is_refused_as_no_audience() {
 /// An already-expired claim set is an invalid lifetime, not a cap exceeded.
 #[tokio::test]
 async fn an_expired_claim_set_is_an_invalid_lifetime() {
-    let idp = es256_idp().await;
-    let claims = MintClaims::new("worker-1", chrono::Utc::now() - Duration::hours(1));
+    let clock = MockClock::at_reference();
+    let idp = es256_idp(&clock).await;
+    let claims = MintClaims::new(
+        "worker-1",
+        axess_clock::testing::MockClock::reference_time().minus(SignedDuration::hours(1)),
+    );
     assert!(matches!(
         idp.mint(&claims).await,
         Err(IssuanceError::InvalidLifetime(
@@ -594,12 +666,13 @@ async fn an_expired_claim_set_is_an_invalid_lifetime() {
 /// minted.
 #[tokio::test]
 async fn an_uncapped_idp_still_refuses_invalid_lifetimes() {
-    let idp = es256_idp().await.without_max_ttl();
-    let now = Utc::now();
+    let clock = MockClock::at_reference();
+    let idp = es256_idp(&clock).await.without_max_ttl();
+    let now = axess_clock::testing::MockClock::reference_time();
 
-    let expired = MintClaims::new("w", now - Duration::hours(1)).with_audience("api");
-    let never_valid = MintClaims::new("w", now + Duration::hours(1))
-        .with_not_before(now + Duration::hours(2))
+    let expired = MintClaims::new("w", now.minus(SignedDuration::hours(1))).with_audience("api");
+    let never_valid = MintClaims::new("w", now.plus(SignedDuration::hours(1)))
+        .with_not_before(now.plus(SignedDuration::hours(2)))
         .with_audience("api");
 
     for (claims, want) in [
@@ -621,6 +694,6 @@ async fn an_uncapped_idp_still_refuses_invalid_lifetimes() {
             "mint_with_header: {want}"
         );
     }
-    let long = MintClaims::new("w", now + Duration::days(30)).with_audience("api");
+    let long = MintClaims::new("w", now.plus(SignedDuration::days(30))).with_audience("api");
     assert!(idp.mint(&long).await.is_ok(), "a long lifetime still mints");
 }

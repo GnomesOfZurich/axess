@@ -6,7 +6,7 @@ use crate::authn::service::AuthnService;
 use crate::session::{MemorySessionRegistry, store::SessionRegistry};
 use crate::testing::{
     mock_authn::{MockFactorStore, MockIdentityStore},
-    tenant_record, test_session, user_record,
+    tenant_record_at, test_session, user_record_at,
 };
 use axess_factors::oauth::{OAuthClaims, types::keys as oauth_keys};
 
@@ -30,9 +30,16 @@ fn claims() -> OAuthClaims {
 }
 
 async fn login(arm_failure: bool) -> (bool, usize, usize) {
-    let user = user_record("u1", "t1");
+    let user = user_record_at(
+        "u1",
+        "t1",
+        axess_clock::testing::MockClock::reference_time(),
+    );
     let identity = MockIdentityStore::new()
-        .with_tenant(tenant_record("t1"))
+        .with_tenant(tenant_record_at(
+            "t1",
+            axess_clock::testing::MockClock::reference_time(),
+        ))
         .with_user(user.clone());
     if arm_failure {
         identity.arm_record_event_failure();
@@ -81,10 +88,21 @@ async fn successful_login_keeps_session_registry_entry_and_sid_mapping() {
 /// session stays live: it is ended only once the new login has succeeded.
 #[tokio::test]
 async fn a_refused_login_does_not_end_the_session_it_would_have_displaced() {
-    let first = user_record("u1", "t1");
-    let second = user_record("u2", "t1");
+    let first = user_record_at(
+        "u1",
+        "t1",
+        axess_clock::testing::MockClock::reference_time(),
+    );
+    let second = user_record_at(
+        "u2",
+        "t1",
+        axess_clock::testing::MockClock::reference_time(),
+    );
     let identity = MockIdentityStore::new()
-        .with_tenant(tenant_record("t1"))
+        .with_tenant(tenant_record_at(
+            "t1",
+            axess_clock::testing::MockClock::reference_time(),
+        ))
         .with_user(first.clone())
         .with_user(second.clone());
     let registry = MemorySessionRegistry::new();
@@ -102,7 +120,7 @@ async fn a_refused_login_does_not_end_the_session_it_would_have_displaced() {
     req.complete_oauth_login(&first, &c, &first_session)
         .await
         .expect("first login");
-    let first_id = first_session.session_id().await;
+    let first_id = first_session.session_key().await;
     assert!(registry.is_valid(&first.id, &first_id).await.unwrap());
 
     // The second login reuses the sid, and its audit write fails.
@@ -128,10 +146,21 @@ async fn a_refused_login_does_not_end_the_session_it_would_have_displaced() {
 /// The displaced session is still ended once the displacing login succeeds.
 #[tokio::test]
 async fn a_successful_login_still_ends_the_session_it_displaces() {
-    let first = user_record("u1", "t1");
-    let second = user_record("u2", "t1");
+    let first = user_record_at(
+        "u1",
+        "t1",
+        axess_clock::testing::MockClock::reference_time(),
+    );
+    let second = user_record_at(
+        "u2",
+        "t1",
+        axess_clock::testing::MockClock::reference_time(),
+    );
     let identity = MockIdentityStore::new()
-        .with_tenant(tenant_record("t1"))
+        .with_tenant(tenant_record_at(
+            "t1",
+            axess_clock::testing::MockClock::reference_time(),
+        ))
         .with_user(first.clone())
         .with_user(second.clone());
     let registry = MemorySessionRegistry::new();
@@ -151,7 +180,7 @@ async fn a_successful_login_still_ends_the_session_it_displaces() {
         req.complete_oauth_login(user, &c, &session)
             .await
             .expect("login");
-        ids.push(session.session_id().await);
+        ids.push(session.session_key().await);
     }
 
     assert!(!registry.is_valid(&first.id, &ids[0]).await.unwrap());
@@ -165,10 +194,21 @@ async fn a_successful_login_still_ends_the_session_it_displaces() {
 /// session was out of reach of a logout by `sid` alone.
 #[tokio::test]
 async fn a_refused_login_leaves_the_displaced_users_sid_mapping_in_place() {
-    let first = user_record("u1", "t1");
-    let second = user_record("u2", "t1");
+    let first = user_record_at(
+        "u1",
+        "t1",
+        axess_clock::testing::MockClock::reference_time(),
+    );
+    let second = user_record_at(
+        "u2",
+        "t1",
+        axess_clock::testing::MockClock::reference_time(),
+    );
     let identity = MockIdentityStore::new()
-        .with_tenant(tenant_record("t1"))
+        .with_tenant(tenant_record_at(
+            "t1",
+            axess_clock::testing::MockClock::reference_time(),
+        ))
         .with_user(first.clone())
         .with_user(second.clone());
     let registry = MemorySessionRegistry::new();
@@ -186,7 +226,7 @@ async fn a_refused_login_leaves_the_displaced_users_sid_mapping_in_place() {
     req.complete_oauth_login(&first, &c, &first_session)
         .await
         .expect("first login");
-    let first_id = first_session.session_id().await;
+    let first_id = first_session.session_key().await;
     let sid_key = ("test".to_string(), "idp-sid-1".to_string());
     let before = svc.inner.sid_map.get(&sid_key).expect("mapped after login");
     assert_eq!((before.0, before.1), (first.id, first_id));

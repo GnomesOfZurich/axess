@@ -5,17 +5,15 @@
 # It cannot see the book: `docs/**.md` is prose plus 112 fenced Rust
 # blocks, and 108 of those are ```rust,ignore, which nothing compiles.
 # So a chapter can confidently document a struct, an enum variant or an
-# error that was renamed years ago, or never existed, and every gate stays
-# green. That is not hypothetical. One sweep found 59 such names across 20
-# of the 44 chapters, including:
+# error that was renamed, or never existed, and every gate stays green. The
+# shapes it catches include:
 #
-#   - a 363-line audit-events catalogue specifying `LoginStarted`,
-#     `LoginCompleted`, `LoginFailed` and per-event field lists, against a
-#     flat `AuthEvent` whose outcome lives in `event_status`;
-#   - a FIPS route through a `crypto-aws-lc` feature that does not exist;
-#   - `InMemorySessionStore` in the getting-started tutorial, where the
-#     type is `MemorySessionStore`, so the first block an adopter copies
-#     did not compile.
+#   - an event catalogue naming per-outcome event types (`LoginStarted`,
+#     `LoginFailed`) against a flat `AuthEvent` whose outcome lives in
+#     `event_status`;
+#   - a route through a feature that does not exist;
+#   - a store type misnamed in a tutorial, so the first block an adopter
+#     copies does not compile.
 #
 # The check is deliberately crude and therefore cheap: every CamelCase
 # identifier the docs write in backticks must appear somewhere in the
@@ -46,18 +44,116 @@ ROOT = pathlib.Path(".")
 # stopped checking something it should.
 #
 # Holds bare type and method names and `Type::member` alike; every branch
-# below consults it. Until 0.7.0 only the `Type::member` branch did, so a removed
-# *type* had no way through the gate at all and the only recourse was
-# ALLOW, which would have been a false claim about provenance.
+# below consults it, so a removed *type* has a way through the gate that is
+# not ALLOW, which would be a false claim about provenance.
 REMOVED = {
+    # 0.20.0: the configured windows held as signed counts of seconds are
+    # `std::time::Duration`s with the `_secs` suffix dropped, and the cap
+    # refusal that could no longer be negative is `ZeroCap`; the "0.19.0 to
+    # 0.20.0" section names each old name to say what replaces it.
+    "DpopVerifyRequest::max_iat_skew_secs", "DpopProofRequest::max_iat_skew_secs",
+    "max_iat_skew_secs", "MAX_IAT_SKEW_SECS",
+    "RequestProofCheck::max_age_secs", "RequestProofCheck::max_ahead_secs",
+    "max_ahead_secs",
+    "StoredDelegationSession::with_refresh_skew_secs", "with_refresh_skew_secs",
+    "LifetimeFault::NonPositiveCap", "NonPositiveCap",
+    # 0.20.0: the bounds and settings held as integer counts of seconds are
+    # `std::time::Duration`s with the `_secs` or `_seconds` suffix dropped;
+    # the same section names each old name to say what replaces it.
+    "MAX_IAT_AGE_SECS", "MAX_IAT_FUTURE_SECS", "JTI_RETENTION_SECS", "GRACE_SECS",
+    "ValidationConfig::leeway_secs", "leeway_secs", "MAX_LEEWAY_SECS",
+    "FapiConfig::max_id_token_lifetime_secs", "max_id_token_lifetime_secs",
+    "SignerSpec::assertion_ttl_secs", "assertion_ttl_secs",
+    "EmailOtpConfig::ttl_secs", "MIN_EMAIL_OTP_TTL_SECS", "MAX_EMAIL_OTP_TTL_SECS",
+    "TotpConfig::period_secs", "period_secs",
+    "AssumeRoleWithWebIdentityRequest::duration_seconds",
+    "AssumeRoleWithWebIdentityRequest::with_duration_seconds", "with_duration_seconds",
+    # 0.20.0: no stored session is carried over, so the migrate step, the
+    # Valkey session store's legacy-blob switch and the JSON read's error
+    # variant are gone; the "0.19.0 to 0.20.0" section names each under
+    # "Compile breaks".
+    "SessionData::migrate", "ValkeySessionStore::with_legacy_blobs",
+    "SqlStoreError::Serialization",
+    # 0.20.0: no code outside the cookie reads a session's id, so the
+    # extractor's accessor and the snapshot's field that handed it out are
+    # gone for `session_key`; the same section names both.
+    "AuthSession::session_id", "AuthSnapshot::session_id",
+    # 0.20.0: the discovery fetches that named their policy beside a client
+    # of the caller's own (`fetch_screened`), the profile's `jwt_verifier`,
+    # the by-name token revocation and the nine provider reload and removal
+    # methods on `AuthnService` are gone; the "0.19.0 to 0.20.0" section names
+    # each under "Compile breaks" to say what replaces it, and two earlier
+    # sections name them where they were introduced.
+    "DiscoveryDocument::fetch_screened", "Discovery::fetch_screened", "fetch_screened",
+    "ProfileValues::jwt_verifier", "jwt_verifier",
+    # 0.20.0: the setters that replaced a library-built HTTP client with one
+    # of the caller's own, or handed out the raw builder, are gone in favour
+    # of `with_client_settings`; the same section names them, each by its
+    # type, which is how the semver inventory reads a break.
+    "OutboundOAuthClient::with_http_client", "with_http_client",
+    "TokenExchangeClient::with_http_client", "StoredDelegationSession::with_http_client",
+    "AwsStsClient::with_http_client", "AzureFicClient::with_http_client",
+    "GcpStsClient::with_http_client", "GcpServiceAccountImpersonator::with_http_client",
+    "SocialProvider::with_http_client_builder", "with_http_client_builder",
+    "AuthnService::revoke_oauth_token",
+    "AuthnService::reload_ldap", "reload_ldap",
+    # 0.20.0: the helpers that read the global registration by a provider's
+    # name, the raw client builder of the egress policy, the unbound type's
+    # constructor of the bound front-channel handler and the old name of
+    # `ScopedOAuth::attributed_to` are gone; the same section names them, and
+    # the "0.15.0 to 0.16.0" section names two where they were introduced.
+    "AuthnService::fetch_userinfo",
+    "AuthnService::build_end_session_url", "AuthnService::generate_dpop_proof",
+    "RequestAuthnService::refresh_oauth_token",
+    "EgressPolicy::client_builder", "client_builder",
+    "FrontChannelLogoutHandler::new",
+    "ScopedOAuth::as_user", "as_user",
+    # 0.20.0: the eight provider reload and removal methods beside
+    # `reload_ldap` above, and the callback form that took the `iss` beside
+    # the others; the same section names each by its type, which is how the
+    # semver inventory reads a break.
+    "AuthnService::reload_oauth_provider", "AuthnService::remove_oauth_provider",
+    "AuthnService::reload_tenant_oauth_provider",
+    "AuthnService::remove_tenant_oauth_provider", "AuthnService::reload_fido2",
+    "AuthnService::reload_fido2_with", "AuthnService::remove_fido2",
+    "AuthnService::remove_ldap",
+    "RequestAuthnService::finish_oauth_login_with_iss",
+    "reload_oauth_provider", "remove_oauth_provider", "reload_tenant_oauth_provider",
+    "remove_tenant_oauth_provider", "reload_fido2", "reload_fido2_with", "remove_fido2",
+    "remove_ldap", "finish_oauth_login_with_iss",
     # 0.19.0: the `testing-oauth` feature of axess-core is gone, its fixtures
     # live in the `axess-testing` crate; the "0.18.0 to 0.19.0" section names it.
     "testing-oauth",
+    # 0.20.0: `AuthzStore::role_uid` went with `tenant_uid`, `platform_uid`
+    # and `entity_uid`, which nothing on the store took; the "0.19.0 to
+    # 0.20.0" section names them to say `make_entity_uid` builds each, each by
+    # its type, which is how the semver inventory reads a break.
+    "AuthzStore::role_uid", "AuthzStore::tenant_uid", "AuthzStore::platform_uid",
+    "AuthzStore::entity_uid",
+    "role_uid", "tenant_uid", "platform_uid", "entity_uid",
+    # 0.20.0: the holder lookup left the trait when the claim began to answer
+    # who holds the id; the "0.19.0 to 0.20.0" section says what to do with a
+    # store's own, and the sections and changelog entries before it name it.
+    "FactorStore::fido2_credential_holder",
+    "fido2_credential_holder",
+    # 0.20.0: the trace context layer and middleware keep their own names
+    # only; the "0.19.0 to 0.20.0" section names the two others under
+    # "Compile breaks" to say which type takes each one's place.
+    "TraceIdLayer", "TraceIdMiddleware",
+    # 0.20.0: the W3C Trace Context feature is `trace-context`; the same
+    # section names the feature it replaces, to say what to change in
+    # Cargo.toml.
+    "trace-id",
+    # 0.20.0: the module is `trace_context`; the same section names each
+    # item by its old module path to say where it is now.
+    "trace_id::TraceContext", "trace_id::TraceContextLayer",
+    "trace_id::TraceContextMiddleware", "trace_id::TraceIdLayer",
+    "trace_id::TraceIdMiddleware",
     # 0.18.0: `Fido2Credential::passkey` is `Fido2Credential::key`; the
     # "0.17.0 to 0.18.0" section and the assurance page name the old field.
     "Fido2Credential::passkey",
     # 0.17.0: `AuthnMetrics` is replaced by one trait per concern; the
-    # "0.16.0 to 0.17.0" section and the observability page name it.
+    # "0.16.0 to 0.17.0" section names it.
     "AuthnMetrics",
     # 0.16.0: the deprecated `refresh_session_with_status_check_in_tenant`
     # and its `RefreshScope` argument went with it; the "0.15.0 to 0.16.0"
@@ -85,29 +181,28 @@ REMOVED = {
     # section names them to say what replaces them.
     "SidMap::take_subject_sessions", "take_subject_sessions", "SidMap::remove",
     "IdentityLookup::lockout_policy",
-    # Removed in 0.6.0. the migration guide (`docs/production/migrating/`) names it under
+    # Removed in 0.6.0. The migration guide (`docs/production/migrating/`) names it under
     # "0.5.0 to 0.6.0" to say the call has no replacement.
     "ShortString::prefix",
     # Removed in 0.7.0: the runtime policy that checked whether a route had
-    # wired an audit context. the migration guide (`docs/production/migrating/`) names it to say
-    # the check is the compiler's now, and `docs/production/audit-events.md`
-    # names it to say why the SQL detector outlives it.
+    # wired an audit context. The migration guide (`docs/production/migrating/`) names it to say
+    # the check is the compiler's.
     "AuditContextPolicy",
     # Removed in 0.11.0: `verify_reset_token` takes the instant, so the mock
-    # no longer needs a clock of its own. the migration guide (`docs/production/migrating/`)
+    # no longer needs a clock of its own. The migration guide (`docs/production/migrating/`)
     # names it under "0.10.0 to 0.11.0" to say what replaces it.
     "MockIdentityStore::with_clock",
     # Removed in 0.12.0: the public seal and open with an empty AAD, which
-    # bound nothing to the row. the migration guide (`docs/production/migrating/`) names them
+    # bound nothing to the row. The migration guide (`docs/production/migrating/`) names them
     # under "0.11.0 to 0.12.0" to say what replaces them.
     "SessionCrypto::encrypt", "encrypt",
     # Removed in 0.12.0: the store counts, evicts and inserts in one step
-    # through `issue_capped`. the migration guide (`docs/production/migrating/`) names it under
+    # through `issue_capped`. The migration guide (`docs/production/migrating/`) names it under
     # "0.11.0 to 0.12.0" to say what replaces it.
     "RefreshTokenStore::issue_with_eviction", "issue_with_eviction",
     # Removed in 0.13.0: every administrative call names its actor and
     # defaults to the tenant rail, so the variants that left the actor out or
-    # the rail off are gone. the migration guide (`docs/production/migrating/`) names them under
+    # the rail off are gone. The migration guide (`docs/production/migrating/`) names them under
     # "0.12.0 to 0.13.0" to say what replaces them.
     "invalidate_user_sessions_as", "invalidate_session_as",
     "RequestAuthnService::invalidate_user_sessions_as",
@@ -121,18 +216,27 @@ REMOVED = {
     "RequestAuthnService::begin_impersonation_in_tenant",
     # Removed in 0.14.0: hiding a taken identifier at signup is the default,
     # and `with_signup_conflicts_revealed` is the opt-out.
-    # the migration guide (`docs/production/migrating/`) names it under "0.13.0 to 0.14.0".
+    # The migration guide (`docs/production/migrating/`) names it under "0.13.0 to 0.14.0".
     "with_hidden_signup_conflicts", "AuthnServiceBuilder::with_hidden_signup_conflicts",
     # Removed in 0.15.0: `totp-rs` left the dependency tree, and with it the
     # `TotpBuilder` re-export; the `moka-cache` feature and `MokaEntityCache`
-    # went too. the migration guide (`docs/production/migrating/`) names them under "0.14.0 to
-    # the next release" to say what replaces them.
+    # went too. The migration guide (`docs/production/migrating/`) names them under "0.14.0 to
+    # 0.15.0" to say what replaces them.
     "TotpBuilder", "moka-cache", "MokaEntityCache",
 }
 
 ALLOW = {
+    # rkyv's derive, not this workspace's source: the archived form and the
+    # resolver it makes for `AuthEventType` under the `rkyv` feature. The
+    # "0.19.0 to 0.20.0" section names the variants they gain, which the
+    # semver inventory reads as breaks of their own.
+    "ArchivedAuthEventType", "AuthEventTypeResolver",
     # std / core
     "RwLock", "HashMap", "AtomicU64", "DashMap",
+    # std's clock type and span. axess-clock implements its conversions for
+    # them (`impl TryFrom<Timestamp> for SystemTime`), which reads here as
+    # owning them, and their members are std's to define.
+    "SystemTime", "Duration",
     # SQL, Redis and HTTP vocabulary that happens to be CamelCase
     "SELECT", "INSERT", "MERGE", "NULL", "DATETIME", "EXPIRE", "SETNX", "PING",
     "HttpOnly", "README",
@@ -141,6 +245,16 @@ ALLOW = {
     "RequestChallengeResponse", "PublicKeyCredential",
     "AttestationConveyancePreference", "ResidentKeyRequirement",
     "UserVerificationPolicy", "verify_attestation",
+    # webauthn-rs's relying-party builder, named by the FIDO2 chapter.
+    "append_allowed_origin",
+    # webauthn-rs's error variants for a relying-party id hash or origin
+    # that does not match, named by the FIDO2 chapter's refusal table.
+    "InvalidRPIDHash", "InvalidRPOrigin",
+    # rustls: the TLS alert a peer sends (`AlertReceived` with
+    # `BadCertificate` or `UnknownCA`) and the connection's
+    # `peer_certificates`, named by the mTLS pages for what the handshake
+    # reports.
+    "AlertReceived", "BadCertificate", "UnknownCA", "peer_certificates",
     # webauthn-rs-core's expert constructor, named by the assurance page to
     # say axess does not build on it.
     "WebauthnCore", "new_unsafe_experts_only",
@@ -156,10 +270,10 @@ ALLOW = {
     # migration guide name it as one of the two ways an adopter's own sqlx
     # can sign in to a default MySQL 8 account.
     "mysql-rsa",
-    # Features named precisely because axess does NOT ship them: `spire` is
-    # on the ROADMAP, and `wif-gitlab` is the per-issuer adapter the
-    # federation chapter explains why there is no point building.
-    "spire", "wif-gitlab",
+    # A feature named precisely because axess does NOT ship it: `wif-gitlab`
+    # is the per-issuer adapter the federation chapter explains why there is
+    # no point building.
+    "wif-gitlab",
     # cedar-policy
     "EntitySet",
     # AWS STS action name, and the Kubernetes API that mints pod tokens
@@ -186,31 +300,35 @@ ALLOW = {
     "AxessSession", "SqliteStore",
 }
 
-# Only tracked files. Two local-only trees would otherwise be read, and both
-# hold stale copies of the source: `.mutants-worktree`, which `mutants.sh`
-# leaves behind, and `target/package/`, where `cargo package` unpacks every
-# release ever built here. Reading either lets a name deleted from the real
-# source keep resolving, which is the one thing this gate exists to notice.
+# The files git lists: the tracked ones, and the untracked ones it does not
+# ignore, so a file not yet added is checked as well. Two local-only trees
+# would otherwise be read, both ignored, and both hold stale copies of the
+# source: `.mutants-worktree`, which `mutants.sh` leaves behind, and
+# `target/package/`, where `cargo package` unpacks every release ever built
+# here. Reading either lets a name deleted from the real source keep
+# resolving, which is the one thing this gate exists to notice.
 #
-# This was not hypothetical. The filter used to be a substring test for
-# "/target", which never matched the top-level `target/` because a relative
-# path has no leading slash. `ShortString::prefix` was removed in 0.6.0 and
-# went on resolving locally against `target/package/axess-strings-0.4.0/`
-# for a whole session; CI, which checks out clean, caught it. A filesystem
-# walk cannot tell a stale copy from the real thing, so ask git instead.
+# A substring test for "/target" does not do it: it never matches the
+# top-level `target/`, because a relative path has no leading slash, and a
+# name removed from the source goes on resolving locally against a packaged
+# copy under `target/package/` while CI, which checks out clean, refuses it.
+# A filesystem walk cannot tell a
+# stale copy from the real thing, so ask git instead.
 import subprocess
 
 
 def tracked(pattern):
-    """Paths git knows about, which is what a clean checkout will contain."""
+    """Paths git tracks, and untracked paths it does not ignore: what a
+    clean checkout will contain once the files not yet added are."""
     try:
         out = subprocess.run(
-            ["git", "ls-files", "-z", pattern],
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard", "--deduplicate", "-z", pattern],
             capture_output=True, text=True, check=True, cwd=ROOT,
         ).stdout
     except (subprocess.CalledProcessError, FileNotFoundError) as exc:
         raise SystemExit(
-            "ERROR: this gate lists its inputs with `git ls-files`, and that "
+            "ERROR: this gate lists its inputs, the tracked files and the "
+            "untracked ones git does not ignore, with `git ls-files`, and that "
             "failed. Run it inside a git checkout of the repository; a "
             "filesystem walk was the previous approach and it read stale "
             f"copies under target/ that a clean checkout does not have. ({exc})"
@@ -445,7 +563,7 @@ method_pat = re.compile(
 
 # A cargo feature, recognised by the word "feature" beside it.
 feature_pat = re.compile(
-    r"features?\s+`([a-z0-9][a-z0-9-]*)`|`([a-z0-9][a-z0-9-]*)`\s+feature"
+    r"features?\s+`([a-z0-9][a-z0-9_-]*)`|`([a-z0-9][a-z0-9_-]*)`\s+feature"
 )
 
 FENCE = re.compile(r"^\s*```+\s*([A-Za-z0-9_,+-]*)")

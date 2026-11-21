@@ -1,6 +1,7 @@
 //! Row-bound encryption: a blob only opens for the row id it was sealed for.
 
 use super::*;
+use axess_clock::testing::Shift;
 
 const KEY: [u8; 32] = crate::testing::test_key(5);
 const A: &[u8] = b"session-a";
@@ -240,10 +241,12 @@ fn legacy_blobs_are_refused_by_default() {
 #[test]
 fn legacy_blobs_are_accepted_only_until_the_cutoff() {
     use axess_clock::testing::MockClock;
-    let t0 = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let t0 = axess_clock::Timestamp::from_unix_seconds(1_700_000_000).unwrap();
     let clock = Arc::new(MockClock::at(t0));
     let crypto = SessionCrypto::new(KEY)
-        .with_legacy_blobs(LegacyBlobs::AcceptUntil(t0 + chrono::Duration::hours(1)))
+        .with_legacy_blobs(LegacyBlobs::AcceptUntil(
+            t0.plus(axess_clock::SignedDuration::hours(1)),
+        ))
         .with_clock(clock.clone());
     let legacy = crypto.encrypt_unbound(b"old row").unwrap();
     let v1 = v1_device_blob(&crypto, "t", "d", b"bindings");
@@ -254,7 +257,7 @@ fn legacy_blobs_are_accepted_only_until_the_cutoff() {
             .is_ok()
     );
     assert!(open_device(&crypto, "t", "d", &v1).is_ok());
-    clock.set(t0 + chrono::Duration::hours(1));
+    clock.set(t0.plus(axess_clock::SignedDuration::hours(1)));
     assert!(
         crypto
             .open_bound(BoundFormat::SESSION, A, &[], &legacy)
@@ -271,8 +274,8 @@ fn legacy_blobs_are_accepted_only_until_the_cutoff() {
 }
 
 /// A pre-binding nonce is random, so about one legacy blob in 2^32 starts
-/// with the four marker bytes. It used to fail to open under every policy;
-/// now a policy that reads legacy blobs opens it, and the default refuses it.
+/// with the four marker bytes. A policy that reads legacy blobs opens it
+/// all the same, and the default refuses it.
 #[test]
 fn a_legacy_blob_whose_nonce_starts_with_the_marker_still_opens() {
     struct MarkerNonce;
@@ -400,4 +403,122 @@ fn the_public_seal_refuses_an_empty_aad() {
         "a blob sealed with no AAD opens as an unbound row"
     );
     assert!(crypto.encrypt_with_aad(b"app.v1", b"x").is_ok());
+}
+
+/// The strict open reads the current sealed form of a format, bound to the
+/// row it is asked for, and nothing else, under every legacy policy.
+mod open_current {
+    use super::*;
+
+    fn policies() -> [LegacyBlobs; 3] {
+        let far =
+            axess_clock::Timestamp::from_unix_seconds(4_000_000_000).expect("a valid instant");
+        [
+            LegacyBlobs::Reject,
+            LegacyBlobs::AcceptUntil(far),
+            LegacyBlobs::Accept,
+        ]
+    }
+
+    fn crypto(policy: LegacyBlobs) -> SessionCrypto {
+        SessionCrypto::new(crate::testing::test_key(1)).with_legacy_blobs(policy)
+    }
+
+    #[test]
+    fn the_current_form_opens_for_its_row_only() {
+        for policy in policies() {
+            let crypto = crypto(policy);
+            let sealed = crypto
+                .seal_bound(BoundFormat::SESSION, A, b"a session")
+                .unwrap();
+            assert_eq!(sealed[..4], [0x41, 0x58, 0x53, 0x82]);
+            let opened = crypto
+                .open_current(BoundFormat::SESSION, A, &sealed)
+                .expect("the row it was sealed for");
+            assert_eq!(opened.plaintext, b"a session");
+            assert!(!opened.stale);
+            assert!(
+                crypto
+                    .open_current(BoundFormat::SESSION, B, &sealed)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn a_blob_only_the_previous_key_opens_is_stale() {
+        let old = SessionCrypto::new(crate::testing::test_key(2));
+        let sealed = old.seal_bound(BoundFormat::SESSION, A, b"rotated").unwrap();
+        let rotated = SessionCrypto::new(crate::testing::test_key(1))
+            .with_previous_key(crate::testing::test_key(2));
+        let opened = rotated
+            .open_current(BoundFormat::SESSION, A, &sealed)
+            .expect("the previous key opens it");
+        assert_eq!(opened.plaintext, b"rotated");
+        assert!(opened.stale);
+    }
+
+    /// Every blob that is not the current form of the session format: the
+    /// first session format (marker `81`), the direct layout of either
+    /// format, no marker and no binding, and the current marker put before
+    /// a body that was sealed without a binding.
+    #[test]
+    fn nothing_but_the_current_form_opens_under_any_policy() {
+        for policy in policies() {
+            let crypto = crypto(policy);
+            let first_format = crypto
+                .seal_bound(BoundFormat::SESSION_V1, A, b"earlier")
+                .unwrap();
+            assert_eq!(first_format[..4], [0x41, 0x58, 0x53, 0x81]);
+            let unbound = crypto.encrypt_unbound(b"earlier").unwrap();
+            let mut marked_unbound = BoundFormat::SESSION.subkeyed_magic().to_vec();
+            marked_unbound.extend_from_slice(&unbound);
+            let refused = [
+                ("the first session format", first_format),
+                (
+                    "the direct layout of the first format",
+                    crypto
+                        .seal_direct_layout(BoundFormat::SESSION_V1, A, b"earlier")
+                        .unwrap(),
+                ),
+                (
+                    "the direct layout of the current format",
+                    crypto
+                        .seal_direct_layout(BoundFormat::SESSION, A, b"earlier")
+                        .unwrap(),
+                ),
+                ("a blob with no binding", unbound),
+                ("the current marker before an unbound body", marked_unbound),
+                ("an empty blob", Vec::new()),
+                (
+                    "the marker alone",
+                    BoundFormat::SESSION.subkeyed_magic().to_vec(),
+                ),
+            ];
+            for (what, blob) in refused {
+                assert!(
+                    crypto.open_current(BoundFormat::SESSION, A, &blob).is_err(),
+                    "{what} opened under {policy:?}"
+                );
+            }
+        }
+    }
+
+    /// The policy still governs the open the device stores use: the same
+    /// unbound blob that the strict open refuses is read there under
+    /// `Accept`.
+    #[test]
+    fn the_legacy_open_still_reads_an_unbound_blob_under_accept() {
+        let crypto = crypto(LegacyBlobs::Accept);
+        let unbound = crypto.encrypt_unbound(b"a device row").unwrap();
+        assert!(
+            crypto
+                .open_current(BoundFormat::SESSION, A, &unbound)
+                .is_err()
+        );
+        let opened = crypto
+            .open_bound(BoundFormat::SESSION, A, &[], &unbound)
+            .expect("the legacy open reads it");
+        assert_eq!(opened.binding, Binding::Unbound);
+    }
 }

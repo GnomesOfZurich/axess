@@ -74,7 +74,7 @@ fn a_gate_tries_possession_codes_first_and_the_strictest_ceremony_last() {
 
 #[test]
 fn the_best_proof_is_what_the_ceremony_can_yield() {
-    let at = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+    let at = Timestamp::from_unix_seconds(1_700_000_000).unwrap();
     let passkey = StepUp::Fido2(Fido2Ceremony::Passkey).best_proof(at);
     assert!(passkey.user_verified);
     assert_eq!(passkey.credential, CredentialBinding::DeviceBound);

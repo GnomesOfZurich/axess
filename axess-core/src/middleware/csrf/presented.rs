@@ -8,7 +8,7 @@ pub(super) struct Refused(pub(super) crate::metrics::CsrfRefusal);
 
 /// Decide whether a state-changing request carries a valid CSRF token.
 ///
-/// Fails closed: with no session id there is nothing to bind the token to,
+/// Fails closed: with no session key there is nothing to bind the token to,
 /// so the request is refused. The Origin/Referer check runs before any body
 /// is buffered. On success the request is returned with its body intact (a
 /// form-encoded body may have been read to find the token); on failure the
@@ -16,18 +16,18 @@ pub(super) struct Refused(pub(super) crate::metrics::CsrfRefusal);
 pub(super) async fn validate_state_changing(
     mut req: Request<Body>,
     config: &CsrfConfig,
-    session_id: Option<SessionId>,
+    session_key: Option<SessionKey>,
     cookie_token: Option<&str>,
 ) -> Result<Request<Body>, Refused> {
     let method = req.method().clone();
-    // Fail closed: without a session id we cannot verify the
+    // Fail closed: without a session key we cannot verify the
     // binding, so a mis-ordered layer stack (CsrfLayer outside the
     // session layer) is rejected rather than silently validating
     // an unbound token.
-    let Some(session_id) = session_id else {
+    let Some(session_key) = session_key else {
         tracing::warn!(
             method = %method,
-            path = %req.uri().path(),
+            route = %crate::logged_route::logged_route(req.extensions()),
             "csrf: no session id on state-changing request \
              (CsrfLayer must be layered inside the session layer)"
         );
@@ -41,7 +41,7 @@ pub(super) async fn validate_state_changing(
     {
         tracing::warn!(
             method = %method,
-            path = %req.uri().path(),
+            route = %crate::logged_route::logged_route(req.extensions()),
             "csrf: Origin/Referer validation failed"
         );
         return Err(Refused(crate::metrics::CsrfRefusal::OriginMismatch));
@@ -67,12 +67,12 @@ pub(super) async fn validate_state_changing(
     if !validate_pair(
         cookie_present,
         presented.as_deref(),
-        session_id.as_bytes(),
+        session_key.as_bytes(),
         &config.signing_key,
     ) {
         tracing::warn!(
             method = %method,
-            path = %req.uri().path(),
+            route = %crate::logged_route::logged_route(req.extensions()),
             cookie_present = cookie_present.is_some(),
             header_or_form_present = presented.is_some(),
             "csrf: token validation failed"

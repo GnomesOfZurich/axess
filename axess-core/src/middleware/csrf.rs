@@ -1,7 +1,7 @@
 //! CSRF (Cross-Site Request Forgery) protection middleware.
 //!
 //! Implements the **signed double-submit cookie** pattern: the server issues
-//! a token bound to the session id via HMAC and the client must echo it back
+//! a token bound to the session's key via HMAC and the client must echo it back
 //! on every state-changing request (POST/PUT/PATCH/DELETE) either as the
 //! `X-CSRF-Token` header (AJAX) or the `_csrf` form field on
 //! `application/x-www-form-urlencoded` bodies (HTML forms). The cookie
@@ -34,16 +34,18 @@
 //! [`CsrfConfig::websocket_origin_check`](crate::middleware::csrf::CsrfConfig::websocket_origin_check)
 //! turns the host rule off.
 //!
-//! The token is `HMAC(signing_key, nonce || session_id)`, so it is bound to
+//! The token is `HMAC(signing_key, nonce || session_key)`, where `session_key`
+//! is the 32 bytes of the session's key (the digest of its id that names it in
+//! the store; the id itself never leaves the session layer), so it is bound to
 //! the session that was current when it was minted: a token minted under one
-//! session id fails validation once the request carries a different session
-//! id (e.g. after the session is regenerated on login). A token stolen from
+//! session fails validation once the request carries a different session (e.g.
+//! after the session is regenerated on login). A token stolen from
 //! one session therefore cannot be replayed against another. Tokens are
 //! constant-time verified against the cookie.
 //!
 //! # Layering requirement
 //!
-//! The [`CsrfLayer`](crate::middleware::csrf::CsrfLayer) reads the current session id from the session-handle
+//! The [`CsrfLayer`] reads the current session key from the session-handle
 //! request extension that the session layer injects. It MUST therefore be
 //! layered **inside** (i.e. run after) the session layer so the handle is
 //! present by the time this middleware runs. In an `axum` `Router`, layers
@@ -86,19 +88,19 @@
 //!
 //! Read the token from the `CsrfToken` request extension and inject it into
 //! HTML forms or expose it to your SPA via a `/csrf` endpoint. Because the
-//! token is bound to the session id, a client that caches the token across a
+//! token is bound to the session's key, a client that caches the token across a
 //! session change (e.g. login, which regenerates the session) must re-read
 //! it afterwards or its first post-login state-changing request will 403.
 //!
-//! **Rotating the session in the handler.** The [`CsrfToken`](crate::middleware::csrf::CsrfToken) request
-//! extension is bound to the session id observed at request entry, and a
+//! **Rotating the session in the handler.** The [`CsrfToken`] request
+//! extension is bound to the session's key observed at request entry, and a
 //! handler cannot change a value it was handed by clone. A handler that
 //! rotates the session (e.g. after login) and then embeds a token in the
-//! page it renders must therefore take the [`CsrfIssuer`](crate::middleware::csrf::CsrfIssuer) request extension
+//! page it renders must therefore take the [`CsrfIssuer`] request extension
 //! and call [`CsrfIssuer::token`](crate::middleware::csrf::CsrfIssuer::token) *after* rotating: it returns a token bound
-//! to the post-rotation id, and it is the very token the layer ships as the
+//! to the post-rotation key, and it is the very token the layer ships as the
 //! response `Set-Cookie`, so the embedded value and the cookie always agree.
-//! Before any rotation `token()` returns the same value as the [`CsrfToken`](crate::middleware::csrf::CsrfToken)
+//! Before any rotation `token()` returns the same value as the [`CsrfToken`]
 //! extension.
 
 use axess_rng::SecureRng;
@@ -113,9 +115,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use tower::{Layer, Service};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
-use crate::session::id::SessionId;
+use crate::session::id::SessionKey;
 use crate::session::layer::SessionHandle;
 
 /// Default cookie name for the CSRF token when the cookie is `Secure`. The
@@ -197,10 +199,23 @@ impl CsrfConfig {
     /// tokens already rendered into open forms, and those pages reload.
     /// A key that is a single repeated byte is logged at `error`; use
     /// [`try_new`](Self::try_new) to refuse it.
-    pub fn new(signing_key: [u8; 32]) -> Self {
-        crate::session::weak_key::warn_if_constant_key("CSRF signing key", &signing_key);
+    ///
+    /// The key is copied into a buffer that is zeroed on drop, and the copy
+    /// handed to this call is zeroed before it returns. The caller's own
+    /// copy is the caller's to wipe.
+    pub fn new(mut signing_key: [u8; 32]) -> Self {
+        let config = Self::from_key(&signing_key);
+        signing_key.zeroize();
+        config
+    }
+
+    /// [`new`](Self::new) with the key read through a reference: the only
+    /// copy this makes is the one in the configuration's own buffer, which
+    /// is zeroed on drop.
+    fn from_key(signing_key: &[u8; 32]) -> Self {
+        crate::session::weak_key::warn_if_constant_key("CSRF signing key", signing_key);
         Self {
-            signing_key: Arc::new(Zeroizing::new(signing_key)),
+            signing_key: Arc::new(Zeroizing::new(*signing_key)),
             rng: Arc::new(axess_rng::SystemRng),
             cookie_name: None,
             header_name: DEFAULT_CSRF_HEADER.into(),
@@ -221,11 +236,13 @@ impl CsrfConfig {
     /// # Errors
     ///
     /// [`WeakKeyError`](crate::session::WeakKeyError) for such a key.
-    pub fn try_new(signing_key: [u8; 32]) -> Result<Self, crate::session::WeakKeyError> {
+    pub fn try_new(mut signing_key: [u8; 32]) -> Result<Self, crate::session::WeakKeyError> {
         if crate::session::is_constant_key(&signing_key) {
             return Err(crate::session::WeakKeyError);
         }
-        Ok(Self::new(signing_key))
+        let config = Self::from_key(&signing_key);
+        signing_key.zeroize();
+        Ok(config)
     }
 
     /// Issue a CSRF token, and store a session to bind it to, on every
@@ -350,14 +367,16 @@ impl CsrfConfig {
     ///
     /// # Panics
     ///
-    /// Panics if `origins` yielded at least one input but every entry
-    /// failed to canonicalize (missing scheme, opaque-origin scheme,
-    /// unparseable URL). Silently dropping every entry would leave
-    /// `allowed_origins` empty, which the request-time gate treats as
-    /// "Origin check disabled": the adopter would think Origin
-    /// validation was on when it was actually off. Fail-fast at
-    /// construction matches `SessionConfigBuilder::build`'s discipline
-    /// for the same misconfig class.
+    /// Panics if `origins` is empty, or yielded at least one input but
+    /// every entry failed to canonicalize (missing scheme, opaque-origin
+    /// scheme, unparseable URL). Either would leave `allowed_origins`
+    /// empty, which the request-time gate treats as "Origin check
+    /// disabled": the adopter would think Origin validation was on when
+    /// it was actually off, and a call with an empty list would turn off
+    /// a check an earlier call had turned on. Fail-fast at construction
+    /// matches `SessionConfigBuilder::build`'s discipline for the same
+    /// misconfig class. A caller whose list may be empty decides before
+    /// it calls.
     ///
     /// If only *some* entries fail to canonicalize, the surviving ones are
     /// kept and the failures are logged at `WARN`. The gate stays armed, so
@@ -377,7 +396,12 @@ impl CsrfConfig {
             }
         }
         assert!(
-            !(supplied_any && normalized.is_empty()),
+            supplied_any,
+            "CsrfConfig::require_origin: no origin was supplied. An empty list would \
+             silently disable the Origin/Referer gate; leave the call out to run without it."
+        );
+        assert!(
+            !normalized.is_empty(),
             "CsrfConfig::require_origin: all {} supplied origin(s) failed to canonicalize \
              (missing scheme, opaque-origin scheme, or unparseable URL): {:?}. \
              Leaving the list empty would silently disable the Origin/Referer gate.",
@@ -396,6 +420,14 @@ impl CsrfConfig {
         }
         self.allowed_origins = normalized.into();
         self
+    }
+
+    /// The origins the `Origin` / `Referer` check admits, canonicalized:
+    /// what [`require_origin`](Self::require_origin) set. Empty means the
+    /// check is off.
+    #[must_use]
+    pub fn allowed_origins(&self) -> &[Arc<str>] {
+        &self.allowed_origins
     }
 }
 
@@ -484,14 +516,14 @@ where
         Box::pin(async move {
             let cookie_token = extract_cookie_token(&req, config.effective_cookie_name());
 
-            // Read the current session id from the handle the session layer
+            // Read the current session key from the handle the session layer
             // injects. The token is HMAC-bound to this id, so the session
             // layer MUST wrap this middleware (see the module docs). Clone
             // the handle out first so the request borrow ends before we await
             // the read lock.
             let session_handle = req.extensions().get::<SessionHandle>().cloned();
-            let session_id = match &session_handle {
-                Some(handle) => Some(handle.0.read().await.id),
+            let session_key = match &session_handle {
+                Some(handle) => Some(*handle.0.read().await.session.key()),
                 None => None,
             };
 
@@ -510,7 +542,7 @@ where
                 if !admitted {
                     metrics.csrf_rejected(crate::metrics::CsrfRefusal::WebSocketOrigin);
                     tracing::warn!(
-                        path = %req.uri().path(),
+                        route = %crate::logged_route::logged_route(req.extensions()),
                         "csrf: WebSocket upgrade refused, Origin is not an allowed origin or the \
                          request's own host"
                     );
@@ -521,11 +553,21 @@ where
             // Validate on state-changing methods. GET/HEAD/OPTIONS pass through
             // because they must be safe (idempotent, no side effects) per
             // RFC 9110 section 9.2.1; and CSRF only matters for unsafe verbs.
-            if is_state_changing(req.method()) {
+            // A request to a device-key path carries no token: it is
+            // authenticated by a signature over a server challenge, and the
+            // session layer marks it.
+            #[cfg(feature = "device-keys")]
+            let signed_key_request = req
+                .extensions()
+                .get::<crate::device_key::SignedKeyRequest>()
+                .is_some();
+            #[cfg(not(feature = "device-keys"))]
+            let signed_key_request = false;
+            if is_state_changing(req.method()) && !signed_key_request {
                 req = match validate_state_changing(
                     req,
                     &config,
-                    session_id,
+                    session_key,
                     cookie_token.as_deref(),
                 )
                 .await
@@ -541,7 +583,7 @@ where
             let EntryToken {
                 provisional_mint,
                 extension_token,
-            } = entry_token(&config, cookie_token.as_deref(), session_id);
+            } = entry_token(&config, cookie_token.as_deref(), session_key);
             // A request the session layer could not tie to a stored session
             // runs under a guest that exists only in memory. Storing it for a
             // token nobody reads is storage amplification from unauthenticated
@@ -555,7 +597,7 @@ where
                 config.signing_key.clone(),
                 config.rng.clone(),
                 session_handle.clone(),
-                session_id.map(|sid| (sid, extension_token.clone())),
+                session_key.map(|key| (key, extension_token.clone())),
                 read.clone(),
             );
             req.extensions_mut()
@@ -564,7 +606,7 @@ where
 
             let mut response = inner.call(req).await?;
 
-            // Re-read the session id after the handler runs. If the
+            // Re-read the session's key after the handler runs. If the
             // handler regenerated (login-success, MFA add, tenant switch),
             // the cookie the client currently holds: even if it was
             // valid at request entry: no longer validates against the
@@ -572,10 +614,10 @@ where
             // changing request until the browser cookie expires. Deciding
             // the mint post-handler closes that gap: if the cookie the
             // client will present next no longer verifies against the
-            // effective (post-handler) session id, mint a fresh one and
+            // effective (post-handler) session key, mint a fresh one and
             // ship it as Set-Cookie on this response.
-            let session_id_after = match &session_handle {
-                Some(handle) => Some(handle.0.read().await.id),
+            let session_key_after = match &session_handle {
+                Some(handle) => Some(*handle.0.read().await.session.key()),
                 None => None,
             };
             let mut token_to_set = replacement_token(
@@ -583,15 +625,15 @@ where
                 &issuer,
                 provisional_mint,
                 cookie_token.as_deref(),
-                session_id_after,
+                session_key_after,
             );
-            // Nobody read the token and the session id is the one the request
+            // Nobody read the token and the session's key is the one the request
             // began with (a rotation stores its session regardless): leave
             // the guest unstored and the response without cookies.
             if fresh_session
                 && !config.mint_on_every_request
                 && !read.load(Ordering::Relaxed)
-                && session_id_after == session_id
+                && session_key_after == session_key
             {
                 token_to_set = None;
             }
@@ -599,7 +641,7 @@ where
             if token_to_set.is_some()
                 && let Some(handle) = &session_handle
             {
-                // A token bound to the id needs the session stored and its
+                // A token bound to the key needs the session stored and its
                 // cookie set, or the next request cannot present it.
                 handle.mark_needs_persist().await;
             }
@@ -645,3 +687,6 @@ mod rotation_tests;
 
 #[cfg(test)]
 mod upgrade_tests;
+
+#[cfg(test)]
+mod route_log_tests;

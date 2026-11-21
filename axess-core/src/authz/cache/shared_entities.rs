@@ -2,7 +2,6 @@
 //! it, and concurrent cold misses share one inner-provider call.
 
 use std::collections::{HashMap, HashSet};
-use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -10,6 +9,7 @@ use std::time::Duration;
 use cedar_policy::{Entities, Entity, EntityUid};
 
 use super::EntityCache;
+use super::test_support::{guest_session, uid};
 use crate::authz::error::AuthzError;
 use crate::authz::provider::RequestEntityProvider;
 use crate::session::AuthSession;
@@ -22,13 +22,14 @@ struct SlowProvider {
 impl RequestEntityProvider for SlowProvider {
     fn entities_for<'a>(
         &'a self,
-        _session: &'a AuthSession,
+        _: &'a AuthSession,
         principal: &'a EntityUid,
         resource: &'a EntityUid,
-        _action: &'a EntityUid,
+        _: &'a EntityUid,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Entities, AuthzError>> + Send + 'a>,
     > {
+        // The set depends on the principal and the resource alone.
         let calls = self.calls.clone();
         let (principal, resource) = (principal.clone(), resource.clone());
         Box::pin(async move {
@@ -40,29 +41,6 @@ impl RequestEntityProvider for SlowProvider {
     }
 }
 
-fn session() -> AuthSession {
-    use crate::session::SessionData;
-    use crate::session::id::SessionId;
-    use crate::session::layer::{SessionHandle, SessionInner};
-    use tokio::sync::RwLock;
-    AuthSession(SessionHandle(Arc::new(RwLock::new(SessionInner {
-        id: SessionId::new(&axess_rng::SystemRng),
-        data: SessionData::default(),
-        modified: false,
-        needs_persist: false,
-        regenerate: false,
-        pre_cycle_id: None,
-        rng: std::sync::Arc::new(axess_rng::SystemRng),
-        pending_fingerprint: None,
-        max_custom_bytes: 64 * 1024,
-        consume: None,
-    }))))
-}
-
-fn uid(s: &str) -> EntityUid {
-    EntityUid::from_str(s).unwrap()
-}
-
 #[tokio::test]
 async fn entity_cache_hits_return_the_same_allocation() {
     let calls = Arc::new(AtomicUsize::new(0));
@@ -70,7 +48,7 @@ async fn entity_cache_hits_return_the_same_allocation() {
         calls: calls.clone(),
     });
     let (s, p, r, a) = (
-        session(),
+        guest_session(),
         uid("App::User::\"alice\""),
         uid("App::Doc::\"d\""),
         uid("App::Action::\"View\""),

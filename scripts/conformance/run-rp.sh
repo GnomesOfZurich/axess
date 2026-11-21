@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run the OpenID Foundation relying-party test plans against examples/oauth.
 #
-#   scripts/conformance/run-rp.sh                  # all three plans
+#   scripts/conformance/run-rp.sh                  # all five plan runs
 #   scripts/conformance/run-rp.sh --plans oidcc-client-basic-certification-test-plan
 #
 # Needs podman (or docker with compose), python3 and a Rust toolchain. It
@@ -30,11 +30,12 @@ mkdir -p "$out"
 cargo_cmd="${CARGO_CMD:-cargo}"
 # shellcheck disable=SC2086
 (cd "$root" && $cargo_cmd build -p axess-example-oauth)
-target="$(cd "$root" && ${CARGO_CMD:-cargo} metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
+metadata="$(cd "$root" && ${CARGO_CMD:-cargo} metadata --format-version 1 --no-deps)"
+target="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])' <<<"$metadata")"
 bin="$target/debug/axess-example-oauth"
 
 "${compose[@]}" up -d
-image="$(grep -E '^\s+image: registry' "$here/compose.yml" | head -1 | sed -E 's/.*image: //')"
+image="$(grep -E '^\s+image: registry' "$here/compose.yml" | sed -n 1p | sed -E 's/.*image: //')"
 
 python3 -I "$here/run_rp.py" \
     --bin "$bin" --out "$out" --image "$image" \

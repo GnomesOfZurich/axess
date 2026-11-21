@@ -9,30 +9,29 @@
 //! - `Shared`: an `Arc<str>` for anything longer. Cloning bumps a
 //!   refcount rather than copying the bytes.
 //!
-//! # Why this is not the Umbra layout it used to be
+//! # Why this is not an Umbra-style union
 //!
-//! This module previously packed the three forms into a 16-byte union
-//! with a tag bit in the length field, a manual heap allocation carrying
-//! its own `AtomicU32` refcount, and an `unsafe impl Sync`. It was the
-//! only `unsafe` in the workspace.
+//! An Umbra layout packs the three forms into a 16-byte union with a tag
+//! bit in the length field, a manual heap allocation carrying its own
+//! `AtomicU32` refcount, and an `unsafe impl Sync`. It would be the only
+//! `unsafe` in the workspace.
 //!
-//! It was replaced because it cost nothing measurable to do so. The
-//! consumer that matters is `platform/domain/messaging/core`, which
-//! builds event subject ids from SPIFFE URIs of roughly 42 bytes. Those
-//! exceed every inline buffer here, so the union and this enum both
-//! allocate and both bump a refcount, and the `short_string` benchmark
-//! finds them in the same band: construction 31 ns against 37 ns for a
-//! bare `Arc<str>`, cloning 4.7 ns against 5.0 ns.
+//! The enum costs nothing measurable beside it. The workload that
+//! matters builds event subject ids from SPIFFE URIs of roughly 42
+//! bytes. Those exceed every inline buffer here, so a union and this
+//! enum both allocate and both bump a refcount, and the `short_string`
+//! benchmark finds them in the same band: construction 31 ns against
+//! 37 ns for a bare `Arc<str>`, cloning 4.7 ns against 5.0 ns.
 //!
-//! Where the inline buffer does engage, 13 to 22 bytes, widening it from
-//! the old 12-byte limit is a clear gain: those ids stopped allocating
-//! entirely. The union won only on cloning ids of twelve bytes or fewer.
+//! Where the inline buffer does engage, 13 to 22 bytes, it is a clear
+//! gain over a union's 12-byte limit: those ids do not allocate at all.
+//! The union wins only on cloning ids of twelve bytes or fewer.
 //!
 //! The enum costs eight bytes of footprint, 24 against 16, and a
 //! twelve-byte-larger allocation header on long strings, since `Arc`
-//! carries strong and weak counts where the union carried one. Both are
-//! memory rather than time, and neither was judged worth twenty
-//! `unsafe` blocks in an authentication library.
+//! carries strong and weak counts where the union carries one. Both are
+//! memory rather than time, and neither is worth twenty `unsafe` blocks
+//! in an authentication library.
 //!
 //! # Invariants
 //!

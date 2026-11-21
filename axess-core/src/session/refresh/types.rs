@@ -1,14 +1,15 @@
 //! Refresh token records, configuration and errors.
 
 use crate::authn::ids::{DeviceId, TenantId, UserId};
+use axess_clock::{SignedDuration, Timestamp, Until};
 use axess_identity::define_id;
-use chrono::{DateTime, Duration, Utc};
+use std::time::Duration;
 use zeroize::Zeroizing;
 
 define_id! {
     /// Opaque identifier for a single [`RefreshToken`] record. Uuid v4
     /// newtype: 16 bytes, `Copy`, hyphenated string on the wire. Mint
-    /// via [`Self::new`]`(&mut rng)`; validate user-supplied strings via
+    /// via [`Self::new`]`(&rng)`; validate user-supplied strings via
     /// [`Self::try_new`].
     pub RefreshTokenId
 }
@@ -95,12 +96,16 @@ pub struct RefreshToken {
     /// HMAC-SHA256 under `RefreshTokenConfig::hash_pepper` when one is set.
     pub token_hash: String,
     /// When this token was created.
-    pub issued_at: DateTime<Utc>,
-    /// When this token expires.
-    pub expires_at: DateTime<Utc>,
+    pub issued_at: Timestamp,
+    /// When this token expires: never, for a configured lifetime that runs
+    /// past the range of a reading.
+    pub expires_at: Until,
     /// Whether this token has been revoked.
     pub revoked: bool,
-    /// Optional device fingerprint (User-Agent or custom identifier).
+    /// The token's device binding: a digest of the device string the
+    /// caller gave when the token was issued (keyed with the refresh
+    /// pepper when one is set), never the string itself. A token issued by
+    /// an earlier release holds the raw string until it is next rotated.
     pub device_info: Option<String>,
     /// Family ID for token rotation tracking.
     ///
@@ -124,33 +129,36 @@ pub struct RefreshToken {
     /// [`DeviceTrustLevel::Revoked`]: crate::device::DeviceTrustLevel::Revoked
     /// [`cascade_revoke_devices_and_tokens`]: crate::device::cascade_revoke_devices_and_tokens
     pub device_id: Option<DeviceId>,
-    /// When the user last proved who they are, as opposed to when this
-    /// token was minted.
+    /// When the login the token descends from completed, as opposed to when
+    /// this token was minted. A token issued from a session carries the
+    /// session's `signed_in_at`, so a step-up before the issue does not move
+    /// it.
     ///
     /// Rotation mints a new token every time one is used, so `issued_at`
     /// moves forward with each refresh while the person has not signed in
     /// again. A session built from a refresh carries this instant as its
-    /// `authn_time`, which is what "recent login" and step-up freshness
-    /// checks read. Rotation copies it from parent to child unchanged.
+    /// `authn_time` and its `signed_in_at`: what "recent login" and step-up
+    /// freshness checks read, and what its absolute age cap counts from.
+    /// Rotation copies it from parent to child unchanged.
     ///
     /// `None` for a token issued at login (its `issued_at` is the login) and
     /// for rows written before this field existed; both read as `issued_at`.
     /// A store that does not persist the field therefore degrades towards a
     /// later `authn_time`, never an earlier one than the last rotation, so
     /// persist it.
-    pub authn_time: Option<DateTime<Utc>>,
+    pub authn_time: Option<Timestamp>,
     /// Why the token was revoked, when it was. `None` while live, and for
     /// rows revoked before the reason was recorded (read as a rotation).
     pub revoked_reason: Option<RevocationReason>,
     /// When the token was revoked. For a rotation this is the instant the
     /// child was issued, which the reuse grace window is measured from.
-    pub revoked_at: Option<DateTime<Utc>>,
+    pub revoked_at: Option<Timestamp>,
 }
 
 impl RefreshToken {
     /// The time of the authentication this token descends from: the carried
     /// [`authn_time`](Self::authn_time), else when the token was issued.
-    pub fn authenticated_at(&self) -> DateTime<Utc> {
+    pub fn authenticated_at(&self) -> Timestamp {
         self.authn_time.unwrap_or(self.issued_at)
     }
 }
@@ -238,7 +246,7 @@ pub struct RefreshTokenConfig {
     /// by it), the client is handed nothing and keeps presenting the token
     /// it has. Reuse detection is unchanged: the record under the old hash
     /// is revoked as rotated and is reached only when the current-pepper
-    /// lookup misses, which for a kept token it no longer does. Once every
+    /// lookup misses, which for a re-stored token it does not. Once every
     /// live token has been refreshed (one `ttl`, at most `max_lifetime` for
     /// tokens that are never used), set this back to `None`.
     ///
@@ -279,13 +287,20 @@ pub struct RefreshTokenConfig {
 }
 
 impl RefreshTokenConfig {
+    /// The shortest `hash_pepper` accepted: 32 bytes, the HMAC-SHA256 output
+    /// size, as the recovery-code pepper requires. A `previous_hash_pepper`
+    /// has no minimum beyond non-empty, so a deployment rotates away from a
+    /// shorter pepper rather than being locked out of its tokens.
+    pub const MIN_PEPPER_LEN: usize = 32;
+
     /// Check the invariants every issuing and refreshing function relies on:
-    /// `ttl` is positive, `max_per_user` is at least 1 and a configured `hash_pepper` is not
-    /// empty. Those functions call this first and return
+    /// `ttl` is positive, `max_per_user` is at least 1 and a configured
+    /// `hash_pepper` is at least [`MIN_PEPPER_LEN`](Self::MIN_PEPPER_LEN)
+    /// bytes. Those functions call this first and return
     /// [`RefreshError::InvalidConfig`] with the same message; call it at
     /// start-up to fail early.
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.ttl <= Duration::zero() {
+        if self.ttl.is_zero() {
             return Err("ttl must be positive");
         }
         if self.max_per_user == 0 {
@@ -293,6 +308,16 @@ impl RefreshTokenConfig {
         }
         if self.hash_pepper.as_ref().is_some_and(|p| p.is_empty()) {
             return Err("hash_pepper must not be empty; use None for the unkeyed hash");
+        }
+        if self
+            .hash_pepper
+            .as_ref()
+            .is_some_and(|p| p.len() < Self::MIN_PEPPER_LEN)
+        {
+            return Err(
+                "hash_pepper must be at least 32 bytes (the HMAC-SHA256 output size); a shorter \
+                 key confirms guessable device-binding inputs once a dump is in hand",
+            );
         }
         if self
             .previous_hash_pepper
@@ -309,11 +334,8 @@ impl RefreshTokenConfig {
                 "previous_hash_pepper Unkeyed needs a hash_pepper: without one the current hash is unkeyed too",
             );
         }
-        if self.reuse_grace < Duration::zero() {
-            return Err("reuse_grace must not be negative");
-        }
         if let Some(max) = self.max_lifetime {
-            if max <= Duration::zero() {
+            if max.is_zero() {
                 return Err("max_lifetime must be positive");
             }
             if max < self.ttl {
@@ -326,9 +348,10 @@ impl RefreshTokenConfig {
     /// The instant a token descending from `authenticated_at` can no longer
     /// be refreshed: `authenticated_at + max_lifetime`, or `None` without a
     /// cap (or when the sum is out of range, which reads as no cap).
-    pub fn lifetime_end(&self, authenticated_at: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    pub fn lifetime_end(&self, authenticated_at: Timestamp) -> Option<Timestamp> {
         self.max_lifetime
-            .and_then(|max| authenticated_at.checked_add_signed(max))
+            .and_then(|max| SignedDuration::try_from(max).ok())
+            .and_then(|max| authenticated_at.checked_add(max))
     }
 
     /// Refuse a `device_info` that would be stored (or compared) as an
@@ -431,14 +454,14 @@ impl Default for RefreshTokenConfig {
     /// [`allow_unkeyed_hashes`](RefreshTokenConfig::allow_unkeyed_hashes)).
     fn default() -> Self {
         Self {
-            ttl: Duration::days(30),
+            ttl: Duration::from_hours(30 * 24),
             max_per_user: 10,
             rotation: true,
             hash_pepper: None,
             previous_hash_pepper: None,
-            max_lifetime: Some(Duration::days(90)),
+            max_lifetime: Some(Duration::from_hours(90 * 24)),
             allow_unkeyed_hashes: false,
-            reuse_grace: Duration::zero(),
+            reuse_grace: Duration::ZERO,
         }
     }
 }
@@ -499,6 +522,38 @@ pub enum RefreshError<E: std::error::Error + Send + Sync + 'static> {
     /// ([`Refresh::device_store`](super::Refresh::device_store)).
     #[error("device store error: {0}")]
     DeviceStore(String),
+
+    /// The token's device has a key, and the proof presented with the token
+    /// is the key's but answers a challenge that is not the current one (or
+    /// one that has expired). Nothing was rotated or revoked; sign
+    /// `challenge` and refresh again. Returned only by a refresh given the
+    /// device-key service (`Refresh::device_key`, with the `device-keys`
+    /// feature).
+    #[error("the device key must sign the current challenge")]
+    KeyProofRequired {
+        /// The challenge to sign, as the text a client signs.
+        challenge: String,
+    },
+
+    /// The token's device has a key and the token was presented without a
+    /// proof by it: the token is held by someone who does not hold the key.
+    /// The token's family was revoked and the compromise hook ran, as for a
+    /// rotated-out token that comes back. Returned only by a refresh given
+    /// the device-key service.
+    #[error("the refresh token was presented without its device key")]
+    KeyProofInvalid,
+
+    /// The token's device has a key and this refresh cannot check it: it was
+    /// given the device store ([`Refresh::device_store`](super::Refresh::device_store))
+    /// and not the device-key service (`Refresh::device_key`), or the build
+    /// has no `device-keys` feature. Nothing was rotated or revoked. A keyed
+    /// device's token is never refreshed into a session that is not bound
+    /// to the key, so give the refresh the key service.
+    #[error(
+        "the token's device has a key and this refresh was not given the device-key service \
+         (Refresh::device_key)"
+    )]
+    KeyCheckMissing,
 
     /// An error from the underlying store.
     #[error("store error: {0}")]

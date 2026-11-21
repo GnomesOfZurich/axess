@@ -57,8 +57,8 @@
 //! "String", "required": false }` if you call `at(..)` with an explicit
 //! timestamp.
 
+use axess_clock::Timestamp;
 use cedar_policy::{Context, RestrictedExpression};
-use chrono::{DateTime, Utc};
 
 use super::error::AuthzError;
 
@@ -74,18 +74,30 @@ pub trait BuildRequestContext: Send + Sync {
     ///
     /// Any error causes the authorization check to fail closed.
     fn to_cedar_context(&self) -> Result<Context, AuthzError>;
+
+    /// Whether this value stands for the facts of a request. `true` for
+    /// every context but [`NoContext`], which stands for "none".
+    ///
+    /// An [`AuthzStore`](super::session::AuthzStore) refuses to begin a
+    /// session for a value that answers `false` while the policies in force
+    /// read `context`, whichever of its builders is handed the value: naming
+    /// `NoContext` to a builder that takes a context supplies none.
+    fn supplies_context(&self) -> bool {
+        true
+    }
 }
 
 // ── RequestContextProvider ────────────────────────────────────────────────────
 
 /// Builds the Cedar [`Context`] for one request of a `require_authz!` gate.
 ///
-/// The macro looks for an `Arc<dyn RequestContextProvider>` in the request
-/// extensions and calls [`context_for`](Self::context_for) with the session
-/// and the request head. Install it with an `Extension` layer beside the
-/// policy store and the entity provider; the extension must be stored under
-/// exactly this type (an `Arc<MyProvider>` is a different type to the
-/// extension map).
+/// The gate takes the provider from its
+/// [`AuthzInstallation`](super::installation::AuthzInstallation) and calls
+/// [`context_for`](Self::context_for) with the session and the request head.
+/// Hand it to
+/// [`AuthzInstallation::new`](super::installation::AuthzInstallation::new)
+/// together with the policy store and the entity provider; there is no
+/// other way to give a gate a context provider.
 ///
 /// Derive facts such as MFA status from the session or from state the
 /// application's own layers wrote into the request extensions, never from a
@@ -93,14 +105,22 @@ pub trait BuildRequestContext: Send + Sync {
 ///
 /// # Without a provider
 ///
-/// When no provider is installed and the policy store mentions `context`
+/// When a policy or template of the store reads the `context` variable
 /// ([`PolicyStore::mentions_context`](super::store::PolicyStore::mentions_context)),
-/// the gate refuses with a 500 and an error log naming the missing extension:
-/// an empty context would let a `forbid` that guards an optional attribute
-/// with `context has ..` stop applying while the `permit` beside it allows.
-/// When no policy mentions `context` the gate evaluates with an empty context.
-/// Declare the attributes policies rely on as required, and install the
-/// provider as `Arc<dyn RequestContextProvider>`.
+/// the installation cannot be built without a provider:
+/// `AuthzInstallation::new` answers
+/// [`AuthzError::ContextProviderRequired`], because an empty context would
+/// let a `forbid` that guards an optional attribute with `context has ..`
+/// stop applying while the `permit` beside it allows. When none reads it the
+/// installation takes `None` and its gates evaluate with an empty context.
+/// The store answers from the parsed policies, so the word in a comment or a
+/// string is not a read.
+///
+/// A policy reload can bring a read in after the installation was built
+/// with `None`. The gate then refuses each request with a 500 and an error
+/// log until a set that does not read `context` is in force again, so an
+/// application that reloads policies passes a provider from the start.
+/// Declare the attributes policies rely on as required.
 ///
 /// # Errors
 ///
@@ -120,11 +140,21 @@ pub trait RequestContextProvider: Send + Sync {
 ///
 /// Produces an empty [`Context`]. Use this when all Cedar policy decisions are
 /// based purely on principal attributes (RBAC) or resource relationships (ReBAC).
+///
+/// It supplies no context, and says so
+/// ([`supplies_context`](BuildRequestContext::supplies_context) is `false`):
+/// an [`AuthzStore`](super::session::AuthzStore) whose policies read
+/// `context` refuses a session begun with it, with
+/// [`AuthzError::ContextRequired`].
 pub struct NoContext;
 
 impl BuildRequestContext for NoContext {
     fn to_cedar_context(&self) -> Result<Context, AuthzError> {
         Ok(Context::empty())
+    }
+
+    fn supplies_context(&self) -> bool {
+        false
     }
 }
 
@@ -141,6 +171,7 @@ impl BuildRequestContext for NoContext {
 /// | `ip_address`       | String  | only if `Some` |
 /// | `timestamp`        | String (ISO 8601) | only if built via [`StandardRequestContext::at`] |
 /// | `assurance`        | `AxessAssurance` | only if built with [`StandardRequestContext::with_assurance`] |
+/// | `key_bound`        | Boolean | only if built with [`StandardRequestContext::with_key_bound`] |
 ///
 /// Cedar policy example: require recent MFA for financial operations:
 ///
@@ -168,12 +199,18 @@ pub struct StandardRequestContext {
     ///
     /// [`new`]: Self::new
     /// [`at`]: Self::at
-    pub timestamp: Option<DateTime<Utc>>,
+    pub timestamp: Option<Timestamp>,
 
     /// The session's assurance record, emitted as `assurance` when `Some`
     /// (see [`with_assurance`](Self::with_assurance)); the action's schema
     /// must then declare `assurance` (`AxessAssurance`).
     pub assurance: Option<super::assurance::AssuranceContext>,
+
+    /// Whether this request ran as a session bound to a device key and
+    /// proved that key, emitted as `key_bound` when `Some` (see
+    /// [`with_key_bound`](Self::with_key_bound)); the action's schema must
+    /// then declare `key_bound: Bool`.
+    pub key_bound: Option<bool>,
 }
 
 impl StandardRequestContext {
@@ -188,6 +225,7 @@ impl StandardRequestContext {
             ip_address,
             timestamp: None,
             assurance: None,
+            key_bound: None,
         }
     }
 
@@ -199,13 +237,14 @@ impl StandardRequestContext {
     pub fn at(
         mfa_verified: bool,
         ip_address: Option<std::net::IpAddr>,
-        timestamp: DateTime<Utc>,
+        timestamp: Timestamp,
     ) -> Self {
         Self {
             mfa_verified,
             ip_address,
             timestamp: Some(timestamp),
             assurance: None,
+            key_bound: None,
         }
     }
 
@@ -216,6 +255,22 @@ impl StandardRequestContext {
     #[must_use]
     pub fn with_assurance(mut self, assurance: super::assurance::AssuranceContext) -> Self {
         self.assurance = Some(assurance);
+        self
+    }
+
+    /// Emit `key_bound` as well: whether the request ran as a session bound
+    /// to a device key and proved that key, as
+    /// [`AuthSession::key_bound`](crate::session::extractor::AuthSession::key_bound)
+    /// answers. A deployment that prefers device keys without requiring them
+    /// can then demand one for the actions that warrant it:
+    ///
+    /// ```cedar
+    /// forbid (principal, action == App::Action::"Transfer", resource)
+    /// unless { context.key_bound };
+    /// ```
+    #[must_use]
+    pub fn with_key_bound(mut self, key_bound: bool) -> Self {
+        self.key_bound = Some(key_bound);
         self
     }
 }
@@ -237,7 +292,7 @@ impl BuildRequestContext for StandardRequestContext {
         if let Some(ts) = &self.timestamp {
             pairs.push((
                 "timestamp".to_string(),
-                RestrictedExpression::new_string(ts.to_rfc3339()),
+                RestrictedExpression::new_string(ts.to_rfc3339_numeric_offset()),
             ));
         }
 
@@ -245,6 +300,13 @@ impl BuildRequestContext for StandardRequestContext {
             pairs.push((
                 super::assurance::ASSURANCE_ATTRIBUTE.to_string(),
                 assurance.to_expression()?,
+            ));
+        }
+
+        if let Some(key_bound) = self.key_bound {
+            pairs.push((
+                "key_bound".to_string(),
+                RestrictedExpression::new_bool(key_bound),
             ));
         }
 
@@ -257,5 +319,9 @@ impl BuildRequestContext for StandardRequestContext {
 impl<T: BuildRequestContext> BuildRequestContext for std::sync::Arc<T> {
     fn to_cedar_context(&self) -> Result<Context, AuthzError> {
         self.as_ref().to_cedar_context()
+    }
+
+    fn supplies_context(&self) -> bool {
+        self.as_ref().supplies_context()
     }
 }

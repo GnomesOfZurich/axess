@@ -6,7 +6,6 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 documentation = "https://docs.rs/axess-identity"
 readme = "README.md"
 description = """
@@ -18,9 +17,12 @@ SPIFFE-shaped `WorkloadId` / `TrustDomain` / `Issuer`, and the async
 `PrincipalResolver` trait + `CliResolver` impl).
 
 Foundation crate, deliberately small: depends only on `axess-rng`
-(for the DST-injectable `SecureRng` trait), `uuid`, and `thiserror`.
+(for the DST-injectable `SecureRng` trait), `uuid`, `thiserror`, and
+`sha2` (a session's key is a SHA-256 of its id).
 No tokio, no axum, no Cedar; axess-core layers session integration
-plus Cedar entity emission on top of these primitives.
+plus Cedar entity emission on top of these primitives. Also holds
+`log_text`, the one predicate every axess crate uses for what outside
+text may not carry raw into a log line or an error.
 
 See `docs/workload-identity/README.md` for the broader design.
 """
@@ -30,6 +32,9 @@ categories = ["authentication", "data-structures"]
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
 
 [features]
 # `serde` on by default: JSON is the dominant external surface (sqlx
@@ -44,6 +49,11 @@ rkyv = ["dep:rkyv"]
 # fixture surface in dev-deps without forcing production consumers of the
 # typed-id newtypes to compile it.
 testing = []
+# The named opt-out for the release-build guard: with `testing` on and
+# debug assertions off the crate refuses to compile, because the feature
+# ships test doubles in a production binary. Enable this only for a build
+# that means it (a benchmark, a release-mode test run).
+allow-testing-in-release = []
 # sqlx integration for typed ids. `Type<DB>` + `Encode<'q, DB>` +
 # `Decode<'r, DB>` impls in the `define_id!` macro expansion, gated on
 # this feature, delegate to the underlying `Uuid`'s sqlx integration. The
@@ -63,6 +73,9 @@ axess-rng = { workspace = true }
 # `Uuid::Builder::from_random_bytes` and needs no uuid feature.
 uuid = { workspace = true, default-features = false, features = ["v5"] }
 thiserror = { workspace = true, default-features = false }
+# `SessionKey`, the name a session is stored and recorded under, is the
+# SHA-256 of a fixed tag and the session id.
+sha2 = { workspace = true }
 
 serde = { version = "1.0.229", optional = true, default-features = false, features = ["derive", "alloc"] }
 serde_json = { workspace = true, default-features = false, features = ["alloc"] }
@@ -76,6 +89,9 @@ rkyv = { workspace = true, optional = true }
 sqlx = { version = "0.9.0", optional = true, default-features = false }
 
 [dev-dependencies]
+# The compile-fail cases under tests/ui hold `Issuer::Custom` to its two
+# errors by recorded text.
+trybuild = "1.0.122"
 # Internal `#[cfg(test)] mod tests` uses `axess_rng::testing::MockRng`;
 # enabling `testing` here makes that surface visible during `cargo test`
 # without forcing the production `[dependencies]` row to carry it.

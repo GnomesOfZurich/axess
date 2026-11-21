@@ -4,7 +4,7 @@
 //!
 //! ```sql
 //! CREATE TABLE IF NOT EXISTS sessions (
-//!   id TEXT PRIMARY KEY,
+//!   id TEXT PRIMARY KEY,           -- the session's key, 64 hex characters
 //!   data TEXT NOT NULL,
 //!   data_bin BYTEA,
 //!   expires_at BIGINT NOT NULL
@@ -13,15 +13,19 @@
 //! CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions (expires_at);
 //! ```
 //!
+//! `id` holds the session's key: the 64 lowercase hexadecimal characters of
+//! its [`SessionKey`], a SHA-256 digest of the
+//! session id. The id itself, the value a cookie carries, is in no column,
+//! so a read of this table yields nothing a cookie could carry.
+//!
 //! `data_bin` holds the session as raw bytes (MessagePack, sealed with
-//! AES-256-GCM when encryption is on). `data` is the base64 text column of
-//! earlier releases: rows written by them keep working because a load reads
-//! `data_bin` first and falls back to `data`, and every write stores
-//! `data_bin` and empties `data`. A legacy row moves to `data_bin` with its
-//! next write; a load moves it only when its blob is bound to the row, since
-//! a blob without a binding proves nothing about the row it sits under (see
-//! `LegacyBlobs`). `data` stays `NOT NULL`, so new rows carry an empty string
-//! there.
+//! AES-256-GCM when encryption is on), and is the only column a load reads.
+//! `data` is the text column earlier releases kept the session in, and is
+//! unused: every write stores an empty string there, so it can stay
+//! `NOT NULL` and a table an earlier release created needs no change to it.
+//! A row whose `data_bin` is NULL is refused as undecodable, whatever its
+//! `data` holds: sessions stored by an earlier release are not carried
+//! over.
 //!
 //! # Upgrading an existing deployment
 //!
@@ -33,9 +37,17 @@
 //! ALTER TABLE sessions ADD COLUMN IF NOT EXISTS data_bin BYTEA;
 //! ```
 //!
-//! Rolling back to the earlier release afterwards is safe for rows it wrote
-//! itself, but it cannot read a row this release saved (the text column is
-//! empty): that user signs in again.
+//! A rollback to the earlier release finds none of the sessions this release
+//! stored (they are named by their key and sealed in a form it does not
+//! read): their holders sign in again.
+//!
+//! A row an earlier release stored under the session id itself (36
+//! characters) is never read again, since no key is 36 characters long. It
+//! expires by itself; to remove such rows at once:
+//!
+//! ```sql
+//! DELETE FROM sessions WHERE length(id) <> 64;
+//! ```
 
 use crate::session::storage::session_codec::{
     DEFAULT_MAX_PAYLOAD_BYTES, Decoded, SessionCodec, SqlStoreError, expires_at,
@@ -43,7 +55,7 @@ use crate::session::storage::session_codec::{
 use crate::session::storage::sql_helpers::{log_cleanup_outcome, require_cleanup_interval};
 use crate::session::{
     data::SessionData,
-    id::SessionId,
+    id::SessionKey,
     store::{
         ConditionalUpdate, CycleOutcome, SessionStore,
         cas::{CasRow, CasWrite, cas_by_revision, cycle_by_revision},
@@ -160,54 +172,29 @@ impl PostgresSessionStore {
         Ok(())
     }
 
-    /// Re-seal a row that was read in an older form (a blob without the
-    /// current row binding, or the legacy text column) in the current
-    /// format. Best effort: the write is conditional on the row still
+    /// Re-seal under the current key a row whose blob only the previous key
+    /// opened. Best effort: the write is conditional on the row still
     /// holding exactly the bytes that were read, so a save that landed
     /// meanwhile is never overwritten, and the row keeps its expiry. A
     /// failure is logged and the row is re-sealed by its next save.
-    async fn reseal(
-        &self,
-        id: &SessionId,
-        data: &SessionData,
-        binary: Option<&[u8]>,
-        text: &str,
-        now: i64,
-    ) {
-        let sealed = match self.codec.encode_bytes(id, data) {
+    async fn reseal(&self, key: &SessionKey, data: &SessionData, old: &[u8], now: i64) {
+        let sealed = match self.codec.encode_bytes(key, data) {
             Ok(sealed) => sealed,
             Err(e) => {
                 tracing::warn!(error = %e, "could not re-seal a stale session row");
                 return;
             }
         };
-        let id_str = id.to_string();
-        let result = match binary {
-            Some(old) => {
-                sqlx::query(
-                    "UPDATE sessions SET data = '', data_bin = $1 \
-                     WHERE id = $2 AND expires_at > $3 AND data_bin = $4",
-                )
-                .bind(&sealed)
-                .bind(&id_str)
-                .bind(now)
-                .bind(old)
-                .execute(&self.pool)
-                .await
-            }
-            None => {
-                sqlx::query(
-                    "UPDATE sessions SET data = '', data_bin = $1 \
-                     WHERE id = $2 AND expires_at > $3 AND data_bin IS NULL AND data = $4",
-                )
-                .bind(&sealed)
-                .bind(&id_str)
-                .bind(now)
-                .bind(text)
-                .execute(&self.pool)
-                .await
-            }
-        };
+        let result = sqlx::query(
+            "UPDATE sessions SET data = '', data_bin = $1 \
+             WHERE id = $2 AND expires_at > $3 AND data_bin = $4",
+        )
+        .bind(&sealed)
+        .bind(key.to_string())
+        .bind(now)
+        .bind(old)
+        .execute(&self.pool)
+        .await;
         if let Err(e) = result {
             tracing::warn!(error = %e, "could not re-seal a stale session row");
         }
@@ -216,7 +203,7 @@ impl PostgresSessionStore {
     /// Delete all sessions whose `expires_at` is now or in the past: the
     /// instant from which `load` no longer returns them.
     pub async fn cleanup_expired(&self) -> Result<u64, sqlx::Error> {
-        let now = self.clock.now().timestamp();
+        let now = self.clock.now().unix_seconds();
         let result = sqlx::query("DELETE FROM sessions WHERE expires_at <= $1")
             .bind(now)
             .execute(&self.pool)
@@ -246,7 +233,7 @@ impl PostgresSessionStore {
     /// ```rust,ignore
     /// let store = PostgresSessionStore::new(pool, crypto);
     /// store.init_schema().await?;
-    /// let _cleanup = store.spawn_cleanup_task(std::time::Duration::from_secs(3600));
+    /// let cleanup = store.spawn_cleanup_task(std::time::Duration::from_secs(3600));
     /// ```
     pub fn spawn_cleanup_task(&self, interval: Duration) -> tokio::task::JoinHandle<()> {
         require_cleanup_interval("postgres", interval);
@@ -271,31 +258,31 @@ impl SessionStore for PostgresSessionStore {
     /// they cannot be listed by user.
     async fn find_sessions_for_user(
         &self,
-        _user_id: &crate::authn::ids::UserId,
-        _limit: usize,
-    ) -> Result<Vec<(SessionId, SessionData)>, Self::Error> {
+        _: &crate::authn::ids::UserId,
+        _: usize,
+    ) -> Result<Vec<(SessionKey, SessionData)>, Self::Error> {
         Err(SqlStoreError::Unsupported("find_sessions_for_user"))
     }
 
     type Error = SqlStoreError;
 
-    async fn load(&self, id: &SessionId) -> Result<Option<SessionData>, Self::Error> {
-        let id_str = id.to_string();
-        let now = self.clock.now().timestamp();
+    async fn load(&self, key: &SessionKey) -> Result<Option<SessionData>, Self::Error> {
+        let key_text = key.to_string();
+        let now = self.clock.now().unix_seconds();
 
-        let row: Option<(Option<Vec<u8>>, String)> =
-            sqlx::query_as("SELECT data_bin, data FROM sessions WHERE id = $1 AND expires_at > $2")
-                .bind(&id_str)
+        let row: Option<(Option<Vec<u8>>,)> =
+            sqlx::query_as("SELECT data_bin FROM sessions WHERE id = $1 AND expires_at > $2")
+                .bind(&key_text)
                 .bind(now)
                 .fetch_optional(&self.pool)
                 .await?;
 
         match row {
-            Some((binary, text)) => {
-                let Decoded { data, reseal } =
-                    self.codec.decode_row(id, binary.as_deref(), &text)?;
+            Some((binary,)) => {
+                let blob = SessionCodec::binary_column(binary)?;
+                let Decoded { data, reseal } = self.codec.decode_bytes_checked(key, &blob)?;
                 if reseal {
-                    self.reseal(id, &data, binary.as_deref(), &text, now).await;
+                    self.reseal(key, &data, &blob, now).await;
                 }
                 Ok(Some(data))
             }
@@ -305,19 +292,19 @@ impl SessionStore for PostgresSessionStore {
 
     async fn save(
         &self,
-        id: &SessionId,
+        key: &SessionKey,
         data: &SessionData,
         ttl: Duration,
     ) -> Result<(), Self::Error> {
         if ttl.is_zero() {
             // Already expired: nothing may be stored, and a previous row under
-            // this id must not outlive the expiry it was just given.
-            return SessionStore::delete(self, id).await;
+            // this key must not outlive the expiry it was just given.
+            return SessionStore::delete(self, key).await;
         }
-        let id_str = id.to_string();
+        let key_text = key.to_string();
         let encoded = self
             .codec
-            .encode_bytes_within(id, data, self.max_payload_bytes)?;
+            .encode_bytes_within(key, data, self.max_payload_bytes)?;
         let exp = expires_at(&*self.clock, ttl);
 
         sqlx::query(
@@ -327,7 +314,7 @@ impl SessionStore for PostgresSessionStore {
             ON CONFLICT (id) DO UPDATE SET data = '', data_bin = EXCLUDED.data_bin, expires_at = EXCLUDED.expires_at
             "#,
         )
-        .bind(&id_str)
+        .bind(&key_text)
         .bind(&encoded)
         .bind(exp)
         .execute(&self.pool)
@@ -336,10 +323,10 @@ impl SessionStore for PostgresSessionStore {
         Ok(())
     }
 
-    async fn delete(&self, id: &SessionId) -> Result<(), Self::Error> {
-        let id_str = id.to_string();
+    async fn delete(&self, key: &SessionKey) -> Result<(), Self::Error> {
+        let key_text = key.to_string();
         sqlx::query("DELETE FROM sessions WHERE id = $1")
-            .bind(&id_str)
+            .bind(&key_text)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -347,22 +334,22 @@ impl SessionStore for PostgresSessionStore {
 
     async fn update(
         &self,
-        id: &SessionId,
+        key: &SessionKey,
         data: &SessionData,
         ttl: Duration,
     ) -> Result<bool, Self::Error> {
         if ttl.is_zero() {
-            // Already expired: nothing may stay stored under this id, and
+            // Already expired: nothing may stay stored under this key, and
             // the session is reported as not kept.
-            SessionStore::delete(self, id).await?;
+            SessionStore::delete(self, key).await?;
             return Ok(false);
         }
-        let id_str = id.to_string();
+        let key_text = key.to_string();
         let encoded = self
             .codec
-            .encode_bytes_within(id, data, self.max_payload_bytes)?;
+            .encode_bytes_within(key, data, self.max_payload_bytes)?;
         let exp = expires_at(&*self.clock, ttl);
-        let now = self.clock.now().timestamp();
+        let now = self.clock.now().unix_seconds();
 
         let result = sqlx::query(
             "UPDATE sessions SET data = '', data_bin = $1, expires_at = $2 \
@@ -370,7 +357,7 @@ impl SessionStore for PostgresSessionStore {
         )
         .bind(&encoded)
         .bind(exp)
-        .bind(&id_str)
+        .bind(&key_text)
         .bind(now)
         .execute(&self.pool)
         .await?;
@@ -380,39 +367,39 @@ impl SessionStore for PostgresSessionStore {
 
     async fn update_if_revision(
         &self,
-        id: &SessionId,
+        key: &SessionKey,
         expected_revision: u64,
         data: &SessionData,
         ttl: Duration,
     ) -> Result<ConditionalUpdate, Self::Error> {
-        cas_by_revision(self, id, expected_revision, data, ttl).await
+        cas_by_revision(self, key, expected_revision, data, ttl).await
     }
 
     async fn cycle(
         &self,
-        old_id: &SessionId,
-        new_id: &SessionId,
+        old: &SessionKey,
+        new: &SessionKey,
         data: &SessionData,
         ttl: Duration,
         require_old: bool,
     ) -> Result<CycleOutcome, Self::Error> {
-        let old_str = old_id.to_string();
-        let new_str = new_id.to_string();
+        let old_text = old.to_string();
+        let new_text = new.to_string();
         if ttl.is_zero() {
             // Already expired: the rotated session is stored nowhere, so both
             // rows go and the session is reported gone, never as rotated.
             sqlx::query("DELETE FROM sessions WHERE id IN ($1, $2)")
-                .bind(&old_str)
-                .bind(&new_str)
+                .bind(&old_text)
+                .bind(&new_text)
                 .execute(&self.pool)
                 .await?;
             return Ok(CycleOutcome::SessionGone);
         }
         let encoded = self
             .codec
-            .encode_bytes_within(new_id, data, self.max_payload_bytes)?;
+            .encode_bytes_within(new, data, self.max_payload_bytes)?;
         let exp = expires_at(&*self.clock, ttl);
-        let now = self.clock.now().timestamp();
+        let now = self.clock.now().unix_seconds();
 
         let mut tx = self.pool.begin().await?;
 
@@ -422,8 +409,8 @@ impl SessionStore for PostgresSessionStore {
         // that arrives later waits for this transaction. With `require_old`
         // a delete that removed no live row rolls the transaction back (by
         // dropping it) instead of writing the authenticated data under the
-        // new id.
-        if old_str == new_str {
+        // new key.
+        if old_text == new_text {
             if require_old {
                 let replaced = sqlx::query(
                     "UPDATE sessions SET data = '', data_bin = $1, expires_at = $2 \
@@ -431,7 +418,7 @@ impl SessionStore for PostgresSessionStore {
                 )
                 .bind(&encoded)
                 .bind(exp)
-                .bind(&new_str)
+                .bind(&new_text)
                 .bind(now)
                 .execute(&mut *tx)
                 .await?;
@@ -443,7 +430,7 @@ impl SessionStore for PostgresSessionStore {
             }
         } else {
             let removed = sqlx::query("DELETE FROM sessions WHERE id = $1 AND expires_at > $2")
-                .bind(&old_str)
+                .bind(&old_text)
                 .bind(now)
                 .execute(&mut *tx)
                 .await?;
@@ -451,9 +438,9 @@ impl SessionStore for PostgresSessionStore {
                 return Ok(CycleOutcome::SessionGone);
             }
             if removed.rows_affected() == 0 {
-                // An expired remnant of the old id is removed too.
+                // An expired remnant of the old key is removed too.
                 sqlx::query("DELETE FROM sessions WHERE id = $1")
-                    .bind(&old_str)
+                    .bind(&old_text)
                     .execute(&mut *tx)
                     .await?;
             }
@@ -466,7 +453,7 @@ impl SessionStore for PostgresSessionStore {
             ON CONFLICT (id) DO UPDATE SET data = '', data_bin = EXCLUDED.data_bin, expires_at = EXCLUDED.expires_at
             "#,
         )
-        .bind(&new_str)
+        .bind(&new_text)
         .bind(&encoded)
         .bind(exp)
         .execute(&mut *tx)
@@ -478,23 +465,14 @@ impl SessionStore for PostgresSessionStore {
 
     async fn cycle_if_revision(
         &self,
-        old_id: &SessionId,
-        new_id: &SessionId,
+        old: &SessionKey,
+        new: &SessionKey,
         data: &SessionData,
         ttl: Duration,
         require_old: bool,
         expected_revision: u64,
     ) -> Result<CycleOutcome, Self::Error> {
-        cycle_by_revision(
-            self,
-            old_id,
-            new_id,
-            data,
-            ttl,
-            require_old,
-            expected_revision,
-        )
-        .await
+        cycle_by_revision(self, old, new, data, ttl, require_old, expected_revision).await
     }
 
     async fn prune_expired(&self) -> Result<u64, Self::Error> {
@@ -508,36 +486,34 @@ impl SessionStore for PostgresSessionStore {
 /// The SQL store compares the stored columns: a write names the bytes it
 /// read, the only thing a statement can match on.
 impl CasRow for PostgresSessionStore {
-    type Seen = (Option<Vec<u8>>, String);
+    type Seen = Vec<u8>;
     type Error = SqlStoreError;
 
-    async fn read(&self, id: &SessionId) -> Result<Option<(u64, Self::Seen)>, Self::Error> {
-        let row: Option<(Option<Vec<u8>>, String)> =
-            sqlx::query_as("SELECT data_bin, data FROM sessions WHERE id = $1 AND expires_at > $2")
-                .bind(id.to_string())
-                .bind(self.clock.now().timestamp())
+    async fn read(&self, key: &SessionKey) -> Result<Option<(u64, Self::Seen)>, Self::Error> {
+        let row: Option<(Option<Vec<u8>>,)> =
+            sqlx::query_as("SELECT data_bin FROM sessions WHERE id = $1 AND expires_at > $2")
+                .bind(key.to_string())
+                .bind(self.clock.now().unix_seconds())
                 .fetch_optional(&self.pool)
                 .await?;
-        let Some((binary, text)) = row else {
+        let Some((binary,)) = row else {
             return Ok(None);
         };
-        let stored = self.codec.decode_row(id, binary.as_deref(), &text)?.data;
-        Ok(Some((stored.revision, (binary, text))))
+        let blob = SessionCodec::binary_column(binary)?;
+        let stored = self.codec.decode_bytes_checked(key, &blob)?.data;
+        Ok(Some((stored.revision, blob)))
     }
 
     async fn delete_if(
         &self,
-        id: &SessionId,
-        (binary, text): &Self::Seen,
+        key: &SessionKey,
+        blob: &Self::Seen,
     ) -> Result<CasWrite, Self::Error> {
-        let removed = sqlx::query(
-            "DELETE FROM sessions WHERE id = $1 AND data_bin IS NOT DISTINCT FROM $2 AND data = $3",
-        )
-        .bind(id.to_string())
-        .bind(binary)
-        .bind(text)
-        .execute(&self.pool)
-        .await?;
+        let removed = sqlx::query("DELETE FROM sessions WHERE id = $1 AND data_bin = $2")
+            .bind(key.to_string())
+            .bind(blob)
+            .execute(&self.pool)
+            .await?;
         Ok(if removed.rows_affected() > 0 {
             CasWrite::Done
         } else {
@@ -547,8 +523,8 @@ impl CasRow for PostgresSessionStore {
 
     async fn replace_if(
         &self,
-        id: &SessionId,
-        (binary, text): &Self::Seen,
+        key: &SessionKey,
+        blob: &Self::Seen,
         data: &SessionData,
         ttl: Duration,
     ) -> Result<CasWrite, Self::Error> {
@@ -556,17 +532,16 @@ impl CasRow for PostgresSessionStore {
         // moved on costs no seal.
         let encoded = self
             .codec
-            .encode_bytes_within(id, data, self.max_payload_bytes)?;
+            .encode_bytes_within(key, data, self.max_payload_bytes)?;
         let replaced = sqlx::query(
             "UPDATE sessions SET data = '', data_bin = $1, expires_at = $2 \
-             WHERE id = $3 AND expires_at > $4 AND data_bin IS NOT DISTINCT FROM $5 AND data = $6",
+             WHERE id = $3 AND expires_at > $4 AND data_bin = $5",
         )
         .bind(&encoded)
         .bind(expires_at(&*self.clock, ttl))
-        .bind(id.to_string())
-        .bind(self.clock.now().timestamp())
-        .bind(binary)
-        .bind(text)
+        .bind(key.to_string())
+        .bind(self.clock.now().unix_seconds())
+        .bind(blob)
         .execute(&self.pool)
         .await?;
         Ok(if replaced.rows_affected() > 0 {
@@ -593,24 +568,24 @@ impl HealthCheck for PostgresSessionStore {
     }
 }
 
-// ── Store<SessionId, SessionData> ────────────────────────────────────────────
+// ── Store<SessionKey, SessionData> ────────────────────────────────────────────
 //
 // surface; see the same impl on `SqliteSessionStore` for the
 // rationale. Identical body shape (forwards to `SessionStore`).
 
-impl crate::store::Store<SessionId, SessionData> for PostgresSessionStore {
+impl crate::store::Store<SessionKey, SessionData> for PostgresSessionStore {
     type Error = SqlStoreError;
 
     fn get(
         &self,
-        key: &SessionId,
+        key: &SessionKey,
     ) -> impl std::future::Future<Output = Result<Option<SessionData>, Self::Error>> + Send {
         <Self as SessionStore>::load(self, key)
     }
 
     fn put(
         &self,
-        key: &SessionId,
+        key: &SessionKey,
         value: &SessionData,
         ttl: Duration,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
@@ -619,7 +594,7 @@ impl crate::store::Store<SessionId, SessionData> for PostgresSessionStore {
 
     fn delete(
         &self,
-        key: &SessionId,
+        key: &SessionKey,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
         <Self as SessionStore>::delete(self, key)
     }
@@ -671,13 +646,13 @@ mod postgres_tests {
         )
     }
 
-    fn sample_id() -> SessionId {
-        SessionId::new(&axess_rng::SystemRng)
+    fn sample_key() -> SessionKey {
+        SessionKey::of(&SessionId::new(&axess_rng::SystemRng))
     }
 
     #[tokio::test]
     async fn plaintext_constructor_emits_warning() {
-        // Pins line 71 against `-> Default::default()` (unviable; no
+        // Pins `plaintext_insecure` against `-> Default::default()` (unviable; no
         // `Default` impl exists) AND the inline `tracing::warn!`
         // diagnostic against accidental removal during refactors.
         let capture = TracingCapture::install();
@@ -691,9 +666,9 @@ mod postgres_tests {
 
     #[tokio::test]
     async fn load_propagates_connection_error_not_ok_none() {
-        // Pins line 162 body against `Ok(None)` and
+        // Pins the body against `Ok(None)` and
         // `Ok(Some(Default::default()))` mutations.
-        let result = store().load(&sample_id()).await;
+        let result = store().load(&sample_key()).await;
         assert!(
             result.is_err(),
             "load must propagate sqlx error from an unreachable pool, \
@@ -703,10 +678,10 @@ mod postgres_tests {
 
     #[tokio::test]
     async fn save_propagates_connection_error_not_ok_unit() {
-        // Pins line 184 body against `Ok(())`.
+        // Pins the body against `Ok(())`.
         let result = store()
             .save(
-                &sample_id(),
+                &sample_key(),
                 &SessionData::default(),
                 Duration::from_secs(60),
             )
@@ -719,8 +694,8 @@ mod postgres_tests {
 
     #[tokio::test]
     async fn delete_propagates_connection_error_not_ok_unit() {
-        // Pins line 205 body against `Ok(())`.
-        let result = store().delete(&sample_id()).await;
+        // Pins the body against `Ok(())`.
+        let result = store().delete(&sample_key()).await;
         assert!(
             result.is_err(),
             "delete must propagate sqlx error, not Ok(())"
@@ -729,14 +704,14 @@ mod postgres_tests {
 
     #[tokio::test]
     async fn cycle_propagates_connection_error_not_ok_unit() {
-        // Pins line 220 body against `Ok(())`. Even though `cycle` opens
+        // Pins the body against `Ok(())`. Even though `cycle` opens
         // a transaction with two statements, the *begin* fails first
         // against an unreachable pool; so we observe Err from the very
         // first await.
         let result = store()
             .cycle(
-                &sample_id(),
-                &sample_id(),
+                &sample_key(),
+                &sample_key(),
                 &SessionData::default(),
                 Duration::from_secs(60),
                 true,
@@ -750,7 +725,7 @@ mod postgres_tests {
 
     #[tokio::test]
     async fn prune_expired_propagates_connection_error_not_ok_count() {
-        // Pins line 247 body against `Ok(0)` and `Ok(1)`. `prune_expired`
+        // Pins the body against `Ok(0)` and `Ok(1)`. `prune_expired`
         // is a thin wrapper around `cleanup_expired`, which is itself
         // covered below; this test specifically guards the trait surface.
         let result = store().prune_expired().await;
@@ -762,7 +737,7 @@ mod postgres_tests {
 
     #[tokio::test]
     async fn cleanup_expired_propagates_connection_error_not_ok_count() {
-        // Pins line 111 body against `Ok(0)` and `Ok(1)` mutations on
+        // Pins the body against `Ok(0)` and `Ok(1)` mutations on
         // the inherent `cleanup_expired` method.
         let result = store().cleanup_expired().await;
         assert!(
@@ -773,7 +748,7 @@ mod postgres_tests {
 
     #[tokio::test]
     async fn init_schema_propagates_connection_error_not_ok_unit() {
-        // Pins line 90 body against `Ok(())`.
+        // Pins the body against `Ok(())`.
         let result = store().init_schema().await;
         assert!(
             result.is_err(),
@@ -783,7 +758,7 @@ mod postgres_tests {
 
     #[tokio::test]
     async fn health_check_returns_unhealthy_on_unreachable_pool() {
-        // Pins line 259 body against `Pin::new(...)`-style mutations
+        // Pins the body against `Pin::new(...)`-style mutations
         // that would degrade the response to a default future. The
         // original yields a real `HealthStatus::Unhealthy(_)` against
         // an unreachable pool.

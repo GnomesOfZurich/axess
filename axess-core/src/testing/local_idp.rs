@@ -1,5 +1,6 @@
 //! In-process IdP test fixture: mints workload-identity JWTs
-//! against an in-memory RSA keypair and exposes the matching JWKS.
+//! against an in-memory keypair (ES256 unless asked otherwise) and exposes
+//! the matching JWKS.
 //!
 //! **Scope: test / dev only.** This fixture is for adopters writing
 //! integration tests that exercise the inbound JWT-SVID resolver,
@@ -20,20 +21,24 @@
 //!
 //! ```rust,ignore
 //! use axess::jwt::svid::JwtSvidResolver;
+//! use axess::testing::MockClock;
 //! use axess::testing::local_idp::{LocalIdpFixture, MintClaims};
-//! use chrono::{Duration, Utc};
+//! use axess::Clock;
+//! use axess_clock::SignedDuration;
 //!
-//! let idp = LocalIdpFixture::new("https://test.idp.local");
+//! let clock = MockClock::at_reference();
+//! let idp = LocalIdpFixture::new("https://test.idp.local").with_clock(clock.clone());
 //! let token = idp.mint(
-//!     &MintClaims::new("alice", Utc::now() + Duration::hours(1))
+//!     &MintClaims::new("alice", clock.now().plus(SignedDuration::hours(1)))
 //!         .with_audience("https://api.example.com"),
 //! );
 //!
 //! // Verifier reads the fixture's JWKS handle and validates the
-//! // signature + iss + exp.
+//! // signature + iss + exp, the expiry at the test's time.
 //! let verifier = JwtVerifier::new(idp.jwks_handle())
 //!     .with_issuer(idp.issuer())
-//!     .with_audience("https://api.example.com");
+//!     .with_audience("https://api.example.com")
+//!     .with_clock(std::sync::Arc::new(clock));
 //! let claims = verifier.verify::<MyClaims>(&token, "https://api.example.com").await?;
 //! ```
 //!
@@ -46,19 +51,21 @@
 //!
 //! let idp = LocalIdpFixture::new("https://oidc.test.local");
 //! let token = idp.mint_jwt_svid(
-//!     "test.gnomes", "worker", "acme",
+//!     "test.example.org", "worker", "acme",
 //!     "sts.amazonaws.com",
-//!     Duration::minutes(5),
+//!     SignedDuration::minutes(5),
 //! );
 //! // Point AwsStsClient at LocalStack (or wiremock) and call
 //! // AssumeRoleWithWebIdentity with the minted token.
 //! ```
 
+use axess_clock::testing::Shift;
 use std::sync::{Arc, Mutex, RwLock};
 
-use chrono::{DateTime, Duration, Utc};
+use axess_clock::{Clock, SystemClock};
+use axess_clock::{SignedDuration, Timestamp};
 use jsonwebtoken::jwk::{Jwk, JwkSet};
-use jsonwebtoken::{Algorithm, Header, encode};
+use jsonwebtoken::{Algorithm, Header};
 
 use crate::local_idp::primitives::LocalIdpKeyError;
 use crate::local_idp::primitives::{
@@ -83,11 +90,11 @@ pub struct RecordedIssuance {
     /// `aud` claim values (empty `Vec` indicates the claim was omitted).
     pub audience: Vec<String>,
     /// `exp` claim.
-    pub expires_at: DateTime<Utc>,
+    pub expires_at: Timestamp,
     /// `nbf` claim, if set.
-    pub not_before: Option<DateTime<Utc>>,
+    pub not_before: Option<Timestamp>,
     /// `iat` claim, if set.
-    pub issued_at: Option<DateTime<Utc>>,
+    pub issued_at: Option<Timestamp>,
     /// `jti` claim, if set.
     pub jwt_id: Option<String>,
 }
@@ -192,7 +199,7 @@ struct LocalIdpInner {
     /// panics when `exp - now` exceeds this
     /// duration. Models the production-side guardrail against
     /// mistakenly issuing year-long tokens.
-    max_ttl: Option<Duration>,
+    max_ttl: Option<std::time::Duration>,
     /// Optional adopter-supplied audit hook fired after every
     /// successful mint. See [`IssuanceListener`] for the contract.
     issuance_listener: Option<Arc<dyn IssuanceListener>>,
@@ -200,6 +207,9 @@ struct LocalIdpInner {
     /// order). Rebuilt by [`rebuild_jwks`] whenever any contributing
     /// source changes.
     jwks: JwkSet,
+    /// The time [`LocalIdpFixture::mint`] stamps and caps tokens at:
+    /// [`SystemClock`] unless [`LocalIdpFixture::with_clock`] sets another.
+    clock: Arc<dyn Clock>,
 }
 
 impl LocalIdpFixture {
@@ -207,11 +217,11 @@ impl LocalIdpFixture {
     /// tokens with `iss = issuer` and `alg = ES256`.
     ///
     /// ES256 is the default because it is fast (about a millisecond), its
-    /// tokens are small, and it avoids the `rsa` crate's private-key
-    /// operations and their timing side channel (the Marvin advisory).
-    /// A verifier that cannot take ES256 gets RSA from
-    /// [`new_rsa`](Self::new_rsa) or [`with_algorithm`](Self::with_algorithm).
-    /// Adopters wanting a stable keypair across runs reach for
+    /// tokens are small, and it needs no `rsa` crate, whose private-key
+    /// operations leak timing (RUSTSEC-2023-0071, the Marvin attack). A
+    /// verifier that cannot take ES256 gets RSA from `new_rsa` or
+    /// [`with_algorithm`](Self::with_algorithm), with the `local-idp-rsa`
+    /// feature. Adopters wanting a stable keypair across runs reach for
     /// [`with_signing_key`](Self::with_signing_key) instead.
     pub fn new(issuer: impl Into<String>) -> Self {
         Self::with_signing_key(issuer, LocalIdpSigningKey::generate_es256())
@@ -222,23 +232,28 @@ impl LocalIdpFixture {
     /// cannot take ES256. Key generation takes ~50-200ms; construct once
     /// and share via `Clone`. See [`new`](Self::new) for why RSA is not the
     /// default.
+    #[cfg(feature = "local-idp-rsa")]
     pub fn new_rsa(issuer: impl Into<String>) -> Self {
         Self::with_signing_key(issuer, LocalIdpSigningKey::generate_rsa())
     }
 
     /// Construct with an explicit signing algorithm. Dispatches by
-    /// algorithm family: `RS256` / `RS384` / `RS512` produce a fresh
-    /// RSA-2048 keypair (per [`LocalIdpSigningKey::generate_rsa_with_algorithm`]);
-    /// `ES256` produces a fresh P-256 keypair (per
-    /// [`LocalIdpSigningKey::generate_es256`]).
+    /// algorithm family: `ES256` produces a fresh P-256 keypair (per
+    /// [`LocalIdpSigningKey::generate_es256`]); with the `local-idp-rsa`
+    /// feature, `RS256` / `RS384` / `RS512` produce a fresh RSA-2048 keypair
+    /// (per `LocalIdpSigningKey::generate_rsa_with_algorithm`).
     ///
     /// # Panics
     ///
-    /// On any other algorithm; [`try_with_algorithm`](Self::try_with_algorithm)
+    /// On any other algorithm, and on an RSA algorithm without the
+    /// `local-idp-rsa` feature; [`try_with_algorithm`](Self::try_with_algorithm)
     /// returns the error instead.
     pub fn with_algorithm(issuer: impl Into<String>, algorithm: Algorithm) -> Self {
         Self::try_with_algorithm(issuer, algorithm).unwrap_or_else(|e| {
-            panic!("LocalIdpFixture::with_algorithm supports RS256/RS384/RS512 and ES256: {e}")
+            panic!(
+                "LocalIdpFixture::with_algorithm supports ES256, and RS256/RS384/RS512 with the \
+                 `local-idp-rsa` feature: {e}"
+            )
         })
     }
 
@@ -248,7 +263,8 @@ impl LocalIdpFixture {
     /// # Errors
     ///
     /// [`LocalIdpKeyError::UnsupportedAlgorithm`] for an algorithm other
-    /// than `RS256`, `RS384`, `RS512` or `ES256`;
+    /// than `ES256`, `RS256`, `RS384` or `RS512`, and for one of the three
+    /// RSA algorithms in a build without the `local-idp-rsa` feature;
     /// [`LocalIdpKeyError::KeyGeneration`] if an RSA keypair could not be
     /// generated.
     pub fn try_with_algorithm(
@@ -257,12 +273,20 @@ impl LocalIdpFixture {
     ) -> Result<Self, LocalIdpKeyError> {
         let signing_key = match algorithm {
             Algorithm::ES256 => LocalIdpSigningKey::generate_es256(),
+            #[cfg(feature = "local-idp-rsa")]
             Algorithm::RS256 | Algorithm::RS384 | Algorithm::RS512 => {
                 LocalIdpSigningKey::try_generate_rsa_with_algorithm(algorithm)?
             }
+            #[cfg(not(feature = "local-idp-rsa"))]
+            Algorithm::RS256 | Algorithm::RS384 | Algorithm::RS512 => {
+                return Err(LocalIdpKeyError::UnsupportedAlgorithm(format!(
+                    "{algorithm:?} (an RSA key needs the `local-idp-rsa` feature)"
+                )));
+            }
             other => {
                 return Err(LocalIdpKeyError::UnsupportedAlgorithm(format!(
-                    "{other:?} (the fixture generates RS256, RS384, RS512 and ES256 keys)"
+                    "{other:?} (the fixture generates ES256 keys, and RS256, RS384 and RS512 keys \
+                     with the `local-idp-rsa` feature)"
                 )));
             }
         };
@@ -285,6 +309,7 @@ impl LocalIdpFixture {
                 max_ttl: None,
                 issuance_listener: None,
                 jwks,
+                clock: Arc::new(SystemClock),
             }),
         }
     }
@@ -299,11 +324,11 @@ impl LocalIdpFixture {
     /// ```rust,ignore
     /// // Snapshot under k1, then build a rotated fixture that still
     /// // verifies tokens minted under k1:
-    /// let k1 = LocalIdpSigningKey::generate_rsa().with_key_id("k1");
+    /// let k1 = LocalIdpSigningKey::generate_es256().with_key_id("k1");
     /// let old_idp = LocalIdpFixture::with_signing_key("https://idp", k1.clone());
     /// let token_old = old_idp.mint(&claims);
     ///
-    /// let k2 = LocalIdpSigningKey::generate_rsa().with_key_id("k2");
+    /// let k2 = LocalIdpSigningKey::generate_es256().with_key_id("k2");
     /// let rotated_idp = LocalIdpFixture::with_signing_key("https://idp", k2)
     ///     .with_historical_signing_key(k1);
     ///
@@ -331,6 +356,7 @@ impl LocalIdpFixture {
                 max_ttl: self.inner.max_ttl,
                 issuance_listener: self.inner.issuance_listener.clone(),
                 jwks,
+                clock: self.inner.clock.clone(),
             }),
         }
     }
@@ -352,6 +378,7 @@ impl LocalIdpFixture {
                 max_ttl: self.inner.max_ttl,
                 issuance_listener: self.inner.issuance_listener.clone(),
                 jwks,
+                clock: self.inner.clock.clone(),
             }),
         }
     }
@@ -378,6 +405,7 @@ impl LocalIdpFixture {
                 max_ttl: self.inner.max_ttl,
                 issuance_listener: self.inner.issuance_listener.clone(),
                 jwks,
+                clock: self.inner.clock.clone(),
             }),
         }
     }
@@ -395,7 +423,7 @@ impl LocalIdpFixture {
     /// production deployment would refuse.
     ///
     /// Unset (the default) means no cap.
-    pub fn with_max_ttl(self, ttl: Duration) -> Self {
+    pub fn with_max_ttl(self, ttl: std::time::Duration) -> Self {
         Self {
             inner: Arc::new(LocalIdpInner {
                 signing_key: self.inner.signing_key.clone(),
@@ -405,12 +433,34 @@ impl LocalIdpFixture {
                 max_ttl: Some(ttl),
                 issuance_listener: self.inner.issuance_listener.clone(),
                 jwks: self.inner.jwks.clone(),
+                clock: self.inner.clock.clone(),
+            }),
+        }
+    }
+
+    /// Mint at `clock`'s time: [`mint`](Self::mint),
+    /// [`mint_with_header`](Self::mint_with_header) and
+    /// [`mint_jwt_svid`](Self::mint_jwt_svid) measure the max-TTL cap, and
+    /// the JWT-SVID's `iat` and `exp`, from it instead of the system clock,
+    /// so a test's tokens belong to the world its
+    /// [`MockClock`](crate::testing::MockClock) runs.
+    pub fn with_clock(self, clock: impl Clock + 'static) -> Self {
+        Self {
+            inner: Arc::new(LocalIdpInner {
+                signing_key: self.inner.signing_key.clone(),
+                historical_keys: self.inner.historical_keys.clone(),
+                extra_public_jwks: self.inner.extra_public_jwks.clone(),
+                issuer: self.inner.issuer.clone(),
+                max_ttl: self.inner.max_ttl,
+                issuance_listener: self.inner.issuance_listener.clone(),
+                jwks: self.inner.jwks.clone(),
+                clock: Arc::new(clock),
             }),
         }
     }
 
     /// Borrow the configured max-TTL cap, if any.
-    pub fn max_ttl(&self) -> Option<Duration> {
+    pub fn max_ttl(&self) -> Option<std::time::Duration> {
         self.inner.max_ttl
     }
 
@@ -428,7 +478,7 @@ impl LocalIdpFixture {
     /// let recorder = std::sync::Arc::new(MockIssuanceListener::new());
     /// let idp = LocalIdpFixture::new("https://idp")
     ///     .with_issuance_listener(recorder.clone());
-    /// idp.mint(&MintClaims::new("alice", Utc::now() + Duration::hours(1)));
+    /// idp.mint(&MintClaims::new("alice", MockClock::reference_time().plus(SignedDuration::hours(1))));
     /// assert_eq!(recorder.count(), 1);
     /// ```
     pub fn with_issuance_listener(self, listener: Arc<dyn IssuanceListener>) -> Self {
@@ -441,6 +491,7 @@ impl LocalIdpFixture {
                 max_ttl: self.inner.max_ttl,
                 issuance_listener: Some(listener),
                 jwks: self.inner.jwks.clone(),
+                clock: self.inner.clock.clone(),
             }),
         }
     }
@@ -471,6 +522,7 @@ impl LocalIdpFixture {
                 max_ttl: self.inner.max_ttl,
                 issuance_listener: self.inner.issuance_listener.clone(),
                 jwks,
+                clock: self.inner.clock.clone(),
             }),
         }
     }
@@ -568,16 +620,17 @@ impl LocalIdpFixture {
     /// header `alg` automatically; caller supplies the rest via
     /// [`MintClaims`].
     ///
-    /// The max-TTL cap, when configured, is measured from the wall clock;
-    /// use [`mint_at`](Self::mint_at) to measure it from a chosen instant.
+    /// The max-TTL cap, when configured, is measured from the fixture's
+    /// clock ([`with_clock`](Self::with_clock)); use
+    /// [`mint_at`](Self::mint_at) to measure it from a chosen instant.
     pub fn mint(&self, claims: &MintClaims) -> String {
-        self.mint_at(claims, Utc::now())
+        self.mint_at(claims, self.inner.clock.now())
     }
 
     /// Like [`mint`](Self::mint) but measures the max-TTL cap from `now`
-    /// instead of the wall clock, so a test driving a
+    /// instead of the fixture's clock, so a test driving a
     /// [`MockClock`](crate::testing::MockClock) gets exact behaviour.
-    pub fn mint_at(&self, claims: &MintClaims, now: DateTime<Utc>) -> String {
+    pub fn mint_at(&self, claims: &MintClaims, now: Timestamp) -> String {
         self.mint_with_header_at(
             claims,
             &mut Header::new(self.inner.signing_key.algorithm()),
@@ -591,16 +644,16 @@ impl LocalIdpFixture {
     /// and the key-location fields `jku`, `jwk`, `x5u` and `x5c` are cleared,
     /// as the production `LocalIdp` does.
     pub fn mint_with_header(&self, claims: &MintClaims, header: &mut Header) -> String {
-        self.mint_with_header_at(claims, header, Utc::now())
+        self.mint_with_header_at(claims, header, self.inner.clock.now())
     }
 
     /// Like [`mint_with_header`](Self::mint_with_header) but measures the
-    /// max-TTL cap from `now` instead of the wall clock.
+    /// max-TTL cap from `now` instead of the fixture's clock.
     pub fn mint_with_header_at(
         &self,
         claims: &MintClaims,
         header: &mut Header,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> String {
         if let Some(max_ttl) = self.inner.max_ttl {
             enforce_max_ttl(claims, max_ttl, now);
@@ -616,12 +669,8 @@ impl LocalIdpFixture {
         header.x5c = None;
         let claims_json = build_claims_json(&self.inner.issuer, claims);
         let key = self.inner.signing_key.encoding_key();
-        // Signing needs a crypto provider, and with two backends compiled in
-        // `jsonwebtoken` cannot pick one; without this an adopter's test
-        // panics unless something earlier in the process installed one.
-        axess_factors::jwt::ensure_crypto_provider();
-        let token =
-            encode(header, &claims_json, key).expect("JWT encode never fails on valid inputs");
+        let token = axess_factors::jwt::encode(header, &claims_json, key)
+            .expect("JWT encode never fails on valid inputs");
         if let Some(listener) = &self.inner.issuance_listener {
             let event = IssuanceEvent {
                 issuer: &self.inner.issuer,
@@ -638,7 +687,7 @@ impl LocalIdpFixture {
     /// `sub = "spiffe://<trust_domain>/<service>/<tenant>"` and
     /// the given audience + TTL. The fixture sets `iat = now`,
     /// `exp = now + ttl`, `iss = self.issuer()`, with `now` read from the
-    /// wall clock; [`mint_jwt_svid_at`](Self::mint_jwt_svid_at) takes it
+    /// fixture's clock; [`mint_jwt_svid_at`](Self::mint_jwt_svid_at) takes it
     /// as a parameter.
     pub fn mint_jwt_svid(
         &self,
@@ -646,9 +695,16 @@ impl LocalIdpFixture {
         service: &str,
         tenant: &str,
         audience: impl Into<String>,
-        ttl: Duration,
+        ttl: SignedDuration,
     ) -> String {
-        self.mint_jwt_svid_at(trust_domain, service, tenant, audience, ttl, Utc::now())
+        self.mint_jwt_svid_at(
+            trust_domain,
+            service,
+            tenant,
+            audience,
+            ttl,
+            self.inner.clock.now(),
+        )
     }
 
     /// Like [`mint_jwt_svid`](Self::mint_jwt_svid) with `iat = now`,
@@ -659,10 +715,10 @@ impl LocalIdpFixture {
         service: &str,
         tenant: &str,
         audience: impl Into<String>,
-        ttl: Duration,
-        now: DateTime<Utc>,
+        ttl: SignedDuration,
+        now: Timestamp,
     ) -> String {
-        let exp = now + ttl;
+        let exp = now.plus(ttl);
         let subject = format!("spiffe://{trust_domain}/{service}/{tenant}");
         let claims = MintClaims::new(subject, exp)
             .with_audience(audience)
@@ -691,7 +747,9 @@ mod es256;
 mod max_ttl;
 #[cfg(test)]
 mod mint_verify;
-#[cfg(test)]
+#[cfg(all(test, feature = "local-idp-rsa"))]
 mod multi_key;
-#[cfg(test)]
+#[cfg(all(test, not(feature = "local-idp-rsa")))]
+mod rsa_refused;
+#[cfg(all(test, feature = "local-idp-rsa"))]
 mod signing_key;

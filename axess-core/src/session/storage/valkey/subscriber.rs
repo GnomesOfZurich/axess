@@ -22,9 +22,15 @@
 //! next join that subscribes a new connection flags the waiting watchers for
 //! a recheck and clears the record, so a loss is never forgotten between the
 //! dispatcher noticing it and a successful reconnect.
+//!
+//! The connection carries a name on the server: `axess-revocations:` and the
+//! registry's prefix (`connection_name`). It is set before the connection
+//! subscribes and again after the client reconnects by itself, so an
+//! operator reading `CLIENT LIST` sees which registry each pub/sub
+//! connection belongs to.
 
 use fred::prelude::*;
-use fred::types::Message;
+use fred::types::{ClusterHash, CustomCommand, Message};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
@@ -120,6 +126,46 @@ struct Connection {
 /// How long opening and subscribing a connection may each take.
 const SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// The digits a byte of the prefix is written with after `%`.
+const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+/// What a registry's subscriber connection is called on the server, the
+/// name `CLIENT LIST` shows for it: `axess-revocations:` and the registry's
+/// key prefix. A client name holds printable ASCII with no space, so every
+/// other byte of the prefix, and `%` itself, is written as `%` and two hex
+/// digits: two prefixes never share a name.
+pub(super) fn connection_name(prefix: &str) -> String {
+    let mut name = String::from("axess-revocations:");
+    for byte in prefix.bytes() {
+        if byte.is_ascii_graphic() && byte != b'%' {
+            name.push(char::from(byte));
+        } else {
+            name.push('%');
+            name.push(char::from(HEX[usize::from(byte >> 4)]));
+            name.push(char::from(HEX[usize::from(byte & 0x0F)]));
+        }
+    }
+    name
+}
+
+/// Give the pub/sub connection of `client` its `name`. Sent before the
+/// connection subscribes, since a subscribed connection takes no other
+/// command. On a cluster the command goes where fred sends this client's
+/// pub/sub commands: to the owner of the slot of the client's id.
+///
+/// The name is a label and nothing reads it back. A server that refuses the
+/// command (an ACL without `CLIENT SETNAME`), or does not answer within
+/// [`SETUP_TIMEOUT`], leaves the connection unnamed and the watchers served.
+async fn name_connection(client: &Client, name: &str) {
+    let slot = fred::util::redis_keyslot(client.id().as_bytes());
+    let command = CustomCommand::new_static("CLIENT", ClusterHash::Custom(slot), false);
+    let named: Result<Result<(), Error>, _> =
+        tokio::time::timeout(SETUP_TIMEOUT, client.custom(command, vec!["SETNAME", name])).await;
+    if !matches!(named, Ok(Ok(()))) {
+        tracing::debug!("the revocation subscriber connection could not be named");
+    }
+}
+
 /// Spacing of reconnection attempts after failures: it doubles from the
 /// first interval up to the last.
 const BACKOFF_FIRST_SECS: u64 = 1;
@@ -175,7 +221,7 @@ impl Connection {
 
 #[derive(Default)]
 struct State {
-    /// Watchers currently holding a [`Watch`], including one still
+    /// Watchers currently holding a [`Hold`], including one still
     /// connecting.
     watchers: usize,
     /// The shared connection, once it is subscribed.
@@ -200,12 +246,14 @@ pub(super) struct SharedSubscriber {
     connecting: tokio::sync::Mutex<()>,
 }
 
-/// A watcher's hold on the shared connection. Dropping it, including when the
-/// watching future is aborted, removes its slot from the routes and releases
-/// the hold; the last one out shuts the connection down.
-struct Hold {
+/// A watcher's hold on the shared connection, and its wake-up slot. Dropping
+/// it, including when the watching future is aborted, removes its slot from
+/// the routes and releases the hold; the last one out shuts the connection
+/// down.
+pub(super) struct Hold {
     shared: Arc<SharedSubscriber>,
-    slot: Arc<Slot>,
+    /// The watcher's wake-up slot.
+    pub(super) slot: Arc<Slot>,
     channels: [String; 2],
 }
 
@@ -236,13 +284,6 @@ impl Drop for Hold {
             connection.shut_down();
         }
     }
-}
-
-/// A watcher joined to the shared connection.
-pub(super) struct Watch {
-    _hold: Hold,
-    /// The watcher's wake-up slot.
-    pub(super) slot: Arc<Slot>,
 }
 
 /// Escape the glob metacharacters of a channel-pattern fragment.
@@ -369,9 +410,8 @@ impl SharedSubscriber {
         base: &Client,
         prefix: &str,
         channels: [String; 2],
-    ) -> Option<Watch> {
+    ) -> Option<Hold> {
         let hold = self.register(channels);
-        let slot = hold.slot.clone();
 
         // The existing connection is reused only if its dispatcher still runs
         // and the connection answers.
@@ -379,10 +419,10 @@ impl SharedSubscriber {
         if let Some((client, _)) = &existing
             && answers_ping(client).await
         {
-            return Some(Watch { _hold: hold, slot });
+            return Some(hold);
         }
 
-        let _connecting = self.connecting.lock().await;
+        let connecting = self.connecting.lock().await;
         // Another joiner may have replaced the connection while this one was
         // probing or waiting; trust a connection that is not the one that
         // failed the probe.
@@ -391,7 +431,7 @@ impl SharedSubscriber {
                 .as_ref()
                 .is_none_or(|(_, seen)| *seen != generation)
         {
-            return Some(Watch { _hold: hold, slot });
+            return Some(hold);
         }
         if !self.lock().backoff.ready() {
             return None;
@@ -406,7 +446,7 @@ impl SharedSubscriber {
         // Setup is serialised by `connecting`, so no other join takes this
         // number meanwhile.
         let generation = self.lock().generation + 1;
-        match self.open(base, prefix, generation).await {
+        let joined = match self.open(base, prefix, generation).await {
             Some(connection) => {
                 {
                     let mut state = self.lock();
@@ -415,7 +455,7 @@ impl SharedSubscriber {
                     state.connection = Some(connection);
                 }
                 self.finish_reconnect();
-                Some(Watch { _hold: hold, slot })
+                Some(hold)
             }
             None => {
                 self.lock().backoff.failed();
@@ -424,7 +464,11 @@ impl SharedSubscriber {
                 self.connection_lost();
                 None
             }
-        }
+        };
+        // Setup ends once the new connection is in place and the waiting
+        // watchers are told, or the failure is recorded.
+        drop(connecting);
+        joined
     }
 
     /// The live connection's client and generation, if its dispatcher runs.
@@ -449,6 +493,8 @@ impl SharedSubscriber {
             .await
             .ok()?
             .ok()?;
+        let name = connection_name(prefix);
+        name_connection(&subscriber, &name).await;
         let messages = subscriber.message_rx();
         let reconnects = subscriber.reconnect_rx();
         let escaped = escape_glob(prefix);
@@ -464,6 +510,7 @@ impl SharedSubscriber {
         let reconnector = tokio::spawn(resubscribe_on_reconnect(
             reconnects,
             subscriber.clone(),
+            name,
             patterns,
             Arc::downgrade(self),
             generation,
@@ -524,8 +571,9 @@ async fn dispatch(
 /// The client reconnects by itself under the registry client's reconnect
 /// policy, and what was published while it was away is lost: the receiver
 /// neither closed nor lagged, so nothing else says so. Each reconnect is
-/// treated as a loss: the watchers are told, the patterns are subscribed
-/// again (a new connection has none), and the watchers recheck the registry.
+/// treated as a loss: the watchers are told, the connection is named and the
+/// patterns are subscribed again (a new connection has neither), and the
+/// watchers recheck the registry.
 /// When the patterns cannot be subscribed the connection is given up, so the
 /// next join opens a replacement. It acts for the connection of `generation`
 /// only: once that has been replaced, a reconnect it reports is not news to
@@ -533,6 +581,7 @@ async fn dispatch(
 async fn resubscribe_on_reconnect(
     mut reconnects: tokio::sync::broadcast::Receiver<Server>,
     client: Client,
+    name: String,
     patterns: Vec<String>,
     shared: Weak<SharedSubscriber>,
     generation: u64,
@@ -546,10 +595,10 @@ async fn resubscribe_on_reconnect(
         let Some(shared) = shared.upgrade() else {
             return;
         };
-        if shared.is_replaced(generation) {
+        if !on_reconnect(&shared, generation) {
             return;
         }
-        shared.connection_lost();
+        name_connection(&client, &name).await;
         let subscribed =
             tokio::time::timeout(SETUP_TIMEOUT, client.psubscribe(patterns.clone())).await;
         if matches!(subscribed, Ok(Ok(()))) {
@@ -559,6 +608,20 @@ async fn resubscribe_on_reconnect(
             return;
         }
     }
+}
+
+/// One reconnect reported for the connection of `generation`, up to the
+/// point where the patterns are subscribed again. A reconnect of a
+/// connection that has since been replaced is not news to the watchers of
+/// the newer one: nothing is done and `false` says the reconnector is done.
+/// For the current connection the watchers are told the connection was
+/// lost, and `true` says the patterns are to be subscribed again.
+fn on_reconnect(shared: &SharedSubscriber, generation: u64) -> bool {
+    if shared.is_replaced(generation) {
+        return false;
+    }
+    shared.connection_lost();
+    true
 }
 
 #[cfg(test)]

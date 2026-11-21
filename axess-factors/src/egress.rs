@@ -70,11 +70,13 @@ impl ReservedRange {
     ///
     /// An IPv6 address that carries an IPv4 address is judged as the IPv4
     /// address it carries, in every form that does: IPv4-mapped
-    /// (`::ffff:a.b.c.d`), IPv4-compatible (`::a.b.c.d`), NAT64
-    /// (`64:ff9b::/96`) and 6to4 (`2002:a.b.c.d::/48`). The locally used
-    /// NAT64 prefix `64:ff9b:1::/48` is never global: it is judged as the
-    /// IPv4 address in its last 32 bits when that one is reserved, and as
-    /// private otherwise.
+    /// (`::ffff:a.b.c.d`), IPv4-translated (`::ffff:0:a.b.c.d`),
+    /// IPv4-compatible (`::a.b.c.d`), NAT64 (`64:ff9b::/96`) and 6to4
+    /// (`2002:a.b.c.d::/48`). Two prefixes are never a public server: the
+    /// locally used NAT64 prefix `64:ff9b:1::/48`, and Teredo (`2001::/32`),
+    /// a tunnel to a client behind a NAT whose address is carried inverted
+    /// in the last 32 bits. Each is judged as the IPv4 address it carries
+    /// when that one is reserved, and as private otherwise.
     #[must_use]
     pub fn of(ip: IpAddr) -> Option<Self> {
         match ip {
@@ -106,6 +108,17 @@ fn of_v6_embedding(ip: Ipv6Addr) -> Option<ReservedRange> {
     }
     if seg[0] == 0x2002 {
         return of_v4(Ipv4Addr::new(o[2], o[3], o[4], o[5]));
+    }
+    if seg[..4] == [0; 4] && seg[4] == 0xffff && seg[5] == 0 {
+        // `::ffff:0:a.b.c.d`, the IPv4-translated form of a stateless
+        // translator: the address in its last 32 bits.
+        return of_v4(last);
+    }
+    if seg[0] == 0x2001 && seg[1] == 0 {
+        // Teredo: the client's address, inverted, in the last 32 bits. The
+        // tunnel ends at a host behind a NAT, never at a public server.
+        let client = Ipv4Addr::new(!o[12], !o[13], !o[14], !o[15]);
+        return of_v4(client).or(Some(ReservedRange::Private));
     }
     of_v6(ip)
 }
@@ -232,7 +245,7 @@ impl EgressPolicy {
     /// so is a host that is an address in a reserved range, and `localhost`
     /// by name. A host name is checked again, on the addresses it resolves
     /// to, when the connection is made: see
-    /// [`client_builder`](Self::client_builder).
+    /// [`build_client`](Self::build_client).
     ///
     /// # Errors
     ///
@@ -268,9 +281,6 @@ impl EgressPolicy {
         match parsed.scheme() {
             "https" => {}
             "http" if self.loopback_http() && loopback_host => {}
-            "http" => {
-                return Err(EgressRefusal::new(what, "HTTPS required"));
-            }
             _ => return Err(EgressRefusal::new(what, "HTTPS required")),
         }
         let range = match host {
@@ -286,8 +296,18 @@ impl EgressPolicy {
         }
     }
 
-    /// An HTTP client builder that follows no redirect and, under a screened
-    /// policy, connects only to addresses outside the reserved ranges.
+    /// An HTTP client that carries this policy, as a [`ScreenedClient`]:
+    /// the only way to make one, so a function that takes a
+    /// `ScreenedClient` knows the client follows no redirect and, under a
+    /// screened policy, connects to no reserved address and follows no
+    /// proxy from the environment. No builder is handed out: a builder
+    /// would take a redirect policy, a proxy or a pinned address after the
+    /// policy's settings and so undo them.
+    ///
+    /// ```compile_fail,E0599
+    /// use axess_factors::egress::EgressPolicy;
+    /// let _ = EgressPolicy::screened().client_builder();
+    /// ```
     ///
     /// The screen runs on the addresses a host name resolves to, at the moment
     /// of connecting, so a name that points at a reserved address is refused
@@ -302,9 +322,36 @@ impl EgressPolicy {
     /// through a proxy either filters at the proxy and uses
     /// [`unscreened`](Self::unscreened), which follows the environment as a
     /// plain client does, or reaches the identity provider directly.
-    pub fn client_builder(self) -> openidconnect::reqwest::ClientBuilder {
-        let builder = openidconnect::reqwest::ClientBuilder::new()
-            .redirect(openidconnect::reqwest::redirect::Policy::none());
+    ///
+    /// `configure` adds the caller's settings to the client as
+    /// [`ClientSettings`]: timeouts, a `User-Agent`, a trusted root
+    /// certificate and a client certificate, the settings that cannot undo
+    /// the policy, and no others. The policy's own settings are applied
+    /// after them.
+    ///
+    /// # Errors
+    ///
+    /// The builder's error: the TLS backend cannot be initialised, or a
+    /// setting does not build (a `User-Agent` that is not a header value).
+    pub fn build_client(
+        self,
+        configure: impl FnOnce(ClientSettings) -> ClientSettings,
+    ) -> Result<ScreenedClient, reqwest::Error> {
+        let settings = configure(ClientSettings {
+            builder: reqwest::ClientBuilder::new(),
+        });
+        let inner = self.screen(settings.builder).build()?;
+        Ok(ScreenedClient {
+            inner,
+            policy: self,
+        })
+    }
+
+    /// The policy's settings on a builder, applied last so they win: no
+    /// redirect, and under a screened policy no environment proxy and the
+    /// address screen in the resolver.
+    fn screen(self, builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+        let builder = builder.redirect(reqwest::redirect::Policy::none());
         if self.is_screened() {
             builder.no_proxy().dns_resolver(Arc::new(ScreenedResolver {
                 allow_loopback: self.loopback_http(),
@@ -312,6 +359,118 @@ impl EgressPolicy {
         } else {
             builder
         }
+    }
+}
+
+/// The settings a caller may add to a client the policy builds, through
+/// [`EgressPolicy::build_client`]: the ones that cannot undo the policy.
+///
+/// A `reqwest` builder offers more, and one of them, a fixed answer for a
+/// host name (`resolve`), would route that name past the address screen:
+/// the resolver the policy installs is asked only about names the caller
+/// did not pin. So the caller does not get the builder. It gets this value,
+/// which offers timeouts, a `User-Agent`, a trusted root certificate and a
+/// client certificate, and nothing else:
+///
+/// ```compile_fail,E0599
+/// use axess_factors::egress::EgressPolicy;
+/// let pinned = "10.0.0.5:443".parse().unwrap();
+/// let _ = EgressPolicy::screened()
+///     .build_client(|settings| settings.resolve("idp.example", pinned));
+/// ```
+///
+/// None of them touches the redirect rule, the proxy rule or the resolver
+/// screen. A proxy is not on offer: a screened policy follows none, and an
+/// unscreened one follows the environment's (`HTTPS_PROXY`), as a plain
+/// client does. A client that needs more than these is not a screened
+/// client, and the policy builds none: it is a `reqwest` client of the
+/// application's own, which no fetch of this library takes.
+#[derive(Debug)]
+#[must_use = "the settings reach the client only when returned to build_client"]
+pub struct ClientSettings {
+    builder: reqwest::ClientBuilder,
+}
+
+impl ClientSettings {
+    /// A timeout for each request as a whole, from the start of the
+    /// connection to the last byte of the body.
+    pub fn timeout(self, timeout: std::time::Duration) -> Self {
+        Self {
+            builder: self.builder.timeout(timeout),
+        }
+    }
+
+    /// A timeout for the connection alone: name lookup, TCP and the TLS
+    /// handshake.
+    pub fn connect_timeout(self, timeout: std::time::Duration) -> Self {
+        Self {
+            builder: self.builder.connect_timeout(timeout),
+        }
+    }
+
+    /// The `User-Agent` sent with every request. Some token endpoints
+    /// refuse a request without one. A value that is not a header value
+    /// (a line break in it, say) is refused when the client is built.
+    pub fn user_agent(self, user_agent: &str) -> Self {
+        Self {
+            builder: self.builder.user_agent(user_agent.to_owned()),
+        }
+    }
+
+    /// Trust `certificate` as a root, beside the bundled web roots: for an
+    /// identity provider on the deployment's own network whose certificate
+    /// chains to a private certificate authority. It widens whom the client
+    /// believes, never where it connects: the address screen and the
+    /// redirect rule are the policy's and stay.
+    pub fn root_certificate(self, certificate: reqwest::Certificate) -> Self {
+        Self {
+            builder: self.builder.add_root_certificate(certificate),
+        }
+    }
+
+    /// The client certificate and key presented on every TLS handshake
+    /// (mutual TLS, RFC 8705), through the rustls backend.
+    pub fn client_certificate(self, identity: reqwest::Identity) -> Self {
+        Self {
+            builder: self.builder.use_rustls_tls().identity(identity),
+        }
+    }
+}
+
+/// An HTTP client built by [`EgressPolicy::build_client`], carrying the
+/// policy it was built under.
+///
+/// A fetch that takes one, such as
+/// [`DiscoveryDocument::fetch`](crate::oidc::DiscoveryDocument::fetch)
+/// or [`JwksCache::fetch`](crate::oidc::JwksCache::fetch),
+/// screens its URLs under [`policy`](Self::policy) and connects through a
+/// client whose redirect, proxy and resolver settings that policy chose, so
+/// the two cannot disagree and a caller cannot hand it a client that
+/// follows a redirect or a DNS answer into a reserved range.
+#[derive(Debug, Clone)]
+pub struct ScreenedClient {
+    inner: reqwest::Client,
+    policy: EgressPolicy,
+}
+
+impl ScreenedClient {
+    /// The policy the client was built under.
+    #[must_use]
+    pub const fn policy(&self) -> EgressPolicy {
+        self.policy
+    }
+
+    /// The client itself, for a request whose URL
+    /// [`check_url`](EgressPolicy::check_url) has passed.
+    #[must_use]
+    pub const fn inner(&self) -> &reqwest::Client {
+        &self.inner
+    }
+
+    /// The client itself, for a holder that keeps the policy beside it.
+    #[must_use]
+    pub fn into_inner(self) -> reqwest::Client {
+        self.inner
     }
 }
 
@@ -342,11 +501,8 @@ struct ScreenedResolver {
     allow_loopback: bool,
 }
 
-impl openidconnect::reqwest::dns::Resolve for ScreenedResolver {
-    fn resolve(
-        &self,
-        name: openidconnect::reqwest::dns::Name,
-    ) -> openidconnect::reqwest::dns::Resolving {
+impl reqwest::dns::Resolve for ScreenedResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let allow_loopback = self.allow_loopback;
         Box::pin(async move {
             let host = name.as_str().to_owned();
@@ -374,7 +530,7 @@ impl openidconnect::reqwest::dns::Resolve for ScreenedResolver {
                 };
                 return Err(why.into());
             }
-            let addrs: openidconnect::reqwest::dns::Addrs = Box::new(allowed.into_iter());
+            let addrs: reqwest::dns::Addrs = Box::new(allowed.into_iter());
             Ok(addrs)
         })
     }

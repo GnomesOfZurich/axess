@@ -1,13 +1,13 @@
 //! The set of sinks a component reports to, one per concern.
 
 use super::{
-    AuditMetrics, AuthFlowMetrics, AuthzCacheMetrics, FactorMetrics, NoopMetrics,
+    AuditMetrics, AuthFlowMetrics, AuthzCacheMetrics, DeviceKeyMetrics, FactorMetrics, NoopMetrics,
     ProviderRegistryMetrics, RequestGuardMetrics, RotationMetrics, SessionMetrics,
 };
 use std::sync::Arc;
 
 /// A type that reports every concern. Implemented for any type that
-/// implements all eight concern traits; use it to wire one exporter to
+/// implements all nine concern traits; use it to wire one exporter to
 /// everything with [`MetricSinks::all`].
 pub trait AxessMetrics:
     AuthFlowMetrics
@@ -18,6 +18,7 @@ pub trait AxessMetrics:
     + RequestGuardMetrics
     + AuthzCacheMetrics
     + AuditMetrics
+    + DeviceKeyMetrics
 {
 }
 
@@ -30,6 +31,7 @@ impl<T> AxessMetrics for T where
         + RequestGuardMetrics
         + AuthzCacheMetrics
         + AuditMetrics
+        + DeviceKeyMetrics
 {
 }
 
@@ -48,6 +50,7 @@ pub struct MetricSinks {
     pub(crate) guard: Arc<dyn RequestGuardMetrics>,
     pub(crate) authz_cache: Arc<dyn AuthzCacheMetrics>,
     pub(crate) audit: Arc<dyn AuditMetrics>,
+    pub(crate) device_keys: Arc<dyn DeviceKeyMetrics>,
 }
 
 impl MetricSinks {
@@ -62,7 +65,8 @@ impl MetricSinks {
             registry: noop.clone(),
             guard: noop.clone(),
             authz_cache: noop.clone(),
-            audit: noop,
+            audit: noop.clone(),
+            device_keys: noop,
         }
     }
 
@@ -76,7 +80,8 @@ impl MetricSinks {
             registry: metrics.clone(),
             guard: metrics.clone(),
             authz_cache: metrics.clone(),
-            audit: metrics,
+            audit: metrics.clone(),
+            device_keys: metrics,
         }
     }
 
@@ -125,6 +130,12 @@ impl MetricSinks {
     /// Report the audit concern to `sink`.
     pub fn with_audit(mut self, sink: Arc<dyn AuditMetrics>) -> Self {
         self.audit = sink;
+        self
+    }
+
+    /// Report the device-key concern to `sink`.
+    pub fn with_device_keys(mut self, sink: Arc<dyn DeviceKeyMetrics>) -> Self {
+        self.device_keys = sink;
         self
     }
 

@@ -9,6 +9,10 @@
 
 #[cfg(not(feature = "testing"))]
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "trybuild runs cargo and the compiler as child processes, which Miri's isolation refuses"
+)]
 fn the_testing_module_is_unreachable_without_the_feature() {
     let cases = trybuild::TestCases::new();
     cases.compile_fail("tests/ui/testing_unreachable.rs");

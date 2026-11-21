@@ -1,5 +1,5 @@
-//! `tests`: extracted from `lib.rs` per the
-//! 200-LoC inline-test rule in AGENTS.md.
+//! `tests`: the unit tests of `lib.rs`, kept beside it per the
+//! 200-line inline-test rule in AGENTS.md.
 
 use super::*;
 use std::collections::HashMap;
@@ -20,11 +20,10 @@ fn from_static_round_trips() {
 }
 
 /// `from_static` of edge-case lengths (0..=4) must not panic. The
-/// `len > N` guards (lines 224..=227 in `repr.rs`) prevent indexing
-/// `bytes[N]` for strings shorter than that. Mutating any guard to
-/// `>=` would index one byte past the input for the threshold length.
-/// We exercise each length so cargo-mutants observes a panic for
-/// every flipped guard.
+/// `len > N` guards in `repr.rs` prevent indexing `bytes[N]` for strings
+/// shorter than that; a guard written `>=` would index one byte past
+/// the input at the threshold length. Each length is exercised, so
+/// every such guard panics here.
 #[test]
 fn from_static_handles_short_lengths_without_panic() {
     const E0: ShortString = ShortString::from_static("");
@@ -281,7 +280,7 @@ fn from_static_is_never_inline_but_never_allocates() {
     // exist: `Static` is allocation-free without carrying its bytes.
     const SHORT: ShortString = ShortString::from_static("ab");
     const LONG: ShortString =
-        ShortString::from_static("spiffe://gnomes.local/compute-worker/gnomes");
+        ShortString::from_static("spiffe://example.org/reporting-worker/acme");
 
     for s in [SHORT, LONG] {
         assert!(
@@ -299,7 +298,7 @@ fn clone_of_an_allocated_value_shares_rather_than_copies() {
     // makes the clone a refcount bump. `CompactString` fails this by
     // design, and a change here that quietly reverted to copying would
     // remove the only reason not to depend on it.
-    let original = ShortString::new("spiffe://gnomes.local/compute-worker/gnomes");
+    let original = ShortString::new("spiffe://example.org/reporting-worker/acme");
     assert!(
         original.is_allocated(),
         "precondition: the case must be over the cap"
@@ -314,28 +313,28 @@ fn clone_of_an_allocated_value_shares_rather_than_copies() {
 }
 
 #[test]
-// `cmp_owned` is right in general and wrong here: building the `String`
-// is the point, since it is the only way to reach
-// `PartialEq<ShortString> for String` rather than the `&str` impl.
-#[allow(clippy::cmp_owned)]
 fn reverse_equality_holds_from_the_std_side() {
     let s = ShortString::new("case-42");
+    // A `String` on the left reaches `PartialEq<ShortString> for String`,
+    // not the `&str` impl, so the owned values are bound and compared.
+    let same = String::from("case-42");
+    let other = String::from("other");
 
     assert!(*"case-42" == s);
     assert!("case-42" == s);
-    assert!(String::from("case-42") == s);
+    assert!(same == s);
 
     assert!(*"other" != s);
     assert!("other" != s);
-    assert!(String::from("other") != s);
+    assert!(other != s);
 }
 
 #[test]
 fn into_string_carries_content_for_every_repr() {
     // One case per form, since each reaches `as_str` differently.
     let inline = ShortString::new("case-42");
-    let stat = ShortString::from_static("spiffe://gnomes.local/compute-worker/gnomes");
-    let shared = ShortString::new("spiffe://gnomes.local/compute-worker/gnomes");
+    let stat = ShortString::from_static("spiffe://example.org/reporting-worker/acme");
+    let shared = ShortString::new("spiffe://example.org/reporting-worker/acme");
 
     assert!(inline.is_inline());
     assert!(!stat.is_allocated() && !stat.is_inline());
@@ -344,10 +343,10 @@ fn into_string_carries_content_for_every_repr() {
     assert_eq!(String::from(inline), "case-42");
     assert_eq!(
         String::from(stat),
-        "spiffe://gnomes.local/compute-worker/gnomes"
+        "spiffe://example.org/reporting-worker/acme"
     );
     assert_eq!(
         String::from(shared),
-        "spiffe://gnomes.local/compute-worker/gnomes"
+        "spiffe://example.org/reporting-worker/acme"
     );
 }

@@ -8,9 +8,10 @@
 
 #![cfg(all(feature = "oauth", feature = "testing"))]
 
-mod common;
+use axess_core::testing::fixtures as common;
 
 use axess_core::authn::AuditContext;
+use axess_core::authn::service::OAuthCallbackRoute;
 use axess_core::{
     authn::service::AuthnService,
     testing::{
@@ -19,6 +20,7 @@ use axess_core::{
     },
 };
 use axess_factors::oauth::{OAuthLoginOptions, OAuthProviderBuilder, OAuthProviderConfig};
+use axess_testing::mock_tracing::TracingCapture;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use common::{test_tenant, test_user};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
@@ -115,7 +117,7 @@ fn build_id_token_with(
     private_der: &[u8],
     extra: serde_json::Value,
 ) -> String {
-    let now = chrono::Utc::now().timestamp();
+    let now = common::start().unix_seconds();
     let mut claims = json!({
         "iss": issuer,
         "sub": subject,
@@ -135,13 +137,8 @@ fn build_id_token_with(
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some(kid.to_string());
 
-    // Signing goes straight to `jsonwebtoken::encode`, which axess does not
-    // wrap, so it needs the provider installed the same as verification does.
-    // With both backends compiled in, which `--all-features` does, deriving
-    // one is impossible and `encode` panics instead of returning an error.
-    axess_factors::jwt::ensure_crypto_provider();
     let key = EncodingKey::from_rsa_der(private_der);
-    jsonwebtoken::encode(&header, &claims, &key).expect("JWT encode")
+    axess_factors::jwt::encode(&header, &claims, &key).expect("JWT encode")
 }
 
 /// Full OIDC discovery → provider setup succeeds against wiremock.
@@ -165,14 +162,16 @@ async fn oidc_discovery_succeeds() {
         .mount(&server)
         .await;
 
-    let provider = OAuthProviderConfig::discover(
+    let provider = OAuthProviderConfig::discover_screened(
         "test",
         &issuer,
         "test-client-id",
         "test-client-secret",
         "http://localhost:3000/callback",
+        axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
     )
     .await
+    .map(|b| b.with_clock(std::sync::Arc::new(common::test_clock())))
     .and_then(OAuthProviderBuilder::build);
 
     assert!(provider.is_ok(), "discovery failed: {:?}", provider.err());
@@ -181,6 +180,7 @@ async fn oidc_discovery_succeeds() {
 /// Full flow: discover → begin_oauth_login → finish_oauth_login with signed JWT.
 #[tokio::test]
 async fn full_oauth_flow_with_signed_id_token() {
+    let clock = common::test_clock();
     let server = MockServer::start().await;
     let issuer = server.uri();
     let client_id = "test-client-id";
@@ -201,22 +201,26 @@ async fn full_oauth_flow_with_signed_id_token() {
         .await;
 
     // Discover the provider.
-    let provider = OAuthProviderConfig::discover(
+    let provider = OAuthProviderConfig::discover_screened(
         "test",
         &issuer,
         client_id,
         "test-secret",
         "http://localhost:3000/callback",
+        axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
     )
     .await
     .expect("discovery should succeed")
+    .with_clock(std::sync::Arc::new(clock.clone()))
     .build()
     .expect("build");
 
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_oauth_provider(provider)
         .build()
         .with_audit_context(AuditContext::default());
@@ -224,7 +228,7 @@ async fn full_oauth_flow_with_signed_id_token() {
     let session = test_session();
 
     // 1. Begin OAuth login; get the authorization URL.
-    let (auth_url, _csrf_state) = authn
+    let (auth_url, _) = authn
         .begin_oauth_login("test", &OAuthLoginOptions::default(), &session)
         .await
         .expect("begin_oauth_login should succeed");
@@ -274,7 +278,13 @@ async fn full_oauth_flow_with_signed_id_token() {
 
     // 5. Finish the OAuth login with the correct CSRF state and a dummy code.
     let result = authn
-        .finish_oauth_login("authorization-code-from-idp", &csrf_state, &session)
+        .finish_oauth_login(
+            OAuthCallbackRoute::global("test"),
+            "authorization-code-from-idp",
+            &csrf_state,
+            None,
+            &session,
+        )
         .await;
 
     match result {
@@ -293,6 +303,7 @@ async fn full_oauth_flow_with_signed_id_token() {
 /// resolver that returns a user from another tenant is refused.
 #[tokio::test]
 async fn cross_tenant_user_refused_after_real_finish() {
+    let clock = common::test_clock();
     let server = MockServer::start().await;
     let issuer = server.uri();
     let client_id = "test-client-id";
@@ -308,23 +319,27 @@ async fn cross_tenant_user_refused_after_real_finish() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "keys": [jwk] })))
         .mount(&server)
         .await;
-    let provider = OAuthProviderConfig::discover(
+    let provider = OAuthProviderConfig::discover_screened(
         "test",
         &issuer,
         client_id,
         "test-secret",
         "http://localhost:3000/callback",
+        axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
     )
     .await
     .expect("discovery should succeed")
+    .with_clock(std::sync::Arc::new(clock.clone()))
     .build()
     .expect("build");
 
     let other_tenant_user = common::test_user_in_tenant("u1", "alice", "t2");
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(other_tenant_user.clone());
     let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_oauth_provider(provider)
         .build()
         .with_audit_context(AuditContext::default());
@@ -369,7 +384,13 @@ async fn cross_tenant_user_refused_after_real_finish() {
         .await;
 
     let claims = authn
-        .finish_oauth_login("code", &csrf, &session)
+        .finish_oauth_login(
+            OAuthCallbackRoute::global("test"),
+            "code",
+            &csrf,
+            None,
+            &session,
+        )
         .await
         .expect("finish should succeed");
     let res = authn
@@ -387,6 +408,7 @@ async fn cross_tenant_user_refused_after_real_finish() {
 async fn login_with_extra_claims(
     extra: serde_json::Value,
 ) -> Result<axess_factors::oauth::OAuthClaims, axess_factors::oauth::OAuthError> {
+    let clock = common::test_clock();
     let server = MockServer::start().await;
     let issuer = server.uri();
     let client_id = "test-client-id";
@@ -409,21 +431,27 @@ async fn login_with_extra_claims(
         )
         .mount(&server)
         .await;
-    let provider = OAuthProviderConfig::discover(
+    let provider = OAuthProviderConfig::discover_screened(
         "test",
         &issuer,
         client_id,
         "test-secret",
         "http://localhost:3000/callback",
+        axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
     )
     .await
     .expect("discovery should succeed")
+    .with_clock(std::sync::Arc::new(clock.clone()))
     .build()
     .expect("build");
-    let authn = AuthnService::builder(MockIdentityStore::new(), MockFactorStore::new())
-        .with_oauth_provider(provider)
-        .build()
-        .with_audit_context(AuditContext::default());
+    let authn = AuthnService::builder(
+        MockIdentityStore::new().with_clock(clock.clone()),
+        MockFactorStore::new(),
+    )
+    .with_clock(clock.clone())
+    .with_oauth_provider(provider)
+    .build()
+    .with_audit_context(AuditContext::default());
     let session = test_session();
     authn
         .begin_oauth_login("test", &OAuthLoginOptions::default(), &session)
@@ -458,7 +486,15 @@ async fn login_with_extra_claims(
         })))
         .mount(&server)
         .await;
-    authn.finish_oauth_login("code", &csrf, &session).await
+    authn
+        .finish_oauth_login(
+            OAuthCallbackRoute::global("test"),
+            "code",
+            &csrf,
+            None,
+            &session,
+        )
+        .await
 }
 
 /// `groups`, `roles` and `sid` in the ID token reach `OAuthClaims`, so
@@ -478,6 +514,7 @@ async fn id_token_groups_roles_and_sid_reach_oauth_claims() {
 /// Token endpoint returning error should propagate as TokenExchange error.
 #[tokio::test]
 async fn oauth_token_endpoint_error_propagates() {
+    let clock = common::test_clock();
     let server = MockServer::start().await;
     let issuer = server.uri();
     let (_, jwk, _) = generate_rsa_keypair();
@@ -504,20 +541,25 @@ async fn oauth_token_endpoint_error_propagates() {
         .mount(&server)
         .await;
 
-    let provider = OAuthProviderConfig::discover(
+    let provider = OAuthProviderConfig::discover_screened(
         "test",
         &issuer,
         "client-id",
         "secret",
         "http://localhost:3000/callback",
+        axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
     )
     .await
     .unwrap()
+    .with_clock(std::sync::Arc::new(clock.clone()))
     .build()
     .unwrap();
 
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
     let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_oauth_provider(provider)
         .build()
         .with_audit_context(AuditContext::default());
@@ -535,7 +577,13 @@ async fn oauth_token_endpoint_error_propagates() {
         .unwrap();
 
     let result = authn
-        .finish_oauth_login("expired-code", &csrf, &session)
+        .finish_oauth_login(
+            OAuthCallbackRoute::global("test"),
+            "expired-code",
+            &csrf,
+            None,
+            &session,
+        )
         .await;
     assert!(result.is_err(), "should fail on token exchange error");
 }
@@ -545,6 +593,7 @@ async fn oauth_token_endpoint_error_propagates() {
 /// rather than the catch-all `TokenExchange`.
 #[tokio::test]
 async fn revoke_unsupported_token_type_maps_to_typed_variant() {
+    let clock = common::test_clock();
     use axess_factors::oauth::{OAuthError, OAuthProvider};
 
     let server = MockServer::start().await;
@@ -575,15 +624,17 @@ async fn revoke_unsupported_token_type_maps_to_typed_variant() {
         .mount(&server)
         .await;
 
-    let provider = OAuthProviderConfig::discover(
+    let provider = OAuthProviderConfig::discover_screened(
         "test",
         &issuer,
         "client-id",
         "secret",
         "http://localhost:3000/callback",
+        axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
     )
     .await
     .unwrap()
+    .with_clock(std::sync::Arc::new(clock.clone()))
     .with_revocation_endpoint(format!("{issuer}/revoke"))
     .build()
     .unwrap();
@@ -609,9 +660,9 @@ async fn unknown_kid_yields_typed_variant() {
     let server = MockServer::start().await;
     let issuer = server.uri();
     // JWKS publishes "key-1" only.
-    let (_, jwk_published, _kid_published) = generate_rsa_keypair();
+    let (_, jwk_published, _) = generate_rsa_keypair();
     // We sign with a different key + a kid the JWKS does NOT carry.
-    let (private_unknown, _jwk_unknown, _) = generate_rsa_keypair();
+    let (private_unknown, _, _) = generate_rsa_keypair();
     let kid_unknown = "rotated-but-not-yet-published".to_string();
 
     Mock::given(method("GET"))
@@ -626,19 +677,21 @@ async fn unknown_kid_yields_typed_variant() {
         .mount(&server)
         .await;
 
-    let provider = OAuthProviderConfig::discover(
+    let provider = OAuthProviderConfig::discover_screened(
         "test",
         &issuer,
         "client-id",
         "secret",
         "http://localhost:3000/callback",
+        axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
     )
     .await
     .unwrap()
+    .with_clock(std::sync::Arc::new(common::test_clock()))
     .build()
     .unwrap();
 
-    let now = chrono::Utc::now().timestamp();
+    let now = common::start().unix_seconds();
     let claims = json!({
         "iss": issuer,
         "aud": "client-id",
@@ -649,9 +702,8 @@ async fn unknown_kid_yields_typed_variant() {
     });
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some(kid_unknown.clone());
-    axess_factors::jwt::ensure_crypto_provider();
     let key = EncodingKey::from_rsa_der(&private_unknown);
-    let token = jsonwebtoken::encode(&header, &claims, &key).expect("JWT encode");
+    let token = axess_factors::jwt::encode(&header, &claims, &key).expect("JWT encode");
 
     let err = provider
         .verify_logout_jwt(&token)
@@ -669,6 +721,7 @@ async fn unknown_kid_yields_typed_variant() {
 /// with the switch off the same token gets as far as the key lookup.
 #[tokio::test]
 async fn a_required_logout_typ_refuses_a_generic_jwt_header() {
+    let clock = common::test_clock();
     use axess_factors::oauth::{OAuthError, OAuthProvider};
 
     let server = MockServer::start().await;
@@ -687,14 +740,17 @@ async fn a_required_logout_typ_refuses_a_generic_jwt_header() {
         .mount(&server)
         .await;
 
-    let discover = || {
-        OAuthProviderConfig::discover(
+    let discover = || async {
+        OAuthProviderConfig::discover_screened(
             "test",
             &issuer,
             "client-id",
             "secret",
             "http://localhost:3000/callback",
+            axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
         )
+        .await
+        .map(|b| b.with_clock(std::sync::Arc::new(clock.clone())))
     };
     let lenient = discover().await.unwrap().build().unwrap();
     let strict = discover()
@@ -707,16 +763,15 @@ async fn a_required_logout_typ_refuses_a_generic_jwt_header() {
     let claims = json!({
         "iss": issuer,
         "aud": "client-id",
-        "iat": chrono::Utc::now().timestamp(),
+        "iat": common::start().unix_seconds(),
         "jti": "logout-1",
         "events": { "http://schemas.openid.net/event/backchannel-logout": {} },
         "sub": "user-123",
     });
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some("not-published".to_string());
-    axess_factors::jwt::ensure_crypto_provider();
     let key = EncodingKey::from_rsa_der(&private_unknown);
-    let token = jsonwebtoken::encode(&header, &claims, &key).expect("JWT encode");
+    let token = axess_factors::jwt::encode(&header, &claims, &key).expect("JWT encode");
 
     match strict.verify_logout_jwt(&token) {
         Err(OAuthError::IdTokenValidation(reason)) => {
@@ -733,7 +788,7 @@ async fn a_required_logout_typ_refuses_a_generic_jwt_header() {
     );
 
     header.typ = Some("logout+jwt".to_string());
-    let explicit = jsonwebtoken::encode(&header, &claims, &key).expect("JWT encode");
+    let explicit = axess_factors::jwt::encode(&header, &claims, &key).expect("JWT encode");
     assert!(
         matches!(
             strict.verify_logout_jwt(&explicit),
@@ -751,6 +806,7 @@ async fn a_required_logout_typ_refuses_a_generic_jwt_header() {
 /// takes it, and an empty or symmetric list is refused when it is set.
 #[tokio::test]
 async fn a_pinned_algorithm_list_decides_which_logout_tokens_verify() {
+    let clock = common::test_clock();
     use axess_factors::oauth::{OAuthError, OAuthProvider};
 
     let server = MockServer::start().await;
@@ -768,14 +824,17 @@ async fn a_pinned_algorithm_list_decides_which_logout_tokens_verify() {
         .mount(&server)
         .await;
 
-    let discover = || {
-        OAuthProviderConfig::discover(
+    let discover = || async {
+        OAuthProviderConfig::discover_screened(
             "test",
             &issuer,
             "client-id",
             "secret",
             "http://localhost:3000/callback",
+            axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
         )
+        .await
+        .map(|b| b.with_clock(std::sync::Arc::new(clock.clone())))
     };
     let unpinned = discover().await.unwrap().build().unwrap();
     let rs256 = discover()
@@ -794,16 +853,15 @@ async fn a_pinned_algorithm_list_decides_which_logout_tokens_verify() {
     let claims = json!({
         "iss": issuer,
         "aud": "client-id",
-        "iat": chrono::Utc::now().timestamp(),
-        "exp": chrono::Utc::now().timestamp() + 120,
+        "iat": common::start().unix_seconds(),
+        "exp": common::start().unix_seconds() + 120,
         "jti": "logout-1",
         "events": { "http://schemas.openid.net/event/backchannel-logout": {} },
         "sub": "user-123",
     });
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some(kid);
-    axess_factors::jwt::ensure_crypto_provider();
-    let token = jsonwebtoken::encode(&header, &claims, &EncodingKey::from_rsa_der(&private))
+    let token = axess_factors::jwt::encode(&header, &claims, &EncodingKey::from_rsa_der(&private))
         .expect("JWT encode");
 
     unpinned.verify_logout_jwt(&token).expect("unpinned");
@@ -838,6 +896,7 @@ async fn a_pinned_algorithm_list_decides_which_logout_tokens_verify() {
 /// retry instead of treating it the same as a permanent rejection.
 #[tokio::test]
 async fn revoke_5xx_maps_to_transient_variant() {
+    let clock = common::test_clock();
     use axess_factors::oauth::{OAuthError, OAuthProvider};
 
     let server = MockServer::start().await;
@@ -867,15 +926,17 @@ async fn revoke_5xx_maps_to_transient_variant() {
         .mount(&server)
         .await;
 
-    let provider = OAuthProviderConfig::discover(
+    let provider = OAuthProviderConfig::discover_screened(
         "test",
         &issuer,
         "client-id",
         "secret",
         "http://localhost:3000/callback",
+        axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
     )
     .await
     .unwrap()
+    .with_clock(std::sync::Arc::new(clock.clone()))
     .with_revocation_endpoint(format!("{issuer}/revoke"))
     .build()
     .unwrap();
@@ -920,6 +981,7 @@ async fn basic_only_provider(
     server: &MockServer,
     token_answer: ResponseTemplate,
 ) -> OAuthProviderBuilder {
+    let clock = common::test_clock();
     let issuer = server.uri();
     let (_, jwk, _) = generate_rsa_keypair();
     let mut discovery = discovery_document(&issuer);
@@ -944,15 +1006,17 @@ async fn basic_only_provider(
         .respond_with(BasicOnly(ResponseTemplate::new(200)))
         .mount(server)
         .await;
-    OAuthProviderConfig::discover(
+    OAuthProviderConfig::discover_screened(
         "test",
         &issuer,
         "client-id",
         "secret",
         "http://localhost:3000/callback",
+        axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
     )
     .await
     .unwrap()
+    .with_clock(std::sync::Arc::new(clock.clone()))
     .with_revocation_endpoint(format!("{issuer}/revoke"))
 }
 
@@ -1006,6 +1070,195 @@ async fn the_device_poll_authenticates_with_basic_when_the_client_holds_a_secret
     assert!(matches!(outcome, DeviceTokenOutcome::Pending));
 }
 
+/// The IdP's refusal text reaches the caller with control characters and the
+/// Unicode line separators escaped and its length capped, so an IdP (or a
+/// party between) cannot forge a log line through a device-flow denial.
+#[tokio::test]
+async fn the_device_poll_denial_text_is_log_safe() {
+    use axess_factors::oauth::{DeviceTokenOutcome, OAuthProvider};
+    let server = MockServer::start().await;
+    let provider = basic_only_provider(&server, ResponseTemplate::new(200))
+        .await
+        .build()
+        .unwrap();
+    // Long enough to cross the 512-byte cap, short enough for the whole
+    // error body to stay under the 1 KiB the error reader keeps.
+    let mut description = "declined\r\nINFO forged line\x1b[2J\u{2028}".to_string();
+    description.push_str(&"A".repeat(600));
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(BasicOnly(ResponseTemplate::new(400).set_body_json(
+            json!({"error": "access_denied", "error_description": description}),
+        )))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+
+    let outcome = provider
+        .poll_device_token("device-code", 5, None, None)
+        .await
+        .expect("a refusal is an outcome, not an error");
+    let DeviceTokenOutcome::Denied(text) = outcome else {
+        panic!("expected Denied, got {outcome:?}");
+    };
+    assert!(!text.chars().any(char::is_control), "{text:?}");
+    assert!(!text.contains('\u{2028}'), "{text:?}");
+    assert!(
+        text.contains("declined") && text.contains("forged line"),
+        "{text}"
+    );
+    assert!(text.len() <= 512, "{} bytes", text.len());
+}
+
+/// An upstream `error` code that carries a line break, a terminal escape
+/// and a Unicode line separator: what a forged log line is made of.
+const FORGED_ERROR_CODE: &str = "invalid_scope\r\nINFO forged line\x1b[2J\u{2028}";
+
+/// `text` kept the words of the forged code and none of its control
+/// characters or line separators.
+fn assert_log_safe(text: &str) {
+    assert!(!text.chars().any(char::is_control), "{text:?}");
+    assert!(!text.contains('\u{2028}'), "{text:?}");
+    assert!(
+        text.contains("invalid_scope") && text.contains("forged line"),
+        "{text}"
+    );
+}
+
+/// The captured log line whose message holds `message` carries the code
+/// escaped, not raw.
+fn assert_log_line_is_safe(capture: &TracingCapture, message: &str) {
+    let events = capture.events();
+    let line = events
+        .iter()
+        .find(|e| e.message.contains(message))
+        .unwrap_or_else(|| panic!("no log line {message:?} among {events:?}"));
+    assert_log_safe(&line.message);
+}
+
+/// The `error` code of a refused device authorization request is the
+/// identity provider's text as much as a description is: it comes out with
+/// control characters and the line separators escaped, in the error the
+/// caller gets and in the log line.
+#[tokio::test]
+async fn the_device_authorization_refusal_code_is_log_safe() {
+    use axess_factors::oauth::{OAuthError, OAuthProvider};
+    let capture = TracingCapture::install();
+    let server = MockServer::start().await;
+    let issuer = server.uri();
+    Mock::given(method("POST"))
+        .and(path("/device"))
+        .respond_with(BasicOnly(
+            ResponseTemplate::new(400).set_body_json(json!({"error": FORGED_ERROR_CODE})),
+        ))
+        .mount(&server)
+        .await;
+    let provider = basic_only_provider(&server, ResponseTemplate::new(200))
+        .await
+        .with_device_authorization_endpoint(format!("{issuer}/device"))
+        .build()
+        .unwrap();
+
+    let err = provider
+        .request_device_code(&["openid"])
+        .await
+        .expect_err("a refused request is an error");
+    let OAuthError::DeviceAuthorization(code) = &err else {
+        panic!("expected DeviceAuthorization, got {err:?}");
+    };
+    assert_log_safe(code);
+    assert_log_line_is_safe(&capture, "device authorization endpoint error");
+}
+
+/// The `error` code of a refused `client_credentials` grant comes out
+/// escaped, in the error and in the log line.
+#[tokio::test]
+async fn the_client_credentials_refusal_code_is_log_safe() {
+    use axess_factors::oauth::{OAuthError, OAuthProvider};
+    let capture = TracingCapture::install();
+    let server = MockServer::start().await;
+    let answer = ResponseTemplate::new(400).set_body_json(json!({"error": FORGED_ERROR_CODE}));
+    let provider = basic_only_provider(&server, answer).await.build().unwrap();
+
+    let err = provider
+        .client_credentials(&["scope-a"], None)
+        .await
+        .expect_err("a refused grant is an error");
+    let OAuthError::TokenExchange(code) = &err else {
+        panic!("expected TokenExchange, got {err:?}");
+    };
+    assert_log_safe(code);
+    assert_log_line_is_safe(&capture, "client_credentials token endpoint error");
+}
+
+/// A refused revocation names the server's `error` code in its log line
+/// only (the error keeps the status): the code comes out escaped there.
+#[tokio::test]
+async fn the_revocation_refusal_code_is_log_safe() {
+    use axess_factors::oauth::OAuthProvider;
+    let capture = TracingCapture::install();
+    let server = MockServer::start().await;
+    let provider = basic_only_provider(&server, ResponseTemplate::new(200))
+        .await
+        .build()
+        .unwrap();
+    Mock::given(method("POST"))
+        .and(path("/revoke"))
+        .respond_with(BasicOnly(
+            ResponseTemplate::new(400).set_body_json(json!({"error": FORGED_ERROR_CODE})),
+        ))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+
+    provider
+        .revoke_token("dummy-token", None, None)
+        .await
+        .expect_err("a refused revocation is an error");
+    assert_log_line_is_safe(&capture, "token revocation failed");
+}
+
+/// A refused authorization-code or refresh grant keeps the token endpoint's
+/// `error` and `error_description` in its message, which the login logs:
+/// both are the identity provider's text and come out with control
+/// characters and the line separators escaped.
+#[tokio::test]
+async fn the_code_and_refresh_grant_refusal_text_is_log_safe() {
+    use axess_factors::oauth::{OAuthError, OAuthProvider};
+    let server = MockServer::start().await;
+    let answer = ResponseTemplate::new(400).set_body_json(json!({
+        "error": FORGED_ERROR_CODE,
+        "error_description": "code expired\nERROR forged description\x1b[2J\u{2029}",
+    }));
+    let provider = basic_only_provider(&server, answer).await.build().unwrap();
+
+    let code = provider
+        .exchange_code("code", "verifier".to_string(), "nonce".to_string(), None)
+        .await
+        .expect_err("a refused code grant is an error");
+    let refresh = provider
+        .refresh_token("refresh-token", "subject", None, None)
+        .await
+        .expect_err("a refused refresh grant is an error");
+    for err in [code, refresh] {
+        let OAuthError::TokenExchange(text) = &err else {
+            panic!("expected TokenExchange, got {err:?}");
+        };
+        assert_log_safe(text);
+        assert!(!text.contains('\u{2029}'), "{text:?}");
+        assert!(
+            text.contains("invalid_scope\\r\\nINFO forged line\\u{1b}[2J\\u{2028}"),
+            "the code is kept, escaped: {text}"
+        );
+        assert!(
+            text.contains("code expired\\nERROR forged description\\u{1b}[2J\\u{2029}"),
+            "the description is kept, escaped: {text}"
+        );
+        // The message is what a log line carries.
+        assert!(!err.to_string().chars().any(char::is_control), "{err:?}");
+    }
+}
+
 /// A token endpoint that answers 200 and then drops the connection before
 /// the body is complete. Returns the endpoint's address.
 async fn token_endpoint_that_cuts_off_its_body() -> std::net::SocketAddr {
@@ -1054,15 +1307,17 @@ async fn a_token_answer_cut_off_after_a_200_is_transient() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "keys": [jwk] })))
         .mount(&server)
         .await;
-    let provider = OAuthProviderConfig::discover(
+    let provider = OAuthProviderConfig::discover_screened(
         "test",
         &issuer,
         "client-id",
         "secret",
         "http://localhost:3000/callback",
+        axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
     )
     .await
     .unwrap()
+    .with_clock(std::sync::Arc::new(common::test_clock()))
     .build()
     .unwrap();
 

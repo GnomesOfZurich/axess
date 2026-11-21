@@ -1,0 +1,38 @@
+# The Rust toolchain rust-toolchain.toml pins, installed for a job that runs
+# on a push, a pull request or a release. The release is read from that file
+# and written nowhere else, so moving the pin is one line there and every
+# such job builds with what a checkout builds with. The repository pins its
+# compiler because a stable release that added a lint turned the clippy gate
+# red with no commit responsible (rust-toolchain.toml says how); a job on
+# `stable` would meet that release the day it ships.
+#
+# The step installs exactly the release the file names. rustup takes the
+# file over its default toolchain, and RUSTUP_TOOLCHAIN over the file, so
+# the compiler is that release whichever of the two the install step sets.
+# scripts/check-workflow-pins.sh refuses `stable` and `beta` in a workflow
+# that runs on a push, a pull request or a release.
+name: Pinned Rust toolchain
+description: Installs the release rust-toolchain.toml pins, with the components a job names.
+inputs:
+  components:
+    description: Components beside the minimal profile, comma-separated (clippy, rustfmt, llvm-tools-preview).
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - id: pin
+      name: Read the release rust-toolchain.toml pins
+      shell: bash
+      run: |
+        set -eu
+        channel=$(sed -n 's/^channel *= *"\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)" *$/\1/p' rust-toolchain.toml)
+        if [ -z "$channel" ]; then
+          echo "::error::rust-toolchain.toml names no exact release (channel = \"X.Y.Z\")."
+          exit 1
+        fi
+        echo "channel=$channel" >> "$GITHUB_OUTPUT"
+    - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+      with:
+        toolchain: ${{ steps.pin.outputs.channel }}
+        components: ${{ inputs.components }}

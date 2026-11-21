@@ -51,30 +51,49 @@ pub(crate) fn require_https_or_loopback(url: &Url) -> Result<(), &'static str> {
 #[error("HTTP client could not be built: {0}")]
 pub struct ClientBuildError(#[source] reqwest::Error);
 
-/// A client that follows no redirects and has a connect and a request timeout.
+/// The HTTP client of a credential-bearing outbound client: built by the
+/// unscreened egress policy, so it follows no redirect, with a connect and
+/// a request timeout first and the caller's settings after them.
+///
+/// Unscreened, because these endpoints are the adopter's own configuration
+/// (a cloud STS endpoint, a token endpoint it registered) and each request
+/// is held to the transport rule ([`require_https_or_loopback`]): the
+/// environment's proxy is followed as a plain client follows it, and no
+/// address is refused. The caller's settings are a
+/// [`ClientSettings`](axess_factors::egress::ClientSettings), which offers
+/// nothing that restores redirects.
 ///
 /// # Errors
 ///
 /// [`ClientBuildError`] when the client cannot be built; it is never
 /// swallowed.
-#[cfg(any(feature = "delegated-exchange", feature = "delegated-stored"))]
-pub(crate) fn hardened_client() -> Result<reqwest::Client, ClientBuildError> {
-    harden(reqwest::Client::builder())
+pub(crate) fn hardened_client(
+    configure: impl FnOnce(
+        axess_factors::egress::ClientSettings,
+    ) -> axess_factors::egress::ClientSettings,
+) -> Result<reqwest::Client, ClientBuildError> {
+    hardened_screened_client(configure).map(axess_factors::egress::ScreenedClient::into_inner)
 }
 
-/// [`hardened_client`] on a builder the caller started: the policy applied,
-/// the build error surfaced. The cloud STS adapters build their default
-/// client here too.
+/// [`hardened_client`], kept in the type that says the library built it,
+/// for a function that takes its client from the caller.
 ///
 /// # Errors
 ///
 /// [`ClientBuildError`] when the client cannot be built.
-pub(crate) fn harden(builder: reqwest::ClientBuilder) -> Result<reqwest::Client, ClientBuildError> {
-    builder
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
-        .build()
+pub(crate) fn hardened_screened_client(
+    configure: impl FnOnce(
+        axess_factors::egress::ClientSettings,
+    ) -> axess_factors::egress::ClientSettings,
+) -> Result<axess_factors::egress::ScreenedClient, ClientBuildError> {
+    axess_factors::egress::EgressPolicy::unscreened()
+        .build_client(|settings| {
+            configure(
+                settings
+                    .connect_timeout(CONNECT_TIMEOUT)
+                    .timeout(REQUEST_TIMEOUT),
+            )
+        })
         .map_err(ClientBuildError)
 }
 
@@ -105,20 +124,18 @@ mod tests {
     }
 
     /// A client that cannot be built is an error, never `reqwest::Client::default()`
-    /// (redirects followed, no timeouts) in its place. A TLS configuration of
-    /// a type no backend recognises is the one build failure a test can
-    /// arrange whatever TLS backend the feature set resolves to.
-    #[cfg(any(feature = "delegated-exchange", feature = "delegated-stored"))]
+    /// (redirects followed, no timeouts) in its place. A `User-Agent` that is
+    /// not a header value is a build failure a test can arrange whatever TLS
+    /// backend the feature set resolves to.
     #[test]
     fn a_client_that_cannot_be_built_is_an_error_not_a_default_client() {
-        let unbuildable = reqwest::Client::builder().use_preconfigured_tls(());
-        let result = harden(unbuildable);
+        let result = hardened_client(|settings| settings.user_agent("not a\nheader value"));
         assert!(
             result.is_err(),
             "a failed build must surface, not fall back to an unhardened client"
         );
         assert!(
-            hardened_client().is_ok(),
+            hardened_client(|settings| settings).is_ok(),
             "the default build still succeeds"
         );
     }

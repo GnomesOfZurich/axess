@@ -245,7 +245,7 @@ impl<P: AuthzEntityProvider> AuthzStore<P> {
         schema_json: &str,
         origin: ReloadOrigin,
     ) -> Result<Reloaded, AuthzError> {
-        let _serialised = self.reload.lock.lock().await;
+        let serialised = self.reload.lock.lock().await;
 
         // Validate before swap: nothing below the next three lines runs for
         // a set that failed to parse, validate or fit the provider.
@@ -316,6 +316,9 @@ impl<P: AuthzEntityProvider> AuthzStore<P> {
             announced,
             "policy set reloaded",
         );
+        // One reload at a time, from the parse through the hooks and the
+        // announcement: the next reload begins after this one is logged.
+        drop(serialised);
         Ok(Reloaded {
             digest,
             cache_invalidated,

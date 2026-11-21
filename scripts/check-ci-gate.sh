@@ -28,7 +28,7 @@ needs="$(awk -v gate="$GATE" '
   in_gate && in_needs && /^      - / { sub(/^      - /, ""); sub(/[[:space:]#].*/, ""); print; next }
   in_gate && in_needs && /^    [A-Za-z]/ { in_needs = 0 }' "$WORKFLOW" | sort)"
 
-if ! printf '%s\n' "$jobs" | grep -qx "$GATE"; then
+if ! grep -qx -- "$GATE" <<<"$jobs"; then
   echo "REFUSED: $WORKFLOW has no '$GATE' job." >&2
   exit 1
 fi
@@ -40,13 +40,13 @@ fi
 errors=0
 for job in $jobs; do
   [ "$job" = "$GATE" ] && continue
-  if ! printf '%s\n' "$needs" | grep -qx "$job"; then
+  if ! grep -qx -- "$job" <<<"$needs"; then
     echo "REFUSED: job '$job' is not in the needs of '$GATE', so it cannot block a release pull request." >&2
     errors=$((errors + 1))
   fi
 done
 for need in $needs; do
-  if ! printf '%s\n' "$jobs" | grep -qx "$need"; then
+  if ! grep -qx -- "$need" <<<"$jobs"; then
     echo "REFUSED: '$GATE' needs '$need', which is not a job in $WORKFLOW." >&2
     errors=$((errors + 1))
   fi

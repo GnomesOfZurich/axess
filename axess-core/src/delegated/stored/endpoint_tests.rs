@@ -3,17 +3,18 @@
 
 use super::*;
 use crate::delegated::error::DelegatedError;
+use axess_clock::Timestamp;
 use axess_clock::testing::MockClock;
+use axess_clock::testing::Shift;
 use axess_identity::{TenantId, UserId};
 use axess_rng::testing::MockRng;
-use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use url::Url;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-fn t0() -> DateTime<Utc> {
-    DateTime::from_timestamp(1_700_000_000, 0).expect("fixed t0")
+fn t0() -> Timestamp {
+    Timestamp::from_unix_seconds(1_700_000_000).expect("fixed t0")
 }
 
 fn provider_at(token_endpoint: &str) -> Arc<DelegatedProvider> {
@@ -23,20 +24,20 @@ fn provider_at(token_endpoint: &str) -> Arc<DelegatedProvider> {
         Url::parse(token_endpoint).unwrap(),
         "client",
         "secret",
-        Url::parse("https://gnomes.local/callback").unwrap(),
+        Url::parse("https://example.org/callback").unwrap(),
     ))
 }
 
 #[tokio::test]
 async fn a_plain_http_remote_token_endpoint_is_refused_before_any_request() {
     let provider = provider_at("http://192.0.2.1:9/token");
-    let (_url, ctx) = begin_grant(&provider, &[], &MockRng::new(1)).expect("begin_grant");
+    let (_, ctx) = begin_grant(&provider, &[], &MockRng::new(1)).expect("begin_grant");
     let err = complete_grant(
         &provider,
         &ctx,
         "code",
         &ctx.state,
-        &reqwest::Client::new(),
+        &grant_client(|settings| settings).expect("client"),
         &MockClock::at(t0()),
     )
     .await
@@ -71,9 +72,10 @@ async fn the_default_session_client_does_not_follow_a_redirect() {
             &user,
             StoredDelegation {
                 provider: provider.name.clone(),
+                registration: Some(GrantRegistration::of(&provider)),
                 access_token: "stale".into(),
                 refresh_token: Some("rt".into()),
-                expires_at: Some(t0() - chrono::Duration::seconds(60)),
+                expires_at: Some(t0().minus(axess_clock::SignedDuration::seconds(60))),
                 scopes: vec![],
                 token_type: "Bearer".to_string(),
             },
@@ -93,7 +95,7 @@ fn provider_with_authorization_endpoint(authorization_endpoint: &str) -> Delegat
         Url::parse("https://idp.example/token").unwrap(),
         "client",
         "secret",
-        Url::parse("https://gnomes.local/callback").unwrap(),
+        Url::parse("https://example.org/callback").unwrap(),
     )
 }
 
@@ -127,4 +129,79 @@ fn a_loopback_or_https_authorization_endpoint_is_accepted_by_begin_grant() {
             "{endpoint}"
         );
     }
+}
+
+fn provider_with_redirect_uri(redirect_uri: &str) -> DelegatedProvider {
+    DelegatedProvider::new(
+        "p",
+        Url::parse("https://idp.example/authorize").unwrap(),
+        Url::parse("https://idp.example/token").unwrap(),
+        "client",
+        "secret",
+        Url::parse(redirect_uri).unwrap(),
+    )
+}
+
+/// The IdP sends the browser back to `redirect_uri` with the code and the
+/// `state`: a plain-HTTP remote one would carry them in clear, so it is
+/// refused by name before the browser is sent anywhere.
+#[test]
+fn a_plain_http_remote_redirect_uri_is_refused_by_begin_grant() {
+    let provider = provider_with_redirect_uri("http://app.example/cb");
+
+    let refused = begin_grant(&provider, &[], &MockRng::new(1));
+
+    assert!(
+        matches!(&refused, Err(DelegatedError::Transport(m)) if m.contains("redirect_uri")),
+        "{:?}",
+        refused.map(|(url, _)| url.scheme().to_owned())
+    );
+}
+
+#[test]
+fn a_loopback_or_https_redirect_uri_is_accepted_by_begin_grant() {
+    for redirect_uri in [
+        "http://127.0.0.1:3000/cb",
+        "http://localhost:3000/cb",
+        "http://[::1]:3000/cb",
+        "https://app.example/cb",
+    ] {
+        let provider = provider_with_redirect_uri(redirect_uri);
+        assert!(
+            begin_grant(&provider, &[], &MockRng::new(1)).is_ok(),
+            "{redirect_uri}"
+        );
+    }
+}
+
+/// The code exchange echoes `redirect_uri` to the token endpoint; a provider
+/// whose `redirect_uri` the grant could not have begun with is refused here
+/// too, before any request.
+#[tokio::test]
+async fn a_plain_http_remote_redirect_uri_is_refused_by_complete_grant() {
+    let provider = provider_with_redirect_uri("http://app.example/cb");
+    let context = GrantContext {
+        state: "state-value".to_string(),
+        code_verifier: axess_factors::ZeroizedString::from(
+            "verifier-verifier-verifier-verifier-verifier-ok".to_string(),
+        ),
+        requested_scopes: vec![],
+        registration: GrantRegistration::of(&provider),
+    };
+
+    let err = complete_grant(
+        &provider,
+        &context,
+        "code",
+        "state-value",
+        &grant_client(|settings| settings).expect("client"),
+        &MockClock::at(t0()),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(&err, DelegatedError::Transport(m) if m.contains("redirect_uri")),
+        "{err}"
+    );
 }

@@ -648,7 +648,7 @@ where
         user_id: &crate::authn::ids::UserId,
     ) -> impl std::future::Future<
         Output = Result<
-            (u32, Option<chrono::DateTime<chrono::Utc>>),
+            (u32, Option<axess_clock::Timestamp>),
             <L as crate::authn::store::IdentityLookup>::Error,
         >,
     > + Send {
@@ -698,7 +698,7 @@ where
     fn record_last_login(
         &self,
         user_id: &crate::authn::ids::UserId,
-        at: chrono::DateTime<chrono::Utc>,
+        at: axess_clock::Timestamp,
     ) -> impl std::future::Future<
         Output = Result<(), <L as crate::authn::store::IdentityLookup>::Error>,
     > + Send {

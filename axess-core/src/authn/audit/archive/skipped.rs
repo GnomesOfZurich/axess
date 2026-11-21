@@ -7,7 +7,7 @@ const STRIKES_BEFORE_SKIP: u32 = 3;
 
 /// How long a row the sink keeps refusing is left out of the selection before
 /// it is offered again.
-const SKIP_FOR: chrono::Duration = chrono::Duration::hours(1);
+const SKIP_FOR: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 /// The most rows tracked at once; past it a refused row is retried every tick
 /// as before rather than growing the record without bound.
@@ -22,15 +22,18 @@ pub(super) struct Skipped {
 
 struct RowRefusals {
     strikes: u32,
-    until: Option<chrono::DateTime<chrono::Utc>>,
+    until: Option<axess_clock::Until>,
 }
 
 impl Skipped {
     /// Forget skips that ran out, keeping their strikes so one more refusal
     /// sets the row aside again.
-    pub(super) fn expire(&mut self, now: chrono::DateTime<chrono::Utc>) {
+    pub(super) fn expire(&mut self, now: axess_clock::Timestamp) {
         for row in self.rows.values_mut() {
-            if row.until.is_some_and(|until| until <= now) {
+            if row
+                .until
+                .is_some_and(|until| until <= axess_clock::Until::At(now))
+            {
                 row.until = None;
             }
         }
@@ -46,12 +49,7 @@ impl Skipped {
 
     /// Note a refusal of `id`; `certain` when the sink took another row in
     /// the same tick, which shows the row itself is what it refuses.
-    pub(super) fn refused(
-        &mut self,
-        id: String,
-        certain: bool,
-        now: chrono::DateTime<chrono::Utc>,
-    ) {
+    pub(super) fn refused(&mut self, id: String, certain: bool, now: axess_clock::Timestamp) {
         if !self.rows.contains_key(&id) && self.rows.len() >= MAX_TRACKED_ROWS {
             return;
         }
@@ -62,7 +60,7 @@ impl Skipped {
         row.strikes += 1;
         if certain || row.strikes >= STRIKES_BEFORE_SKIP {
             row.strikes = STRIKES_BEFORE_SKIP - 1;
-            row.until = Some(now + SKIP_FOR);
+            row.until = Some(axess_clock::Until::after(now, SKIP_FOR));
         }
     }
 

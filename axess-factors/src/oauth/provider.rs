@@ -41,6 +41,7 @@ mod sender_constrained;
 
 use super::{extract_string_array, types::*};
 use crate::oidc::JwksCache;
+use axess_clock::{SignedDuration, Timestamp};
 use openidconnect::{ClientId, ClientSecret, RedirectUrl, core::CoreProviderMetadata};
 use std::sync::Arc;
 
@@ -92,8 +93,15 @@ pub struct OAuthProviderConfig {
     pub(crate) rng: Arc<dyn axess_rng::SecureRng>,
     /// Redirect URL for the callback.
     pub(crate) redirect_url: RedirectUrl,
-    /// HTTP client for token exchange (configured not to follow redirects).
+    /// HTTP client for token exchange, built by [`egress`](Self::egress):
+    /// it follows no redirect and, under a screened policy, connects to no
+    /// reserved address and follows no proxy from the environment.
     pub(crate) http_client: openidconnect::reqwest::Client,
+    /// The egress policy discovery ran under. Every client the provider
+    /// builds later (the mTLS client of the FAPI profile) is built by it,
+    /// and every URL that reaches the provider after discovery (the
+    /// `mtls_endpoint_aliases`) is checked against it.
+    pub(crate) egress: crate::egress::EgressPolicy,
     /// JWKS cache for back-channel logout signature verification.
     /// Refresh is single-flight + min-interval debounced (see
     /// [`crate::oidc::jwks_cache`]) so concurrent unknown-`kid` tokens
@@ -178,12 +186,13 @@ impl OAuthProviderConfig {
 
     /// The provider's clock as the closure openidconnect's ID-token
     /// verifier reads, so `exp` and `iat` checks follow the injected
-    /// clock instead of the wall clock.
+    /// clock instead of the wall clock. The verifier takes the time as a
+    /// chrono value, so the reading is converted here.
     pub(crate) fn time_fn(
         &self,
     ) -> impl Fn() -> chrono::DateTime<chrono::Utc> + Send + Sync + 'static {
         let clock = self.clock.clone();
-        move || clock.now()
+        move || chrono_time(clock.now())
     }
 
     /// Extract [`OAuthClaims`] from an openidconnect token response.
@@ -266,12 +275,11 @@ impl OAuthProviderConfig {
         if let Some(claim_hash) = claims.access_token_hash() {
             enforce_at_hash(id_token, &id_token_verifier, claim_hash, token_response)?;
         }
-        // c_hash is computed from the authorization code; we don't have
-        // the original code at this point in the flow (it was consumed
-        // by the token exchange), so c_hash enforcement would need to
-        // happen earlier. Document the gap and leave c_hash for the
-        // FAPI-mode verifier to be added once the upstream openidconnect
-        // crate exposes it.
+        // `c_hash` is not checked here. It binds an ID token that arrives
+        // beside an authorization code (the hybrid flow, OIDC Core
+        // §3.3.2.11) to that code. Every login here asks for
+        // `response_type=code`, so the ID token comes only from the token
+        // endpoint, in the answer to the request that spent the code.
 
         // When FAPI is configured, cap the ID-token lifetime and refuse an
         // `nbf` in the future. openidconnect's default verifier honours
@@ -373,7 +381,7 @@ fn enforce_at_hash(
     let access_token = OAuth2TokenResponse::access_token(token_response).secret();
     let alg = id_token
         .signing_alg()
-        .map_err(|e| OAuthError::IdTokenValidation(format!("{e}")))?;
+        .map_err(|e| OAuthError::IdTokenValidation(crate::remote_text::error_text(&e)))?;
     let signing_key = id_token
         .signing_key(id_token_verifier)
         .map_err(|e| OAuthError::IdTokenValidation(format!("signing key: {e}")))?;
@@ -399,6 +407,15 @@ fn enforce_at_hash(
     Ok(())
 }
 
+/// A reading as the chrono value openidconnect takes. A `Timestamp` and a
+/// chrono `DateTime<Utc>` have the same range, so every reading converts.
+/// Were one not to, chrono's latest value stands in, at which every token
+/// has expired.
+fn chrono_time(at: Timestamp) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(at.unix_seconds(), at.subsec_nanos())
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+}
+
 /// The FAPI limits on a verified ID token: its lifetime (`exp - iat`, in
 /// seconds) is within `fapi`'s cap, and its `nbf`, read from the verified
 /// payload, is not more than 60 seconds in the future (FAPI 2.0 section
@@ -406,15 +423,14 @@ fn enforce_at_hash(
 /// nor FAPI 2.0 requires it in an ID token, and Keycloak issues none.
 pub(crate) fn fapi_id_token_violation(
     fapi: &FapiConfig,
-    now: chrono::DateTime<chrono::Utc>,
+    now: Timestamp,
     lifetime: i64,
     verified_payload: &serde_json::Value,
 ) -> Result<(), OAuthError> {
-    let cap = i64::try_from(fapi.max_id_token_lifetime_secs).unwrap_or(i64::MAX);
+    let cap = i64::try_from(fapi.max_id_token_lifetime.as_secs()).unwrap_or(i64::MAX);
     if lifetime <= 0 || lifetime > cap {
         return Err(OAuthError::IdTokenValidation(format!(
-            "ID token lifetime {lifetime}s exceeds FAPI cap of {}s (exp - iat)",
-            fapi.max_id_token_lifetime_secs
+            "ID token lifetime {lifetime}s exceeds FAPI cap of {cap}s (exp - iat)"
         )));
     }
 
@@ -426,10 +442,12 @@ pub(crate) fn fapi_id_token_violation(
     let nbf_secs = nbf.as_i64().ok_or_else(|| {
         OAuthError::IdTokenValidation("ID token `nbf` claim is not an integer".to_string())
     })?;
-    let nbf_time = chrono::DateTime::from_timestamp(nbf_secs, 0).ok_or_else(|| {
+    let nbf_time = Timestamp::from_unix_seconds(nbf_secs).ok_or_else(|| {
         OAuthError::IdTokenValidation("FAPI `nbf` claim is not a valid Unix timestamp".to_string())
     })?;
-    if nbf_time > now + chrono::Duration::seconds(60) {
+    // `nbf > now + 60 s`, as the span between the two readings, which is
+    // defined for every pair of them.
+    if nbf_time.since(now) > SignedDuration::seconds(60) {
         return Err(OAuthError::IdTokenValidation(format!(
             "FAPI `nbf` claim is in the future ({nbf_time}); rejecting",
         )));
@@ -441,14 +459,14 @@ pub(crate) fn fapi_id_token_violation(
 mod fapi_id_token_tests {
     use super::*;
 
-    fn now() -> chrono::DateTime<chrono::Utc> {
-        chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap()
+    fn now() -> Timestamp {
+        Timestamp::from_unix_seconds(1_700_000_000).unwrap()
     }
 
     #[test]
     fn nbf_is_optional_and_must_not_be_in_the_future() {
         let fapi = FapiConfig::default();
-        let t = now().timestamp();
+        let t = now().unix_seconds();
         let check = |payload| fapi_id_token_violation(&fapi, now(), 120, &payload);
         assert!(check(serde_json::json!({ "nbf": t - 5 })).is_ok());
         assert!(check(serde_json::json!({})).is_ok());
@@ -459,11 +477,62 @@ mod fapi_id_token_tests {
     }
 
     #[test]
+    fn nbf_is_judged_at_either_end_of_the_range_without_an_overflow() {
+        let fapi = FapiConfig::default();
+        let nbf = serde_json::json!({ "nbf": now().unix_seconds() });
+        // At the last reading no `nbf` is in the future, and at the first
+        // every one is.
+        assert!(fapi_id_token_violation(&fapi, Timestamp::MAX, 120, &nbf).is_ok());
+        assert!(fapi_id_token_violation(&fapi, Timestamp::MIN, 120, &nbf).is_err());
+        // A second count no reading holds is refused, not clamped.
+        let beyond = serde_json::json!({ "nbf": i64::MAX });
+        assert!(fapi_id_token_violation(&fapi, now(), 120, &beyond).is_err());
+    }
+
+    #[test]
+    fn a_reading_is_the_same_instant_as_the_chrono_value_the_verifier_takes() {
+        let at = Timestamp::new(1_700_000_000, 250_000_000).unwrap();
+        let converted = chrono_time(at);
+        assert_eq!(converted.timestamp(), 1_700_000_000);
+        assert_eq!(converted.timestamp_subsec_nanos(), 250_000_000);
+        // The two ranges have the same ends, so the fallback is never taken.
+        assert_eq!(
+            chrono_time(Timestamp::MAX),
+            chrono::DateTime::<chrono::Utc>::MAX_UTC
+        );
+        assert_eq!(
+            chrono_time(Timestamp::MIN),
+            chrono::DateTime::<chrono::Utc>::MIN_UTC
+        );
+        assert_eq!(
+            chrono_time(Timestamp::UNIX_EPOCH),
+            chrono::DateTime::<chrono::Utc>::UNIX_EPOCH
+        );
+    }
+
+    #[test]
     fn lifetime_is_capped() {
         let fapi = FapiConfig::default();
-        let payload = serde_json::json!({ "nbf": now().timestamp() });
+        let payload = serde_json::json!({ "nbf": now().unix_seconds() });
         assert!(fapi_id_token_violation(&fapi, now(), 300, &payload).is_ok());
         assert!(fapi_id_token_violation(&fapi, now(), 301, &payload).is_err());
         assert!(fapi_id_token_violation(&fapi, now(), 0, &payload).is_err());
+    }
+
+    /// The lifetime is whole seconds, so a cap with a fraction admits the
+    /// whole seconds it holds and no more.
+    #[test]
+    fn a_cap_with_a_fraction_counts_its_whole_seconds() {
+        let fapi = FapiConfig {
+            max_id_token_lifetime: std::time::Duration::from_millis(300_999),
+            ..FapiConfig::default()
+        };
+        let payload = serde_json::json!({});
+        assert!(fapi_id_token_violation(&fapi, now(), 300, &payload).is_ok());
+        let refused = fapi_id_token_violation(&fapi, now(), 301, &payload).unwrap_err();
+        assert!(
+            refused.to_string().contains("FAPI cap of 300s"),
+            "{refused}"
+        );
     }
 }

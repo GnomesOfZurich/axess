@@ -1,5 +1,5 @@
-//! `tests`: extracted from `bearer.rs` per the
-//! 200-LoC inline-test rule in AGENTS.md.
+//! `tests`: the unit tests of `bearer.rs`, kept beside it per the
+//! 200-line inline-test rule in AGENTS.md.
 
 use super::*;
 
@@ -30,7 +30,9 @@ fn extract_bearer_token_wrong_scheme() {
 /// absent: it is refused rather than served as anonymous.
 #[test]
 fn a_bearer_header_without_a_token_is_refused() {
-    let config = BearerConfig::new(Vec::new());
+    let config = BearerConfig::new(Vec::new()).with_clock(std::sync::Arc::new(
+        axess_clock::testing::MockClock::at_reference(),
+    ));
     for header in ["Bearer", "Bearer ", "Bearer   ", "bearer\t", "Bearer\t\t "] {
         assert!(
             matches!(
@@ -46,7 +48,9 @@ fn a_bearer_header_without_a_token_is_refused() {
 /// scheme, so the token is read (and judged) rather than the header ignored.
 #[test]
 fn a_tab_after_the_scheme_separates_the_token() {
-    let config = BearerConfig::new(Vec::new());
+    let config = BearerConfig::new(Vec::new()).with_clock(std::sync::Arc::new(
+        axess_clock::testing::MockClock::at_reference(),
+    ));
     assert!(matches!(
         validate_bearer_token(Some("Bearer\tnot.a.jwt!"), &config),
         Err(BearerError::InvalidToken(_))
@@ -56,7 +60,13 @@ fn a_tab_after_the_scheme_separates_the_token() {
 #[tokio::test]
 async fn the_layer_answers_401_for_a_bearer_header_without_a_token() {
     for header in ["Bearer", "Bearer ", "Bearer   "] {
-        let res = through_layer(header, BearerConfig::new(Vec::new())).await;
+        let res = through_layer(
+            header,
+            BearerConfig::new(Vec::new()).with_clock(std::sync::Arc::new(
+                axess_clock::testing::MockClock::at_reference(),
+            )),
+        )
+        .await;
         assert_eq!(
             res.status(),
             axum::http::StatusCode::UNAUTHORIZED,
@@ -107,11 +117,8 @@ fn rsa_keypair() -> (Vec<u8>, JwkSet, String) {
 }
 
 fn sign_jwt(private_der: &[u8], kid: &str, claims: &serde_json::Value) -> String {
-    use jsonwebtoken::{EncodingKey, Header, encode};
-    // Signing needs a provider as much as verifying does, and under
-    // `--all-features` jsonwebtoken has no default. Verification installs one
-    // itself; a signer asks.
-    crate::jwt::ensure_crypto_provider();
+    use crate::jwt::encode;
+    use jsonwebtoken::{EncodingKey, Header};
     let key = EncodingKey::from_rsa_der(private_der);
     let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
     header.kid = Some(kid.to_string());
@@ -125,10 +132,13 @@ fn make_config(jwks: JwkSet) -> BearerConfig {
         jwks: Arc::new(jwks),
         extra_claims: vec!["namespace".to_string()],
     }])
+    .with_clock(std::sync::Arc::new(
+        axess_clock::testing::MockClock::at_reference(),
+    ))
 }
 
 fn valid_claims() -> serde_json::Value {
-    let now = chrono::Utc::now().timestamp();
+    let now = axess_clock::testing::MockClock::reference_time().unix_seconds();
     serde_json::json!({
         "iss": "https://accounts.example.com",
         "sub": "spiffe://cluster.local/ns/default/sa/worker",
@@ -186,7 +196,7 @@ fn untrusted_issuer_returns_error() {
 fn missing_sub_claim_returns_error() {
     let (private_der, jwks, kid) = rsa_keypair();
     let config = make_config(jwks);
-    let now = chrono::Utc::now().timestamp();
+    let now = axess_clock::testing::MockClock::reference_time().unix_seconds();
     let claims = serde_json::json!({
         "iss": "https://accounts.example.com",
         "aud": "my-service",
@@ -204,7 +214,7 @@ fn missing_sub_claim_returns_error() {
 fn array_aud_claim_populates_all_audiences() {
     let (private_der, jwks, kid) = rsa_keypair();
     let config = make_config(jwks);
-    let now = chrono::Utc::now().timestamp();
+    let now = axess_clock::testing::MockClock::reference_time().unix_seconds();
     let claims = serde_json::json!({
         "iss": "https://accounts.example.com",
         "sub": "worker",
@@ -229,7 +239,7 @@ fn array_aud_claim_populates_all_audiences() {
 fn wrong_audience_returns_jwt_error() {
     let (private_der, jwks, kid) = rsa_keypair();
     let config = make_config(jwks);
-    let now = chrono::Utc::now().timestamp();
+    let now = axess_clock::testing::MockClock::reference_time().unix_seconds();
     let claims = serde_json::json!({
         "iss": "https://accounts.example.com",
         "sub": "worker",
@@ -248,7 +258,7 @@ fn wrong_audience_returns_jwt_error() {
 fn expired_token_returns_jwt_error() {
     let (private_der, jwks, kid) = rsa_keypair();
     let config = make_config(jwks);
-    let now = chrono::Utc::now().timestamp();
+    let now = axess_clock::testing::MockClock::reference_time().unix_seconds();
     let claims = serde_json::json!({
         "iss": "https://accounts.example.com",
         "sub": "worker",
@@ -274,7 +284,7 @@ fn garbage_token_returns_invalid_token() {
 fn missing_iss_claim_returns_error() {
     let (private_der, jwks, kid) = rsa_keypair();
     let config = make_config(jwks);
-    let now = chrono::Utc::now().timestamp();
+    let now = axess_clock::testing::MockClock::reference_time().unix_seconds();
     let claims = serde_json::json!({
         "sub": "worker",
         "aud": "my-service",
@@ -292,7 +302,7 @@ fn missing_iss_claim_returns_error() {
 fn extra_claims_only_captures_configured_keys() {
     let (private_der, jwks, kid) = rsa_keypair();
     let config = make_config(jwks);
-    let now = chrono::Utc::now().timestamp();
+    let now = axess_clock::testing::MockClock::reference_time().unix_seconds();
     let claims = serde_json::json!({
         "iss": "https://accounts.example.com",
         "sub": "worker",
@@ -321,9 +331,9 @@ fn extra_claims_only_captures_configured_keys() {
 const MOCK_EPOCH: i64 = 1_600_000_000;
 
 fn mock_clock() -> Arc<axess_clock::testing::MockClock> {
-    use chrono::TimeZone;
+    use axess_clock::Timestamp;
     Arc::new(axess_clock::testing::MockClock::at(
-        chrono::Utc.timestamp_opt(MOCK_EPOCH, 0).unwrap(),
+        Timestamp::from_unix_seconds(MOCK_EPOCH).unwrap(),
     ))
 }
 
@@ -406,7 +416,7 @@ fn layer_clock_replaces_the_configured_clock() {
 
 async fn through_layer(authorization: &str, config: BearerConfig) -> axum::response::Response {
     use tower::{Layer, ServiceExt};
-    let inner = tower::service_fn(|_req: axum::http::Request<axum::body::Body>| async {
+    let inner = tower::service_fn(|_: axum::http::Request<axum::body::Body>| async {
         Ok::<_, std::convert::Infallible>(axum::response::Response::new(axum::body::Body::empty()))
     });
     let service = BearerTokenLayer::new(config).layer(inner);
@@ -426,7 +436,8 @@ async fn every_rejection_answers_with_the_same_fixed_body() {
     let mut wrong_aud = valid_claims();
     wrong_aud["aud"] = serde_json::json!("another-service");
     let mut expired = valid_claims();
-    expired["exp"] = serde_json::json!(chrono::Utc::now().timestamp() - 3600);
+    expired["exp"] =
+        serde_json::json!(axess_clock::testing::MockClock::reference_time().unix_seconds() - 3600);
 
     let mut bodies = Vec::new();
     for token in [
@@ -457,7 +468,10 @@ fn the_issuer_constructor_pins_an_audience() {
     let config = BearerConfig::new(vec![
         BearerIssuerConfig::new("https://accounts.example.com", "my-service", Arc::new(jwks))
             .with_extra_claims(["namespace"]),
-    ]);
+    ])
+    .with_clock(std::sync::Arc::new(
+        axess_clock::testing::MockClock::at_reference(),
+    ));
     let header = format!("Bearer {}", sign_jwt(&der, &kid, &valid_claims()));
     let identity = validate_bearer_token(Some(&header), &config)
         .unwrap()
@@ -479,7 +493,7 @@ fn the_issuer_constructor_pins_an_audience() {
 fn any_audience_is_an_explicit_dangerous_choice() {
     let (private_der, jwks, kid) = rsa_keypair();
     let jwks = Arc::new(jwks);
-    let now = chrono::Utc::now().timestamp();
+    let now = axess_clock::testing::MockClock::reference_time().unix_seconds();
     let claims = serde_json::json!({
         "iss": "https://accounts.example.com",
         "sub": "worker",
@@ -493,7 +507,10 @@ fn any_audience_is_an_explicit_dangerous_choice() {
         "https://accounts.example.com",
         "my-service",
         jwks.clone(),
-    )]);
+    )])
+    .with_clock(std::sync::Arc::new(
+        axess_clock::testing::MockClock::at_reference(),
+    ));
     assert!(
         matches!(
             validate_bearer_token(Some(&header), &pinned),
@@ -507,7 +524,10 @@ fn any_audience_is_an_explicit_dangerous_choice() {
         audience: Audience::AnyDangerous,
         jwks,
         extra_claims: Vec::new(),
-    }]);
+    }])
+    .with_clock(std::sync::Arc::new(
+        axess_clock::testing::MockClock::at_reference(),
+    ));
     let identity = validate_bearer_token(Some(&header), &any)
         .expect("validates")
         .expect("a bearer token is present");
@@ -521,7 +541,7 @@ fn any_audience_is_an_explicit_dangerous_choice() {
 /// next.
 #[test]
 fn a_token_is_tried_against_every_config_for_its_issuer() {
-    let (_other_der, other_jwks, _) = rsa_keypair();
+    let (_, other_jwks, _) = rsa_keypair();
     let (der, jwks, kid) = rsa_keypair();
     let issuer = |jwks: JwkSet| BearerIssuerConfig {
         issuer: "https://accounts.example.com".to_string(),
@@ -530,7 +550,9 @@ fn a_token_is_tried_against_every_config_for_its_issuer() {
         extra_claims: Vec::new(),
     };
     // The key that signed the token is the second config's.
-    let config = BearerConfig::new(vec![issuer(other_jwks), issuer(jwks)]);
+    let config = BearerConfig::new(vec![issuer(other_jwks), issuer(jwks)]).with_clock(
+        std::sync::Arc::new(axess_clock::testing::MockClock::at_reference()),
+    );
     let token = sign_jwt(&der, &kid, &valid_claims());
     let identity = validate_bearer_token(Some(&format!("Bearer {token}")), &config)
         .expect("the second config verifies it")
@@ -541,16 +563,18 @@ fn a_token_is_tried_against_every_config_for_its_issuer() {
 /// When no config for the issuer verifies the token, it is refused.
 #[test]
 fn a_token_no_config_for_its_issuer_verifies_is_refused() {
-    let (_o1, jwks_a, _) = rsa_keypair();
-    let (_o2, jwks_b, _) = rsa_keypair();
-    let (der, _jwks, kid) = rsa_keypair();
+    let (_, jwks_a, _) = rsa_keypair();
+    let (_, jwks_b, _) = rsa_keypair();
+    let (der, _, kid) = rsa_keypair();
     let issuer = |jwks: JwkSet| BearerIssuerConfig {
         issuer: "https://accounts.example.com".to_string(),
         audience: Audience::Exact("my-service".to_string()),
         jwks: Arc::new(jwks),
         extra_claims: Vec::new(),
     };
-    let config = BearerConfig::new(vec![issuer(jwks_a), issuer(jwks_b)]);
+    let config = BearerConfig::new(vec![issuer(jwks_a), issuer(jwks_b)]).with_clock(
+        std::sync::Arc::new(axess_clock::testing::MockClock::at_reference()),
+    );
     let token = sign_jwt(&der, &kid, &valid_claims());
     assert!(matches!(
         validate_bearer_token(Some(&format!("Bearer {token}")), &config),
@@ -588,7 +612,7 @@ async fn through_layer_raw(
 /// mangled token read as no token.
 #[tokio::test]
 async fn an_authorization_header_that_is_not_text_is_refused() {
-    let (_der, jwks, _kid) = rsa_keypair();
+    let (_, jwks, _) = rsa_keypair();
     let value = axum::http::HeaderValue::from_bytes(b"Bearer \xff\xfe").unwrap();
     let (status, _) = through_layer_raw(value, make_config(jwks)).await;
     assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
@@ -622,7 +646,10 @@ fn an_untrusted_issuer_is_echoed_bounded_and_escaped() {
     let mut claims = valid_claims();
     // Far past the echo cap, and inside the token size limit so the issuer
     // check, not the size check, is what refuses it.
-    let forged = format!("evil\nWARN forged line\r\u{1b}[31m{}", "x".repeat(4 * 1024));
+    let forged = format!(
+        "evil\nWARN forged line\r\u{1b}[31m\u{2028}{}",
+        "x".repeat(4 * 1024)
+    );
     claims["iss"] = serde_json::json!(forged);
     let token = sign_jwt(&private_der, &kid, &claims);
 
@@ -632,11 +659,16 @@ fn an_untrusted_issuer_is_echoed_bounded_and_escaped() {
     let text = err.to_string();
     assert!(matches!(err, BearerError::UntrustedIssuer(_)), "{text}");
     assert!(
-        text.len() <= "untrusted issuer: ".len() + MAX_ISSUER_ECHO_BYTES + 64,
+        text.len() <= "untrusted issuer: ".len() + MAX_ISSUER_ECHO_BYTES,
         "the error carries {} bytes",
         text.len()
     );
-    assert!(!text.chars().any(char::is_control), "{text:?}");
+    assert!(
+        !text
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')),
+        "{text:?}"
+    );
     assert!(text.ends_with("..."), "the cut is marked: {text}");
 }
 
@@ -650,4 +682,15 @@ fn a_short_issuer_is_echoed_whole_and_a_cut_keeps_characters_whole() {
     let echoed = echo_issuer(&multibyte);
     assert!(echoed.ends_with("..."));
     assert!(echoed.trim_end_matches("...").chars().all(|c| c == 'é'));
+
+    // A cut that would fall inside a character moves back to the character's
+    // start, never forward past the bound, and the mark of the cut is inside
+    // the bound.
+    let straddling = format!("a{}", "é".repeat(MAX_ISSUER_ECHO_BYTES));
+    let echoed = echo_issuer(&straddling);
+    assert_eq!(
+        echoed,
+        format!("a{}...", "é".repeat((MAX_ISSUER_ECHO_BYTES - 4) / 2))
+    );
+    assert!(echoed.len() <= MAX_ISSUER_ECHO_BYTES);
 }

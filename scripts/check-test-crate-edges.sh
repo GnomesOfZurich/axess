@@ -19,7 +19,8 @@ set -euo pipefail
 AXESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$AXESS_DIR"
 
-cargo metadata --format-version 1 --all-features --locked 2>/dev/null | python3 -I -c '
+metadata="$(cargo metadata --format-version 1 --all-features --locked 2>/dev/null)"
+python3 -I -c '
 import json, sys
 from collections import deque
 
@@ -53,4 +54,4 @@ if failures:
         print("test-only crate on a production edge: " + line, file=sys.stderr)
     sys.exit(1)
 print("ok: axess-testing and wiremock are reachable only from dev-dependency edges")
-'
+' <<<"$metadata"

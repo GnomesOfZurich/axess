@@ -8,7 +8,7 @@ different from the alternatives.
 **A session is never half logged in.** Authentication state is a typed
 enum, and a partially-completed login is its own variant
 (`Authenticating`), not an `Authenticated` session with a flag unset. A
-handler cannot mistake one-factor for finished, because the type does not
+handler cannot mistake a partial login for a finished one; the type does not
 allow it.
 
 **No clock or RNG is read directly.** Session ids, OTP windows and lockout
@@ -18,15 +18,17 @@ effects included, runs in a unit test with no infrastructure and no
 flakes. That is what makes a token-issuance race a failing test rather
 than a postmortem.
 
-**Authorisation is Cedar policy, not scattered role checks.** Declarative,
-schema-validated, deny-by-default, in policy files rather than handlers.
-Your code asks and gets an `AuthzDecision`, so reviewing the rules is one
-artifact review instead of a hunt across handlers.
+**Authorisation is Cedar policy, not scattered role checks.** Policies are
+declarative, schema-validated and deny-by-default, and live in policy files
+rather than handlers. Your code asks and gets an `AuthzDecision`, so
+reviewing the rules means reading the policy files, not hunting across
+handlers.
 
-Ten small crates, so an adapter you do not use is an adapter you do not
-compile. The split also draws the line that matters most: per-credential
-algorithms in `axess-factors`, the state machine and federation machinery
-in `axess-core`. The next chapter covers it.
+Axess is eleven small crates, so an adapter you do not use is an adapter you
+do not compile. The split also draws the line that matters most: per-credential
+verifiers, the OAuth, OIDC, LDAP and FIDO2 ones included, in `axess-factors`;
+the state machine and the orchestration that composes them in `axess-core`.
+The next chapter covers it.
 
 ## What axess is not
 
@@ -47,49 +49,48 @@ in `axess-core`. The next chapter covers it.
 
 ## The workspace, in one table
 
-The crate split is structural, and the table below is a fair
-approximation of which one you reach for in any given situation. The
-chapter *Architecture at a glance* expands on the dependency direction
-and the rules that keep leaf crates from depending on the orchestrator.
+The table below gives each crate's role. *Architecture at a glance*
+covers the dependency direction and the rules that keep leaf crates from
+depending on the orchestrator.
 
 | Crate | Role |
 |---|---|
 | `axess` | Facade. Re-exports the public API. Application code depends on this. |
-| `axess-core` | Session state machine, `AuthnService`, `AuthzStore`, federation adapters (OAuth, OIDC, LDAP, mTLS, FIDO2, JWT, K8s SA, GitHub OIDC), device identity, OBO/delegated access, middleware, storage backends. The orchestrator. |
-| `axess-factors` | Per-credential verifier primitives: Argon2id, TOTP, HOTP. Composable on their own. |
+| `axess-core` | Session state machine, `AuthnService`, `AuthzStore`, federation orchestration (OAuth provider registry, per-tenant providers, back- and front-channel logout), workload identity, device identity, OBO/delegated access, middleware, storage backends. The orchestrator. |
+| `axess-factors` | Per-credential verifiers: Argon2id, TOTP, HOTP, email OTP, recovery codes, FIDO2, LDAP, mTLS, OAuth and OIDC, JWT, bearer tokens, and a generic resolver for JWT-bearer workload tokens. Composable on their own. |
 | `axess-identity` | Typed IDs (`UserId`, `TenantId`, `WorkloadId`) and the `Principal { Human, Workload }` enum. |
 | `axess-events` | Audit event payloads and async sinks. |
-| `axess-cache` | TTL+LRU cache with single-flight. Used by the Cedar entity cache and the OIDC JWKS cache. |
-| `axess-clock` | `Clock` trait, `SystemClock`, `MockClock`. The DST time foundation. |
+| `axess-cache` | TTL+LRU cache with single-flight. Used by the Cedar entity cache and the device-store cache. |
+| `axess-clock` | `Clock` trait, `SystemClock`, `MockClock`. The time foundation for deterministic simulation testing (DST). |
 | `axess-rng` | `SecureRng` trait, `SystemRng`, `MockRng`. The DST entropy foundation. |
 | `axess-strings` | `ShortString`, an immutable identifier: inline to 22 bytes, `&'static str` in place, or shared behind an `Arc`. |
-| `axess-macros` | `require_authn!`, `require_partial_authn!`, `require_authz!` procedural macros. |
+| `axess-macros` | `require_authn!`, `require_partial_authn!`, `require_authz!` guard macros (declarative, `macro_rules!`). |
+| `axess-testing` | Test fixtures for adopters: a tracing capture and an OIDC identity provider fixture. A dev-dependency only. |
 
 ## When to reach for axess
 
 Axess fits when at least two of these hold:
 
 - **Multi-factor authentication that varies** per user or per tenant.
-  The most common driver: composing factors and threading the result
-  through a typed state machine is the value over a session library.
+  The most common driver: axess composes factors and threads the result
+  through a typed state machine, which a session library does not.
 - **Policy-driven authorisation** in one language across roles,
   relationships and contextual conditions.
 - **Multi-tenancy.** Factors, methods and policies scope at three tiers
   (`System`, `Tenant`, `User`) by default.
 - **Device identity, workload identity or delegated access.**
 - **A regulated industry.** The audit trail is shaped as evidence, and
-  there is FAPI 2.0 conformance work behind it.
+  axess implements the FAPI 2.0 client profile.
 
-It does not fit a single-factor session, a hosted IdP, or a non-HTTP
-protocol: the state machine is shaped against Axum extractors and
-middleware. Each has better answers elsewhere.
+It does not fit a single-factor session or a hosted IdP. Nor does it fit
+a non-HTTP protocol: the state machine is built on Axum extractors and
+middleware. Other tools serve those cases better.
 
 ## Where to read next
 
 - **Evaluating?** Read *Architecture at a glance* next: the
   verifier-versus-orchestrator line, the dependency direction, the three
-  state slices in a request, and the DST mechanics underneath. Twenty
-  minutes there saves an hour in every chapter after.
+  state slices in a request, and the DST mechanics underneath.
 - **Integrating?** *Getting started* walks a minimal Axum application
   end to end, and `examples/sqlite/` is the production-shaped version
   with a real database, encrypted sessions, two-factor login, rate
@@ -98,15 +99,15 @@ middleware. Each has better answers elsewhere.
   Parts II and V carry the day-to-day surface; the rest is reference.
 - **Deploying?** Read *Security posture* and *Operations runbook* first.
   The defaults are conservative for development, and production has
-  knobs that must be set explicitly. Both chapters name them.
+  options that must be set explicitly. Both chapters name them.
 
 ## Status
 
 Axess is [published on crates.io](https://crates.io/crates/axess); that
 page carries the current version. The 0.x line is pre-1.0: minor versions
-may break source compatibility, and each break is catalogued in
-[*Migration guide*](../production/migrating.md). The goal post-1.0 is to
-maintain the SemVer discipline Rust libraries are held to elsewhere.
+may break source compatibility, and each break is catalogued in the
+[*Migration guide*](../production/migrating.md). From 1.0 the goal is to
+follow SemVer as other Rust libraries do.
 
 Vulnerability reports go through the private channel described in
 [`SECURITY.md`](https://github.com/GnomesOfZurich/axess/blob/main/SECURITY.md).

@@ -32,7 +32,7 @@ impl DeviceSql for PostgresSql {
         Ok(tx)
     }
 
-    async fn end_create(_conn: &mut PgConnection, _device: &Device) -> Result<(), sqlx::Error> {
+    async fn end_create(_: &mut PgConnection, _: &Device) -> Result<(), sqlx::Error> {
         Ok(())
     }
 

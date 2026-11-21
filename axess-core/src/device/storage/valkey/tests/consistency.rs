@@ -3,25 +3,22 @@
 //! default (`VALKEY_URL=redis://127.0.0.1:6404`).
 
 use super::*;
-use crate::device::cascade::cascade_revoke_by_refresh_family;
+use crate::device::cascade::cascade_revoke_devices;
 use crate::device::lifecycle::DeviceLifecycleService;
 use crate::device::store::consistency::{self as shared, at, dev_id, tenant, user};
 use crate::device::store::{BindingsUpdate, OwnerClaim};
+use axess_clock::testing::Shift;
 
-/// A key prefix no earlier run on the same server has used.
-fn fresh_prefix(tag: &str) -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    format!("axc_{tag}_{nanos}")
+/// A store under a fresh prefix, held with the sweep that removes its keys.
+///
+/// A contract that takes its store by value is handed a clone, in the
+/// statement that made the swept store: the swept store is a temporary of
+/// that statement, so its keys are removed when the contract has run.
+async fn store(tag: &str) -> Swept<ValkeyDeviceStore> {
+    live_store(tag).await
 }
 
-async fn store(tag: &str) -> ValkeyDeviceStore {
-    live_store(&fresh_prefix(tag)).await
-}
-
-fn refresh(family: &str, now: DateTime<Utc>) -> DeviceBinding {
+fn refresh(family: &str, now: Timestamp) -> DeviceBinding {
     DeviceBinding::Refresh {
         family_id: family.into(),
         issued_at: now,
@@ -43,22 +40,55 @@ fn user_key(s: &ValkeyDeviceStore, u: &UserId) -> String {
 
 #[tokio::test]
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
-async fn valkey_device_shared_contract() {
-    shared::ties_are_broken_by_the_smaller_id(store("ties").await).await;
-    shared::a_shared_fingerprint_stays_findable_while_any_device_carries_it(store("twins").await)
+async fn valkey_device_key_contract() {
+    use crate::device::store::key_contract;
+    key_contract::a_key_binding_round_trips(store("keyrt").await.clone()).await;
+    key_contract::a_challenge_is_replaced_by_one_compare_and_swap(store("keyswap").await.clone())
         .await;
-    shared::a_sighting_never_rewinds_and_skips_a_revoked_row(store("sight").await).await;
-    shared::a_save_never_un_revokes(store("unrevoke").await).await;
-    shared::a_revoked_device_never_comes_back(|| store("neverback")).await;
-    shared::the_fingerprint_lookup_follows_the_newest_sighting(store("newest").await).await;
-    shared::sub_second_instants_compare_as_whole_seconds(store("fraction").await).await;
-    shared::a_revoked_row_keeps_its_revocation_time(store("twice").await).await;
-    shared::a_sighting_reports_the_level_it_found(store("reports").await).await;
-    shared::a_revoked_save_without_a_time_is_stamped_and_purged(store("stamp").await).await;
+    key_contract::a_registration_beside_a_sighting_loses_neither(store("keysight").await.clone())
+        .await;
+}
+
+#[tokio::test]
+#[ignore = "requires a running Valkey (VALKEY_URL)"]
+async fn valkey_device_shared_contract() {
+    shared::ties_are_broken_by_the_smaller_id(store("ties").await.clone()).await;
+    shared::the_family_lookup_is_by_family_and_by_tenant(store("families").await.clone()).await;
+    shared::a_shared_fingerprint_stays_findable_while_any_device_carries_it(
+        store("twins").await.clone(),
+    )
+    .await;
+    shared::a_sighting_never_rewinds_and_skips_a_revoked_row(store("sight").await.clone()).await;
+    shared::a_save_never_un_revokes(store("unrevoke").await.clone()).await;
+    // Each store the contract asks for is under a prefix of its own inside
+    // the one sweep's.
+    let neverback = crate::testing::valkey_sweep::on_node("neverback");
+    let made = std::sync::atomic::AtomicUsize::new(0);
+    shared::a_revoked_device_never_comes_back(|| {
+        let n = made.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        live_store_under(format!("{}_{n}", neverback.prefix()))
+    })
+    .await;
+    shared::the_fingerprint_lookup_follows_the_newest_sighting(store("newest").await.clone()).await;
+    shared::sub_second_instants_compare_as_whole_seconds(store("fraction").await.clone()).await;
+    shared::a_revoked_row_keeps_its_revocation_time(store("twice").await.clone()).await;
+    shared::a_sighting_reports_the_level_it_found(store("reports").await.clone()).await;
+    shared::a_revoked_save_without_a_time_is_stamped_and_purged(store("stamp").await.clone()).await;
+    shared::two_swaps_from_one_read_have_one_winner(store("swaps").await.clone()).await;
+    shared::two_trust_changes_from_one_level_have_one_winner(store("levels").await.clone()).await;
+    shared::two_claims_of_one_unowned_device_have_one_winner(store("claims").await.clone()).await;
     shared::sweep_decisions_agree_to_the_second(
         store("second")
             .await
+            .clone()
             .with_sweep_config(shared::tight_config()),
+    )
+    .await;
+    shared::a_sweep_walks_the_ladder_and_counts_what_it_wrote(
+        store("ladder")
+            .await
+            .clone()
+            .with_sweep_config(shared::ladder_config()),
     )
     .await;
 }
@@ -232,9 +262,9 @@ async fn valkey_device_a_stale_family_entry_neither_lists_nor_revokes_the_device
             .unwrap()
             .is_empty()
     );
-    let revoked = cascade_revoke_by_refresh_family(&s, &t, "fam-1", now)
-        .await
-        .unwrap();
+    let bound = s.find_by_refresh_family(&t, "fam-1").await.unwrap();
+    let targets: Vec<_> = bound.iter().map(|d| (d.tenant_id, d.id)).collect();
+    let revoked = cascade_revoke_devices(&*s, &targets, now).await;
     assert_eq!(
         revoked, 0,
         "the cascade on the old family reaches no device"
@@ -287,7 +317,10 @@ async fn valkey_device_a_stale_user_entry_does_not_hand_over_a_device() {
 #[tokio::test]
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn valkey_device_a_stale_fingerprint_entry_finds_nothing_and_is_removed() {
-    let s = store("stalefp").await.with_legacy_fingerprint_keys();
+    let s = Swept::map(
+        store("stalefp").await,
+        ValkeyDeviceStore::with_legacy_fingerprint_keys,
+    );
     let now = at(0);
     let t = tenant();
     let d = shared::device("fp-owner", 0x86, DeviceTrustLevel::Seen, now);
@@ -322,7 +355,7 @@ async fn valkey_device_a_damaged_row_does_not_stop_the_sweep() {
             label,
             fp,
             DeviceTrustLevel::Trusted,
-            now - Duration::days(91),
+            now.minus(SignedDuration::days(91)),
         )
     };
     let (bad, good) = (idle("bad", 0x91), idle("good", 0x92));
@@ -337,6 +370,16 @@ async fn valkey_device_a_damaged_row_does_not_stop_the_sweep() {
 
     let counts = s.sweep(&t, now).await.unwrap();
     assert_eq!(counts.trusted_to_seen, 1, "the readable row was demoted");
+    assert_eq!(
+        counts.skipped, 1,
+        "the damaged row is counted as left behind, not passed over in silence"
+    );
+    let again = s.sweep(&t, now).await.unwrap();
+    assert_eq!(
+        (again.trusted_to_seen, again.skipped),
+        (0, 1),
+        "nothing more to move, and the damaged row is still reported"
+    );
     let row = s.load(&t, &good.id).await.unwrap().unwrap();
     assert_eq!(row.trust_level, DeviceTrustLevel::Seen);
     assert!(
@@ -374,9 +417,17 @@ async fn valkey_device_a_legacy_revoked_row_without_a_time_ages_out() {
         s.load(&t, &d.id).await.unwrap().unwrap().revoked_at,
         Some(now)
     );
-    let grace = SweepConfig::default().revoked_grace;
+    let grace =
+        axess_clock::SignedDuration::try_from(SweepConfig::default().revoked_grace).unwrap();
     let counts = s
-        .sweep(&t, now + grace + Duration::seconds(1))
+        .sweep(
+            &t,
+            now.plus(
+                grace
+                    .checked_add(axess_clock::SignedDuration::seconds(1))
+                    .unwrap(),
+            ),
+        )
         .await
         .unwrap();
     assert_eq!(counts.revoked_purged, 1);

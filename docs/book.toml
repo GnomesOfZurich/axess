@@ -14,7 +14,7 @@
 [book]
 title = "Axess"
 description = "Policy-driven authentication and authorization for Axum"
-authors = ["Gnomes of Zurich"]
+authors = ["Gnomes"]
 language = "en"
 src = "."
 
@@ -22,10 +22,9 @@ src = "."
 # error, so a non-`ignore` block would be rejected on edition grounds
 # before it reached anything real.
 #
-# 2024, the workspace's edition. mdBook before 0.5 rejected `2024` as an
-# unknown variant, which is why this once said 2021; the CI docs job now
-# pins an mdBook that understands it, and the preflight warns when the
-# local mdBook differs from that pin.
+# 2024, the workspace's edition. mdBook before 0.5 rejects `2024` as an
+# unknown variant; the CI docs job pins an mdBook that understands it, and
+# the preflight warns when the local mdBook differs from that pin.
 [rust]
 edition = "2024"
 

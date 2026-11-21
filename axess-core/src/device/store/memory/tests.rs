@@ -3,7 +3,8 @@
 
 use super::*;
 use crate::device::store::consistency::{self as shared, at, dev_id, device, tenant};
-use chrono::Duration;
+use axess_clock::SignedDuration;
+use axess_clock::testing::Shift;
 
 /// Revocations that land while a sweep is running are never undone by it:
 /// every row ends `Revoked` whichever side got there first.
@@ -17,7 +18,7 @@ async fn a_revocation_during_a_sweep_is_never_undone() {
                 &format!("r{i}"),
                 (i % 200) as u8,
                 DeviceTrustLevel::Trusted,
-                now - Duration::days(91),
+                now.minus(SignedDuration::days(91)),
             );
             store.save(&idle, now).await.unwrap();
         }
@@ -69,7 +70,7 @@ async fn a_sweep_counts_only_the_writes_it_made() {
         "idle",
         0x11,
         DeviceTrustLevel::Trusted,
-        now - Duration::days(91),
+        now.minus(SignedDuration::days(91)),
     );
     store.save(&idle, now).await.unwrap();
     store
@@ -77,14 +78,14 @@ async fn a_sweep_counts_only_the_writes_it_made() {
             &t,
             &idle.id,
             DeviceTrustLevel::Revoked,
-            now - Duration::days(1),
+            now.minus(SignedDuration::days(1)),
         )
         .await
         .unwrap();
     let counts = store.sweep(&t, now).await.unwrap();
     assert_eq!(counts, SweepCounts::default());
     let row = store.load(&t, &idle.id).await.unwrap().unwrap();
-    assert_eq!(row.revoked_at, Some(now - Duration::days(1)));
+    assert_eq!(row.revoked_at, Some(now.minus(SignedDuration::days(1))));
 }
 
 /// Two saves of one device under different fingerprints, racing, leave no
@@ -183,17 +184,34 @@ async fn a_legacy_revoked_row_without_a_time_ages_out() {
     store.sweep(&t, now).await.unwrap();
     let stamped = store.load(&t, &d.id).await.unwrap().unwrap();
     assert_eq!(stamped.revoked_at, Some(now));
-    let grace = SweepConfig::default().revoked_grace;
+    let grace =
+        axess_clock::SignedDuration::try_from(SweepConfig::default().revoked_grace).unwrap();
     let counts = store
-        .sweep(&t, now + grace + Duration::seconds(1))
+        .sweep(
+            &t,
+            now.plus(
+                grace
+                    .checked_add(axess_clock::SignedDuration::seconds(1))
+                    .unwrap(),
+            ),
+        )
         .await
         .unwrap();
     assert_eq!(counts.revoked_purged, 1);
 }
 
 #[tokio::test]
+async fn device_key_contract() {
+    use crate::device::store::key_contract;
+    key_contract::a_key_binding_round_trips(MemoryDeviceStore::new()).await;
+    key_contract::a_challenge_is_replaced_by_one_compare_and_swap(MemoryDeviceStore::new()).await;
+    key_contract::a_registration_beside_a_sighting_loses_neither(MemoryDeviceStore::new()).await;
+}
+
+#[tokio::test]
 async fn shared_contract() {
     shared::ties_are_broken_by_the_smaller_id(MemoryDeviceStore::new()).await;
+    shared::the_family_lookup_is_by_family_and_by_tenant(MemoryDeviceStore::new()).await;
     shared::a_shared_fingerprint_stays_findable_while_any_device_carries_it(
         MemoryDeviceStore::new(),
     )
@@ -206,8 +224,15 @@ async fn shared_contract() {
     shared::a_revoked_row_keeps_its_revocation_time(MemoryDeviceStore::new()).await;
     shared::a_sighting_reports_the_level_it_found(MemoryDeviceStore::new()).await;
     shared::a_revoked_save_without_a_time_is_stamped_and_purged(MemoryDeviceStore::new()).await;
+    shared::two_swaps_from_one_read_have_one_winner(MemoryDeviceStore::new()).await;
+    shared::two_trust_changes_from_one_level_have_one_winner(MemoryDeviceStore::new()).await;
+    shared::two_claims_of_one_unowned_device_have_one_winner(MemoryDeviceStore::new()).await;
     shared::sweep_decisions_agree_to_the_second(
         MemoryDeviceStore::new().with_sweep_config(shared::tight_config()),
+    )
+    .await;
+    shared::a_sweep_walks_the_ladder_and_counts_what_it_wrote(
+        MemoryDeviceStore::new().with_sweep_config(shared::ladder_config()),
     )
     .await;
 }
@@ -224,7 +249,7 @@ async fn tie_order_is_the_same_across_fresh_stores() {
 #[test]
 fn the_sweep_builder_refuses_a_window_with_a_fraction() {
     let err = SweepConfig::builder()
-        .seen_idle(Duration::milliseconds(1_500))
+        .seen_idle(std::time::Duration::from_millis(1_500))
         .build()
         .unwrap_err();
     assert_eq!(
@@ -235,7 +260,7 @@ fn the_sweep_builder_refuses_a_window_with_a_fraction() {
     );
     assert!(
         SweepConfig::builder()
-            .trusted_idle(Duration::seconds(10))
+            .trusted_idle(std::time::Duration::from_secs(10))
             .build()
             .is_ok()
     );

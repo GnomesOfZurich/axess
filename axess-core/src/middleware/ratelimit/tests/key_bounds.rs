@@ -1,7 +1,9 @@
-//! Key bounding: length, header sub-buckets and IPv6 prefixes.
+//! Key bounding: length and header sub-buckets, the client-address extractor
+//! end to end, and the log fingerprint of a key. The address keys themselves
+//! are tested in `carried_client`.
 
 use super::*;
-use keys::{HEADER_SLOTS, bound_key, ip_bucket};
+use keys::{HEADER_SLOTS, bound_key};
 
 /// A key within the natural limit passes through unchanged. One between that
 /// and `MAX_KEY_LEN` is cut, so no uncut key can equal a cut one.
@@ -15,8 +17,8 @@ fn a_key_within_the_limit_is_unchanged() {
     assert_eq!(bound_key(short.clone()), short);
 }
 
-/// Two long identifiers that share their first 256 bytes used to share a
-/// bucket, so one could drain the other's. They now differ.
+/// Two long identifiers that share their first 256 bytes get different
+/// buckets: in one bucket, either could drain the other's.
 #[test]
 fn long_keys_sharing_a_prefix_get_different_buckets() {
     let prefix = "p".repeat(MAX_KEY_LEN);
@@ -86,25 +88,6 @@ fn a_header_flood_by_one_user_adds_at_most_the_slot_count_of_buckets() {
         store.try_acquire_at(&key, t_zero());
     }
     assert!(crate::locked::lock(&store.buckets).len() as u64 <= HEADER_SLOTS);
-}
-
-/// Every address inside one IPv6 /64 is one client; a different /64 is not.
-#[test]
-fn ipv6_clients_are_keyed_by_their_slash_64() {
-    let a = ip_bucket("2001:db8:1:2::1".parse().unwrap());
-    let b = ip_bucket("2001:db8:1:2:ffff:ffff:ffff:ffff".parse().unwrap());
-    let c = ip_bucket("2001:db8:1:3::1".parse().unwrap());
-    assert_eq!(a, b);
-    assert_ne!(a, c);
-    assert_eq!(a, "2001:db8:1:2::/64");
-}
-
-/// IPv4 is keyed as before, and an IPv4-mapped IPv6 address is the IPv4
-/// client it carries.
-#[test]
-fn ipv4_is_unchanged_and_a_mapped_address_is_its_ipv4_client() {
-    assert_eq!(ip_bucket("192.0.2.7".parse().unwrap()), "192.0.2.7");
-    assert_eq!(ip_bucket("::ffff:192.0.2.7".parse().unwrap()), "192.0.2.7");
 }
 
 /// Through the real extractor: many addresses of one /64 share one bucket.

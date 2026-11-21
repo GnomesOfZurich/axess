@@ -1,7 +1,11 @@
-#![cfg(all(feature = "memory", feature = "device"))]
+#![cfg(all(feature = "memory", feature = "device", feature = "testing"))]
 //! A user who arrives without a valid device cookie, login after login, does
 //! not add a device row per login without bound.
 
+use axess_clock::testing::Shift;
+use axess_core::testing::fixtures as common;
+
+use axess_clock::SignedDuration;
 use axess_core::authn::ids::{DeviceId, TenantId, UserId, testing};
 use axess_core::device::DEFAULT_MAX_UNKNOWN_DEVICES_PER_USER;
 use axess_core::{
@@ -9,7 +13,6 @@ use axess_core::{
     MemoryDeviceStore,
 };
 use axess_rng::SystemRng;
-use chrono::{Duration, TimeZone, Utc};
 
 fn tenant() -> TenantId {
     testing::tenant("tenant-1")
@@ -24,14 +27,15 @@ async fn cookieless_login(
     who: &UserId,
     n: i64,
 ) -> DeviceId {
-    let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap() + Duration::seconds(n);
+    let now = common::start().plus(SignedDuration::seconds(n));
     let tenant = tenant();
     let request = DeviceRequest {
         tenant: &tenant,
         user: Some(who),
-        fingerprint: FingerprintHash::from_bytes([7; 32]),
-        presented: None,
+        fingerprint: Some(FingerprintHash::from_bytes([7; 32])),
+        presented: &[],
         session_device: None,
+        keys: axess_core::device_key::KeyEnforcement::none_for_tests(),
     };
     svc.resolve_proven(request, now, &SystemRng, || {
         testing::device(&format!("device-{n}"))
@@ -95,7 +99,7 @@ async fn a_device_the_user_was_recognised_on_is_never_evicted() {
     let alice = user("alice");
     let kept = cookieless_login(&svc, &alice, 0).await;
     store
-        .set_trust_level(&tenant(), &kept, DeviceTrustLevel::Seen, Utc::now())
+        .set_trust_level(&tenant(), &kept, DeviceTrustLevel::Seen, common::start())
         .await
         .unwrap();
 

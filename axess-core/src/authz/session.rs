@@ -27,6 +27,10 @@
 //! }
 //! ```
 //!
+//! `for_user_id` supplies no request context and is for policies that read
+//! none. When the policies in force read `context` it answers
+//! [`AuthzError::ContextRequired`]; the form below is the way through.
+//!
 //! # With ABAC context
 //!
 //! ```rust,ignore
@@ -44,12 +48,38 @@
 //! let authz = state.authz.for_user_id_with_context(&user_id, ctx)?;
 //! authz.require("PostJournalEntry", &ledger_id).await?;
 //! ```
+//!
+//! # For any principal
+//!
+//! [`AuthzStore::for_principal`] begins a session for a [`Principal`], a
+//! human or a workload, as the entity [`ToCedarEntity`] makes of it:
+//! `axess::Human::"<user id>"` or `axess::Workload::"<SPIFFE URI>"`, with
+//! its attributes, in its tenant. The session adds that entity to the ones
+//! the provider supplies, so one policy that reads `principal.tenant_id`
+//! decides for both kinds:
+//!
+//! ```rust,ignore
+//! async fn read_report(
+//!     State(state): State<AppState>,
+//!     principal: AuthPrincipal,
+//!     Path(report_id): Path<String>,
+//! ) -> Result<impl IntoResponse, AppError> {
+//!     let authz = state.authz.for_principal(&principal)?;
+//!     authz.require("read", &report_id).await?;
+//!     // ...handler body
+//! }
+//! ```
+//!
+//! The user-id constructors are the same path for a principal given as a
+//! user id: the principal is `<namespace>::User::"<id>"`, and its entity is
+//! the provider's to supply.
 
 use arc_swap::ArcSwap;
-use cedar_policy::{Context, Entities, EntityUid};
+use axess_identity::Principal;
+use cedar_policy::{Context, Entities, Entity, EntityUid};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use tracing::warn;
+use tracing::{error, warn};
 
 use super::{
     context::{BuildRequestContext, NoContext},
@@ -58,6 +88,7 @@ use super::{
     reload::ReloadState,
     store::{AuthzDecision, PolicyEvaluator, make_uid},
 };
+use crate::principal::cedar::ToCedarEntity;
 
 // ── AuthzStore ────────────────────────────────────────────────────────────────
 
@@ -96,7 +127,9 @@ impl<P: AuthzEntityProvider> AuthzStore<P> {
     ///   and so validates nothing.
     /// - `provider`: your [`AuthzEntityProvider`] implementation.
     /// - `namespace`: the Cedar entity namespace used in your schema and
-    ///   policy files (e.g. `"MyApp"`). All UID builders on this store use it.
+    ///   policy files (e.g. `"MyApp"`). The principal and action UIDs this
+    ///   store builds are in it; a provider builds its own with
+    ///   [`make_entity_uid`](super::provider::make_entity_uid).
     ///
     /// # Errors
     ///
@@ -154,79 +187,85 @@ impl<P: AuthzEntityProvider> AuthzStore<P> {
         make_uid(&self.namespace, "User", id)
     }
 
-    /// Build a Cedar `Role` entity UID in this store's namespace.
-    pub fn role_uid(&self, name: &str) -> Result<EntityUid, AuthzError> {
-        make_uid(&self.namespace, "Role", name)
-    }
-
     /// Build a Cedar `Action` entity UID in this store's namespace.
     pub fn action_uid(&self, name: &str) -> Result<EntityUid, AuthzError> {
         make_uid(&self.namespace, "Action", name)
     }
 
-    /// Build a Cedar `Tenant` entity UID in this store's namespace.
-    pub fn tenant_uid(&self, id: &str) -> Result<EntityUid, AuthzError> {
-        make_uid(&self.namespace, "Tenant", id)
-    }
-
-    /// Build a Cedar `Platform` entity UID in this store's namespace.
-    pub fn platform_uid(&self, id: &str) -> Result<EntityUid, AuthzError> {
-        make_uid(&self.namespace, "Platform", id)
-    }
-
-    /// Build a Cedar entity UID for an arbitrary type in this store's namespace.
-    ///
-    /// Use this for application-specific entity types not covered by the
-    /// named builder methods above.
-    pub fn entity_uid(&self, type_name: &str, id: &str) -> Result<EntityUid, AuthzError> {
-        make_uid(&self.namespace, type_name, id)
-    }
-
     // ── Session builders ──────────────────────────────────────────────────────
 
-    /// Begin a per-request authz session for the given user ID.
+    /// Begin a per-request authz session for the given user ID, without a
+    /// request context.
     ///
-    /// The session uses an **empty** Cedar `Context`, and says so only here:
-    /// a policy that reads `context.mfa_verified` (or any other context
-    /// attribute) is evaluated with nothing to read. With a schema that
-    /// declares the attribute required, `PolicyStore` denies every request
-    /// (the request is invalid); a policy that guards the attribute with
-    /// `context has ..` and treats absence as allowed would permit. Use this
-    /// builder only when all access control is role-based or
-    /// relationship-based.
+    /// For a policy set that never reads `context`: access control that is
+    /// role-based or relationship-based throughout. When the policies in
+    /// force read `context` (a `context.mfa_verified` rule, an IP check, an
+    /// assurance requirement) this answers
+    /// [`AuthzError::ContextRequired`] and begins nothing: on an empty
+    /// context a `forbid` that guards an optional attribute with
+    /// `context has ..` stops applying and the `permit` beside it allows,
+    /// so a session without a context is never decided against such a set.
+    /// Use [`for_user_id_with_context`][Self::for_user_id_with_context] (or
+    /// [`for_session`][Self::for_session]) there.
     ///
-    /// For ABAC policies (IP checks, MFA requirements, etc.) use
-    /// [`for_user_id_with_context`][Self::for_user_id_with_context].
+    /// The question is asked of the policies in force at this call, and
+    /// asked again at every check the session makes: a session begun here
+    /// and still held when a reload brings a read of `context` in is denied
+    /// from then on.
     ///
     /// The session has no tenant; use
     /// [`for_user_in_tenant`][Self::for_user_in_tenant] or
     /// [`for_session`][Self::for_session] when the provider needs one.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthzError::ContextRequired`] when the policies in force read
+    /// `context`; [`AuthzError::InvalidEntityUid`] for a user id that is not
+    /// one.
     pub fn for_user_id(
         self: &Arc<Self>,
         user_id: &str,
     ) -> Result<AuthzSession<P, NoContext>, AuthzError> {
-        let principal = self.user_uid(user_id)?;
-        Ok(AuthzSession {
-            store: Arc::clone(self),
-            principal,
-            tenant: None,
-            context: Context::empty(),
-            cache: Mutex::new(HashMap::new()),
-            _ctx: std::marker::PhantomData,
-        })
+        self.for_user_id_with_context(user_id, NoContext)
     }
 
-    /// Begin a per-request authz session for a user acting in `tenant`.
+    /// Begin a per-request authz session for a user acting in `tenant`,
+    /// without a request context.
     ///
     /// The tenant reaches the provider through
     /// [`AuthzEntityProvider::entities_for_tenant`]. As with
-    /// [`for_user_id`][Self::for_user_id] the Cedar `Context` is empty.
+    /// [`for_user_id`][Self::for_user_id], this is for a policy set that
+    /// never reads `context`; when the policies in force read it, use
+    /// [`for_user_in_tenant_with_context`][Self::for_user_in_tenant_with_context].
+    ///
+    /// # Errors
+    ///
+    /// As [`for_user_id`][Self::for_user_id].
     pub fn for_user_in_tenant(
         self: &Arc<Self>,
         user_id: &str,
         tenant: &str,
     ) -> Result<AuthzSession<P, NoContext>, AuthzError> {
-        let mut session = self.for_user_id(user_id)?;
+        self.for_user_in_tenant_with_context(user_id, tenant, NoContext)
+    }
+
+    /// Begin a per-request authz session for a user acting in `tenant`, with
+    /// the request context the policies read.
+    ///
+    /// The tenant reaches the provider through
+    /// [`AuthzEntityProvider::entities_for_tenant`]; the context is built at
+    /// once, as in [`for_user_id_with_context`][Self::for_user_id_with_context].
+    ///
+    /// # Errors
+    ///
+    /// As [`for_user_id_with_context`][Self::for_user_id_with_context].
+    pub fn for_user_in_tenant_with_context<Ctx: BuildRequestContext>(
+        self: &Arc<Self>,
+        user_id: &str,
+        tenant: &str,
+        ctx: Ctx,
+    ) -> Result<AuthzSession<P, Ctx>, AuthzError> {
+        let mut session = self.for_user_id_with_context(user_id, ctx)?;
         session.tenant = Some(tenant.to_string());
         Ok(session)
     }
@@ -236,8 +275,9 @@ impl<P: AuthzEntityProvider> AuthzStore<P> {
     ///
     /// Reads the user and tenant from one snapshot of the session, so they
     /// cannot come from different states. Returns
-    /// [`AuthzError::InvalidEntityUid`] when the session is not
-    /// authenticated.
+    /// [`AuthzError::NoPrincipal`] when the session is not authenticated,
+    /// and otherwise what
+    /// [`for_user_id_with_context`][Self::for_user_id_with_context] returns.
     pub async fn for_session<Ctx: BuildRequestContext>(
         self: &Arc<Self>,
         session: &crate::session::AuthSession,
@@ -249,24 +289,121 @@ impl<P: AuthzEntityProvider> AuthzStore<P> {
         Ok(authz)
     }
 
-    /// Begin a per-request authz session with an ABAC context.
+    /// Begin a per-request authz session with the request context the
+    /// policies read: the way to a decision whenever a policy reads
+    /// `context`.
     ///
     /// The context is built immediately and stored for the lifetime of the
-    /// session; it is not rebuilt per check.
+    /// session; it is not rebuilt per check. Build it from the authenticated
+    /// session and from what the application's own layers established about
+    /// the request, never from a value the caller writes.
+    ///
+    /// A `ctx` that supplies nothing ([`NoContext`]) makes this the same
+    /// call as [`for_user_id`][Self::for_user_id], with the same refusal.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthzError::ContextRequired`] when `ctx` supplies no context and
+    /// the policies in force read `context`; [`AuthzError::Context`] when
+    /// the context cannot be built; [`AuthzError::InvalidEntityUid`] for a
+    /// user id that is not one.
     pub fn for_user_id_with_context<Ctx: BuildRequestContext>(
         self: &Arc<Self>,
         user_id: &str,
         ctx: Ctx,
     ) -> Result<AuthzSession<P, Ctx>, AuthzError> {
-        let principal = self.user_uid(user_id)?;
+        self.begin(|| Ok((self.user_uid(user_id)?, None)), None, ctx)
+    }
+
+    /// Begin a per-request authz session for `principal`, a human or a
+    /// workload, without a request context.
+    ///
+    /// The principal is the entity [`ToCedarEntity`] makes of it
+    /// (`axess::Human::"<user id>"` or `axess::Workload::"<SPIFFE URI>"`,
+    /// with its attributes), and the session is in the principal's tenant,
+    /// which reaches the provider through
+    /// [`AuthzEntityProvider::entities_for_tenant`]. As with
+    /// [`for_user_id`][Self::for_user_id], this is for a policy set that
+    /// never reads `context`; when the policies in force read it, use
+    /// [`for_principal_with_context`][Self::for_principal_with_context].
+    ///
+    /// # Errors
+    ///
+    /// As [`for_principal_with_context`][Self::for_principal_with_context].
+    pub fn for_principal(
+        self: &Arc<Self>,
+        principal: &Principal,
+    ) -> Result<AuthzSession<P, NoContext>, AuthzError> {
+        self.for_principal_with_context(principal, NoContext)
+    }
+
+    /// Begin a per-request authz session for `principal`, a human or a
+    /// workload, with the request context the policies read.
+    ///
+    /// The session adds the principal's entity to the entities the provider
+    /// supplies for each check, so the provider need not build it and one
+    /// policy decides for both kinds. The principal's entity is the
+    /// library's, with no parents: a provider that supplies an entity of
+    /// the same UID must supply the same entity, and one that differs (other
+    /// attributes, or parents) denies the check, as a decision cannot hold
+    /// two entities of one UID. Groups come from the provider as entities
+    /// of their own, with their parent links between them and their members
+    /// named on them, so a policy reads `principal in Group::"g".members`
+    /// (the principal chapter's "Groups and other parents"). The schema, when the store has one, declares
+    /// `axess::Human` and `axess::Workload` with the attributes the
+    /// principal module documents, or the request is refused at evaluation.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthzError::ContextRequired`] when `ctx` supplies no context and
+    /// the policies in force read `context`; [`AuthzError::Context`] when
+    /// the context cannot be built; [`AuthzError::InvalidEntityUid`] or
+    /// [`AuthzError::EntityBuild`] when the principal's entity cannot be
+    /// built.
+    pub fn for_principal_with_context<Ctx: BuildRequestContext>(
+        self: &Arc<Self>,
+        principal: &Principal,
+        ctx: Ctx,
+    ) -> Result<AuthzSession<P, Ctx>, AuthzError> {
+        self.begin(
+            || {
+                let entity = principal.to_cedar_entity()?;
+                Ok((entity.uid(), Some(entity)))
+            },
+            Some(principal.tenant_id().to_string()),
+            ctx,
+        )
+    }
+
+    /// The one way a session begins: the context rule first, then the
+    /// principal's UID (and, for a [`Principal`], its entity), then the
+    /// context.
+    fn begin<Ctx: BuildRequestContext>(
+        self: &Arc<Self>,
+        principal: impl FnOnce() -> Result<(EntityUid, Option<Entity>), AuthzError>,
+        tenant: Option<String>,
+        ctx: Ctx,
+    ) -> Result<AuthzSession<P, Ctx>, AuthzError> {
+        let context_supplied = ctx.supplies_context();
+        // The one rule of this module: a policy set that reads `context` is
+        // never decided for a session nobody gave a context. It is asked of
+        // the evaluator itself, so it holds for every policy set, and it is
+        // asked again at each decision (`AuthzSession::evaluate`), because a
+        // reload can change the answer under a session already begun.
+        if !context_supplied && self.evaluator.load().mentions_context() {
+            return Err(AuthzError::ContextRequired);
+        }
+        let (principal, principal_entity) = principal()?;
         let context = ctx.to_cedar_context()?;
         Ok(AuthzSession {
             store: Arc::clone(self),
             principal,
-            tenant: None,
+            principal_entity,
+            tenant,
             context,
+            context_supplied,
             cache: Mutex::new(HashMap::new()),
-            _ctx: std::marker::PhantomData,
+            ctx: std::marker::PhantomData,
         })
     }
 }
@@ -275,19 +412,26 @@ impl<P: AuthzEntityProvider> AuthzStore<P> {
 
 /// Per-request authorization session.
 ///
-/// Created by [`AuthzStore::for_user_id`] or [`AuthzStore::for_user_id_with_context`].
+/// Created by [`AuthzStore::for_principal`], [`AuthzStore::for_user_id`],
+/// their `_with_context` forms and their siblings.
 /// `Send`: safe to hold across `.await` in Axum handlers.
 pub struct AuthzSession<P: AuthzEntityProvider, Ctx = NoContext> {
     store: Arc<AuthzStore<P>>,
     principal: EntityUid,
+    /// The principal's entity, for a session begun for a [`Principal`]:
+    /// added to the provider's entities at each check.
+    principal_entity: Option<Entity>,
     tenant: Option<String>,
     context: Context,
+    /// Whether the session was begun with a request context. A session
+    /// without one is denied by any policy set that reads `context`.
+    context_supplied: bool,
     // Per-request entity cache: (action_uid_str, resource_uid_str) → entities.
     // Deduplicates repeated identical checks within one request.
     // Uses Mutex (not RefCell) so the session is Send for Axum handlers.
     // The lock is never held across .await points.
     cache: Mutex<HashMap<(String, String), Arc<Entities>>>,
-    _ctx: std::marker::PhantomData<Ctx>,
+    ctx: std::marker::PhantomData<Ctx>,
 }
 
 impl<P: AuthzEntityProvider, Ctx> AuthzSession<P, Ctx> {
@@ -448,6 +592,22 @@ impl<P: AuthzEntityProvider, Ctx> AuthzSession<P, Ctx> {
                     .await
                 {
                     Ok(ent) => {
+                        let ent = match self.with_principal_entity(ent) {
+                            Ok(ent) => ent,
+                            Err(reason) => {
+                                warn!(
+                                    "authz: the provider's entities do not admit the principal's \
+                                     own entity ({reason}); denied"
+                                );
+                                super::audit::emit_early_deny(
+                                    &self.principal.to_string(),
+                                    &action_uid.to_string(),
+                                    &resource_uid.to_string(),
+                                    reason,
+                                );
+                                return Evaluated::Refused;
+                            }
+                        };
                         let arc = Arc::new(ent);
                         self.cache
                             .lock()
@@ -472,7 +632,27 @@ impl<P: AuthzEntityProvider, Ctx> AuthzSession<P, Ctx> {
         // 5. Evaluate Cedar policy against one snapshot of the swap slot: a
         // wait-free read, dropped with the decision, so a reload that lands
         // now applies to the next request and never splits this one.
-        let decision = self.store.evaluator.load().is_authorized(
+        let evaluator = self.store.evaluator.load();
+        // A session begun without a context is refused where it is begun
+        // when the policies read `context`. A reload can bring that read in
+        // while the session is held, so the set that is about to decide is
+        // asked once more, and a session without a context is denied by it.
+        if !self.context_supplied && evaluator.mentions_context() {
+            // Who and what is in the decision event below; the error line
+            // says what the operator has to change.
+            error!(
+                "authz: the policies in force read `context` and this session was begun \
+                 without one (a policy reload brought the read in); denied"
+            );
+            super::audit::emit_early_deny(
+                &self.principal.to_string(),
+                &action_uid.to_string(),
+                &resource_uid.to_string(),
+                "context_required",
+            );
+            return Evaluated::Refused;
+        }
+        let decision = evaluator.is_authorized(
             &entities,
             self.principal.clone(),
             action_uid.clone(),
@@ -486,6 +666,25 @@ impl<P: AuthzEntityProvider, Ctx> AuthzSession<P, Ctx> {
                 action: action_uid,
                 resource: resource_uid,
             }),
+        }
+    }
+}
+
+impl<P: AuthzEntityProvider, Ctx> AuthzSession<P, Ctx> {
+    /// `entities` with the principal's own entity in it, for a session
+    /// begun for a [`Principal`]; the provider's set as it is otherwise. A
+    /// provider entity of the principal's UID that is not the same entity is
+    /// refused, with the reason the decision log records.
+    fn with_principal_entity(&self, entities: Entities) -> Result<Entities, &'static str> {
+        let Some(entity) = &self.principal_entity else {
+            return Ok(entities);
+        };
+        match entities.get(&entity.uid()) {
+            Some(supplied) if supplied.deep_eq(entity) => Ok(entities),
+            Some(_) => Err("principal_entity_conflict"),
+            None => entities
+                .add_entities([entity.clone()], None)
+                .map_err(|_| "principal_entity_merge_failed"),
         }
     }
 }
@@ -509,3 +708,9 @@ struct Question {
 
 #[cfg(test)]
 mod authz_session_tests;
+
+#[cfg(test)]
+mod principal_tests;
+
+#[cfg(test)]
+mod principal_group_tests;

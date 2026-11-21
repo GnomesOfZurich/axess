@@ -3,7 +3,10 @@
 //! after max attempts, and counter-store outage MUST NOT propagate as
 //! `Err(Store)`.
 
-mod common;
+mod hotp_code;
+use axess_clock::testing::Shift;
+use axess_core::testing::fixtures as common;
+use hotp_code::generate_hotp_code;
 
 use axess_core::Clock as _;
 use axess_core::authn::AuditContext;
@@ -14,16 +17,13 @@ use axess_core::authn::{
     store::{AuthMethod, FactorStore as _, IdentityAdmin},
     types::{CounterUnavailable, LockoutPolicy, StatusDetail},
 };
-use axess_core::session::store::MemorySessionRegistry;
+use axess_core::session::store::{MemorySessionRegistry, SessionRegistry};
+use axess_core::testing::registry_double::{RegistryCall, RegistryDouble, Step};
 use axess_core::testing::{
-    MockClock,
     mock_authn::{MockFactorStore, MockIdentityStore},
     test_session,
 };
-use chrono::Utc;
-use common::{
-    generate_hotp_code, password_config, password_method, test_tenant, test_user, uid, user_scope,
-};
+use common::{password_config, password_method, test_tenant, test_user, uid, user_scope};
 
 /// Simulates the race: between the initial `account_status` check in
 /// `verify_factor` and the `register` call in `complete_factor_step`, an
@@ -32,14 +32,17 @@ use common::{
 /// `Locked`.
 #[tokio::test]
 async fn auth_completing_concurrently_with_suspend_returns_locked() {
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new()
-        .with_factor(user_scope(), password_config("Gnomes2+"))
+        .with_factor(user_scope(), password_config("Sample2+"))
         .with_method(&uid("u1"), password_method());
-    let registry = MemorySessionRegistry::new();
+    let registry = MemorySessionRegistry::new().with_clock(std::sync::Arc::new(clock.clone()));
     let svc = AuthnService::builder(identity.clone(), factors)
+        .with_clock(clock.clone())
         .with_registry(registry.clone())
         .allow_plaintext_factor_secrets()
         .build()
@@ -55,12 +58,12 @@ async fn auth_completing_concurrently_with_suspend_returns_locked() {
     identity
         .suspend_user(
             &uid("u1"),
-            StatusDetail::administrative("concurrent admin suspend", Utc::now()),
+            StatusDetail::administrative("concurrent admin suspend", common::start()),
         )
         .await
         .unwrap();
 
-    let cred = FactorCredential::Password(ZeroizedString::new("Gnomes2+"));
+    let cred = FactorCredential::Password(ZeroizedString::new("Sample2+"));
     let result = svc.verify_factor(&cred, &session).await.unwrap();
 
     assert!(
@@ -68,6 +71,99 @@ async fn auth_completing_concurrently_with_suspend_returns_locked() {
         "got {result:?}"
     );
     assert!(!session.is_authenticated().await);
+}
+
+/// A registry that lets a suspension land the moment a session is
+/// registered: after the status check that precedes the factor step has
+/// read `Active`, and before the status is read again.
+fn suspending_registry(
+    inner: MemorySessionRegistry,
+    identity: MockIdentityStore,
+    detail: StatusDetail,
+) -> RegistryDouble {
+    RegistryDouble::over(inner).before(move |call, _| {
+        let (identity, detail) = (identity.clone(), detail.clone());
+        async move {
+            let RegistryCall::Register { user, .. } = call else {
+                return Step::Forward;
+            };
+            match identity.suspend_user(&user, detail).await {
+                Ok(_) => Step::Forward,
+                Err(_) => Step::Fail("the suspension did not land"),
+            }
+        }
+    })
+}
+
+/// The status read again after the session is registered shows the end of
+/// a suspension by the rule of the check before the step: only for a
+/// lockout a store keeps as a state. A hold an operator places while the
+/// last factor is being verified answers `Locked` with no end, so the step
+/// does not say that an operator holds the account or until when.
+#[tokio::test]
+async fn a_suspension_landing_at_the_register_shows_the_end_of_a_lockout_only() {
+    let clock = common::test_clock();
+    let until = clock.now().plus(axess_clock::SignedDuration::days(1));
+    let causes = [
+        (
+            "lockout",
+            StatusDetail::lockout("too many attempts", clock.now()),
+            Some(until),
+        ),
+        (
+            "administrative",
+            StatusDetail::administrative("hold", clock.now()),
+            None,
+        ),
+        (
+            "verification",
+            StatusDetail::verification("pending", clock.now()),
+            None,
+        ),
+        (
+            "closure",
+            StatusDetail::closure("closing", clock.now()),
+            None,
+        ),
+    ];
+    for (name, detail, shown) in causes {
+        let identity = MockIdentityStore::new()
+            .with_clock(clock.clone())
+            .with_tenant(test_tenant())
+            .with_user(test_user("u1", "alice"))
+            .with_clock(clock.clone());
+        let factors = MockFactorStore::new()
+            .with_factor(user_scope(), password_config("Sample2+"))
+            .with_method(&uid("u1"), password_method());
+        let registry = MemorySessionRegistry::new().with_clock(std::sync::Arc::new(clock.clone()));
+        let svc = AuthnService::builder(identity.clone(), factors)
+            .with_clock(clock.clone())
+            .with_registry(suspending_registry(
+                registry.clone(),
+                identity.clone(),
+                detail.with_until(Some(axess_clock::Until::At(until))),
+            ))
+            .allow_plaintext_factor_secrets()
+            .build()
+            .with_audit_context(AuditContext::default());
+
+        let session = test_session();
+        svc.begin_login("alice", "default", &session).await.unwrap();
+        let cred = FactorCredential::Password(ZeroizedString::new("Sample2+"));
+        let result = svc.verify_factor(&cred, &session).await.unwrap();
+
+        match result {
+            FactorOutcome::Locked { until } => assert_eq!(
+                until,
+                shown.map(axess_clock::Until::At),
+                "{name}: the end shown"
+            ),
+            other => panic!("{name}: expected Locked, got {other:?}"),
+        }
+        assert!(!session.is_authenticated().await, "{name}: not signed in");
+        let Ok(held) = registry.active_sessions(&uid("u1")).await;
+        assert!(held.is_empty(), "{name}: the session is revoked");
+    }
 }
 
 /// After `max_attempts` wrong HOTP codes the factor is locked for a while
@@ -78,14 +174,15 @@ async fn auth_completing_concurrently_with_suspend_returns_locked() {
 #[tokio::test]
 async fn hotp_locks_after_max_attempts_and_keeps_the_token_in_sync() {
     let secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
-    let clock = MockClock::now();
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "carol"))
         .with_clock(clock.clone());
 
     let factors = MockFactorStore::new()
-        .with_factor(user_scope(), password_config("Gnomes2+"))
+        .with_factor(user_scope(), password_config("Sample2+"))
         .with_factor(
             user_scope(),
             FactorConfig::Hotp(HotpConfig {
@@ -123,7 +220,7 @@ async fn hotp_locks_after_max_attempts_and_keeps_the_token_in_sync() {
             .unwrap();
         let r = service
             .verify_factor(
-                &FactorCredential::Password(ZeroizedString::new("Gnomes2+")),
+                &FactorCredential::Password(ZeroizedString::new("Sample2+")),
                 &session,
             )
             .await
@@ -144,7 +241,7 @@ async fn hotp_locks_after_max_attempts_and_keeps_the_token_in_sync() {
     // Three wrong codes: the limit. Each waits out the delay the one before
     // it earned, so the throttle refuses none of them.
     for delay in [0, 1, 2] {
-        clock.advance(chrono::Duration::seconds(delay));
+        clock.advance(axess_clock::SignedDuration::seconds(delay));
         assert!(matches!(
             try_code(&service, "000000").await,
             FactorOutcome::InvalidCredential
@@ -162,7 +259,7 @@ async fn hotp_locks_after_max_attempts_and_keeps_the_token_in_sync() {
     assert!(hotp.is_locked_at(clock.now()), "the factor is locked");
 
     // While the lock holds, the genuine code is refused and nothing moves.
-    clock.advance(chrono::Duration::seconds(4));
+    clock.advance(axess_clock::SignedDuration::seconds(4));
     let code_0 = generate_hotp_code(secret, 0);
     assert!(matches!(
         try_code(&service, &code_0).await,
@@ -170,7 +267,7 @@ async fn hotp_locks_after_max_attempts_and_keeps_the_token_in_sync() {
     ));
 
     // Once it has run out, the same code at the same counter gets in.
-    clock.advance(chrono::Duration::seconds(61));
+    clock.advance(axess_clock::SignedDuration::seconds(61));
     assert!(matches!(
         try_code(&service, &code_0).await,
         FactorOutcome::Authenticated
@@ -199,15 +296,18 @@ async fn hotp_locks_after_max_attempts_and_keeps_the_token_in_sync() {
 /// Both arms are pinned below.
 #[tokio::test]
 async fn wrong_password_during_counter_outage_never_returns_err() {
+    let clock = common::test_clock();
     // Default policy: CounterUnavailable::Lock. The attempt is treated as
     // locked, so the outage cannot be used for unlimited attempts.
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new()
-        .with_factor(user_scope(), password_config("Gnomes2+"))
+        .with_factor(user_scope(), password_config("Sample2+"))
         .with_method(&uid("u1"), password_method());
     let service = AuthnService::builder(identity.clone(), factors)
+        .with_clock(clock.clone())
         .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());
@@ -246,9 +346,11 @@ async fn wrong_password_during_counter_outage_never_returns_err() {
 
 #[tokio::test]
 async fn wrong_password_during_counter_outage_allows_when_configured() {
+    let clock = common::test_clock();
     // CounterUnavailable::Allow keeps logins working and disables lockout
     // for the duration. Still never `Err`, for the enumeration reason above.
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"))
         .with_lockout_policy(LockoutPolicy {
@@ -256,9 +358,10 @@ async fn wrong_password_during_counter_outage_allows_when_configured() {
             ..LockoutPolicy::default()
         });
     let factors = MockFactorStore::new()
-        .with_factor(user_scope(), password_config("Gnomes2+"))
+        .with_factor(user_scope(), password_config("Sample2+"))
         .with_method(&uid("u1"), password_method());
     let service = AuthnService::builder(identity.clone(), factors)
+        .with_clock(clock.clone())
         .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());
@@ -294,13 +397,16 @@ async fn wrong_password_during_counter_outage_allows_when_configured() {
 /// at will by degrading the audit store. Both paths emit now, so both fail.
 #[tokio::test]
 async fn audit_outage_fails_closed_identically_for_known_and_unknown_users() {
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new()
-        .with_factor(user_scope(), password_config("Gnomes2+"))
+        .with_factor(user_scope(), password_config("Sample2+"))
         .with_method(&uid("u1"), password_method());
     let service = AuthnService::builder(identity.clone(), factors)
+        .with_clock(clock.clone())
         .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());
@@ -331,13 +437,17 @@ async fn audit_outage_fails_closed_identically_for_known_and_unknown_users() {
 }
 
 /// With the audit store healthy, a login attempt against an identifier that
-/// does not exist still lands in the trail. A credential-stuffing run over a
-/// list of addresses, none of which are registered, used to leave nothing
-/// behind but a metric counter.
+/// does not exist still lands in the trail. Without the row, a
+/// credential-stuffing run over a list of addresses, none of which are
+/// registered, would leave nothing behind but a metric counter.
 #[tokio::test]
 async fn unknown_identifier_attempts_reach_the_audit_trail() {
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
+    let clock = common::test_clock();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
     let service = AuthnService::builder(identity.clone(), MockFactorStore::new())
+        .with_clock(clock.clone())
         .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());

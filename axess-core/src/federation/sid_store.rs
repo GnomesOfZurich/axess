@@ -27,20 +27,23 @@
 //! # Errors
 //!
 //! Every method can fail with [`SidStoreError`] when the backing store does.
-//! A login that cannot write its mapping is still a login (the mapping is
-//! best effort, as it is when the in-process map is at capacity) and logs
-//! it; a logout that cannot read answers a retryable `503`, so the IdP sends
-//! the token again.
+//! A login whose subject record or `sid` mapping cannot be written is
+//! refused and its session ended, as a login the session registry cannot
+//! register is: no session exists that a logout from the provider cannot
+//! reach, and an outage of the store is an outage of federated sign-in. A
+//! logout that cannot read answers a retryable `503`, so the IdP sends the
+//! token again. The prune and the capacity eviction act on other logins'
+//! records and stay best effort: a failure there leaves records that expire.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use axess_clock::Timestamp;
 
 use super::sid_map::{DisplacedSid, SidEntry, SidKey, SidMap};
 use crate::authn::ids::{TenantId, UserId};
-use crate::session::id::SessionId;
+use crate::session::id::SessionKey;
 
 /// A [`SidStore`] call in flight.
 pub type SidFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, SidStoreError>> + Send + 'a>>;
@@ -53,6 +56,10 @@ pub struct SidStoreError(pub String);
 /// The `sid` map and subject registry, behind a trait so a deployment can
 /// share them between instances. See the [module docs](self); the methods
 /// mean what the same-named methods of [`SidMap`] mean.
+///
+/// A session is named by its [`SessionKey`], as the session store and the
+/// session registry name it: no record a store keeps holds a value a cookie
+/// could carry.
 ///
 /// `scope` on a read is the tenant whose provider verified the logout
 /// token: a mapping or session is returned only if it was recorded for that
@@ -67,8 +74,8 @@ pub trait SidStore: Send + Sync + 'static {
         subject: &'a str,
         tenant: Option<TenantId>,
         user: UserId,
-        session: SessionId,
-        inserted_at: DateTime<Utc>,
+        session: SessionKey,
+        inserted_at: Timestamp,
     ) -> SidFuture<'a, Option<DisplacedSid>>;
 
     /// Put a displaced mapping back if its key is still vacant and its
@@ -87,7 +94,7 @@ pub trait SidStore: Send + Sync + 'static {
     fn remove_if_session<'a>(
         &'a self,
         key: &'a SidKey,
-        session: &'a SessionId,
+        session: &'a SessionKey,
     ) -> SidFuture<'a, Option<SidEntry>>;
 
     /// Record that `session` was established for `user`, who logged in under
@@ -98,7 +105,7 @@ pub trait SidStore: Send + Sync + 'static {
         subject: &'a str,
         tenant: Option<TenantId>,
         user: UserId,
-        session: SessionId,
+        session: SessionKey,
     ) -> SidFuture<'a, ()>;
 
     /// Drop one session from the subject registry; whether it was there.
@@ -106,7 +113,7 @@ pub trait SidStore: Send + Sync + 'static {
         &'a self,
         issuer: &'a str,
         user: &'a UserId,
-        session: &'a SessionId,
+        session: &'a SessionKey,
     ) -> SidFuture<'a, bool>;
 
     /// Every session of `subject` under `issuer` that was recorded for
@@ -116,22 +123,22 @@ pub trait SidStore: Send + Sync + 'static {
         issuer: &'a str,
         subject: &'a str,
         scope: Option<&'a TenantId>,
-    ) -> SidFuture<'a, Vec<(UserId, SessionId)>>;
+    ) -> SidFuture<'a, Vec<(UserId, SessionKey)>>;
 
     /// Up to `max` subject records to check for liveness.
     fn sweep_subject_candidates(
         &self,
         max: usize,
-    ) -> SidFuture<'_, Vec<(String, UserId, SessionId)>>;
+    ) -> SidFuture<'_, Vec<(String, UserId, SessionKey)>>;
 
     /// Remove every mapping of `session`, and its subject record; returns
     /// how many `sid` mappings went.
-    fn remove_session<'a>(&'a self, session: &'a SessionId) -> SidFuture<'a, usize>;
+    fn remove_session<'a>(&'a self, session: &'a SessionKey) -> SidFuture<'a, usize>;
 
     /// Remove up to `max` mappings inserted before `cutoff`, oldest first.
     fn evict_inserted_before(
         &self,
-        cutoff: DateTime<Utc>,
+        cutoff: Timestamp,
         max: usize,
     ) -> SidFuture<'_, Vec<(SidKey, SidEntry)>>;
 
@@ -150,8 +157,8 @@ impl SidStore for SidMap {
         subject: &'a str,
         tenant: Option<TenantId>,
         user: UserId,
-        session: SessionId,
-        inserted_at: DateTime<Utc>,
+        session: SessionKey,
+        inserted_at: Timestamp,
     ) -> SidFuture<'a, Option<DisplacedSid>> {
         Box::pin(async move {
             Ok(SidMap::insert_displacing(
@@ -181,7 +188,7 @@ impl SidStore for SidMap {
     fn remove_if_session<'a>(
         &'a self,
         key: &'a SidKey,
-        session: &'a SessionId,
+        session: &'a SessionKey,
     ) -> SidFuture<'a, Option<SidEntry>> {
         Box::pin(async move { Ok(SidMap::remove_if(self, key, |entry| entry.1 == *session)) })
     }
@@ -192,7 +199,7 @@ impl SidStore for SidMap {
         subject: &'a str,
         tenant: Option<TenantId>,
         user: UserId,
-        session: SessionId,
+        session: SessionKey,
     ) -> SidFuture<'a, ()> {
         Box::pin(async move {
             SidMap::register_subject_session(self, issuer, subject, tenant, user, session);
@@ -204,7 +211,7 @@ impl SidStore for SidMap {
         &'a self,
         issuer: &'a str,
         user: &'a UserId,
-        session: &'a SessionId,
+        session: &'a SessionKey,
     ) -> SidFuture<'a, bool> {
         Box::pin(async move { Ok(SidMap::forget_subject_session(self, issuer, user, session)) })
     }
@@ -214,24 +221,24 @@ impl SidStore for SidMap {
         issuer: &'a str,
         subject: &'a str,
         scope: Option<&'a TenantId>,
-    ) -> SidFuture<'a, Vec<(UserId, SessionId)>> {
+    ) -> SidFuture<'a, Vec<(UserId, SessionKey)>> {
         Box::pin(async move { Ok(SidMap::subject_sessions_in(self, issuer, subject, scope)) })
     }
 
     fn sweep_subject_candidates(
         &self,
         max: usize,
-    ) -> SidFuture<'_, Vec<(String, UserId, SessionId)>> {
+    ) -> SidFuture<'_, Vec<(String, UserId, SessionKey)>> {
         Box::pin(async move { Ok(SidMap::sweep_subject_candidates(self, max)) })
     }
 
-    fn remove_session<'a>(&'a self, session: &'a SessionId) -> SidFuture<'a, usize> {
+    fn remove_session<'a>(&'a self, session: &'a SessionKey) -> SidFuture<'a, usize> {
         Box::pin(async move { Ok(SidMap::remove_session(self, session)) })
     }
 
     fn evict_inserted_before(
         &self,
-        cutoff: DateTime<Utc>,
+        cutoff: Timestamp,
         max: usize,
     ) -> SidFuture<'_, Vec<(SidKey, SidEntry)>> {
         Box::pin(async move { Ok(SidMap::evict_inserted_before(self, cutoff, max)) })

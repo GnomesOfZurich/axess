@@ -38,7 +38,7 @@ fn new_from_pem_parses_valid_pair() {
 
 #[test]
 fn new_from_pem_rejects_empty_cert_chain() {
-    let (_cert_pem, key_pem) = self_signed_pem();
+    let (_, key_pem) = self_signed_pem();
     let err = OutboundMtlsClient::new_from_pem(b"", key_pem.as_bytes())
         .expect_err("empty cert PEM must reject");
     assert!(
@@ -49,7 +49,7 @@ fn new_from_pem_rejects_empty_cert_chain() {
 
 #[test]
 fn new_from_pem_rejects_missing_key() {
-    let (cert_pem, _key_pem) = self_signed_pem();
+    let (cert_pem, _) = self_signed_pem();
     let err = OutboundMtlsClient::new_from_pem(cert_pem.as_bytes(), b"")
         .expect_err("empty key PEM must reject");
     assert!(
@@ -63,7 +63,7 @@ fn new_from_pem_rejects_wrong_block_type_for_cert() {
     // A PRIVATE KEY block where the caller swapped cert + key by
     // mistake. `CertificateDer::pem_slice_iter` filters by section
     // type, so this yields zero items and surfaces as CertParse.
-    let (_cert_pem, key_pem) = self_signed_pem();
+    let (_, key_pem) = self_signed_pem();
     let err = OutboundMtlsClient::new_from_pem(key_pem.as_bytes(), key_pem.as_bytes())
         .expect_err("PRIVATE KEY in cert slot must reject");
     assert!(
@@ -153,9 +153,9 @@ fn new_from_der_round_trips_pem_input() {
 
 #[test]
 fn new_from_der_rejects_empty_chain() {
-    let (_cert_pem, key_pem) = self_signed_pem();
+    let (cert_pem, key_pem) = self_signed_pem();
     let pem_built =
-        OutboundMtlsClient::new_from_pem(_cert_pem.as_bytes(), key_pem.as_bytes()).expect("parse");
+        OutboundMtlsClient::new_from_pem(cert_pem.as_bytes(), key_pem.as_bytes()).expect("parse");
     let key_der = pem_built.private_key().clone_key();
 
     let err = OutboundMtlsClient::new_from_der(Vec::new(), key_der)

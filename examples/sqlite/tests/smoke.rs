@@ -6,10 +6,10 @@
 //! routes (`/login`, `/signup`, `/healthz`, `/metrics`,
 //! `/forgot-password`), and the bare `OurBackend::new` construction.
 
-use axess::SystemClock;
+use axess_clock::testing::MockClock;
 use axess_example_sqlite::{
     models::backend::{OurBackend, seed},
-    web::app::build_router,
+    web::app::build_router_on,
 };
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -41,6 +41,7 @@ async fn migrate(pool: &sqlx::SqlitePool) {
 
 #[tokio::test]
 async fn seed_is_idempotent_across_startups() {
+    let clock = MockClock::at_reference();
     // `seed()` must be safe to run on every startup, so the second
     // invocation on the same pool MUST NOT raise a UNIQUE-constraint
     // error. A schema or shape mismatch surfaces first as a panic
@@ -49,16 +50,18 @@ async fn seed_is_idempotent_across_startups() {
     migrate(&pool).await;
 
     seed(
-        &SystemClock,
+        &clock,
         &pool,
-        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF"),
+        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF")
+            .with_clock(std::sync::Arc::new(clock.clone())),
     )
     .await
     .expect("first seed");
     seed(
-        &SystemClock,
+        &clock,
         &pool,
-        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF"),
+        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF")
+            .with_clock(std::sync::Arc::new(clock.clone())),
     )
     .await
     .expect("second seed must be a no-op, not a constraint violation");
@@ -66,6 +69,7 @@ async fn seed_is_idempotent_across_startups() {
 
 #[tokio::test]
 async fn seeded_methods_load_back_through_runtime_path() {
+    let clock = MockClock::at_reference();
     // `seed()` writes the tagged-enum form
     // (`[{"Required":"Password"}]`); the runtime load path
     // deserializes into `Vec<FactorStep>`. Either side drifting
@@ -73,9 +77,10 @@ async fn seeded_methods_load_back_through_runtime_path() {
     let pool = fresh_pool().await;
     migrate(&pool).await;
     seed(
-        &SystemClock,
+        &clock,
         &pool,
-        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF"),
+        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF")
+            .with_clock(std::sync::Arc::new(clock.clone())),
     )
     .await
     .expect("seed");
@@ -110,19 +115,21 @@ async fn seeded_methods_load_back_through_runtime_path() {
 
 #[tokio::test]
 async fn root_redirects_to_login_when_unauthenticated() {
+    let clock = MockClock::at_reference();
     // `GET /` for a guest MUST land on `/login`. Without an explicit
     // redirect the bare app returns 404 + empty body; a blank page
     // in a browser.
     let pool = fresh_pool().await;
     migrate(&pool).await;
     seed(
-        &SystemClock,
+        &clock,
         &pool,
-        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF"),
+        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF")
+            .with_clock(std::sync::Arc::new(clock.clone())),
     )
     .await
     .expect("seed");
-    let (router, _store) = build_router(pool).await;
+    let (router, store) = build_router_on(pool, std::sync::Arc::new(clock.clone())).await;
 
     let resp = router
         .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -141,10 +148,12 @@ async fn root_redirects_to_login_when_unauthenticated() {
         .and_then(|v| v.to_str().ok())
         .expect("Location header present on redirect");
     assert_eq!(location, "/login", "guests land on /login");
+    drop(store);
 }
 
 #[tokio::test]
 async fn key_surface_routes_respond() {
+    let clock = MockClock::at_reference();
     // Sanity check that the routes a new visitor or operator
     // hits actually return non-error responses. Doesn't assert
     // body content (HTML pages drift); only that the route is
@@ -152,13 +161,14 @@ async fn key_surface_routes_respond() {
     let pool = fresh_pool().await;
     migrate(&pool).await;
     seed(
-        &SystemClock,
+        &clock,
         &pool,
-        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF"),
+        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF")
+            .with_clock(std::sync::Arc::new(clock.clone())),
     )
     .await
     .expect("seed");
-    let (router, _store) = build_router(pool).await;
+    let (router, store) = build_router_on(pool, std::sync::Arc::new(clock.clone())).await;
 
     for (uri, name) in [
         ("/login", "login page"),
@@ -179,6 +189,7 @@ async fn key_surface_routes_respond() {
             resp.status()
         );
     }
+    drop(store);
 }
 
 #[tokio::test]
@@ -188,7 +199,7 @@ async fn backend_construction_does_not_panic() {
     // surface as a panic at init time.
     let pool = fresh_pool().await;
     migrate(&pool).await;
-    let _ = OurBackend::new(pool);
+    let _ = OurBackend::new(pool).with_clock(std::sync::Arc::new(MockClock::at_reference()));
 }
 
 async fn app() -> axum::Router {
@@ -196,16 +207,23 @@ async fn app() -> axum::Router {
 }
 
 async fn app_with_pool() -> (axum::Router, sqlx::SqlitePool) {
+    let clock = MockClock::at_reference();
     let pool = fresh_pool().await;
     migrate(&pool).await;
     seed(
-        &SystemClock,
+        &clock,
         &pool,
-        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF"),
+        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF")
+            .with_clock(std::sync::Arc::new(clock.clone())),
     )
     .await
     .expect("seed");
-    (build_router(pool.clone()).await.0, pool)
+    (
+        build_router_on(pool.clone(), std::sync::Arc::new(clock.clone()))
+            .await
+            .0,
+        pool,
+    )
 }
 
 #[tokio::test]
@@ -303,7 +321,7 @@ async fn signup_enforces_the_password_rules_on_the_server() {
         outcome.contains("at least 12 characters"),
         "a weak password must be refused by the server, got: {outcome}"
     );
-    let outcome = post_signup(&router, "Gnomes2%2BLongEnough").await;
+    let outcome = post_signup(&router, "Sample2%2BLongEnough").await;
     assert!(outcome.contains("Check your email"), "{outcome}");
 }
 
@@ -329,7 +347,7 @@ async fn signup_refuses_a_breached_password_by_name() {
 #[tokio::test]
 async fn signup_with_a_taken_username_does_not_say_so() {
     let router = app().await;
-    let outcome = post_signup_as(&router, "alice", "Gnomes2%2BLongEnough").await;
+    let outcome = post_signup_as(&router, "alice", "Sample2%2BLongEnough").await;
     assert!(
         !outcome.to_lowercase().contains("already exists"),
         "the response named the conflict: {outcome}"
@@ -342,12 +360,14 @@ async fn signup_with_a_taken_username_does_not_say_so() {
 
 #[tokio::test]
 async fn bobs_seeded_totp_secret_is_sealed_at_rest() {
+    let clock = MockClock::at_reference();
     let pool = fresh_pool().await;
     migrate(&pool).await;
     seed(
-        &SystemClock,
+        &clock,
         &pool,
-        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF"),
+        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF")
+            .with_clock(std::sync::Arc::new(clock.clone())),
     )
     .await
     .expect("seed");
@@ -382,7 +402,7 @@ async fn a_failed_signup_leaves_no_half_built_user() {
     .await
     .expect("trigger");
 
-    let outcome = post_signup(&router, "Gnomes2%2BLongEnough").await;
+    let outcome = post_signup(&router, "Sample2%2BLongEnough").await;
     assert!(
         !outcome.starts_with("redirect"),
         "the signup should have failed: {outcome}"

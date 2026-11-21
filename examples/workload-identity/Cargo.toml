@@ -1,6 +1,6 @@
 [package]
 name = "axess-example-workload-identity"
-version = "0.19.0"
+version = "0.20.0"
 edition = "2024"
 rust-version.workspace = true
 publish = false
@@ -11,12 +11,16 @@ WorkloadResolver against GitHub Actions OIDC, GitLab CI ID tokens and
 Kubernetes service-account projected tokens (OpenShift and EKS included), and, as the last resort for a caller with no identity of
 its own, signed requests over a shared secret. Copy whichever recipe matches
 your caller into your own code. `--bin local-idp` runs an in-process IdP
-with a file-backed, rotating key store, for flows without a real IdP.
+with a file-backed, rotating key store, for flows without a real IdP, and
+`--bin spire` is a workload that takes its SVIDs from a local SPIRE agent.
 """
 authors = ["Gnomes"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/GnomesOfZurich/axess"
 categories = ["authentication"]
+
+[lints]
+workspace = true
 
 [dependencies]
 # `jwt` is the first-class facade feature gating the generic
@@ -27,17 +31,26 @@ categories = ["authentication"]
 # adopter wanting FIPS-capable crypto takes `jwt-aws-lc` instead.
 # `service-secret` backs the shared-secret recipe, for callers that can have
 # no identity of their own.
-# `local-idp` backs `--bin local-idp`, an in-process IdP that mints the
-# workload JWTs these recipes verify.
+# `local-idp-rsa` backs `--bin local-idp`, an in-process IdP that mints the
+# workload JWTs these recipes verify, with RSA keys it keeps as PEM files.
+# The local IdP's own default is ES256, and `local-idp` alone compiles no
+# `rsa`; this development IdP signs RS256, which on `jwt-rust-crypto` runs
+# in rsa 0.9 (RUSTSEC-2023-0071). Do not copy that choice for an IdP whose
+# signing others can time: keep ES256, or take `jwt-aws-lc`.
 # `aws-sts` and `azure-fic` back the cloud walkthroughs in
 # `docs/workload-identity/aws.md` and `azure.md`, whose compiled code is
 # `tests/cloud_aws.rs` and `tests/cloud_azure.rs`.
-axess = { path = "../../axess", version = "=0.19.0", features = ["jwt-rust-crypto", "service-secret", "local-idp", "aws-sts", "azure-fic"] }
-axess-factors = { path = "../../axess-factors", version = "=0.19.0", features = ["jwt-rust-crypto"] }
-axess-identity = { path = "../../axess-identity", version = "=0.19.0" }
+# `spire` backs `--bin spire`, a workload that takes its SVIDs from a local
+# SPIRE agent.
+axess = { path = "../../axess", version = "=0.20.0", features = ["jwt-rust-crypto", "service-secret", "local-idp-rsa", "aws-sts", "azure-fic", "spire"] }
+axess-factors = { path = "../../axess-factors", version = "=0.20.0", features = ["jwt-rust-crypto"] }
+axess-identity = { path = "../../axess-identity", version = "=0.20.0" }
 axum = { version = "0.8.9", features = ["json"] }
-chrono = "0.4.45"
+# Held at 11: jsonwebtoken 12 requires rsa ^0.10, which openidconnect and
+# crypto-glue keep out of the lock (see rsa).
 jsonwebtoken = "11.1.0"
+# Held at 0.9 until openidconnect accepts rsa 0.10 and crypto-glue (through
+# webauthn-rs) moves from its rsa 0.10 release candidate to rsa 0.10.0.
 rsa = { version = "0.9.10", features = ["pem"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
@@ -50,18 +63,24 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # `axess_identity::PrincipalResolver` is the trait the integration
 # tests call into; the workspace crate is already a runtime dep
 # above, so the dev-dep just adds nothing extra.
-axess-identity = { path = "../../axess-identity", version = "=0.19.0" }
+axess-identity = { path = "../../axess-identity", version = "=0.20.0" }
 # `MockClock` pins JwtVerifier's notion of "now" so the pinned JWT
 # timestamps validate deterministically under DST.
-axess-clock = { path = "../../axess-clock", version = "=0.19.0", features = ["testing", "allow-testing-in-release"] }
+axess-clock = { path = "../../axess-clock", version = "=0.20.0", features = ["testing", "allow-testing-in-release"] }
 base64 = { version = "0.23.1", default-features = false, features = ["std"] }
+# Held at 11: jsonwebtoken 12 requires rsa ^0.10, which openidconnect and
+# crypto-glue keep out of the lock (see rsa).
 jsonwebtoken = { version = "11.1.0", features = ["aws_lc_rs"] }
 # `pkcs5` matches the workspace pin. The `pkcs1` *module* (used to
 # DER-encode the test signing key) is unconditionally available.
+# Held at 0.9 until openidconnect accepts rsa 0.10 and crypto-glue (through
+# webauthn-rs) moves from its rsa 0.10 release candidate to rsa 0.10.0.
 rsa = { version = "0.9.10", features = ["pkcs5"] }
 tower = { version = "0.5.3", features = ["util"] }
 # The cloud walkthroughs stand a mock STS and a mock Key Vault up with
 # wiremock, and the service under test calls Key Vault with reqwest.
 wiremock = "0.6.5"
 url = "2.5.8"
+# Held at 0.12 until oauth2 and openidconnect require reqwest 0.13: a
+# ScreenedClient is handed to openidconnect as its own reqwest client.
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls"] }

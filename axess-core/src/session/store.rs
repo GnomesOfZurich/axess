@@ -4,7 +4,7 @@
 use crate::health::{HealthCheck, HealthStatus};
 #[cfg(test)]
 use crate::locked::lock;
-use crate::session::{data::SessionData, id::SessionId};
+use crate::session::{data::SessionData, id::SessionKey};
 #[cfg(any(test, feature = "memory"))]
 use crate::store::{MemoryStore, Store};
 #[cfg(any(test, feature = "memory"))]
@@ -23,7 +23,7 @@ use std::time::Duration;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
 pub enum CycleOutcome {
-    /// The data is stored under the new id and the old row is gone.
+    /// The data is stored under the new key and the old row is gone.
     Rotated,
     /// The old row was required but was not live (deleted or expired since
     /// the caller loaded it). Nothing was written.
@@ -49,16 +49,30 @@ pub enum ConditionalUpdate {
 
 /// Typed, async session storage backend.
 ///
-/// Implementors: [`MemorySessionStore`], `SqliteSessionStore`, `ValkeySessionStore`.
+/// Implementors: [`MemorySessionStore`], `SqliteSessionStore`,
+/// `PostgresSessionStore`, `MysqlSessionStore`, `ValkeySessionStore`.
 ///
 /// All methods accept `&self`; implementations are expected to use
 /// interior mutability (`Arc<RwLock<HashMap<...>>>` for memory, connection
 /// pool for SQL/Valkey).
 ///
+/// # A session is named by its key
+///
+/// Every method names a session by its [`SessionKey`], the SHA-256 of a
+/// fixed tag and the session id, and no method receives the id: the id is
+/// what a cookie carries, and a store that never sees it cannot hold a
+/// value that would open a session. Store the key as its 64 characters
+/// (`key.to_string()`) or its 32 bytes (`key.as_bytes()`), whole: a column
+/// narrower than 64 characters, or a comparison that folds case or cuts
+/// the text, can make two sessions one. The session layer computes the key
+/// once from the verified cookie.
+/// `testing::store_contract::assert_key_addressing_contract` holds a store
+/// to this.
+///
 /// # Zero TTL
 ///
 /// A zero `ttl` means the data is already expired, and no shipped store
-/// keeps anything for it: [`save`](Self::save) removes the row under the id,
+/// keeps anything for it: [`save`](Self::save) removes the row under the key,
 /// [`update`](Self::update) removes it and reports `false`,
 /// [`update_if_revision`](Self::update_if_revision) removes the row whose
 /// revision matched and reports [`ConditionalUpdate::Gone`] (another
@@ -71,17 +85,17 @@ pub trait SessionStore: Send + Sync + Clone + 'static {
     /// The error type returned by storage operations.
     type Error: std::error::Error + Send + Sync + 'static;
 
-    /// Load the session data for the given ID. Returns `None` if the session
-    /// does not exist or has expired.
+    /// Load the session data stored under `key`. Returns `None` if the
+    /// session does not exist or has expired.
     fn load(
         &self,
-        id: &SessionId,
+        key: &SessionKey,
     ) -> impl std::future::Future<Output = Result<Option<SessionData>, Self::Error>> + Send;
 
     /// Persist session data with a time-to-live.
     fn save(
         &self,
-        id: &SessionId,
+        key: &SessionKey,
         data: &SessionData,
         ttl: Duration,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send;
@@ -89,12 +103,12 @@ pub trait SessionStore: Send + Sync + Clone + 'static {
     /// Delete the session. Idempotent; does not error if the session is absent.
     fn delete(
         &self,
-        id: &SessionId,
+        key: &SessionKey,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send;
 
     /// Replace the data of a session that is still stored.
     ///
-    /// Returns `Ok(true)` when a live (stored, unexpired) row under `id` was
+    /// Returns `Ok(true)` when a live (stored, unexpired) row under `key` was
     /// replaced, and `Ok(false)` when there is none: the session was deleted
     /// (logout, administrator revocation, front-channel logout) or expired
     /// since the caller loaded it. In the `false` case nothing is written, so
@@ -105,7 +119,7 @@ pub trait SessionStore: Send + Sync + Clone + 'static {
     /// (an `UPDATE ... WHERE`, a `SET ... XX`, a guarded map entry).
     fn update(
         &self,
-        id: &SessionId,
+        key: &SessionKey,
         data: &SessionData,
         ttl: Duration,
     ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send;
@@ -129,43 +143,47 @@ pub trait SessionStore: Send + Sync + Clone + 'static {
     /// is retried while the revision still matches.
     fn update_if_revision(
         &self,
-        id: &SessionId,
+        key: &SessionKey,
         expected_revision: u64,
         data: &SessionData,
         ttl: Duration,
     ) -> impl std::future::Future<Output = Result<ConditionalUpdate, Self::Error>> + Send;
 
     /// Atomically delete the old session row and store the data under the
-    /// caller-supplied new id.
+    /// caller-supplied new key.
     ///
-    /// Used for session fixation prevention. The new id is supplied by the
+    /// Used for session fixation prevention. The new key is supplied by the
     /// caller (rather than minted by the store) so that handler-side code
-    /// can register the *post-rotation* id with `SessionRegistry` *before*
+    /// can register the *post-rotation* session with `SessionRegistry` *before*
     /// the layer persists the rotation; without this ordering, every
     /// authenticated request fails its next `is_valid` check because the
-    /// registry holds the pre-cycle id while the cookie carries the
+    /// registry holds the pre-cycle session while the cookie carries the
     /// post-cycle one. See the internal `SessionInner::rotate_id` helper.
     ///
     /// `require_old` says whether the old row must still be live. The layer
     /// passes `true` when the request ran under a stored session, so a
     /// rotation that races a logout does not carry the authenticated data
-    /// over to the new id: the delete of the old row decides, and when it
+    /// over to the new key: the delete of the old row decides, and when it
     /// removed nothing the call returns [`CycleOutcome::SessionGone`] and
     /// writes nothing. With `require_old == false` (a login on a fresh
-    /// guest whose id was never stored) the old row may be absent and the
+    /// guest whose session was never stored) the old row may be absent and the
     /// new row is always written.
     ///
-    /// A failed write MUST leave the caller able to fail closed: the layer
-    /// deletes the old id after any error, so a backend that cannot keep the
-    /// old row on failure (the Valkey fallback without scripting) does not
-    /// weaken the guarantee. Transactional backends (SQL) do the delete and
-    /// the write in one transaction; Valkey runs one script. Writing the new
-    /// id must be idempotent: a retry of the same rotation succeeds.
+    /// A failed write MUST leave the caller able to fail closed: after any
+    /// error the layer deletes the rows under both keys (it leaves the old
+    /// one only when the audit row of the ending could not be written), so
+    /// a backend that cannot keep the old row on failure (the Valkey
+    /// fallback) does not weaken the guarantee, and neither does one that
+    /// wrote the new row before it failed. Transactional backends (SQL) do
+    /// the delete and the write in one transaction; Valkey runs one script
+    /// where scripting is on and the two keys share a cluster slot, and
+    /// otherwise deletes the old key and then writes the new one. Writing
+    /// the new key must be idempotent: a retry of the same rotation succeeds.
     ///
     /// # Orphan window
     ///
     /// There is a narrow race where `cycle` commits successfully but the
-    /// task is cancelled (or the connection drops) before the new id is
+    /// task is cancelled (or the connection drops) before the new cookie is
     /// returned to the client. The new row exists but no client knows
     /// about it. The row is bounded by the session TTL (it dies on its
     /// own); applications that want to reclaim the storage faster
@@ -173,8 +191,8 @@ pub trait SessionStore: Send + Sync + Clone + 'static {
     /// and on a schedule.
     fn cycle(
         &self,
-        old_id: &SessionId,
-        new_id: &SessionId,
+        old: &SessionKey,
+        new: &SessionKey,
         data: &SessionData,
         ttl: Duration,
         require_old: bool,
@@ -184,7 +202,7 @@ pub trait SessionStore: Send + Sync + Clone + 'static {
     /// `expected_revision`: a concurrent write between the caller's read and
     /// the rotation answers [`CycleOutcome::Conflict`] and writes nothing, so
     /// the caller can merge what was written and try again instead of
-    /// carrying a copy that lost it to the new id. An old row that is not
+    /// carrying a copy that lost it to the new key. An old row that is not
     /// live is [`CycleOutcome::SessionGone`] when `require_old` says it must
     /// be, as for `cycle`.
     ///
@@ -194,20 +212,20 @@ pub trait SessionStore: Send + Sync + Clone + 'static {
     /// the revision as part of its own delete should override it.
     fn cycle_if_revision(
         &self,
-        old_id: &SessionId,
-        new_id: &SessionId,
+        old: &SessionKey,
+        new: &SessionKey,
         data: &SessionData,
         ttl: Duration,
         require_old: bool,
         expected_revision: u64,
     ) -> impl std::future::Future<Output = Result<CycleOutcome, Self::Error>> + Send {
         async move {
-            if let Some(row) = self.load(old_id).await?
+            if let Some(row) = self.load(old).await?
                 && row.revision != expected_revision
             {
                 return Ok(CycleOutcome::Conflict);
             }
-            self.cycle(old_id, new_id, data, ttl, require_old).await
+            self.cycle(old, new, data, ttl, require_old).await
         }
     }
 
@@ -216,7 +234,7 @@ pub trait SessionStore: Send + Sync + Clone + 'static {
     ///
     /// Provides a cheap recovery path for orphans created by a cancelled
     /// [`cycle`](Self::cycle) (the row exists in the store but no client
-    /// holds the id); those rows naturally die at TTL, and this method
+    /// holds its cookie); those rows naturally die at TTL, and this method
     /// is what an operator runs to evict them sooner. Recommended cadence:
     /// once on application startup, then every TTL window.
     ///
@@ -231,7 +249,8 @@ pub trait SessionStore: Send + Sync + Clone + 'static {
     /// in-memory) actually delete.
     fn prune_expired(&self) -> impl std::future::Future<Output = Result<u64, Self::Error>> + Send;
 
-    /// Return active (non-expired) sessions for the given user, newest first.
+    /// Return active (non-expired) sessions for the given user, newest
+    /// first, each with the key it is stored under.
     ///
     /// `limit` caps how many entries are returned; pass a small value
     /// (e.g. 100) for admin "view active devices" pages, since a malicious
@@ -257,7 +276,7 @@ pub trait SessionStore: Send + Sync + Clone + 'static {
     ///
     /// **Do not build breach response or the concurrent-session cap on
     /// this.** Most in-tree backends cannot list (their sessions are
-    /// encrypted blobs keyed by `SessionId`, with the `user_id` inside the
+    /// encrypted blobs named by a [`SessionKey`], with the `user_id` inside the
     /// ciphertext, and a scan would decrypt every row). To end a user's
     /// sessions use [`SessionRegistry::invalidate_user`] (or
     /// [`invalidate_session`](SessionRegistry::invalidate_session)); to list
@@ -267,101 +286,27 @@ pub trait SessionStore: Send + Sync + Clone + 'static {
         &self,
         user_id: &crate::authn::ids::UserId,
         limit: usize,
-    ) -> impl std::future::Future<Output = Result<Vec<(SessionId, SessionData)>, Self::Error>> + Send;
-}
-
-// ── SessionRegistry ───────────────────────────────────────────────────────────
-
-/// Tracks which sessions are valid for each user, enabling forced logout.
-///
-/// Implementors: [`MemorySessionRegistry`], `ValkeySessionRegistry`.
-///
-/// All methods accept the typed [`UserId`](crate::authn::ids::UserId) so the
-/// trait surface cannot accidentally degrade to `&str` at the storage
-/// boundary; implementations that need the underlying string can call
-/// `.as_str()`.
-pub trait SessionRegistry: Send + Sync + Clone + 'static {
-    /// The error type returned by registry operations.
-    type Error: std::error::Error + Send + Sync + 'static;
-
-    /// Register a session ID as belonging to a user.
-    fn register(
-        &self,
-        user_id: &crate::authn::ids::UserId,
-        session_id: &SessionId,
-    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send;
-
-    /// Return `true` if the given session ID is still valid for the user.
-    fn is_valid(
-        &self,
-        user_id: &crate::authn::ids::UserId,
-        session_id: &SessionId,
-    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send;
-
-    /// Invalidate all sessions for a user (e.g. global logout, credential rotation).
-    fn invalidate_user(
-        &self,
-        user_id: &crate::authn::ids::UserId,
-    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send;
-
-    /// Invalidate a single session for a user.
-    fn invalidate_session(
-        &self,
-        user_id: &crate::authn::ids::UserId,
-        session_id: &SessionId,
-    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send;
-
-    /// Return all active session IDs for a user, ordered oldest first.
-    ///
-    /// Used by the concurrent-session-limit enforcement on
-    /// [`AuthnServiceBuilder::with_max_sessions_per_user`](crate::authn::service::AuthnServiceBuilder::with_max_sessions_per_user)
-    /// to FIFO-evict the oldest session when a new login would cross the
-    /// cap. **This method is required**: a silent empty result here
-    /// disables the limit without any warning, which is a security
-    /// regression on every deployment using the cap. Backends that
-    /// genuinely cannot enumerate (rare) should panic with
-    /// `unimplemented!` so misconfiguration surfaces loudly, not
-    /// silently.
-    fn active_sessions(
-        &self,
-        user_id: &crate::authn::ids::UserId,
-    ) -> impl std::future::Future<Output = Result<Vec<SessionId>, Self::Error>> + Send;
-
-    /// Resolve when the named session is invalidated (on this or another
-    /// node), otherwise stay pending. Lets long-lived connections
-    /// (WebSocket, SSE) react proactively to revocation rather than
-    /// discovering it on the next message attempt. The future never
-    /// resolves except on actual revocation, so `select!` callers don't
-    /// need to guard against spurious wakeups.
-    ///
-    /// The default impl returns `std::future::pending()`; backends
-    /// without push support (memory, SQLite without LISTEN/NOTIFY) thus
-    /// compile but won't surface revocations. `ValkeySessionRegistry`
-    /// overrides via Redis pub/sub.
-    fn watch_revocation(
-        &self,
-        user_id: &crate::authn::ids::UserId,
-        session_id: &SessionId,
-    ) -> impl std::future::Future<Output = ()> + Send {
-        let _ = (user_id, session_id);
-        std::future::pending()
-    }
+    ) -> impl std::future::Future<Output = Result<Vec<(SessionKey, SessionData)>, Self::Error>> + Send;
 }
 
 #[cfg(any(
     test,
     feature = "memory",
     feature = "sqlite",
+    feature = "sqlite-unbundled",
     feature = "postgres",
     feature = "mysql",
     feature = "valkey"
 ))]
 pub(crate) mod cas;
 mod handles;
+mod registry;
 pub(crate) use handles::note_revocation;
 pub use handles::{
-    RevocationError, SessionLiveness, SessionRegistryAdapter, SessionRegistryHandle, SessionRevoker,
+    OtherSessionsEnded, RevocationError, SessionLiveness, SessionRegistryAdapter,
+    SessionRegistryHandle, SessionRevoker,
 };
+pub use registry::{CutOff, MAX_MOVE_RECORDS_PER_USER, MoveOutcome, SessionRegistry};
 
 // ── MemorySessionStore ────────────────────────────────────────────────────────
 //
@@ -391,7 +336,7 @@ pub use handles::{
 ///
 /// # Time injection
 ///
-/// Stores `created_at` as `chrono::DateTime<Utc>` against the injected
+/// Stores each entry's expiry as `Timestamp` read from the injected
 /// [`Clock`](axess_clock::Clock) (default
 /// [`SystemClock`](axess_clock::SystemClock)). DST tests can
 /// drive expiry deterministically by constructing the store with
@@ -399,7 +344,7 @@ pub use handles::{
 /// In-memory session store. Suitable for tests and single-process
 /// examples; not durable across restarts and not shared across nodes.
 ///
-/// Thin newtype around [`MemoryStore<SessionId, SessionData>`] (the
+/// Thin newtype around [`MemoryStore<SessionKey, SessionData>`] (the
 /// shared [`Store<K, V>`] backend from
 /// [`axess_core::store`](crate::store)). The session-domain
 /// `SessionStore::cycle` lives on this wrapper because `Store<K, V>`
@@ -408,7 +353,7 @@ pub use handles::{
 #[cfg(any(test, feature = "memory"))]
 #[derive(Clone)]
 pub struct MemorySessionStore {
-    inner: MemoryStore<SessionId, SessionData>,
+    inner: MemoryStore<SessionKey, SessionData>,
     /// Write counter for lazy auto-purge scheduling. Sits outside the
     /// shared backend because auto-purge is a session-specific
     /// ergonomic; backends like `MemoryStore` leave eviction to the
@@ -458,11 +403,9 @@ impl MemorySessionStore {
     }
 }
 
-/// Infallible error for the in-memory store. The previous
-/// `Serialization(serde_json::Error)` variant has been removed since
-/// `MemoryStore<K, V>` holds values by-clone, never serialises, so the
-/// variant was unreachable in practice. Adopters who matched on it
-/// can drop the arm.
+/// Infallible error for the in-memory store: `MemoryStore<K, V>` holds
+/// values by clone and never serialises, so none of its operations can
+/// fail.
 #[cfg(any(test, feature = "memory"))]
 pub type MemoryStoreError = std::convert::Infallible;
 
@@ -470,36 +413,36 @@ pub type MemoryStoreError = std::convert::Infallible;
 impl SessionStore for MemorySessionStore {
     type Error = MemoryStoreError;
 
-    async fn load(&self, id: &SessionId) -> Result<Option<SessionData>, Self::Error> {
-        self.inner.get(id).await
+    async fn load(&self, key: &SessionKey) -> Result<Option<SessionData>, Self::Error> {
+        self.inner.get(key).await
     }
 
     async fn save(
         &self,
-        id: &SessionId,
+        key: &SessionKey,
         data: &SessionData,
         ttl: Duration,
     ) -> Result<(), Self::Error> {
         if ttl.is_zero() {
             // Already expired: nothing may be stored, and a previous entry
-            // under this id must not outlive the expiry it was just given.
-            return self.inner.delete(id).await;
+            // under this key must not outlive the expiry it was just given.
+            return self.inner.delete(key).await;
         }
-        self.inner.put(id, data, ttl).await?;
+        self.inner.put(key, data, ttl).await?;
         self.maybe_auto_purge();
         Ok(())
     }
 
-    async fn delete(&self, id: &SessionId) -> Result<(), Self::Error> {
-        self.inner.delete(id).await
+    async fn delete(&self, key: &SessionKey) -> Result<(), Self::Error> {
+        self.inner.delete(key).await
     }
 
     async fn find_sessions_for_user(
         &self,
         user_id: &crate::authn::ids::UserId,
         limit: usize,
-    ) -> Result<Vec<(SessionId, SessionData)>, Self::Error> {
-        let mut found: Vec<(SessionId, SessionData)> = self
+    ) -> Result<Vec<(SessionKey, SessionData)>, Self::Error> {
+        let mut found: Vec<(SessionKey, SessionData)> = self
             .inner
             .snapshot()
             .into_iter()
@@ -512,16 +455,16 @@ impl SessionStore for MemorySessionStore {
 
     async fn update(
         &self,
-        id: &SessionId,
+        key: &SessionKey,
         data: &SessionData,
         ttl: Duration,
     ) -> Result<bool, Self::Error> {
         if ttl.is_zero() {
-            // Already expired: nothing may stay stored under this id.
-            self.inner.remove_live(id);
+            // Already expired: nothing may stay stored under this key.
+            self.inner.remove_live(key);
             return Ok(false);
         }
-        let replaced = self.inner.replace_live(id, data, ttl);
+        let replaced = self.inner.replace_live(key, data, ttl);
         if replaced {
             self.maybe_auto_purge();
         }
@@ -530,18 +473,18 @@ impl SessionStore for MemorySessionStore {
 
     async fn update_if_revision(
         &self,
-        id: &SessionId,
+        key: &SessionKey,
         expected_revision: u64,
         data: &SessionData,
         ttl: Duration,
     ) -> Result<ConditionalUpdate, Self::Error> {
-        cas::cas_by_revision(self, id, expected_revision, data, ttl).await
+        cas::cas_by_revision(self, key, expected_revision, data, ttl).await
     }
 
     async fn cycle(
         &self,
-        old_id: &SessionId,
-        new_id: &SessionId,
+        old: &SessionKey,
+        new: &SessionKey,
         data: &SessionData,
         ttl: Duration,
         require_old: bool,
@@ -549,52 +492,43 @@ impl SessionStore for MemorySessionStore {
         if ttl.is_zero() {
             // Already expired: the rotated session is stored nowhere, so both
             // entries go and the session is reported gone, never as rotated.
-            self.inner.remove_live(old_id);
-            self.inner.remove_live(new_id);
+            self.inner.remove_live(old);
+            self.inner.remove_live(new);
             return Ok(CycleOutcome::SessionGone);
         }
         // The removal of the old row decides: `remove_live` takes the entry
         // out of the map in one step, so of two racing rotations (or a
-        // rotation and a logout) exactly one sees a live row. Same id: the
+        // rotation and a logout) exactly one sees a live row. Same key: the
         // row is replaced in place, never removed.
-        if old_id == new_id {
+        if old == new {
             if require_old {
-                return Ok(if self.inner.replace_live(new_id, data, ttl) {
+                return Ok(if self.inner.replace_live(new, data, ttl) {
                     CycleOutcome::Rotated
                 } else {
                     CycleOutcome::SessionGone
                 });
             }
         } else {
-            let was_live = self.inner.remove_live(old_id);
+            let was_live = self.inner.remove_live(old);
             if require_old && !was_live {
                 return Ok(CycleOutcome::SessionGone);
             }
         }
-        self.inner.put(new_id, data, ttl).await?;
+        self.inner.put(new, data, ttl).await?;
         self.maybe_auto_purge();
         Ok(CycleOutcome::Rotated)
     }
 
     async fn cycle_if_revision(
         &self,
-        old_id: &SessionId,
-        new_id: &SessionId,
+        old: &SessionKey,
+        new: &SessionKey,
         data: &SessionData,
         ttl: Duration,
         require_old: bool,
         expected_revision: u64,
     ) -> Result<CycleOutcome, Self::Error> {
-        cas::cycle_by_revision(
-            self,
-            old_id,
-            new_id,
-            data,
-            ttl,
-            require_old,
-            expected_revision,
-        )
-        .await
+        cas::cycle_by_revision(self, old, new, data, ttl, require_old, expected_revision).await
     }
 
     async fn prune_expired(&self) -> Result<u64, Self::Error> {
@@ -603,32 +537,32 @@ impl SessionStore for MemorySessionStore {
 }
 
 /// The in-memory store compares the stored revision: its entries are values,
-/// replaced in one step under the map's shard lock.
+/// replaced in one step under the map's lock.
 #[cfg(any(test, feature = "memory"))]
 impl cas::CasRow for MemorySessionStore {
     type Seen = u64;
     type Error = MemoryStoreError;
 
-    async fn read(&self, id: &SessionId) -> Result<Option<(u64, u64)>, Self::Error> {
-        Ok(self.inner.get(id).await?.map(|d| (d.revision, d.revision)))
+    async fn read(&self, key: &SessionKey) -> Result<Option<(u64, u64)>, Self::Error> {
+        Ok(self.inner.get(key).await?.map(|d| (d.revision, d.revision)))
     }
 
-    async fn delete_if(&self, id: &SessionId, seen: &u64) -> Result<cas::CasWrite, Self::Error> {
+    async fn delete_if(&self, key: &SessionKey, seen: &u64) -> Result<cas::CasWrite, Self::Error> {
         Ok(cas_outcome(
-            self.inner.remove_live_if(id, |d| d.revision == *seen),
+            self.inner.remove_live_if(key, |d| d.revision == *seen),
         ))
     }
 
     async fn replace_if(
         &self,
-        id: &SessionId,
+        key: &SessionKey,
         seen: &u64,
         data: &SessionData,
         ttl: Duration,
     ) -> Result<cas::CasWrite, Self::Error> {
         let written = cas_outcome(
             self.inner
-                .replace_live_if(id, data, ttl, |d| d.revision == *seen),
+                .replace_live_if(key, data, ttl, |d| d.revision == *seen),
         );
         if matches!(written, cas::CasWrite::Done) {
             self.maybe_auto_purge();

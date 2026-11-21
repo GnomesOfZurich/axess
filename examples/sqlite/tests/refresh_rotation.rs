@@ -9,7 +9,8 @@ use axess::session::{
     DeviceTokenRevocation, RefreshToken, RefreshTokenId, RefreshTokenStore, RevocationReason,
     RotationOutcome,
 };
-use axess::{Clock, SystemClock};
+use axess_clock::testing::MockClock;
+use axess_clock::testing::Shift;
 use axess_example_sqlite::models::backend::{OurBackend, seed};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::str::FromStr;
@@ -17,7 +18,7 @@ use std::str::FromStr;
 const ALICE: &str = "00000000-0000-0000-0000-000000000010";
 const TENANT: &str = "00000000-0000-0000-0000-000000000001";
 
-async fn backend() -> OurBackend {
+async fn backend(clock: &MockClock) -> OurBackend {
     let opts = SqliteConnectOptions::from_str("sqlite::memory:")
         .expect("in-memory url")
         .create_if_missing(true);
@@ -28,17 +29,18 @@ async fn backend() -> OurBackend {
         .expect("connect in-memory sqlite");
     sqlx::migrate!().run(&pool).await.expect("migrations");
     seed(
-        &SystemClock,
+        clock,
         &pool,
-        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF"),
+        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF")
+            .with_clock(std::sync::Arc::new(clock.clone())),
     )
     .await
     .expect("seed");
-    OurBackend::new(pool)
+    OurBackend::new(pool).with_clock(std::sync::Arc::new(clock.clone()))
 }
 
 fn token(suffix: &str) -> RefreshToken {
-    let now = SystemClock.now();
+    let now = MockClock::reference_time();
     RefreshToken {
         id: RefreshTokenId::try_new(format!("00000000-0000-0000-0000-0000000000{suffix}"))
             .expect("token id"),
@@ -46,7 +48,7 @@ fn token(suffix: &str) -> RefreshToken {
         tenant_id: TenantId::try_new(TENANT).expect("tenant id"),
         token_hash: format!("hash-{suffix}"),
         issued_at: now,
-        expires_at: now + chrono::Duration::days(30),
+        expires_at: axess_clock::Until::At(now.plus(axess_clock::SignedDuration::days(30))),
         revoked: false,
         device_info: None,
         family_id: None,
@@ -59,7 +61,8 @@ fn token(suffix: &str) -> RefreshToken {
 
 #[tokio::test]
 async fn a_parent_rotates_once_and_a_second_rotation_is_a_lost_race() {
-    let store = backend().await;
+    let clock = MockClock::at_reference();
+    let store = backend(&clock).await;
     let parent = token("a0");
     store.store_token(&parent).await.expect("store parent");
 
@@ -96,7 +99,8 @@ async fn a_parent_rotates_once_and_a_second_rotation_is_a_lost_race() {
 #[tokio::test]
 async fn revocation_reasons_are_persisted_and_not_overwritten() {
     use axess::session::RevocationReason;
-    let store = backend().await;
+    let clock = MockClock::at_reference();
+    let store = backend(&clock).await;
     let user = UserId::try_new(ALICE).expect("user id");
 
     let rotated = token("b0");
@@ -152,7 +156,8 @@ async fn revocation_reasons_are_persisted_and_not_overwritten() {
 /// of one of them is refused as revoked and not read as theft.
 #[tokio::test]
 async fn revoking_a_device_records_the_reason_and_the_time() {
-    let store = backend().await;
+    let clock = MockClock::at_reference();
+    let store = backend(&clock).await;
     let device = DeviceId::try_new("00000000-0000-0000-0000-0000000000d1").expect("device id");
     let mut parent = token("b0");
     parent.device_id = Some(device);
@@ -192,10 +197,11 @@ mod compromise_revokes_the_familys_devices {
     use axess::{SystemRng, authn::DeviceId};
     use std::sync::Arc;
 
-    async fn device_store(backend: &OurBackend) -> SqliteDeviceStore {
+    async fn device_store(clock: &MockClock, backend: &OurBackend) -> SqliteDeviceStore {
         let devices = SqliteDeviceStore::new(
             backend.pool().clone(),
-            SessionCrypto::new(*b"0123456789abcdef0123456789abcdeF"),
+            SessionCrypto::new(*b"0123456789abcdef0123456789abcdeF")
+                .with_clock(std::sync::Arc::new(clock.clone())),
         );
         devices.init_schema().await.expect("device schema");
         devices
@@ -204,7 +210,7 @@ mod compromise_revokes_the_familys_devices {
     async fn trusted_device(devices: &SqliteDeviceStore) -> (TenantId, DeviceId) {
         let tenant = TenantId::try_new(TENANT).expect("tenant id");
         let id = DeviceId::try_new("00000000-0000-0000-0000-0000000000d1").expect("device id");
-        let now = SystemClock.now();
+        let now = MockClock::reference_time();
         devices
             .save(
                 &Device {
@@ -234,7 +240,7 @@ mod compromise_revokes_the_familys_devices {
         (tenant, device): (TenantId, DeviceId),
     ) -> DeviceTrustLevel {
         let config = RefreshTokenConfig::default();
-        let now = SystemClock.now();
+        let now = MockClock::reference_time();
         let user = UserId::try_new(ALICE).expect("user id");
         let (v1, _) = issue_refresh_token(
             IssueRequest {
@@ -252,10 +258,12 @@ mod compromise_revokes_the_familys_devices {
         .await
         .expect("issued");
         Refresh::any_tenant(&v1, |_| async { true })
+            .without_device_check()
             .run(store, &config, &SystemRng, now)
             .await
             .expect("first refresh rotates");
         let reuse = Refresh::any_tenant(&v1, |_| async { true })
+            .without_device_check()
             .run(store, &config, &SystemRng, now)
             .await;
         assert!(
@@ -272,10 +280,11 @@ mod compromise_revokes_the_familys_devices {
 
     #[tokio::test]
     async fn reuse_of_a_rotated_out_token_leaves_the_familys_devices_revoked() {
-        let backend = backend().await;
-        let devices = device_store(&backend).await;
+        let clock = MockClock::at_reference();
+        let backend = backend(&clock).await;
+        let devices = device_store(&clock, &backend).await;
         let target = trusted_device(&devices).await;
-        let store = CascadingRefreshStore::new(backend, devices.clone(), Arc::new(SystemClock));
+        let store = CascadingRefreshStore::new(backend, devices.clone(), Arc::new(clock.clone()));
         let level = reuse_on(&store, &devices, target).await;
         assert_eq!(
             level,
@@ -286,11 +295,12 @@ mod compromise_revokes_the_familys_devices {
 
     #[tokio::test]
     async fn the_bare_backend_only_logs_the_compromise() {
+        let clock = MockClock::at_reference();
         // The contrast the wrapper exists for: a refresh store holds no
         // device store, so the trait default can revoke nothing. An
         // application that hands out refresh tokens wraps its store.
-        let backend = backend().await;
-        let devices = device_store(&backend).await;
+        let backend = backend(&clock).await;
+        let devices = device_store(&clock, &backend).await;
         let target = trusted_device(&devices).await;
         let level = reuse_on(&backend, &devices, target).await;
         assert_eq!(level, DeviceTrustLevel::Trusted);

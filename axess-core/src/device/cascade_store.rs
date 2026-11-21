@@ -159,8 +159,8 @@ mod tests {
     use crate::device::store::MemoryDeviceStore;
     use crate::device::types::{Device, DeviceBinding, DeviceTrustLevel, FingerprintHash};
     use crate::testing::MemoryRefreshTokenStore;
+    use axess_clock::testing::Shift;
     use axess_rng::testing::MockRng;
-    use chrono::Utc;
 
     fn token(
         rng: &MockRng,
@@ -168,14 +168,14 @@ mod tests {
         family: Option<TokenFamilyId>,
         dev: DeviceId,
     ) -> RefreshToken {
-        let now = Utc::now();
+        let now = axess_clock::testing::MockClock::reference_time();
         RefreshToken {
             id: RefreshTokenId::new(rng),
             user_id: axess_identity::testing::user("u1"),
             tenant_id: axess_identity::testing::tenant("t1"),
             token_hash: hash.to_string(),
             issued_at: now,
-            expires_at: now + chrono::Duration::days(1),
+            expires_at: axess_clock::Until::At(now.plus(axess_clock::SignedDuration::days(1))),
             revoked: false,
             device_info: None,
             family_id: family,
@@ -193,7 +193,8 @@ mod tests {
         let rng = MockRng::new(11);
         let tenant = axess_identity::testing::tenant("t1");
         let device_id = axess_identity::testing::device("dev-a");
-        let now = crate::device::store::whole_second(Utc::now());
+        let now =
+            crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time());
         let devices = MemoryDeviceStore::new();
         devices
             .save(

@@ -1,76 +1,12 @@
-//! `tests`: extracted from `entity_cache.rs` per the
-//! 200-LoC inline-test rule in AGENTS.md.
+//! `tests`: the unit tests of `entity_cache.rs`, kept beside it per the
+//! 200-line inline-test rule in AGENTS.md.
 
 use super::*;
+use crate::authz::cache::test_support::{CountingProvider, guest_session};
 use axess_clock::testing::MockClock;
 use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-
-/// Counts inner-provider calls so the test can verify cache hits/misses.
-struct CountingProvider {
-    calls: Arc<AtomicUsize>,
-}
-
-impl RequestEntityProvider for CountingProvider {
-    fn entities_for<'a>(
-        &'a self,
-        session: &'a AuthSession,
-        principal: &'a EntityUid,
-        resource: &'a EntityUid,
-        action: &'a EntityUid,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Entities, AuthzError>> + Send + 'a>,
-    > {
-        // Synthetic counting fixture; doesn't need session/action; explicit
-        // acknowledgment per the axess no-`_`-prefix convention.
-        let _ = (session, action);
-        let calls = self.calls.clone();
-        let principal = principal.clone();
-        let resource = resource.clone();
-        Box::pin(async move {
-            calls.fetch_add(1, Ordering::SeqCst);
-            let p = cedar_policy::Entity::new(
-                principal,
-                std::collections::HashMap::new(),
-                HashSet::new(),
-            )
-            .unwrap();
-            let r = cedar_policy::Entity::new(
-                resource,
-                std::collections::HashMap::new(),
-                HashSet::new(),
-            )
-            .unwrap();
-            Ok(Entities::from_entities(vec![p, r], None).unwrap())
-        })
-    }
-}
-
-/// Construct a guest (unauthenticated) `AuthSession` for unit tests.
-/// Reaches into `pub(crate)` `SessionInner` / `SessionHandle`: usable
-/// only from inside axess-core; mirrors the pattern in
-/// `session::extractor::tests::make_session`.
-fn guest_session() -> AuthSession {
-    use crate::session::SessionData;
-    use crate::session::id::SessionId;
-    use crate::session::layer::{SessionHandle, SessionInner};
-    use tokio::sync::RwLock;
-
-    let inner = SessionInner {
-        id: SessionId::new(&axess_rng::SystemRng),
-        data: SessionData::default(),
-        modified: false,
-        needs_persist: false,
-        regenerate: false,
-        pre_cycle_id: None,
-        rng: std::sync::Arc::new(axess_rng::SystemRng),
-        pending_fingerprint: None,
-        max_custom_bytes: 64 * 1024,
-        consume: None,
-    };
-    AuthSession(SessionHandle(Arc::new(RwLock::new(inner))))
-}
 
 fn principal() -> EntityUid {
     EntityUid::from_str("App::User::\"alice\"").unwrap()
@@ -182,7 +118,7 @@ async fn concurrent_cold_misses_share_one_inner_call() {
 /// advancing `MockClock` had no effect on its eviction).
 #[tokio::test]
 async fn entries_expire_under_injected_clock() {
-    let clock = Arc::new(MockClock::now());
+    let clock = Arc::new(MockClock::at_reference());
     let calls = Arc::new(AtomicUsize::new(0));
     let cached = EntityCache::with_options(
         CountingProvider {
@@ -227,7 +163,9 @@ fn fluent_setters_keep_each_others_settings() {
     .with_capacity(100);
     assert_eq!(cached.ttl, std::time::Duration::from_secs(5));
     assert_eq!(cached.capacity, 100);
-    let clocked = cached.with_clock(Arc::new(MockClock::at(chrono::Utc::now())));
+    let clocked = cached.with_clock(Arc::new(MockClock::at(
+        axess_clock::testing::MockClock::reference_time(),
+    )));
     assert_eq!(clocked.ttl, std::time::Duration::from_secs(5));
     assert_eq!(clocked.capacity, 100);
 }
@@ -313,14 +251,13 @@ impl SessionAwareProvider {
 impl RequestEntityProvider for SessionAwareProvider {
     fn entities_for<'a>(
         &'a self,
-        session: &'a AuthSession,
+        _: &'a AuthSession,
         principal: &'a EntityUid,
         resource: &'a EntityUid,
-        action: &'a EntityUid,
+        _: &'a EntityUid,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Entities, AuthzError>> + Send + 'a>,
     > {
-        let _ = (session, action);
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::SeqCst);
             // The state is read when the build starts, as a provider that
@@ -347,9 +284,8 @@ impl RequestEntityProvider for SessionAwareProvider {
 
     fn cache_discriminator<'a>(
         &'a self,
-        session: &'a AuthSession,
+        _: &'a AuthSession,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>> {
-        let _ = session;
         let named = self.named;
         let mfa = self.mfa.load(Ordering::SeqCst);
         Box::pin(async move { named.then(|| format!("mfa={mfa}")) })
@@ -487,14 +423,13 @@ struct FolderedProvider {
 impl RequestEntityProvider for FolderedProvider {
     fn entities_for<'a>(
         &'a self,
-        session: &'a AuthSession,
+        _: &'a AuthSession,
         principal: &'a EntityUid,
         resource: &'a EntityUid,
-        action: &'a EntityUid,
+        _: &'a EntityUid,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Entities, AuthzError>> + Send + 'a>,
     > {
-        let _ = (session, action);
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let entity = |uid: &EntityUid, parents: HashSet<EntityUid>| {

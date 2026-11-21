@@ -30,7 +30,10 @@ async fn a_device_with_many_families_is_indexed_across_chunk_boundaries() {
         1,
         (0..count).map(|i| refresh(format!("fam-{i}"))).collect(),
     );
-    store.save(&device, chrono::Utc::now()).await.unwrap();
+    store
+        .save(&device, axess_clock::testing::MockClock::reference_time())
+        .await
+        .unwrap();
 
     for i in [0, FAMILY_INSERT_CHUNK - 1, FAMILY_INSERT_CHUNK, count - 1] {
         let found = store
@@ -46,7 +49,10 @@ async fn a_device_with_many_families_is_indexed_across_chunk_boundaries() {
     assert_eq!(rows, count as i64);
 
     // Saving again rewrites the index rather than duplicating it.
-    store.save(&device, chrono::Utc::now()).await.unwrap();
+    store
+        .save(&device, axess_clock::testing::MockClock::reference_time())
+        .await
+        .unwrap();
     let (rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM device_bindings_refresh")
         .fetch_one(&store.pool)
         .await

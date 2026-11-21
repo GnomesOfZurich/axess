@@ -116,7 +116,6 @@
 
 use crate::authn::audit::archive::{ArchiveBatchId, AuditArchiver};
 use crate::authn::event::AuthEvent;
-use chrono::Datelike;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -176,12 +175,12 @@ impl FilesystemAuditArchiver {
     /// Compute the on-disk path for events with the given date.
     /// Public so callers writing their own loop can verify whether
     /// archived files exist before deleting hot rows.
-    pub fn path_for_date(&self, date: chrono::NaiveDate) -> PathBuf {
+    pub fn path_for_date(&self, date: axess_clock::UtcDate) -> PathBuf {
         self.root
             .join(format!("{:04}", date.year()))
             .join(format!("{:02}", date.month()))
             .join(format!("{:02}", date.day()))
-            .join(format!("audit-{}.jsonl", date.format("%Y-%m-%d")))
+            .join(format!("audit-{}.jsonl", date))
     }
 }
 
@@ -424,17 +423,17 @@ fn write_phase(
 /// already recorded, and write the rest all-or-nothing.
 fn archive_blocking(
     root: &std::path::Path,
-    by_day: std::collections::BTreeMap<chrono::NaiveDate, Vec<String>>,
+    by_day: std::collections::BTreeMap<axess_clock::UtcDate, Vec<String>>,
     batch_line: &str,
     sidecars: &std::sync::Mutex<SidecarCache>,
     faults: &mut Faults<'_>,
 ) -> Result<(), FilesystemArchiveError> {
-    let _root_lock = lock_root(root)?;
-    let day_path = |day: chrono::NaiveDate| {
+    let root_lock = lock_root(root)?;
+    let day_path = |day: axess_clock::UtcDate| {
         root.join(format!("{:04}", day.year()))
             .join(format!("{:02}", day.month()))
             .join(format!("{:02}", day.day()))
-            .join(format!("audit-{}.jsonl", day.format("%Y-%m-%d")))
+            .join(format!("audit-{}.jsonl", day))
     };
     let batch_id = batch_line.trim_end();
     let marker = marker_line(batch_id, &content_digest(&by_day));
@@ -470,12 +469,18 @@ fn archive_blocking(
     for (path, _) in &markers {
         cache.note_appended(path, &marker);
     }
+    // The root's lock ends here, after the markers are noted, and after the
+    // cache's lock, as at the end of the scope.
+    drop(cache);
+    drop(root_lock);
     Ok(())
 }
 
 /// A SHA-256 over the batch's events, day by day, as lower-case hex. Part of
 /// the marker, so a reused batch id over different events is not skipped.
-fn content_digest(by_day: &std::collections::BTreeMap<chrono::NaiveDate, Vec<String>>) -> String {
+fn content_digest(
+    by_day: &std::collections::BTreeMap<axess_clock::UtcDate, Vec<String>>,
+) -> String {
     use sha2::{Digest as _, Sha256};
     use std::fmt::Write as _;
     let mut h = Sha256::new();
@@ -532,10 +537,10 @@ impl FilesystemAuditArchiver {
         // Group events by day (in UTC) so each day file gets one
         // bulk append. `BTreeMap` so iteration order is stable for
         // test determinism + log readability.
-        let mut by_day: std::collections::BTreeMap<chrono::NaiveDate, Vec<String>> =
+        let mut by_day: std::collections::BTreeMap<axess_clock::UtcDate, Vec<String>> =
             std::collections::BTreeMap::new();
         for event in events {
-            let day = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(event.event_time)
+            let day = axess_clock::Timestamp::from_unix_micros(event.event_time)
                 .ok_or_else(|| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -545,7 +550,7 @@ impl FilesystemAuditArchiver {
                         ),
                     )
                 })?
-                .date_naive();
+                .utc_date();
             let line = serde_json::to_string(event)?;
             by_day.entry(day).or_default().push(line);
         }
@@ -554,11 +559,11 @@ impl FilesystemAuditArchiver {
         // This guard goes when the future is dropped; the file lock taken
         // inside the blocking task does not, so a cancelled call cannot hand
         // the root to a retry while its writes are still in progress.
-        let _queue = self.write_lock.lock().await;
+        let queue = self.write_lock.lock().await;
         let root = self.root.clone();
         let sidecars = Arc::clone(&self.sidecars);
         let batch_line = format!("{batch}\n");
-        tokio::task::spawn_blocking(move || {
+        let written = tokio::task::spawn_blocking(move || {
             archive_blocking(
                 &root,
                 by_day,
@@ -571,8 +576,10 @@ impl FilesystemAuditArchiver {
                 },
             )
         })
-        .await
-        .map_err(|join_err| {
+        .await;
+        // The queue ends once the blocking task has ended.
+        drop(queue);
+        written.map_err(|join_err| {
             FilesystemArchiveError::Io(std::io::Error::other(format!(
                 "spawn_blocking task panicked: {join_err}"
             )))
@@ -601,13 +608,13 @@ impl AuditArchiver for FilesystemAuditArchiver {
 mod tests {
     use super::*;
     use crate::authn::event::{AuthEventStatus, AuthEventType, AuthFailureReason};
-    use chrono::{TimeZone, Utc};
+    use axess_clock::Timestamp;
 
     pub(super) fn bid(name: &str) -> ArchiveBatchId {
         ArchiveBatchId::from_ids([name])
     }
 
-    pub(super) fn make_event(year: i32, month: u32, day: u32) -> AuthEvent {
+    pub(super) fn make_event(year: i32, month: u8, day: u8) -> AuthEvent {
         use crate::authn::event::AuthEventBuilder;
         AuthEventBuilder::new(
             None,
@@ -621,7 +628,7 @@ mod tests {
                 .expect("literal is a valid IPv4 address"),
         )
         .with_error(AuthFailureReason::Other("test event".into()))
-        .build_at(Utc.with_ymd_and_hms(year, month, day, 12, 0, 0).unwrap())
+        .build_at(Timestamp::from_utc(year, month, day, 12, 0, 0).unwrap())
     }
 
     #[tokio::test]
@@ -641,7 +648,7 @@ mod tests {
 
         archiver.archive_batch(&bid("b"), &events).await.unwrap();
 
-        let path = archiver.path_for_date(chrono::NaiveDate::from_ymd_opt(2026, 5, 19).unwrap());
+        let path = archiver.path_for_date(axess_clock::UtcDate::new(2026, 5, 19).unwrap());
         assert!(path.exists(), "expected day file at {:?}", path);
 
         let contents = std::fs::read_to_string(&path).unwrap();
@@ -664,8 +671,8 @@ mod tests {
 
         archiver.archive_batch(&bid("b"), &events).await.unwrap();
 
-        let day1 = archiver.path_for_date(chrono::NaiveDate::from_ymd_opt(2026, 5, 18).unwrap());
-        let day2 = archiver.path_for_date(chrono::NaiveDate::from_ymd_opt(2026, 5, 19).unwrap());
+        let day1 = archiver.path_for_date(axess_clock::UtcDate::new(2026, 5, 18).unwrap());
+        let day2 = archiver.path_for_date(axess_clock::UtcDate::new(2026, 5, 19).unwrap());
 
         assert_eq!(std::fs::read_to_string(&day1).unwrap().lines().count(), 1);
         assert_eq!(std::fs::read_to_string(&day2).unwrap().lines().count(), 2);
@@ -687,7 +694,7 @@ mod tests {
             .await
             .unwrap();
 
-        let path = archiver.path_for_date(chrono::NaiveDate::from_ymd_opt(2026, 5, 19).unwrap());
+        let path = archiver.path_for_date(axess_clock::UtcDate::new(2026, 5, 19).unwrap());
         assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 2);
     }
 

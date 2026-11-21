@@ -4,6 +4,3 @@
 # not listed here and on any listed offender that grew; shrink them and
 # re-bless so the numbers only go down.
 # format: kind<TAB>lines<TAB>path<TAB>function (functions only)
-file	866	axess-core/src/authn/service/login.rs
-file	947	axess-core/src/authn/store.rs
-file	906	axess-core/src/middleware/csrf.rs

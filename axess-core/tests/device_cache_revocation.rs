@@ -3,6 +3,8 @@
 //! instance at once, though that instance's device cache still holds the
 //! trusted row.
 
+use axess_core::testing::fixtures as common;
+
 use axess_core::authn::ids::testing;
 use axess_core::session::refresh::{
     IssueRequest, Refresh, RefreshError, RefreshTokenConfig, issue_refresh_token,
@@ -11,14 +13,15 @@ use axess_core::testing::{MemoryRefreshTokenStore, MockRng};
 use axess_core::{
     CachedDeviceStore, Device, DeviceStore, DeviceTrustLevel, FingerprintHash, MemoryDeviceStore,
 };
-use chrono::Utc;
+use std::sync::Arc;
 
 #[tokio::test]
 async fn a_device_revoked_elsewhere_stops_the_refresh_despite_a_cached_trusted_row() {
+    let clock = common::test_clock();
     let tenant = testing::tenant("t1");
     let user = testing::user("u1");
     let device_id = testing::device("dev-1");
-    let now = Utc::now();
+    let now = common::start();
     let rng = MockRng::new(4);
     let config = RefreshTokenConfig {
         rotation: true,
@@ -27,8 +30,8 @@ async fn a_device_revoked_elsewhere_stops_the_refresh_despite_a_cached_trusted_r
 
     // One backing store, two instances in front of it, each with its cache.
     let backing = MemoryDeviceStore::new();
-    let pod_a = CachedDeviceStore::new(backing.clone());
-    let pod_b = CachedDeviceStore::new(backing.clone());
+    let pod_a = CachedDeviceStore::new(backing.clone()).with_clock(Arc::new(clock.clone()));
+    let pod_b = CachedDeviceStore::new(backing.clone()).with_clock(Arc::new(clock.clone()));
     backing
         .save(
             &Device {
@@ -47,7 +50,7 @@ async fn a_device_revoked_elsewhere_stops_the_refresh_despite_a_cached_trusted_r
         )
         .await
         .unwrap();
-    let tokens = MemoryRefreshTokenStore::new();
+    let tokens = MemoryRefreshTokenStore::new().with_clock(Arc::new(clock.clone()));
     let (plaintext, _) = issue_refresh_token(
         IssueRequest {
             user_id: &user,

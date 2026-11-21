@@ -1,8 +1,8 @@
-//! HMAC algorithm choice shared by [`TotpConfig`](crate::totp::TotpConfig)
-//! and [`HotpConfig`](crate::hotp::HotpConfig).
+//! HMAC algorithm choice shared by [`TotpConfig`]
+//! and [`HotpConfig`].
 //!
-//! Not collapsed with the verifier-internal [`TotpAlgorithm`](crate::totp::TotpAlgorithm)
-//! and [`HotpAlgorithm`](crate::hotp::HotpAlgorithm); those are the
+//! Not collapsed with the verifier-internal [`TotpAlgorithm`]
+//! and [`HotpAlgorithm`]; those are the
 //! per-verifier algorithm tags (one with `SHA1` casing, the other with
 //! `Sha1` casing). This enum is the storage shape that round-trips through
 //! `FactorConfig` and the adopter-facing JSON. Unifying the three is a separate concern.

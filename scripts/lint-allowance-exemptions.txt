@@ -1,0 +1,9 @@
+# Lint allowances scripts/check-lint-allowances.sh admits, one per line:
+#
+#   <file> | <lint> | <reason>
+#
+# for instance `src/generated.rs | missing_docs | <why it cannot be fixed>`.
+# An entry admits every `allow` or `expect` of that lint in that one file,
+# for code this repository cannot change (generated code, the output of a
+# macro it does not write). A warning in code the repository writes is
+# fixed, not listed. An entry that admits nothing is refused.

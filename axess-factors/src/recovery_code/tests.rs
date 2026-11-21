@@ -18,8 +18,8 @@ impl SecureRng for CountingRng {
     }
 }
 
-fn at(secs: i64) -> DateTime<Utc> {
-    DateTime::from_timestamp(secs, 0).unwrap()
+fn at(secs: i64) -> Timestamp {
+    Timestamp::from_unix_seconds(secs).unwrap()
 }
 
 #[test]

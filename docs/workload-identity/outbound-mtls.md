@@ -1,7 +1,7 @@
 # Outbound: mTLS
 
-Your application presents an X.509 client certificate during the
-outbound TLS handshake, to a downstream service that requires mTLS. The credential is the
+Your application presents an X.509 client certificate in the
+outbound TLS handshake to a downstream service that requires mTLS. The credential is the
 application's workload identity in X.509 form, typically an
 X.509-SVID issued by SPIRE or an equivalent. The downstream
 validates the certificate against its trust anchor and accepts
@@ -17,19 +17,19 @@ mechanism (a SPIFFE-based service mesh, an intra-organisation
 network where everything speaks mTLS, a partner integration where
 both sides have agreed to mTLS). The application's certificate
 identifies it as a workload to the downstream; no bearer token
-needs to ride the request.
+travels with the request.
 
 The pattern is operationally simpler than outbound OAuth because
 the authentication happens once at connection setup rather than
 per request. A long-lived TLS connection handles many requests
-without re-authenticating; a short-lived connection re-authenticates
-on the next request. The cost is the TLS handshake's CPU and
+without re-authenticating; each new connection authenticates again
+in its handshake. The cost is the TLS handshake's CPU and
 round-trip; the benefit is no per-request authentication state.
 
 ## Configuration
 
-`OutboundMtlsClient` is the type that holds the certificate and
-key, and provides them to the outbound TLS handshake. The
+`OutboundMtlsClient` holds the certificate and key and provides
+them to the outbound TLS handshake. The
 configuration:
 
 ```rust,ignore
@@ -42,37 +42,41 @@ let client = OutboundMtlsClient::new_from_pem(&cert_chain_pem, &private_key_pem)
     .with_server_roots_pem(&ca_bundle_pem)?;
 ```
 
-`client_cert_path` and `client_key_path` are filesystem paths to
-the certificate and the private key. The conventional location is
-where SPIRE writes them: SPIRE rotates the certificate on a
-configurable schedule (typically every few hours), writes the new
-files atomically, and the client picks them up on next read.
+`new_from_pem` takes the certificate chain, leaf first, and the
+matching private key, both as PEM bytes; `new_from_der` takes them as
+DER. The client parses them at construction and holds the parsed
+material, so the buffers they came from can be wiped.
 
-`ca_bundle_path` is the optional path to the trust anchor for the
-downstream's server certificate. When set, the client validates
-the downstream's server cert against this bundle; when unset, the
-client uses the system trust store.
+`with_server_roots_pem` pins the trust anchor for the downstream's
+server certificate, and `with_server_roots` takes a root store you
+built. With neither, `rustls_client_config` refuses to build a
+configuration and answers `MtlsClientError::ClientConfig`: rustls
+requires explicit roots, and the client does not guess them.
 
-`reload_interval` controls how often the client checks the
-certificate files for changes. The check is a stat call; an
-unchanged file is a no-op, a changed file triggers a re-read. The
-default (every five minutes) matches typical SPIRE rotation
-schedules; deployments with faster rotation lower this.
+Where the material comes from is the application's: files a sidecar
+writes, a secret store, or a SPIRE agent's socket. For the last, the
+`spire` feature builds the client from a fetched SVID
+(`X509Svid::outbound_mtls_client`, with the server's roots pinned by
+the caller); *SPIRE Workload API client* is its chapter.
 
 ## The TLS handshake
 
 The client integrates with your HTTP client (typically
-`reqwest`, but the pattern generalises) through a custom
-`Connector`:
+`reqwest`, but the pattern generalises) through the rustls
+`ClientConfig` it builds:
 
 ```rust,ignore
-use axess::workload::outbound::OutboundMtlsClient;
+use std::sync::Arc;
+
+use axess::workload::outbound::mtls_client::OutboundMtlsClient;
 use reqwest::Client;
 
-let mtls = OutboundMtlsClient::new(/* ... */);
+let mtls = OutboundMtlsClient::new_from_pem(&cert_chain_pem, &private_key_pem)?
+    .with_server_roots_pem(&ca_bundle_pem)?;
+let config = mtls.rustls_client_config()?; // Arc<rustls::ClientConfig>
 
 let http_client = Client::builder()
-    .use_preconfigured_tls(mtls.rustls_client_config())
+    .use_preconfigured_tls(Arc::unwrap_or_clone(config))
     .build()?;
 
 let response = http_client
@@ -81,13 +85,15 @@ let response = http_client
     .await?;
 ```
 
-`rustls_client_config` returns a rustls `ClientConfig` with the
-certificate, key, and trust anchor configured. The
-`use_preconfigured_tls` integration on `reqwest` accepts this
-directly; other HTTP clients have similar integration points.
+`rustls_client_config` returns an `Arc<ClientConfig>` with the
+certificate, key, and trust anchor configured. `use_preconfigured_tls`
+on `reqwest` takes the `ClientConfig` itself, not the `Arc` (with an
+`Arc`, `build` fails), so the example unwraps it; other HTTP clients
+have similar integration points.
 
 The handshake validates the downstream's server certificate against
-the configured trust anchor (or the system store), then presents
+the trust anchor you pinned (there is no fallback to the system
+store), then presents
 the client certificate. If the downstream requires the client
 certificate and yours is missing or
 invalid, the handshake fails. If the downstream does not require
@@ -96,32 +102,33 @@ ignored.
 
 ## Certificate rotation
 
-The certificate rotation is what makes outbound mTLS sustainable
-in production. A static certificate provisioned at deployment time
-expires; the deployment has to redeploy to refresh it. A rotated
-certificate refreshes itself; the deployment runs indefinitely.
+Certificate rotation makes outbound mTLS sustainable in production.
+A static certificate provisioned at deployment time expires, and
+replacing it takes a redeploy; a rotated certificate is replaced while
+the deployment keeps running.
 
 SPIRE rotates X.509-SVIDs on a schedule the operator configures
-(typically every few hours). The new certificate is written
-atomically to the filesystem (a temporary file plus a rename, so
-the in-progress reads see either the old or the new, never a
-truncated file). The application's `OutboundMtlsClient` reads the
-files at construction and on its reload interval.
+(typically every few hours). An `OutboundMtlsClient` holds the
+certificate it was constructed with and does not reload: a rotation
+means a new client, and a new `ClientConfig` from it, handed to the
+HTTP client that makes the next connection. How the application
+learns of a rotation depends on where its certificate comes from.
 
-The reload-interval choice matters. Too short, and the client
-spends CPU on stat calls. Too long, and the client uses an
-expired certificate, producing handshake failures. The
-recommendation is to set the interval to about a third of the
-certificate's lifetime, so a typical rotation leaves enough time
-for the next reload to pick up the new files before expiry.
+With certificates on disk, the writer replaces the files atomically
+(a temporary file plus a rename, so a read sees the old pair or the
+new, never a truncated file), and the application watches the files
+or re-reads them on a schedule well inside the certificate's
+lifetime. A re-read that finds a malformed certificate should keep
+the previous client: it works until the previous certificate expires,
+so a botched rotation does not bring the service down at once.
 
-A reload that finds a malformed certificate logs the error and
-keeps the previous certificate in memory. The client continues
-to function until the previous certificate expires, by which
-point either the malformed state is fixed or the handshake
-fails. The graceful-degradation pattern is the right shape: a
-botched rotation should not bring your service down
-immediately.
+With a SPIRE agent, the `spire` feature's `X509Source` follows the
+agent's rotation, and `X509Source::rustls_client_config` builds one
+configuration that presents whatever SVID the source holds at each
+handshake, so nothing is rebuilt. It verifies the server by its
+SPIFFE ID rather than by a DNS name; *SPIRE Workload API client*
+covers both that and the snapshot form for a downstream verified by
+name.
 
 ## When the downstream is also axess
 
@@ -131,19 +138,18 @@ the `outbound-mtls` machinery; the receiving side validates it
 through the `mtls` resolver from *Inbound: mTLS-SVID*. The two
 sides compose without any further integration: the same SPIFFE
 identity flows through the TLS handshake, the receiving resolver
-extracts it, the resulting principal is the calling service's
+extracts it, and the resulting principal is the calling service's
 identity.
 
-The pattern is what gives a SPIFFE-based deployment a fully
-identity-aware service mesh at the application layer, without
-requiring a sidecar proxy. The mesh's identity is the
+This gives a SPIFFE-based deployment an identity-aware service
+mesh at the application layer without a sidecar proxy. The mesh's identity is the
 application's identity; the audit trail records the same
 identity at every hop.
 
 ## Threat model
 
 Outbound mTLS shares the threat model of the X.509-SVID inbound
-case from *Inbound: mTLS-SVID*. The key-storage problem is the
+case from *Inbound: mTLS-SVID*. Key storage is the
 biggest concern: a workload whose private key is on disk is
 vulnerable to filesystem compromise; a workload whose key lives
 in a TPM, HSM, or KMS is much harder to compromise.
@@ -158,23 +164,32 @@ configuration on a schedule.
 
 ## Troubleshooting
 
-If the handshake fails with a certificate-validation error, the
-downstream does not trust your CA. Its trust bundle needs to include
-your CA; this is the
-downstream's configuration, not the client's.
+If the handshake fails with a certificate-validation error, first
+see which side refused. An error your client raises (rustls reports
+`Error::InvalidCertificate`, for instance `UnknownIssuer`) means the
+downstream's server certificate does not chain to the roots you
+pinned; fix the roots given to `with_server_roots_pem` or
+`with_server_roots`. An alert from the downstream (rustls reports
+`Error::AlertReceived`, for instance `UnknownCA` or `BadCertificate`)
+means the downstream does not trust your CA. Its trust bundle must
+include your CA; that is the downstream's configuration, not the
+client's.
 
 If the handshake succeeds but the downstream returns 401 on every
-request, the downstream is performing authorisation against the
-certificate's identity rather than just authentication. Check
-the downstream's authorisation policy: it may require a specific
-SPIFFE path, a specific issuer, or a specific X.509 extension
-that your certificate does not have.
+request, the downstream authorises the certificate's identity as well as
+authenticating it, and the authorisation fails. Check
+the downstream's authorisation policy: it may require a particular
+SPIFFE path, issuer or X.509 extension that your certificate does
+not have.
 
-If the reload fails silently and you keep using an
-expired certificate, check the reload-interval configuration and
-your log output. The reload errors are logged at
-warn level; a missed reload typically surfaces as a
-"failed to read certificate" message.
+If handshakes start failing some hours after a deployment, the
+certificate has expired and nothing replaced it: the client holds
+the certificate it was built with. Check what rebuilds the client on
+rotation. With the `spire` feature, a read of the source answers
+`SpireError::Expired` in that state. The
+`workload_credential_refresh_failed` counter counts the failed
+refreshes by credential kind; its history in your metrics backend
+shows when the agent stopped answering.
 
 ## Further reading
 
@@ -182,5 +197,6 @@ warn level; a missed reload typically surfaces as a
 machinery. *Workload identity overview* covers the SPIFFE model
 both sides use. *Cloud STS exchange* covers the alternative
 pattern for downstreams that require bearer tokens rather than
-mTLS. *Operations runbook* covers the certificate rotation and
-the key-storage choices for production deployments.
+mTLS. *SPIRE Workload API client* covers taking the certificate
+from a local SPIRE agent. *Operations runbook* covers the certificate
+rotation and the key-storage choices for production deployments.

@@ -1,9 +1,10 @@
 //! Clock injection, the time-gated sweep, the bucket count and the hard cap.
 
 use super::*;
+use axess_clock::testing::Shift;
 
-fn millis(t: DateTime<Utc>, ms: i64) -> DateTime<Utc> {
-    t + chrono::Duration::milliseconds(ms)
+fn millis(t: Timestamp, ms: i64) -> Timestamp {
+    t.plus(axess_clock::SignedDuration::milliseconds(ms))
 }
 
 fn status(res: Result<Response<Body>, std::convert::Infallible>) -> StatusCode {
@@ -135,7 +136,7 @@ fn the_bucket_count_tracks_inserts_and_evictions() {
     assert!(crate::locked::lock(&store.buckets).is_empty());
 }
 
-fn fill_to_the_cap(store: &BucketStore, at: DateTime<Utc>) {
+fn fill_to_the_cap(store: &BucketStore, at: Timestamp) {
     for i in 0..HARD_BUCKET_CAP {
         assert!(matches!(
             store.try_acquire_at(&format!("flood-{i}"), at),

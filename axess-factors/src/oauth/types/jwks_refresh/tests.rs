@@ -5,6 +5,7 @@ use super::*;
 use crate::oauth::types::{DpopSigner, OAuthClaims, RefreshOutcome, UserInfoClaims};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// How a scripted provider's refresh ends.
 #[derive(Clone, Copy)]
@@ -14,11 +15,20 @@ enum Refresh {
     Panics,
 }
 
+/// How many refreshes are under way at once, and the most there ever were.
+#[derive(Default)]
+struct Gauge {
+    under_way: AtomicUsize,
+    peak: AtomicUsize,
+}
+
 /// A provider that only refreshes: every other operation is out of scope.
 struct Scripted {
     name: Arc<str>,
     refresh: Refresh,
     scopes: Vec<String>,
+    /// Counts this provider's refresh while it is under way.
+    gauge: Option<Arc<Gauge>>,
 }
 
 impl Scripted {
@@ -27,6 +37,18 @@ impl Scripted {
             name: Arc::from(name),
             refresh,
             scopes: Vec::new(),
+            gauge: None,
+        })
+    }
+
+    /// A provider whose refresh succeeds after staying under way for a few
+    /// turns of the scheduler, counted in `gauge` meanwhile.
+    fn gauged(name: &str, gauge: &Arc<Gauge>) -> Arc<dyn OAuthProvider> {
+        Arc::new(Self {
+            name: Arc::from(name),
+            refresh: Refresh::Succeeds,
+            scopes: Vec::new(),
+            gauge: Some(Arc::clone(gauge)),
         })
     }
 }
@@ -52,7 +74,16 @@ impl OAuthProvider for Scripted {
 
     fn refresh_jwks(&self) -> Pending<'_, ()> {
         let refresh = self.refresh;
+        let gauge = self.gauge.clone();
         Box::pin(async move {
+            if let Some(gauge) = gauge {
+                let under_way = gauge.under_way.fetch_add(1, Ordering::SeqCst) + 1;
+                gauge.peak.fetch_max(under_way, Ordering::SeqCst);
+                for _ in 0..3 {
+                    tokio::task::yield_now().await;
+                }
+                gauge.under_way.fetch_sub(1, Ordering::SeqCst);
+            }
             match refresh {
                 Refresh::Succeeds => Ok(()),
                 Refresh::Fails => Err(OAuthError::Discovery("keys unavailable".to_string())),
@@ -63,27 +94,27 @@ impl OAuthProvider for Scripted {
 
     fn refresh_token_unchecked<'a>(
         &'a self,
-        _refresh_token: &'a str,
-        _original_nonce: Option<&'a str>,
-        _dpop: Option<DpopSigner<'a>>,
+        _: &'a str,
+        _: Option<&'a str>,
+        _: Option<DpopSigner<'a>>,
     ) -> Pending<'a, RefreshOutcome> {
         unimplemented!("a scripted provider only refreshes its keys")
     }
 
     fn exchange_code<'a>(
         &'a self,
-        _code: &'a str,
-        _pkce_verifier: String,
-        _nonce: String,
-        _dpop: Option<DpopSigner<'a>>,
+        _: &'a str,
+        _: String,
+        _: String,
+        _: Option<DpopSigner<'a>>,
     ) -> Pending<'a, OAuthClaims> {
         unimplemented!("a scripted provider only refreshes its keys")
     }
 
     fn fetch_userinfo_unchecked<'a>(
         &'a self,
-        _access_token: &'a str,
-        _dpop: Option<DpopSigner<'a>>,
+        _: &'a str,
+        _: Option<DpopSigner<'a>>,
     ) -> Pending<'a, UserInfoClaims> {
         unimplemented!("a scripted provider only refreshes its keys")
     }
@@ -135,4 +166,46 @@ async fn a_pass_over_healthy_providers_reports_nothing() {
     ];
 
     assert!(refresh_providers_jwks(&providers).await.is_empty());
+}
+
+/// A pass refreshes as many providers at once as its bound says, and never
+/// one more.
+#[tokio::test]
+async fn a_pass_runs_as_many_refreshes_at_once_as_its_bound_and_no_more() {
+    let gauge = Arc::new(Gauge::default());
+    let providers: Vec<Arc<dyn OAuthProvider>> = (0..3 * JWKS_REFRESH_CONCURRENCY)
+        .map(|i| Scripted::gauged(&format!("p-{i}"), &gauge))
+        .collect();
+
+    assert!(refresh_providers_jwks(&providers).await.is_empty());
+
+    assert_eq!(gauge.peak.load(Ordering::SeqCst), JWKS_REFRESH_CONCURRENCY);
+    assert_eq!(gauge.under_way.load(Ordering::SeqCst), 0);
+}
+
+/// A provider's name may be a tenant's text: every line a pass writes about
+/// a provider carries it escaped, whether its refresh succeeded, failed or
+/// panicked.
+#[tokio::test]
+async fn a_provider_name_reaches_the_log_escaped() {
+    let capture = axess_testing::mock_tracing::TracingCapture::install();
+    let forged = "acme\nWARN forged\u{202E}";
+    let providers = [
+        Scripted::provider(forged, Refresh::Succeeds),
+        Scripted::provider(forged, Refresh::Fails),
+        Scripted::provider(forged, Refresh::Panics),
+    ];
+
+    let failures = refresh_providers_jwks(&providers).await;
+
+    assert_eq!(failures.len(), 2);
+    let events = capture.events();
+    assert!(events.len() >= 3, "{events:?}");
+    for event in events {
+        assert!(
+            !event.message.chars().any(crate::log_text::escapes),
+            "{:?}",
+            event.message
+        );
+    }
 }

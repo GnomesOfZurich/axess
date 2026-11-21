@@ -8,6 +8,7 @@
 //!
 //! [`OAuthProvider`]: axess_factors::oauth::OAuthProvider
 
+use crate::authn::factor::FederatedProvider;
 use axess_factors::oauth::OAuthProvider;
 use std::sync::Arc;
 
@@ -21,24 +22,55 @@ use std::sync::Arc;
 ///
 /// A value of this type is an immutable snapshot: a running service swaps the
 /// whole registry when a provider is reloaded or removed
-/// ([`AuthnService::reload_oauth_provider`](crate::authn::service::AuthnService::reload_oauth_provider)),
+/// ([`RequestAuthnService::reload_oauth_provider_as`](crate::authn::service::RequestAuthnService::reload_oauth_provider_as)),
 /// so a snapshot taken from
 /// [`AuthnService::oauth_providers`](crate::authn::service::AuthnService::oauth_providers)
 /// does not change under the caller.
+///
+/// Each name has a kind, the [`FederatedProvider`] every login through the
+/// provider records: the one its configuration named, or `Custom(name)`.
+/// [`with_oauth_provider_of_kind`](crate::authn::service::AuthnServiceBuilder::with_oauth_provider_of_kind)
+/// names it at construction, and a reload
+/// ([`reload_oauth_provider_as`](crate::authn::service::RequestAuthnService::reload_oauth_provider_as),
+/// or a [`ProviderSource`](crate::authn::service::ProviderSource) a
+/// follower reads) names it again with the provider it installs, so the
+/// kind is always the one the provider in force was configured with.
 #[derive(Default, Clone)]
 pub struct OAuthProviderRegistry {
     providers: std::collections::HashMap<Arc<str>, Arc<dyn OAuthProvider>>,
+    /// The kinds the configurations named; a name not here is
+    /// `Custom(name)`.
+    kinds: std::collections::HashMap<Arc<str>, FederatedProvider>,
 }
 
+/// A provider as the registry held it, with the kind its configuration
+/// named (`None` for `Custom(name)`): what a change takes out, and what an
+/// undone change puts back.
+pub(crate) type HeldProvider = (Arc<dyn OAuthProvider>, Option<FederatedProvider>);
+
 impl OAuthProviderRegistry {
-    /// Set `provider` under `name`; `true` when it replaced one.
-    pub(crate) fn set(&mut self, name: Arc<str>, provider: Arc<dyn OAuthProvider>) -> bool {
-        self.providers.insert(name, provider).is_some()
+    /// Set `provider` under `name`, with the kind its configuration named
+    /// (`None` for `Custom(name)`); what it replaced, if anything.
+    pub(crate) fn set(
+        &mut self,
+        name: Arc<str>,
+        provider: Arc<dyn OAuthProvider>,
+        kind: Option<FederatedProvider>,
+    ) -> Option<HeldProvider> {
+        let was_kind = match kind {
+            Some(kind) => self.kinds.insert(name.clone(), kind),
+            None => self.kinds.remove(&name),
+        };
+        self.providers
+            .insert(name, provider)
+            .map(|was| (was, was_kind))
     }
 
-    /// Drop the provider under `name`; `true` when there was one.
-    pub(crate) fn remove(&mut self, name: &str) -> bool {
-        self.providers.remove(name).is_some()
+    /// Drop the provider under `name` and its kind; what was there, if
+    /// anything.
+    pub(crate) fn remove(&mut self, name: &str) -> Option<HeldProvider> {
+        let was_kind = self.kinds.remove(name);
+        self.providers.remove(name).map(|was| (was, was_kind))
     }
 
     pub(crate) fn get(&self, name: &str) -> Option<&Arc<dyn OAuthProvider>> {
@@ -47,6 +79,16 @@ impl OAuthProviderRegistry {
 
     pub(crate) fn values(&self) -> impl Iterator<Item = &Arc<dyn OAuthProvider>> {
         self.providers.values()
+    }
+
+    /// The kind the logins through the provider `name` record: the one its
+    /// registration named, or `FederatedProvider::Custom(name)` when it named
+    /// none (and for a name nothing registered).
+    pub fn provider_kind(&self, name: &str) -> FederatedProvider {
+        self.kinds
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| FederatedProvider::Custom(name.to_string()))
     }
 
     /// Return the names of all registered providers.
@@ -83,10 +125,14 @@ impl OAuthRegistrySlot {
     /// Register `provider` under its own name at construction; `true` on a
     /// duplicate, which is logged: at construction a repeated name is a
     /// misconfiguration (see [`OAuthProviderRegistry::add`]).
-    pub(crate) fn add(&self, provider: impl OAuthProvider) -> bool {
+    pub(crate) fn add(
+        &self,
+        provider: impl OAuthProvider,
+        kind: Option<FederatedProvider>,
+    ) -> bool {
         let provider: Arc<dyn OAuthProvider> = Arc::new(provider);
         let name = provider.name().clone();
-        let replaced = self.set(&name, provider);
+        let replaced = self.set(&name, provider, kind).is_some();
         if replaced {
             tracing::warn!(
                 provider_name = %name,
@@ -98,30 +144,36 @@ impl OAuthRegistrySlot {
         replaced
     }
 
-    /// Set `provider` under `name`; `true` when it replaced one. A reload
-    /// replaces on purpose and is reported by its caller.
-    pub(crate) fn set(&self, name: &Arc<str>, provider: Arc<dyn OAuthProvider>) -> bool {
-        let replaced = std::sync::atomic::AtomicBool::new(false);
+    /// Set `provider` under `name` with the kind its configuration named
+    /// (`None` for `Custom(name)`), provider and kind in one swap; what it
+    /// replaced, if anything. A reload replaces on purpose and is reported
+    /// by its caller.
+    pub(crate) fn set(
+        &self,
+        name: &Arc<str>,
+        provider: Arc<dyn OAuthProvider>,
+        kind: Option<FederatedProvider>,
+    ) -> Option<HeldProvider> {
+        let replaced = std::sync::Mutex::new(None);
         self.current.rcu(|registry| {
             let mut next = OAuthProviderRegistry::clone(registry);
-            replaced.store(
-                next.set(name.clone(), provider.clone()),
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            *replaced.lock().unwrap_or_else(|p| p.into_inner()) =
+                next.set(name.clone(), provider.clone(), kind.clone());
             next
         });
-        replaced.load(std::sync::atomic::Ordering::Relaxed)
+        replaced.into_inner().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Drop the provider under `name`; `true` when there was one.
-    pub(crate) fn remove(&self, name: &str) -> bool {
-        let removed = std::sync::atomic::AtomicBool::new(false);
+    /// Drop the provider under `name` and its kind; what was there, if
+    /// anything.
+    pub(crate) fn remove(&self, name: &str) -> Option<HeldProvider> {
+        let removed = std::sync::Mutex::new(None);
         self.current.rcu(|registry| {
             let mut next = OAuthProviderRegistry::clone(registry);
-            removed.store(next.remove(name), std::sync::atomic::Ordering::Relaxed);
+            *removed.lock().unwrap_or_else(|p| p.into_inner()) = next.remove(name);
             next
         });
-        removed.load(std::sync::atomic::Ordering::Relaxed)
+        removed.into_inner().unwrap_or_else(|p| p.into_inner())
     }
 }
 
@@ -133,7 +185,7 @@ mod tests {
     impl OAuthProviderRegistry {
         fn add(&mut self, provider: impl OAuthProvider) -> bool {
             let provider: Arc<dyn OAuthProvider> = Arc::new(provider);
-            self.set(provider.name().clone(), provider)
+            self.set(provider.name().clone(), provider, None).is_some()
         }
     }
 
@@ -165,6 +217,61 @@ mod tests {
         assert_eq!(registry.provider_count(), 1);
         registry.add(MockOAuthProvider::new("github"));
         assert_eq!(registry.provider_count(), 2);
+    }
+
+    /// A name's kind is the one its registration named, `Custom(name)`
+    /// otherwise; a later registration or reload of the name sets it again,
+    /// and a removal takes it with the provider.
+    #[test]
+    fn a_names_kind_is_the_one_its_registration_named() {
+        let slot = OAuthRegistrySlot::default();
+        slot.add(
+            MockOAuthProvider::new("google"),
+            Some(FederatedProvider::Google),
+        );
+        slot.add(MockOAuthProvider::new("sso"), None);
+        let registry = slot.load();
+        assert_eq!(registry.provider_kind("google"), FederatedProvider::Google);
+        assert_eq!(
+            registry.provider_kind("sso"),
+            FederatedProvider::Custom("sso".to_string())
+        );
+        assert_eq!(
+            registry.provider_kind("unknown"),
+            FederatedProvider::Custom("unknown".to_string())
+        );
+        // A reload sets the kind it names, and answers what it replaced.
+        let name: Arc<str> = Arc::from("google");
+        let (_, was) = slot
+            .set(
+                &name,
+                Arc::new(MockOAuthProvider::new("google")),
+                Some(FederatedProvider::Microsoft),
+            )
+            .expect("a provider was there");
+        assert_eq!(was, Some(FederatedProvider::Google));
+        assert_eq!(
+            slot.load().provider_kind("google"),
+            FederatedProvider::Microsoft
+        );
+        slot.add(MockOAuthProvider::new("google"), None);
+        assert_eq!(
+            slot.load().provider_kind("google"),
+            FederatedProvider::Custom("google".to_string())
+        );
+        // A removal takes the kind with the provider.
+        let sso: Arc<str> = Arc::from("sso");
+        slot.set(
+            &sso,
+            Arc::new(MockOAuthProvider::new("sso")),
+            Some(FederatedProvider::Github),
+        );
+        let (_, removed) = slot.remove("sso").expect("a provider was there");
+        assert_eq!(removed, Some(FederatedProvider::Github));
+        assert_eq!(
+            slot.load().provider_kind("sso"),
+            FederatedProvider::Custom("sso".to_string())
+        );
     }
 
     /// A second registration under one name replaces the first and says so,

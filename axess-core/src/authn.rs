@@ -61,6 +61,7 @@ pub use factor::{
 };
 pub use ids::{DeviceId, IdError, TenantId, UserId};
 pub use provisioning::{ProvisioningError, TenantBootstrap, create_tenant};
+pub use service::OtherSessionsError;
 pub use service::{
     ActiveSessionsError, Actor, AuthnService, AuthnServiceBuilder, ChosenPasswordError,
     FactorOutcome, LoginOutcome, NoSessionRegistryError, PrepareOutcome, RequestAuthnService,
@@ -69,11 +70,13 @@ pub use service::{
 #[cfg(feature = "oauth")]
 pub use service::{DEFAULT_JWKS_REFRESH_INTERVAL, DEFAULT_SID_MAP_CAPACITY};
 pub use store::{
-    AuditOutcome, AuditQuery, AuthMethod, AuthnBackend, EventQueryFilter, FactorStore,
-    IdentityAdmin, IdentityAuthnLog, IdentityLookup, IdentityPasswordHistory,
-    IdentityPasswordReset, IdentityStore, NoopAuthnLog, ResolvedFactor,
+    AuditOutcome, AuditQuery, AuditTrail, AuthMethod, AuthnBackend, EventQueryFilter, FactorStore,
+    Fido2CredentialClaim, IdentityAdmin, IdentityAuthnLog, IdentityLookup, IdentityPasswordHistory,
+    IdentityPasswordReset, IdentityStore, NoopAuthnLog, ResolvedFactor, UnreadableReason,
+    UnreadableRows,
 };
 pub use types::{
-    AuthnScope, CounterUnavailable, EntityState, IpPolicy, LockoutPolicy, ScopeColumns,
-    StatusCause, StatusDetail, Tenant, Throttle, ThrottleKey, ThrottleState, ThrottleSubject, User,
+    AuthnScope, CounterUnavailable, EntityState, IpPolicy, LockoutPolicy, LockoutPolicyError,
+    ScopeColumns, StatusCause, StatusDetail, Tenant, Throttle, ThrottleKey, ThrottleState,
+    ThrottleSubject, User,
 };

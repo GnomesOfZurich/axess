@@ -10,6 +10,9 @@ use std::collections::BTreeMap;
 
 use crate::{IdentityError, Issuer};
 
+/// The scheme of a SPIFFE ID, with the separator that follows it.
+const SCHEME: &str = "spiffe://";
+
 /// SPIFFE-ID-shaped workload identifier.
 ///
 /// Wire format: `spiffe://<trust-domain>/<path>` where the trust domain is
@@ -18,8 +21,9 @@ use crate::{IdentityError, Issuer};
 ///
 /// - scheme must be exactly `spiffe`
 /// - no userinfo, no port, no query, no fragment
-/// - trust domain matches `[a-z0-9][a-z0-9.-]*`, lowercase, max 255 chars
-/// - each path segment is non-empty and matches `[A-Za-z0-9._~-]+`
+/// - trust domain matches `[a-z0-9._-]+`, lowercase, max 255 chars (section 2.1)
+/// - each path segment is non-empty, is not `.` or `..`, and matches
+///   `[A-Za-z0-9._-]+` (section 2.2)
 /// - full URI length ≤ 2048 characters
 ///
 /// Constructors:
@@ -27,6 +31,9 @@ use crate::{IdentityError, Issuer};
 ///   used by `CliResolver` (trust domain, service name, tenant slug).
 /// - [`WorkloadId::parse`] validates an arbitrary string. Used when
 ///   loading from external sources (JWT-SVID `sub` claim, mTLS SAN, etc.).
+///
+/// Taken apart again by [`WorkloadId::trust_domain`], which every SPIFFE ID
+/// has, and [`WorkloadId::components`], for an ID of the platform's shape.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(try_from = "String", into = "String"))]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -73,9 +80,20 @@ impl WorkloadId {
                 Self::MAX_LEN
             )));
         }
-        let after_scheme = raw.strip_prefix("spiffe://").ok_or_else(|| {
-            IdentityError::InvalidSpiffeId(format!("missing 'spiffe://' scheme prefix: {raw}"))
-        })?;
+        // SPIFFE-ID section 2.4: the scheme is case-insensitive. The ID is
+        // kept with it in lower case, so two spellings of one ID are one
+        // value. The trust domain is another matter: section 2.1 has it in
+        // lower case, and an upper-case letter in it is refused below.
+        let after_scheme = raw
+            .get(..SCHEME.len())
+            .filter(|scheme| scheme.eq_ignore_ascii_case(SCHEME))
+            .and_then(|_| raw.get(SCHEME.len()..))
+            .ok_or_else(|| {
+                IdentityError::InvalidSpiffeId(format!(
+                    "missing 'spiffe://' scheme prefix: {}",
+                    quoted(raw)
+                ))
+            })?;
         if after_scheme.contains('?') || after_scheme.contains('#') {
             return Err(IdentityError::InvalidSpiffeId(
                 "query and fragment components not permitted".to_string(),
@@ -113,13 +131,83 @@ impl WorkloadId {
                 })?;
             }
         }
-        Ok(Self(raw.to_string()))
+        Ok(Self(format!("{SCHEME}{after_scheme}")))
     }
 
     /// Borrow the underlying URI as a string slice.
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The URI's authority, and the path after it without the slash
+    /// between them. Both constructors validated the URI, so the scheme is
+    /// there and the authority is a trust domain.
+    fn authority_and_path(&self) -> (&str, &str) {
+        let after_scheme = self.0.strip_prefix(SCHEME).unwrap_or(&self.0);
+        after_scheme.split_once('/').unwrap_or((after_scheme, ""))
+    }
+
+    /// The trust domain the ID belongs to: the authority of its URI.
+    pub fn trust_domain(&self) -> TrustDomain {
+        TrustDomain(self.authority_and_path().0.to_owned())
+    }
+
+    /// The ID taken apart into the three platform components
+    /// [`build`](Self::build) puts together: the trust domain, the service
+    /// name and the tenant slug.
+    ///
+    /// The platform's shape is `spiffe://<trust_domain>/<service>/<tenant_slug>`.
+    /// An ID of any other shape (no path, one segment, more than two) is a
+    /// valid SPIFFE ID and not one of the platform's, and is refused with
+    /// [`IdentityError::InvalidSpiffeId`]. Every resolver that reads a
+    /// service and a tenant out of a SPIFFE ID reads them here.
+    ///
+    /// ```
+    /// use axess_identity::{TrustDomain, WorkloadId};
+    ///
+    /// let trust_domain = TrustDomain::new("prod.example.com")?;
+    /// let id = WorkloadId::build(&trust_domain, "billing-api", "acme")?;
+    /// let parts = id.components()?;
+    /// assert_eq!(parts.trust_domain, trust_domain);
+    /// assert_eq!((parts.service, parts.tenant_slug), ("billing-api", "acme"));
+    ///
+    /// let other = WorkloadId::parse("spiffe://prod.example.com/ns/payments/sa/api")?;
+    /// assert!(other.components().is_err());
+    /// # Ok::<(), axess_identity::IdentityError>(())
+    /// ```
+    pub fn components(&self) -> Result<WorkloadIdComponents<'_>, IdentityError> {
+        let (_, path) = self.authority_and_path();
+        let mut segments = path.split('/');
+        match (segments.next(), segments.next(), segments.next()) {
+            (Some(service), Some(tenant_slug), None)
+                if !service.is_empty() && !tenant_slug.is_empty() =>
+            {
+                Ok(WorkloadIdComponents {
+                    trust_domain: self.trust_domain(),
+                    service,
+                    tenant_slug,
+                })
+            }
+            // The identifier is the presenter's text, up to `MAX_LEN` bytes
+            // of it: the refusal quotes it cut.
+            _ => Err(IdentityError::InvalidSpiffeId(format!(
+                "SPIFFE path is not <service>/<tenant_slug>: {}",
+                quoted(self.as_str())
+            ))),
+        }
+    }
+}
+
+/// A SPIFFE ID of the platform's shape, taken apart: what
+/// [`WorkloadId::components`] returns, and what [`WorkloadId::build`] takes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkloadIdComponents<'a> {
+    /// The trust domain: the URI's authority.
+    pub trust_domain: TrustDomain,
+    /// The service name: the first segment of the path.
+    pub service: &'a str,
+    /// The tenant slug: the second segment of the path.
+    pub tenant_slug: &'a str,
 }
 
 impl TryFrom<String> for WorkloadId {
@@ -144,8 +232,11 @@ impl std::fmt::Display for WorkloadId {
 
 /// SPIFFE trust domain: the authority component of a SPIFFE-ID URI.
 ///
-/// Per the spec: non-empty, lowercase ASCII, alphanumeric / hyphen / dot,
-/// must start with an alphanumeric, max 255 characters.
+/// Per section 2.1 of the SPIFFE-ID standard: not empty, at most 255
+/// characters, and only lowercase letters, digits, dots, dashes and
+/// underscores. A trust domain name is not a DNS name: one that starts with
+/// a dash or holds an underscore is as valid as one that could be a host
+/// name, and the standard forbids treating the two differently.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(try_from = "String", into = "String"))]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -169,18 +260,14 @@ impl TrustDomain {
                 Self::MAX_LEN
             )));
         }
-        let mut chars = raw.chars();
-        let first = chars.next().expect("non-empty checked above");
-        if !first.is_ascii_alphanumeric() {
-            return Err(IdentityError::InvalidTrustDomain(format!(
-                "must start with an alphanumeric: {raw}"
-            )));
-        }
-        for c in std::iter::once(first).chain(chars) {
-            let valid = c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.';
+        for c in raw.chars() {
+            let valid =
+                c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '-' | '_');
             if !valid {
                 return Err(IdentityError::InvalidTrustDomain(format!(
-                    "invalid character '{c}' in trust domain '{raw}' (expected [a-z0-9.-])"
+                    "invalid character '{}' in trust domain '{}' (expected [a-z0-9._-])",
+                    quoted(c.encode_utf8(&mut [0; 4])),
+                    quoted(raw)
                 )));
             }
         }
@@ -216,8 +303,9 @@ impl std::fmt::Display for TrustDomain {
 /// A workload principal: a service, batch job, agent, or other
 /// non-human compute identity. Carries the SPIFFE-shaped workload id,
 /// its trust domain, the issuer that vouched for it, the tenant
-/// scope, and arbitrary attributes (empty today; populated from JWT
-/// claims when JWT-SVID resolution lands).
+/// scope, and arbitrary attributes (empty from `CliResolver` and the
+/// SPIFFE resolvers, JWT-SVID, mTLS and the SPIRE agent's; filled from the
+/// token's claims by the federation `WorkloadResolver`'s claim mapper).
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkloadPrincipal {
@@ -239,8 +327,9 @@ pub struct WorkloadPrincipal {
     /// Service identifier: `"compute-worker"`, `"feed-worker"`, etc.
     pub service_name: String,
     /// Arbitrary key-value attributes from the resolver. Empty for
-    /// `CliResolver`; populated from JWT claims by future federation
-    /// resolvers.
+    /// `CliResolver` and the SPIFFE resolvers; the federation
+    /// `WorkloadResolver` fills them from the claim mapper's
+    /// `WorkloadMapping`.
     pub attributes: BTreeMap<String, serde_json::Value>,
 }
 
@@ -258,15 +347,33 @@ fn validate_path_segment(segment: &str, role: &str) -> Result<(), IdentityError>
             "{role} must not be '.' or '..'"
         )));
     }
+    // SPIFFE-ID section 2.2: letters, numbers, dots, dashes and underscores.
     for c in segment.chars() {
-        let valid = c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '~' || c == '-';
+        let valid = c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_');
         if !valid {
             return Err(IdentityError::InvalidComponent(format!(
-                "invalid character '{c}' in {role} '{segment}' (expected [A-Za-z0-9._~-])"
+                "invalid character '{}' in {role} '{}' (expected [A-Za-z0-9._-])",
+                quoted(c.encode_utf8(&mut [0; 4])),
+                quoted(segment)
             )));
         }
     }
     Ok(())
+}
+
+/// The most bytes of a refused value an error quotes.
+const QUOTED_BYTES: usize = 64;
+
+/// A refused value as an error quotes it. The value is whatever the caller
+/// was handed (a token's `sub`, a certificate's URI name), and the error is
+/// logged: it is made safe by the one predicate of the workspace
+/// ([`log_safe`](crate::log_text::log_safe)), so every character
+/// [`escapes`](crate::log_text::escapes) names is written as an escape and
+/// the text is cut to [`QUOTED_BYTES`] bytes with `...` marking the cut. A
+/// refused value can neither forge a log line, make one read otherwise
+/// than it is, nor fill one.
+fn quoted(text: &str) -> String {
+    crate::log_text::log_safe(text, QUOTED_BYTES)
 }
 
 #[cfg(test)]

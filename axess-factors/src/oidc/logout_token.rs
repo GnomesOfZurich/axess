@@ -6,22 +6,22 @@
 //! because it needs access to the matched provider's JWKS cache.
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use std::time::Duration;
 
 /// The OIDC event URI that must be present in a back-channel logout token.
 pub const BACKCHANNEL_LOGOUT_EVENT: &str = "http://schemas.openid.net/event/backchannel-logout";
 
 /// Maximum age of a logout token's `iat` claim (5 minutes).
-pub const MAX_IAT_AGE_SECS: i64 = 300;
+pub const MAX_IAT_AGE: Duration = Duration::from_secs(300);
 
-/// How far in the future a logout token's `iat` may be (clock skew), in
-/// seconds.
-pub const MAX_IAT_FUTURE_SECS: i64 = 60;
+/// How far in the future a logout token's `iat` may be (clock skew).
+pub const MAX_IAT_FUTURE: Duration = Duration::from_secs(60);
 
 /// How long a logout token's `jti` must be remembered to refuse a replay: a
-/// token is accepted from `MAX_IAT_FUTURE_SECS` before its `iat` until
-/// `MAX_IAT_AGE_SECS` after it, so the same token can arrive this many
-/// seconds apart.
-pub const JTI_RETENTION_SECS: i64 = MAX_IAT_AGE_SECS + MAX_IAT_FUTURE_SECS;
+/// token is accepted from [`MAX_IAT_FUTURE`] before its `iat` until
+/// [`MAX_IAT_AGE`] after it, so the same token can arrive this far apart.
+pub const JTI_RETENTION: Duration =
+    Duration::from_secs(MAX_IAT_AGE.as_secs() + MAX_IAT_FUTURE.as_secs());
 
 /// Maximum logout token size (8 KiB). Real OIDC logout tokens are typically
 /// well under 2 KiB; the larger limit allows headroom for unusual claim
@@ -75,7 +75,8 @@ fn decode_payload_capped(
         .decode(parts[1])
         .map_err(|e| format!("base64 decode failed: {e}"))?;
 
-    serde_json::from_slice(&payload_bytes).map_err(|e| format!("JSON parse failed: {e}"))
+    serde_json::from_slice(&payload_bytes)
+        .map_err(|e| format!("JSON parse failed: {}", crate::remote_text::parse_error(&e)))
 }
 
 /// Check that the JWT `aud` claim contains the expected client ID. Accepts
@@ -124,7 +125,7 @@ pub fn azp_satisfied(payload: &serde_json::Value, client_id: &str) -> bool {
 /// Outcome of `iat` (issued-at) recency validation.
 pub enum IatCheck {
     /// The `iat` claim is within tolerance: pre-dated by at most 60 s
-    /// (clock skew) and no older than [`MAX_IAT_AGE_SECS`].
+    /// (clock skew) and no older than [`MAX_IAT_AGE`].
     Ok,
     /// Missing or non-integer `iat` claim: reject.
     Missing,
@@ -143,7 +144,7 @@ pub fn check_iat(payload: &serde_json::Value, now: i64) -> IatCheck {
     let Some(iat) = payload.get("iat").and_then(|v| v.as_i64()) else {
         return IatCheck::Missing;
     };
-    if crate::iat_window::iat_within(iat, now, MAX_IAT_FUTURE_SECS, MAX_IAT_AGE_SECS) {
+    if crate::iat_window::iat_within(iat, now, MAX_IAT_FUTURE, MAX_IAT_AGE) {
         IatCheck::Ok
     } else {
         IatCheck::OutOfRange { iat, now }

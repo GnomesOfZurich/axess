@@ -111,9 +111,7 @@
 use std::future::Future;
 use std::time::Duration;
 
-#[cfg(test)]
-use chrono::TimeZone;
-use chrono::{DateTime, Utc};
+use axess_clock::Timestamp;
 use sqlx::SqlitePool;
 
 use crate::authn::ids::{DeviceId, TenantId, UserId};
@@ -192,6 +190,14 @@ impl SqliteDeviceStore {
 }
 
 impl DeviceStore for SqliteDeviceStore {
+    fn load_fresh(
+        &self,
+        tenant_id: &TenantId,
+        id: &DeviceId,
+    ) -> impl Future<Output = Result<Option<Device>, Self::Error>> + Send {
+        // No cache of its own: the database is the authoritative store.
+        self.load(tenant_id, id)
+    }
     type Error = SqlDeviceStoreError;
 
     fn load(
@@ -326,7 +332,7 @@ impl DeviceStore for SqliteDeviceStore {
     fn save(
         &self,
         device: &Device,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         let pool = self.pool.clone();
         let codec = self.codec.clone();
@@ -337,7 +343,7 @@ impl DeviceStore for SqliteDeviceStore {
     fn create_or_find(
         &self,
         device: &Device,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<Device, Self::Error>> + Send {
         let pool = self.pool.clone();
         let codec = self.codec.clone();
@@ -349,7 +355,7 @@ impl DeviceStore for SqliteDeviceStore {
         &self,
         tenant_id: &TenantId,
         id: &DeviceId,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<DeviceTrustLevel, Self::Error>> + Send {
         ops::record_sighting::<Sql>(
             self.pool.clone(),
@@ -364,7 +370,7 @@ impl DeviceStore for SqliteDeviceStore {
         tenant_id: &TenantId,
         id: &DeviceId,
         level: DeviceTrustLevel,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         let pool = self.pool.clone();
         let tenant = tenant_id.to_string();
@@ -402,7 +408,7 @@ impl DeviceStore for SqliteDeviceStore {
         id: &DeviceId,
         expected: DeviceTrustLevel,
         level: DeviceTrustLevel,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<TrustTransition, Self::Error>> + Send {
         ops::set_trust_level_if::<Sql>(
             self.pool.clone(),
@@ -419,7 +425,7 @@ impl DeviceStore for SqliteDeviceStore {
         id: &DeviceId,
         expected: &[DeviceBinding],
         bindings: &[DeviceBinding],
-        _now: DateTime<Utc>,
+        _: Timestamp,
     ) -> impl Future<Output = Result<BindingsUpdate, Self::Error>> + Send {
         let pool = self.pool.clone();
         let codec = self.codec.clone();
@@ -435,7 +441,7 @@ impl DeviceStore for SqliteDeviceStore {
         tenant_id: &TenantId,
         id: &DeviceId,
         user: &UserId,
-        _now: DateTime<Utc>,
+        _: Timestamp,
     ) -> impl Future<Output = Result<OwnerClaim, Self::Error>> + Send {
         ops::claim_owner::<Sql>(
             self.pool.clone(),
@@ -499,7 +505,7 @@ impl DeviceStore for SqliteDeviceStore {
     fn sweep(
         &self,
         tenant_id: &TenantId,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<SweepCounts, Self::Error>> + Send {
         let pool = self.pool.clone();
         let cutoffs = SweepCutoffs::new(&self.sweep_config, now);

@@ -37,8 +37,9 @@
 //! # Recipes for common issuers
 //!
 //! See the `axess-example-workload-identity` crate for ready-made
-//! claim parsers + mappers for GitHub Actions and Kubernetes
-//! service-account tokens. Adopters copy the recipe that matches their
+//! claim parsers + mappers for GitHub Actions, GitLab CI and Kubernetes
+//! service-account tokens (with the Amazon EKS and OpenShift issuers on the
+//! Kubernetes recipe). Adopters copy the recipe that matches their
 //! IdP into their own code and wire it up against the resolver here.
 
 use std::collections::BTreeMap;
@@ -89,10 +90,10 @@ pub struct WorkloadMapping {
 /// // Startup wiring:
 /// let verifier = Arc::new(
 ///     JwtVerifier::new(okta_jwks_handle)
-///         .with_issuer("https://gnomes.okta.com")
+///         .with_issuer("https://idp.example.com")
 ///         .with_audience("axess-platform"),
 /// );
-/// let trust_domain = TrustDomain::new("okta.gnomes.local").unwrap();
+/// let trust_domain = TrustDomain::new("idp.example.org").unwrap();
 ///
 /// // Per request: the tenant registry (a cached slug → TenantId map) is the
 /// // lookup, and a claim mapper pulls the workload identity from `sub`.
@@ -128,7 +129,7 @@ where
     issuer: Issuer,
     token: String,
     claim_mapper: F,
-    _marker: PhantomData<fn() -> C>,
+    marker: PhantomData<fn() -> C>,
 }
 
 impl<C, F, R> WorkloadResolver<C, F, R>
@@ -171,7 +172,7 @@ where
             issuer,
             token: token.into(),
             claim_mapper,
-            _marker: PhantomData,
+            marker: PhantomData,
         }
     }
 }

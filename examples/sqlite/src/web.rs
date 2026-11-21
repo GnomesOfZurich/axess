@@ -1,5 +1,7 @@
 pub mod app;
 pub mod auth;
+#[cfg(feature = "device-keys")]
+pub mod device_keys;
 pub mod protected;
 
 use axess::csrf::CsrfToken;

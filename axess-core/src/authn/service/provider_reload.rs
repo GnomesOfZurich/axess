@@ -1,5 +1,6 @@
 //! Live provider reload: replace, add and remove the OAuth, FIDO2 and LDAP
-//! providers of a running [`AuthnService`].
+//! providers of a running
+//! [`AuthnService`](crate::authn::service::AuthnService).
 //!
 //! The design, the invariants and the failure modes are in the book chapter
 //! "Live provider reload". In short: a candidate provider is built and
@@ -7,8 +8,18 @@
 //! parse for FIDO2, reachability for LDAP), under a deadline; only then is it
 //! swapped into a lock-free slot, and a refusal leaves the previous provider
 //! serving and names the step. With a coordinator, a local change is announced
-//! and [`AuthnService::follow_provider_reloads`] is the receiving side.
+//! and
+//! [`AuthnService::follow_provider_reloads`](crate::authn::service::AuthnService::follow_provider_reloads)
+//! is the receiving side.
+//!
+//! A provider is changed through the `_as` methods on
+//! [`RequestAuthnService`](crate::authn::service::RequestAuthnService), which
+//! take the administrator and write an audit row, without which the change
+//! is not made.
 
+mod audited;
+#[cfg(feature = "oauth")]
+mod client_ownership;
 #[cfg(feature = "fido2")]
 mod fido2_options;
 mod install;
@@ -21,13 +32,19 @@ use crate::authn::store::{FactorStore, IdentityStore};
 use crate::metrics::ProviderCategory;
 use crate::reload::ReloadCoordinator;
 
+pub use audited::{PROVIDER_SOURCE_REASON, ProviderChangeError};
+#[cfg(feature = "oauth")]
+pub use client_ownership::{
+    CLIENT_OWNERSHIP_ATTESTED_REASON, CLIENT_PAIR_HAND_OVER_REQUESTED_REASON,
+    CLIENT_PAIR_HANDED_OVER_REASON,
+};
 #[cfg(feature = "fido2")]
 pub use fido2_options::ReloadFido2;
 pub use source::{
     BuiltProvider, ProviderEntry, ProviderFollower, ProviderSource, ProviderSourceError, ReadCause,
 };
 
-use super::{AuthnService, AuthnServiceBuilder};
+use super::AuthnServiceBuilder;
 
 /// How long a candidate provider has to build and check itself before a reload
 /// is refused as [`ProviderReloadError::TimedOut`]: 30 seconds, the same bound
@@ -66,6 +83,19 @@ impl ProviderKey {
             Self::Fido2 => ProviderCategory::Fido2,
             #[cfg(feature = "ldap")]
             Self::Ldap => ProviderCategory::Ldap,
+        }
+    }
+
+    /// The tenant and the name of an OAuth slot; `None` for a key of any
+    /// other category.
+    #[cfg(feature = "oauth")]
+    pub(crate) fn oauth_slot(&self) -> Option<(Option<&crate::authn::ids::TenantId>, &Arc<str>)> {
+        match self {
+            Self::OAuth { tenant, name } => Some((tenant.as_ref(), name)),
+            #[cfg(feature = "fido2")]
+            Self::Fido2 => None,
+            #[cfg(feature = "ldap")]
+            Self::Ldap => None,
         }
     }
 
@@ -170,6 +200,20 @@ pub enum ProviderReloadError {
         /// The relying-party id the candidate carries.
         candidate: String,
     },
+    /// A tenant provider's issuer and client id are held by another
+    /// provider of the live registry (another tenant's, or this tenant's
+    /// under another name) or by a global provider: one pair belongs to one
+    /// provider, or that client's back-channel logout tokens are ambiguous.
+    #[error(
+        "the provider {label} was refused: its issuer and client id are already registered by {}",
+        if *by_global { "the global provider" } else { "another provider" }
+    )]
+    PairHeld {
+        /// The key's label.
+        label: String,
+        /// Whether a global provider holds the pair.
+        by_global: bool,
+    },
     /// A source built a provider of another category than its key names.
     #[error("the source built a {built} provider for the key {label}")]
     WrongCategory {
@@ -209,7 +253,8 @@ where
     /// **Single-instance by design.** Calling `with_fido2` twice replaces
     /// the previously attached provider silently: one deployment, one
     /// relying-party configuration is the assumption. To change the provider of a
-    /// running service use [`reload_fido2`](AuthnService::reload_fido2). Multi-tenant apps
+    /// running service use
+    /// [`reload_fido2_as`](crate::authn::service::RequestAuthnService::reload_fido2_as). Multi-tenant apps
     /// that need per-tenant relying-party ids (e.g. distinct RP-IDs per
     /// customer domain) must wrap dispatch in the application layer;
     /// axess-core does not maintain a per-tenant FIDO2 registry.
@@ -230,7 +275,8 @@ where
     /// **Single-instance by design.** Calling `with_ldap` twice replaces
     /// the previously attached provider silently: one deployment, one
     /// directory is the assumption. To change the provider of a running service
-    /// use [`reload_ldap`](AuthnService::reload_ldap). Multi-tenant apps that need
+    /// use
+    /// [`reload_ldap_as`](crate::authn::service::RequestAuthnService::reload_ldap_as). Multi-tenant apps that need
     /// per-subsidiary directories must wrap dispatch in the application
     /// layer; axess-core does not maintain a per-tenant LDAP registry.
     ///
@@ -259,7 +305,7 @@ where
     }
 
     /// Announce every local provider change on `coordinator`, and let
-    /// [`follow_provider_reloads`](AuthnService::follow_provider_reloads)
+    /// [`follow_provider_reloads`](crate::authn::service::AuthnService::follow_provider_reloads)
     /// listen on it.
     ///
     /// Give the providers a coordinator of their own (a separate
@@ -272,7 +318,7 @@ where
     }
 
     /// Resolve tenant OAuth providers from `live`, and let
-    /// [`reload_tenant_oauth_provider`](AuthnService::reload_tenant_oauth_provider)
+    /// [`reload_tenant_oauth_provider_as`](crate::authn::service::RequestAuthnService::reload_tenant_oauth_provider_as)
     /// change them. Also installs `live` as the service's tenant provider
     /// source, as
     /// [`with_tenant_oauth_providers`](Self::with_tenant_oauth_providers)
@@ -286,232 +332,6 @@ where
         self.tenant_oauth_providers = Some(live.clone());
         self.provider_reload.live_tenants = Some(live);
         self
-    }
-}
-
-impl<I, F> AuthnService<I, F>
-where
-    I: IdentityStore,
-    F: FactorStore<Error = I::Error>,
-{
-    /// Replace or add the global OAuth provider named `name` with the one
-    /// `candidate` builds.
-    ///
-    /// `candidate` is awaited under the validation deadline; pass the future
-    /// of `OAuthProviderConfig::discover(..)` finished with `.build()`, so the
-    /// discovery fetch and the issuer check run before anything is swapped.
-    /// The provider's own name must equal `name`. On success the next
-    /// `begin_oauth_login(name, ..)` uses the new provider; a login begun
-    /// against the old one finishes only if the issuer is unchanged.
-    ///
-    /// # Errors
-    ///
-    /// [`ProviderReloadError::Build`], [`TimedOut`](ProviderReloadError::TimedOut)
-    /// or [`NameMismatch`](ProviderReloadError::NameMismatch); the previous
-    /// provider keeps serving.
-    #[cfg(feature = "oauth")]
-    pub async fn reload_oauth_provider<P, E>(
-        &self,
-        name: &str,
-        candidate: impl std::future::Future<Output = Result<P, E>>,
-    ) -> Result<ProviderChange, ProviderReloadError>
-    where
-        P: axess_factors::oauth::OAuthProvider,
-        E: std::fmt::Display,
-    {
-        let key = oauth_key(None, name);
-        let provider = self
-            .candidate(&key, candidate)
-            .await
-            .map(|p| Arc::new(p) as Arc<dyn axess_factors::oauth::OAuthProvider>);
-        self.settle(
-            &key,
-            provider.and_then(|p| self.install_oauth(&key, p)),
-            true,
-        )
-        .await
-    }
-
-    /// Take the global OAuth provider named `name` out. Its routes refuse by
-    /// name (`OAuthError::UnknownProvider`) from the next call on; a login in
-    /// flight fails its callback the same way.
-    ///
-    /// # Errors
-    ///
-    /// [`ProviderReloadError::NotFound`] when no such provider is registered.
-    #[cfg(feature = "oauth")]
-    pub async fn remove_oauth_provider(
-        &self,
-        name: &str,
-    ) -> Result<ProviderChange, ProviderReloadError> {
-        let key = oauth_key(None, name);
-        let removed = self.remove_key(&key);
-        self.settle(&key, removed, true).await
-    }
-
-    /// As [`reload_oauth_provider`](Self::reload_oauth_provider), for the
-    /// provider `tenant` has under `name`. Only that entry changes: another
-    /// tenant's provider of the same name is not read or rebuilt.
-    ///
-    /// # Errors
-    ///
-    /// As [`reload_oauth_provider`](Self::reload_oauth_provider), and
-    /// [`ProviderReloadError::NoTenantRegistry`] without
-    /// [`with_live_tenant_oauth_providers`](AuthnServiceBuilder::with_live_tenant_oauth_providers).
-    #[cfg(feature = "oauth")]
-    pub async fn reload_tenant_oauth_provider<P, E>(
-        &self,
-        tenant: &crate::authn::ids::TenantId,
-        name: &str,
-        candidate: impl std::future::Future<Output = Result<P, E>>,
-    ) -> Result<ProviderChange, ProviderReloadError>
-    where
-        P: axess_factors::oauth::OAuthProvider,
-        E: std::fmt::Display,
-    {
-        let key = oauth_key(Some(*tenant), name);
-        let provider = self
-            .candidate(&key, candidate)
-            .await
-            .map(|p| Arc::new(p) as Arc<dyn axess_factors::oauth::OAuthProvider>);
-        self.settle(
-            &key,
-            provider.and_then(|p| self.install_oauth(&key, p)),
-            true,
-        )
-        .await
-    }
-
-    /// Take the provider `tenant` has under `name` out of the live registry.
-    ///
-    /// # Errors
-    ///
-    /// [`ProviderReloadError::NotFound`] or
-    /// [`ProviderReloadError::NoTenantRegistry`].
-    #[cfg(feature = "oauth")]
-    pub async fn remove_tenant_oauth_provider(
-        &self,
-        tenant: &crate::authn::ids::TenantId,
-        name: &str,
-    ) -> Result<ProviderChange, ProviderReloadError> {
-        let key = oauth_key(Some(*tenant), name);
-        let removed = self.remove_key(&key);
-        self.settle(&key, removed, true).await
-    }
-
-    /// Replace or add the FIDO2 provider with the one `candidate` builds.
-    ///
-    /// `candidate` parses the relying party (`WebauthnBuilder::build`), so an
-    /// invalid RP id or origin is refused before the swap. Changing the RP id
-    /// orphans every registered credential, so a candidate whose
-    /// [`relying_party_id`](axess_factors::fido2::Fido2Provider::relying_party_id)
-    /// differs from the provider in force is refused as
-    /// [`RpIdChanged`](ProviderReloadError::RpIdChanged); use
-    /// [`reload_fido2_with`](Self::reload_fido2_with) to acknowledge it.
-    ///
-    /// # Errors
-    ///
-    /// [`ProviderReloadError::Build`], [`TimedOut`](ProviderReloadError::TimedOut)
-    /// or [`RpIdChanged`](ProviderReloadError::RpIdChanged).
-    #[cfg(feature = "fido2")]
-    pub async fn reload_fido2<P, E>(
-        &self,
-        candidate: impl std::future::Future<Output = Result<P, E>>,
-    ) -> Result<ProviderChange, ProviderReloadError>
-    where
-        P: axess_factors::fido2::Fido2Provider,
-        E: std::fmt::Display,
-    {
-        self.reload_fido2_with(candidate, ReloadFido2::default())
-            .await
-    }
-
-    /// As [`reload_fido2`](Self::reload_fido2), with `options` stating what
-    /// the caller accepts. [`ReloadFido2::allow_rp_id_change`] lets a changed
-    /// relying-party id through; the change is counted
-    /// (`ProviderRegistryMetrics::fido2_rp_id_changed`) and logged with both
-    /// ids on `axess::authn::provider_reload`.
-    ///
-    /// # Errors
-    ///
-    /// As [`reload_fido2`](Self::reload_fido2).
-    #[cfg(feature = "fido2")]
-    pub async fn reload_fido2_with<P, E>(
-        &self,
-        candidate: impl std::future::Future<Output = Result<P, E>>,
-        options: ReloadFido2,
-    ) -> Result<ProviderChange, ProviderReloadError>
-    where
-        P: axess_factors::fido2::Fido2Provider,
-        E: std::fmt::Display,
-    {
-        let key = ProviderKey::Fido2;
-        let provider = self
-            .candidate(&key, candidate)
-            .await
-            .map(|p| Arc::new(p) as Arc<dyn axess_factors::fido2::Fido2Provider>);
-        self.settle(
-            &key,
-            provider.and_then(|p| self.install_fido2(&key, p, options)),
-            true,
-        )
-        .await
-    }
-
-    /// Take the FIDO2 provider out. Its ceremony steps answer
-    /// `AuthnError::NoFlow` from the next call on; credentials already
-    /// registered stay in the store.
-    ///
-    /// # Errors
-    ///
-    /// [`ProviderReloadError::NotFound`] when no FIDO2 provider is attached.
-    #[cfg(feature = "fido2")]
-    pub async fn remove_fido2(&self) -> Result<ProviderChange, ProviderReloadError> {
-        let key = ProviderKey::Fido2;
-        let removed = self.remove_key(&key);
-        self.settle(&key, removed, true).await
-    }
-
-    /// Take the LDAP provider out. A factor chain with
-    /// [`FactorKind::LdapBind`](crate::authn::factor::FactorKind::LdapBind)
-    /// answers `FactorOutcome::InvalidCredential` from the next call on.
-    ///
-    /// # Errors
-    ///
-    /// [`ProviderReloadError::NotFound`] when no LDAP provider is attached.
-    #[cfg(feature = "ldap")]
-    pub async fn remove_ldap(&self) -> Result<ProviderChange, ProviderReloadError> {
-        let key = ProviderKey::Ldap;
-        let removed = self.remove_key(&key);
-        self.settle(&key, removed, true).await
-    }
-
-    /// Replace or add the LDAP provider with the one `candidate` builds,
-    /// after its directory answered
-    /// [`check_reachable`](axess_factors::ldap::LdapProvider::check_reachable)
-    /// within the validation deadline.
-    ///
-    /// # Errors
-    ///
-    /// [`ProviderReloadError::Build`], [`TimedOut`](ProviderReloadError::TimedOut)
-    /// or [`Unreachable`](ProviderReloadError::Unreachable).
-    #[cfg(feature = "ldap")]
-    pub async fn reload_ldap<P, E>(
-        &self,
-        candidate: impl std::future::Future<Output = Result<P, E>>,
-    ) -> Result<ProviderChange, ProviderReloadError>
-    where
-        P: axess_factors::ldap::LdapProvider,
-        E: std::fmt::Display,
-    {
-        let key = ProviderKey::Ldap;
-        let provider = match self.candidate(&key, candidate).await {
-            Ok(p) => Arc::new(p) as Arc<dyn axess_factors::ldap::LdapProvider>,
-            Err(e) => return self.settle(&key, Err(e), true).await,
-        };
-        let checked = self.check_ldap(provider).await;
-        self.settle(&key, checked.and_then(|p| self.install_ldap(&key, p)), true)
-            .await
     }
 }
 

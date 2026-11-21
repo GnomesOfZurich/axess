@@ -5,7 +5,7 @@
 
 use crate::lru::LruMap;
 use crate::stats::{CacheCounters, CacheStats};
-use axess_clock::Clock;
+use axess_clock::{Clock, Until};
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::num::NonZeroUsize;
@@ -25,15 +25,17 @@ impl<T> LockUnpoisoned<T> for Mutex<T> {
     }
 }
 
-/// Cached value plus the absolute (epoch-µs) instant at which it expires.
+/// Cached value plus the end of its life.
 ///
-/// `expires_at_micros` is computed at insert time as `clock.now() + ttl`,
-/// then compared against `clock.now()` at every read. Storing the absolute
-/// expiry rather than the insert-time + a static TTL means changing the
-/// cache's TTL doesn't retroactively re-validate stale entries.
+/// `expires_at` is computed at insert time as the end of a life of `ttl`
+/// that starts at `clock.now()`, then compared against `clock.now()` at
+/// every read. A TTL that runs past the range of the clock's readings never
+/// ends ([`Until::Forever`]). Storing the absolute expiry rather than the
+/// insert-time + a static TTL means changing the cache's TTL doesn't
+/// retroactively re-validate stale entries.
 struct Entry<V> {
     value: V,
-    expires_at_micros: i64,
+    expires_at: Until,
 }
 
 /// TTL+LRU cache with all time decisions routed through an injected [`Clock`].
@@ -55,17 +57,17 @@ struct Entry<V> {
 /// half-way). Reads briefly
 /// acquire the lock to update LRU recency. The single mutex becomes the
 /// bottleneck only once multiple threads contend on the same hot key;
-/// `benches/cache_bench.rs` quantifies the regression. A sharded variant
-/// is deferred until real profiling shows it matters.
+/// `benches/cache_bench.rs` quantifies the cost. The cache is not
+/// sharded: the bench's header says what sharding would buy and for whom.
 ///
 /// # DST guarantees
 ///
-/// Every TTL decision and every `expires_at_micros` calculation goes
+/// Every TTL decision and every `expires_at` calculation goes
 /// through `clock.now()`. Tests using
 /// `MockClock` can advance time in
 /// arbitrary jumps and observe deterministic eviction. There are no
 /// background tasks and no calls into `Instant::now()` /
-/// `chrono::Utc::now()`.
+/// `SystemTime::now()`.
 pub struct ClockTtlCache<K, V>
 where
     K: Hash + Eq + Send + Sync,
@@ -122,12 +124,12 @@ where
     /// expired from exactly `insert + ttl` onward: the expiry instant is
     /// exclusive.
     pub fn get(&self, key: &K) -> Option<V> {
-        let now_micros = self.clock.now().timestamp_micros();
+        let now = Until::At(self.clock.now());
         let mut guard = self.inner.lock_unpoisoned();
         // LruMap::get updates recency, which is what we want on a hit;
         // on an expired-hit we then `pop` to evict.
         if let Some(entry) = guard.get(key)
-            && entry.expires_at_micros > now_micros
+            && entry.expires_at > now
         {
             let v = entry.value.clone();
             drop(guard);
@@ -145,21 +147,14 @@ where
 
     /// Insert or replace a value with the configured TTL.
     pub fn insert(&self, key: K, value: V) {
-        let now_micros = self.clock.now().timestamp_micros();
-        // A TTL beyond i64 microseconds saturates to "never expires" instead
-        // of wrapping negative (which would make every entry born expired).
-        let ttl_micros = i64::try_from(self.ttl.as_micros()).unwrap_or(i64::MAX);
-        let expires_at_micros = now_micros.saturating_add(ttl_micros);
+        // A TTL that runs past the range of the clock's readings never
+        // ends, instead of wrapping into the past (which would make every
+        // entry born expired).
+        let expires_at = Until::after(self.clock.now(), self.ttl);
         let mut guard = self.inner.lock_unpoisoned();
         let len_before = guard.len();
         let cap = guard.cap().get();
-        guard.put(
-            key,
-            Entry {
-                value,
-                expires_at_micros,
-            },
-        );
+        guard.put(key, Entry { value, expires_at });
         // LruMap::put on a full cache evicts the LRU entry to make room.
         // Detect the eviction by checking that we hit (or were already at)
         // capacity and the cache size didn't grow. Counts both
@@ -309,12 +304,12 @@ where
         fields(removed = tracing::field::Empty),
     )]
     pub fn cleanup_expired(&self) -> usize {
-        let now_micros = self.clock.now().timestamp_micros();
+        let now = Until::At(self.clock.now());
         let mut guard = self.inner.lock_unpoisoned();
         let to_remove: Vec<K> = guard
             .iter()
             .filter_map(|(k, e)| {
-                if e.expires_at_micros <= now_micros {
+                if e.expires_at <= now {
                     Some(k.clone())
                 } else {
                     None

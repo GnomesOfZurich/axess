@@ -83,8 +83,6 @@ impl ValkeyReloadCoordinator {
 
         let forward = notices.clone();
         let bridge = tokio::spawn(async move {
-            // The subscriber client is moved in to keep its connection alive.
-            let _keep = subscriber;
             loop {
                 match messages.recv().await {
                     Ok(message) => {
@@ -105,6 +103,9 @@ impl ValkeyReloadCoordinator {
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
+            // The subscriber client is moved in to keep its connection alive
+            // while the loop runs.
+            drop(subscriber);
         });
         Ok(Self {
             publisher,

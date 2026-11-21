@@ -1,5 +1,5 @@
-//! `tests`: extracted from `id.rs` per the
-//! 200-LoC inline-test rule in AGENTS.md.
+//! `tests`: the unit tests of `id.rs`, kept beside it per the
+//! 200-line inline-test rule in AGENTS.md.
 
 use super::*;
 use crate::testing;
@@ -53,8 +53,8 @@ fn new_is_dst_reproducible() {
 #[test]
 fn from_namespaced_str_is_deterministic() {
     let ns = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
-    let a = TenantId::from_namespaced_str(ns, "gnomes");
-    let b = TenantId::from_namespaced_str(ns, "gnomes");
+    let a = TenantId::from_namespaced_str(ns, "acme");
+    let b = TenantId::from_namespaced_str(ns, "acme");
     let c = TenantId::from_namespaced_str(ns, "wctest");
     assert_eq!(a, b);
     assert_ne!(a, c);

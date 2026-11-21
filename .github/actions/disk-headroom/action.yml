@@ -1,0 +1,44 @@
+# Room on the disk for the jobs that build every test of the workspace with
+# every feature and run them: the Test Suite and Coverage jobs of ci.yml and
+# the jobs of mutants.yml that build. A pull-request run of the Test Suite on
+# ubuntu-latest (Ubuntu 26.04) left its runner under 100 MB free while
+# trybuild built its cases, and trybuild then read two compile-fail cases as
+# compiled. The jobs that use this also build with line tables only
+# (CARGO_PROFILE_DEV_DEBUG in their `env:`): a backtrace keeps its files and
+# lines, and each test binary leaves out the rest of the debug info, the
+# largest part of it.
+#
+# The hosted image holds SDKs no job of this repository uses, on the disk
+# the workspace is on: Android with three NDKs, a dozen .NET SDKs, GHC
+# through GHCup, Swift and the CodeQL bundle. This removes their
+# directories before the job builds anything and prints the free space
+# before and after, so each run shows the room it had. Nothing a job here
+# runs is among them: Rust comes from rustup, the services run in
+# containers, and the scripts run the image's own Python and shell. A
+# directory a later image drops is removed as a missing path is, with no
+# error, and the reading after shows less room won; a job then short of
+# room stops by name before its tests (scripts/check-disk-floor.sh). On
+# macOS nothing is removed.
+name: Disk headroom
+description: Removes preinstalled SDKs no job of this repository uses, for jobs that build the workspace with every feature.
+runs:
+  using: composite
+  steps:
+    - name: Remove the preinstalled SDKs this repository does not use
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        set -euo pipefail
+        free_gib() {
+          df -Pk / | awk 'NR == 2 { printf "%.1f", int($4 * 10 / 1048576) / 10 }'
+        }
+        before="$(free_gib)"
+        pids=()
+        for dir in /usr/local/lib/android /usr/share/dotnet /usr/local/.ghcup /usr/share/swift /opt/hostedtoolcache/CodeQL; do
+          sudo rm -rf -- "$dir" &
+          pids+=("$!")
+        done
+        for pid in "${pids[@]}"; do
+          wait "$pid"
+        done
+        echo "Free on /: $before GiB before, $(free_gib) GiB after removing the SDKs."

@@ -4,12 +4,16 @@
 //! a single master key via `HKDF-Expand`. Distinct `info` labels make the
 //! sub-keys independent: a side-channel on one path (e.g. cookie verify)
 //! cannot be replayed against another (e.g. fingerprint binding). The
-//! `SigningKeys` bundle and the master are zeroed on drop.
+//! master and every sub-key of a `SigningKeys` bundle are held in buffers
+//! that are zeroed on drop, and a sub-key leaves its derivation in such a
+//! buffer too.
 
-use crate::session::id::SessionId;
+use crate::session::id::{SessionId, SessionKey};
+use axess_rng::SecureRng;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::Mac;
 use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
 
 /// HKDF-Expand a 32-byte sub-key from a master key + per-use
 /// `info` label. RFC 5869 §2.3. Domain-separating session signing,
@@ -17,17 +21,71 @@ use subtle::ConstantTimeEq;
 /// cross-protocol forgery: a successful compromise of one HMAC
 /// instance (e.g. a side-channel on the cookie verify path) cannot be
 /// replayed against a different consumer of the same raw key.
-pub(super) fn hkdf_expand_subkey(prk: &[u8; 32], info: &[u8]) -> [u8; 32] {
+///
+/// The sub-key is returned in a buffer that is zeroed on drop, and the HMAC
+/// output it is copied from is zeroed before this returns.
+pub(super) fn hkdf_expand_subkey(prk: &[u8; 32], info: &[u8]) -> Zeroizing<[u8; 32]> {
     // For 32-byte output (= one SHA-256 block) the iteration is a single
     // HMAC call: T(1) = HMAC(prk, info || 0x01). No iteration needed
     // since `L = HashLen`.
     let mut mac = crate::hmac::new_signer(prk);
     mac.update(info);
     mac.update(&[0x01]);
-    let bytes = mac.finalize().into_bytes();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
-    out
+    crate::hmac::finalize_key(mac)
+}
+
+/// The session a cookie names: the value the cookie carries and the key
+/// that value is stored, registered and recorded under.
+///
+/// This is the one type that holds a session id outside the cookie text.
+/// The id is private to this file, which signs and verifies cookies; the
+/// key is computed from it once, in [`CookieSession::holding`], so that no
+/// code path derives it a second time or from another value. Two sessions
+/// are compared by [`key`](Self::key): the type has no equality of its own,
+/// so that a comparison never reads the id.
+#[derive(Clone, Copy)]
+pub(crate) struct CookieSession {
+    id: SessionId,
+    key: SessionKey,
+}
+
+impl CookieSession {
+    /// The session of `id`, with its key. Every `CookieSession` is built
+    /// here: from an id a cookie's signature vouched for, or a fresh one.
+    fn holding(id: SessionId) -> Self {
+        Self {
+            id,
+            key: SessionKey::of(&id),
+        }
+    }
+
+    /// A fresh session id from `rng`, and its key.
+    pub(crate) fn mint(rng: &dyn SecureRng) -> Self {
+        Self::holding(SessionId::new(rng))
+    }
+
+    /// The session of a known id, for a test that plants a row or signs a
+    /// cookie for it.
+    #[cfg(test)]
+    pub(crate) fn of_id(id: SessionId) -> Self {
+        Self::holding(id)
+    }
+
+    /// The key. Every caller outside this file reads the session through it:
+    /// there is no accessor of the id, so no code outside the cookie codec
+    /// can read the value the cookie carries, whatever it does with a
+    /// session.
+    pub(crate) fn key(&self) -> &SessionKey {
+        &self.key
+    }
+}
+
+/// Prints the key's log form and never the id, so a session in a `Debug`
+/// of whatever holds it is not a value a cookie could carry.
+impl std::fmt::Debug for CookieSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CookieSession({:?})", self.key)
+    }
 }
 
 /// HKDF info labels: distinct byte strings ensure the derived
@@ -40,7 +98,8 @@ const HKDF_INFO_FINGERPRINT: &[u8] = b"axess.v1.session.fingerprint.hmac";
 /// Bundle of HKDF-derived sub-keys, one per HMAC use site.
 /// Each sub-key is independent of the others, so a compromise on one
 /// path (oracle, side-channel) cannot be replayed against the others.
-/// All three keys (and the master) are zeroed on drop.
+/// The master and both sub-keys are each held in a `Zeroizing` buffer,
+/// which is zeroed on drop.
 ///
 /// Kept as an internal implementation detail of the signing module:
 /// external callers reach the HMAC operations via [`SigningKeyRing`]
@@ -50,27 +109,20 @@ const HKDF_INFO_FINGERPRINT: &[u8] = b"axess.v1.session.fingerprint.hmac";
 pub(super) struct SigningKeys {
     /// Master key: kept around so applications can derive *additional*
     /// sub-keys for domain-specific HMAC uses (CSRF, push tokens, etc.).
-    master: [u8; 32],
-    cookie: [u8; 32],
-    fingerprint: [u8; 32],
+    master: Zeroizing<[u8; 32]>,
+    cookie: Zeroizing<[u8; 32]>,
+    fingerprint: Zeroizing<[u8; 32]>,
 }
 
 impl SigningKeys {
-    fn from_master(master: [u8; 32]) -> Self {
+    /// Takes the master by reference, so the only copy this makes of it is
+    /// the one in the bundle's own buffer.
+    fn from_master(master: &[u8; 32]) -> Self {
         Self {
-            cookie: hkdf_expand_subkey(&master, HKDF_INFO_COOKIE),
-            fingerprint: hkdf_expand_subkey(&master, HKDF_INFO_FINGERPRINT),
-            master,
+            cookie: hkdf_expand_subkey(master, HKDF_INFO_COOKIE),
+            fingerprint: hkdf_expand_subkey(master, HKDF_INFO_FINGERPRINT),
+            master: Zeroizing::new(*master),
         }
-    }
-}
-
-impl Drop for SigningKeys {
-    fn drop(&mut self) {
-        use zeroize::Zeroize;
-        self.master.zeroize();
-        self.cookie.zeroize();
-        self.fingerprint.zeroize();
     }
 }
 
@@ -84,11 +136,11 @@ impl Drop for SigningKeys {
 ///   fingerprints are minted under the current master only.
 /// - **Verification**: tries `current` first; on mismatch, falls back
 ///   to `previous` if present. Callers receive a
-///   [`VerifiedSessionId::verified_by_previous`] signal so they can
+///   [`VerifiedCookie::verified_by_previous`] signal so they can
 ///   re-issue the cookie under the current key and update any
 ///   stored-at-rest values (fingerprint) to converge onto `current`.
-/// - **Zeroization**: both sets zero on drop via [`SigningKeys::drop`].
-///   Dropping the last `Arc<SigningKeyRing>` runs Drop on both.
+/// - **Zeroization**: every key of both sets is zeroed when the set is
+///   dropped, which dropping the last `Arc<SigningKeyRing>` does.
 ///
 /// # Rotation cadence
 ///
@@ -104,7 +156,7 @@ pub(crate) struct SigningKeyRing {
 }
 
 impl SigningKeyRing {
-    pub(super) fn from_master(master: [u8; 32]) -> Self {
+    pub(super) fn from_master(master: &[u8; 32]) -> Self {
         Self {
             current: SigningKeys::from_master(master),
             previous: None,
@@ -114,7 +166,7 @@ impl SigningKeyRing {
     /// Install a previous master. Called through
     /// [`SessionLayer::with_previous_signing_key`](super::SessionLayer::with_previous_signing_key)
     /// via `Arc::make_mut` on the ring.
-    pub(super) fn set_previous(&mut self, previous_master: [u8; 32]) {
+    pub(super) fn set_previous(&mut self, previous_master: &[u8; 32]) {
         self.previous = Some(SigningKeys::from_master(previous_master));
     }
 
@@ -132,15 +184,15 @@ impl SigningKeyRing {
         self.previous.is_some()
     }
 
-    /// Sign a session-id under the CURRENT cookie sub-key and format
+    /// Sign a session's id under the CURRENT cookie sub-key and format
     /// it as the wire cookie value (`base64(id) . base64(mac)`).
     ///
     /// New / re-issued cookies always sign under the current key
     /// regardless of rotation state; the previous key is used only on
     /// verify.
-    pub(crate) fn sign_cookie(&self, id: SessionId) -> String {
-        let id_enc = URL_SAFE_NO_PAD.encode(id.as_bytes());
-        let mac = sign_bytes(id.as_bytes(), &self.current.cookie);
+    pub(crate) fn sign_cookie(&self, session: &CookieSession) -> String {
+        let id_enc = URL_SAFE_NO_PAD.encode(session.id.as_bytes());
+        let mac = sign_bytes(session.id.as_bytes(), &self.current.cookie);
         format!("{id_enc}.{mac}")
     }
 
@@ -149,25 +201,25 @@ impl SigningKeyRing {
     /// fall back to the previous sub-key. Returns `None` when neither
     /// key verifies.
     ///
-    /// The returned [`VerifiedSessionId::verified_by_previous`] flag
+    /// The returned [`VerifiedCookie::verified_by_previous`] flag
     /// signals whether the response layer must re-issue the cookie
     /// under the current key.
-    pub(crate) fn decode_cookie(&self, value: &str) -> Option<VerifiedSessionId> {
-        if let Some(id) = decode_cookie_with_key(value, &self.current.cookie) {
-            return Some(VerifiedSessionId {
-                id,
+    pub(crate) fn decode_cookie(&self, value: &str) -> Option<VerifiedCookie> {
+        if let Some(session) = decode_cookie_with_key(value, &self.current.cookie) {
+            return Some(VerifiedCookie {
+                session,
                 verified_by_previous: false,
             });
         }
         if let Some(previous) = &self.previous
-            && let Some(id) = decode_cookie_with_key(value, &previous.cookie)
+            && let Some(session) = decode_cookie_with_key(value, &previous.cookie)
         {
             tracing::debug!(
                 "session cookie verified with previous (rotated) signing key; \
                  response will re-sign with current key"
             );
-            return Some(VerifiedSessionId {
-                id,
+            return Some(VerifiedCookie {
+                session,
                 verified_by_previous: true,
             });
         }
@@ -210,7 +262,7 @@ impl SigningKeyRing {
     /// Panics on a label that starts with `axess.v1.reserved-label.`, the
     /// namespace the reserved labels are remapped into: such a label would
     /// share its key with the remap of another one.
-    pub(crate) fn derive_subkey(&self, info: &'static [u8]) -> [u8; 32] {
+    pub(crate) fn derive_subkey(&self, info: &'static [u8]) -> Zeroizing<[u8; 32]> {
         assert!(
             !info.starts_with(RESERVED_LABEL_PREFIX),
             "derive_subkey: labels starting with `axess.v1.reserved-label.` are reserved"
@@ -226,6 +278,32 @@ impl SigningKeyRing {
 
 /// The namespace the reserved labels are remapped into.
 const RESERVED_LABEL_PREFIX: &[u8] = b"axess.v1.reserved-label.";
+
+/// Label of the sub-key that signs device-key proof cookies and registration
+/// offers. Under the reserved prefix, so `derive_subkey` cannot hand the same
+/// key to an application.
+#[cfg(feature = "device-keys")]
+const HKDF_INFO_DEVICE_KEY: &[u8] = b"axess.v1.reserved-label.device-key.cookie.hmac";
+
+#[cfg(feature = "device-keys")]
+impl SigningKeyRing {
+    /// The keys device-key proof cookies and offers are signed with: under
+    /// the current signing key, and under the previous one while a rotation
+    /// window is open, so a rotation does not cost every client a failed
+    /// request.
+    pub(crate) fn device_key_cookie_keys(&self) -> crate::device_key::cookie::KeyCookieKeys {
+        // Each sub-key is copied out of the wiping buffer it was derived
+        // into, which is wiped as it drops, into a struct that wipes itself
+        // on drop.
+        crate::device_key::cookie::KeyCookieKeys {
+            current: *hkdf_expand_subkey(&self.current.master, HKDF_INFO_DEVICE_KEY),
+            previous: self
+                .previous
+                .as_ref()
+                .map(|keys| *hkdf_expand_subkey(&keys.master, HKDF_INFO_DEVICE_KEY)),
+        }
+    }
+}
 
 /// Compute HMAC-SHA256 of `bytes` under `key`; return the raw 32-byte
 /// tag. Verify paths compare against this directly to avoid a
@@ -251,9 +329,10 @@ pub(super) fn sign_bytes(bytes: &[u8], key: &[u8; 32]) -> String {
 /// when `true`, the response handler emits a fresh `Set-Cookie` signed
 /// under the current key so the client stops presenting a
 /// previous-key cookie on subsequent requests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct VerifiedSessionId {
-    pub(crate) id: SessionId,
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct VerifiedCookie {
+    /// The session the cookie names.
+    pub(crate) session: CookieSession,
     pub(crate) verified_by_previous: bool,
 }
 
@@ -264,7 +343,10 @@ pub(crate) struct VerifiedSessionId {
 /// duplicating the parse / length-check / constant-time-compare
 /// logic. `pub(super)` so tests can exercise the crypto primitive
 /// independently of the rotation wrapper.
-pub(super) fn decode_cookie_with_key(value: &str, key: &[u8; 32]) -> Option<SessionId> {
+///
+/// The session's key is computed here, once, and only for an id whose
+/// signature verified: a forged cookie costs no hash and names no key.
+pub(super) fn decode_cookie_with_key(value: &str, key: &[u8; 32]) -> Option<CookieSession> {
     let (id_enc, mac_enc) = value.split_once('.')?;
 
     let id_bytes = URL_SAFE_NO_PAD.decode(id_enc).ok()?;
@@ -283,19 +365,17 @@ pub(super) fn decode_cookie_with_key(value: &str, key: &[u8; 32]) -> Option<Sess
     // Constant-time comparison prevents timing side-channels.
     if mac_bytes.ct_eq(&expected).into() {
         let arr: [u8; 16] = id_bytes.try_into().ok()?;
-        Some(SessionId::from_bytes(arr))
+        Some(CookieSession::holding(SessionId::from_bytes(arr)))
     } else {
         None
     }
 }
 
-// Closes the layer.rs mutants finding: HKDF sub-key
-// derivation must actually depend on the master key and the info
-// label. The mutation-testing pass on `session/layer.rs` discovered
-// that `hkdf_expand_subkey` and `derive_subkey` could be replaced
-// with `[0; 32]` or `[1; 32]` and the test suite would not notice;
-// a deployment shipping with constant cookie sub-keys (every session
-// forgeable) would have passed CI. These tests anchor the contract.
+// HKDF sub-key derivation depends on the master key and on the info
+// label. A `hkdf_expand_subkey` or `derive_subkey` that answered a
+// constant (`[0; 32]`, `[1; 32]`) would give every deployment the same
+// cookie sub-keys and make every session forgeable; these tests fail on
+// either.
 #[cfg(test)]
 mod subkey_derivation_tests {
     use super::*;
@@ -312,11 +392,13 @@ mod subkey_derivation_tests {
             MemorySessionStore::new(),
             [0xAA; 32],
             crate::MemorySessionRegistry::new().handle(),
+            std::sync::Arc::new(crate::session::UnrecordedSessionEnds),
         );
         let layer_b = SessionLayer::new_unchecked(
             MemorySessionStore::new(),
             [0xBB; 32],
             crate::MemorySessionRegistry::new().handle(),
+            std::sync::Arc::new(crate::session::UnrecordedSessionEnds),
         );
 
         let info = b"axess.test.v1";
@@ -328,8 +410,8 @@ mod subkey_derivation_tests {
             "derive_subkey must depend on the master key; \
              two layers with different masters produced the same sub-key"
         );
-        // Also assert against the constant mutants directly so a
-        // future cargo-mutants run kills them on a single property.
+        // Each constant is also refused by name, so a derivation that
+        // answers one fails on that property alone.
         assert_ne!(
             *key_a, [0u8; 32],
             "derive_subkey returned the [0;32] mutant value"
@@ -351,9 +433,10 @@ mod subkey_derivation_tests {
             MemorySessionStore::new(),
             [0x42; 32],
             crate::MemorySessionRegistry::new().handle(),
+            std::sync::Arc::new(crate::session::UnrecordedSessionEnds),
         );
-        let cookie_key = layer.signing_keys.current.cookie;
-        let fingerprint_key = layer.signing_keys.current.fingerprint;
+        let cookie_key = *layer.signing_keys.current.cookie;
+        let fingerprint_key = *layer.signing_keys.current.fingerprint;
 
         let asked_cookie = layer.derive_subkey(b"axess.v1.session.cookie.hmac");
         let asked_fingerprint = layer.derive_subkey(b"axess.v1.session.fingerprint.hmac");
@@ -375,6 +458,7 @@ mod subkey_derivation_tests {
             MemorySessionStore::new(),
             [0x42; 32],
             crate::MemorySessionRegistry::new().handle(),
+            std::sync::Arc::new(crate::session::UnrecordedSessionEnds),
         );
         let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             layer.derive_subkey(b"axess.v1.reserved-label.axess.v1.session.cookie.hmac")
@@ -398,6 +482,7 @@ mod subkey_derivation_tests {
             MemorySessionStore::new(),
             [0x42; 32],
             crate::MemorySessionRegistry::new().handle(),
+            std::sync::Arc::new(crate::session::UnrecordedSessionEnds),
         );
         let key_cookie = layer.derive_subkey(b"axess.v1.session.cookie.hmac");
         let key_csrf = layer.derive_subkey(b"axess.v1.csrf");
@@ -418,6 +503,7 @@ mod subkey_derivation_tests {
             MemorySessionStore::new(),
             [0x77; 32],
             crate::MemorySessionRegistry::new().handle(),
+            std::sync::Arc::new(crate::session::UnrecordedSessionEnds),
         );
         let info = b"axess.v1.session.cookie.hmac";
         let k1 = layer.derive_subkey(info);
@@ -436,12 +522,12 @@ mod subkey_derivation_tests {
     /// other two).
     #[test]
     fn signing_keys_cookie_subkey_is_non_constant() {
-        let keys_a = SigningKeys::from_master([0xAA; 32]);
-        let keys_b = SigningKeys::from_master([0xBB; 32]);
-        assert_ne!(keys_a.cookie, [0u8; 32]);
-        assert_ne!(keys_a.cookie, [1u8; 32]);
-        assert_ne!(keys_a.fingerprint, [0u8; 32]);
-        assert_ne!(keys_a.fingerprint, [1u8; 32]);
+        let keys_a = SigningKeys::from_master(&[0xAA; 32]);
+        let keys_b = SigningKeys::from_master(&[0xBB; 32]);
+        assert_ne!(*keys_a.cookie, [0u8; 32]);
+        assert_ne!(*keys_a.cookie, [1u8; 32]);
+        assert_ne!(*keys_a.fingerprint, [0u8; 32]);
+        assert_ne!(*keys_a.fingerprint, [1u8; 32]);
         // Different masters → different cookie sub-keys.
         assert_ne!(
             keys_a.cookie, keys_b.cookie,
@@ -458,6 +544,34 @@ mod subkey_derivation_tests {
             "cookie and fingerprint sub-keys collapsed to the same value"
         );
     }
+
+    /// The master and each sub-key are `Zeroizing` buffers, which wipe
+    /// themselves when the bundle is dropped. The bundle has no `Drop` of
+    /// its own to keep in step with its fields: taking them out of it
+    /// compiles only while it has none, and only while every field is named.
+    #[test]
+    fn every_signing_key_is_held_in_a_zeroizing_buffer() {
+        let SigningKeys {
+            master,
+            cookie,
+            fingerprint,
+        } = SigningKeys::from_master(&[0xAA; 32]);
+        let held: [Zeroizing<[u8; 32]>; 3] = [master, cookie, fingerprint];
+        assert_eq!(*held[0], [0xAA; 32]);
+        assert_ne!(held[1], held[2]);
+    }
+
+    /// A sub-key leaves both derivations in a buffer that wipes itself, so
+    /// no plain copy of it stays behind where the derivation ran. The ring
+    /// derives an application's label from the current master as it is.
+    #[test]
+    fn a_derived_subkey_is_returned_in_a_zeroizing_buffer() {
+        let expanded: Zeroizing<[u8; 32]> = hkdf_expand_subkey(&[0xAA; 32], b"axess.test.v1");
+        let ring = SigningKeyRing::from_master(&[0xAA; 32]);
+        let derived: Zeroizing<[u8; 32]> = ring.derive_subkey(b"axess.test.v1");
+        assert_eq!(expanded, derived);
+        assert_ne!(*expanded, [0u8; 32]);
+    }
 }
 
 #[cfg(test)]
@@ -472,7 +586,7 @@ mod signing_helpers_tests {
         [0xA5; 32]
     }
 
-    /// Kills line 717 `replace -> String::new()`: HMAC output is
+    /// Kills the mutant `replace -> String::new()`: HMAC output is
     /// always non-empty. Also kills `-> "xyzzy".into()`: HMAC output
     /// is base64-url-encoded SHA256 (43 chars without padding) and
     /// not the literal "xyzzy".
@@ -503,7 +617,7 @@ mod signing_helpers_tests {
         assert_ne!(sig_a, sig_b, "different keys must yield different HMACs");
     }
 
-    /// Kills line 723 `decode_cookie -> None`: a freshly
+    /// Kills the mutant `decode_cookie -> None`: a freshly
     /// signed cookie must round-trip back to the original
     /// `SessionId`.
     #[test]
@@ -516,10 +630,10 @@ mod signing_helpers_tests {
 
         let decoded = decode_cookie_with_key(&cookie, &key)
             .expect("signed cookie must decode back to a SessionId");
-        assert_eq!(decoded, id);
+        assert_eq!(decoded.id, id);
     }
 
-    /// Kills line 726 `!= → ==` on the id-length guard. With the
+    /// Kills the mutant `!= → ==` on the id-length guard. With the
     /// mutation, `id_bytes.len() == 16` returns None (and only
     /// non-16-byte ids pass). Construct a valid 16-byte id, encode
     /// + sign; mutation rejects (None), original accepts (Some).
@@ -557,7 +671,7 @@ mod signing_helpers_tests {
         );
     }
 
-    /// Kills line 735 `!= → ==` on the MAC-length guard. A truncated
+    /// Kills the mutant `!= → ==` on the MAC-length guard. A truncated
     /// MAC must be rejected. With the mutation, only mismatched
     /// lengths would pass; and there's no path that reaches
     /// constant-time comparison with a same-length MAC.
@@ -606,7 +720,7 @@ mod rotation_tests {
     /// Craft a signed cookie under a given master's derived cookie
     /// sub-key. Helper mirrors what a real request cookie would carry.
     fn cookie_signed_by(master: [u8; 32], id: SessionId) -> String {
-        let keys = SigningKeys::from_master(master);
+        let keys = SigningKeys::from_master(&master);
         let id_enc = URL_SAFE_NO_PAD.encode(id.as_bytes());
         let mac = sign_bytes(id.as_bytes(), &keys.cookie);
         format!("{id_enc}.{mac}")
@@ -617,14 +731,14 @@ mod rotation_tests {
     #[test]
     fn no_rotation_verifies_current_and_flags_no_fallback() {
         let master = [0xAA; 32];
-        let ring = SigningKeyRing::from_master(master);
+        let ring = SigningKeyRing::from_master(&master);
         let id = SessionId::new(&MockRng::new(1));
         let cookie = cookie_signed_by(master, id);
 
         let out = ring
             .decode_cookie(&cookie)
             .expect("current-key cookie must verify");
-        assert_eq!(out.id, id);
+        assert_eq!(out.session.id, id);
         assert!(
             !out.verified_by_previous,
             "no rotation window → must not flag previous-key fallback"
@@ -638,8 +752,8 @@ mod rotation_tests {
         let current = [0xBB; 32];
         let previous = [0xAA; 32];
         let ring = SigningKeyRing {
-            current: SigningKeys::from_master(current),
-            previous: Some(SigningKeys::from_master(previous)),
+            current: SigningKeys::from_master(&current),
+            previous: Some(SigningKeys::from_master(&previous)),
         };
         let id = SessionId::new(&MockRng::new(1));
         let cookie = cookie_signed_by(current, id);
@@ -647,7 +761,7 @@ mod rotation_tests {
         let out = ring
             .decode_cookie(&cookie)
             .expect("current-key cookie must verify under rotation");
-        assert_eq!(out.id, id);
+        assert_eq!(out.session.id, id);
         assert!(
             !out.verified_by_previous,
             "current-key match must not flag fallback"
@@ -662,8 +776,8 @@ mod rotation_tests {
         let current = [0xBB; 32];
         let previous = [0xAA; 32];
         let ring = SigningKeyRing {
-            current: SigningKeys::from_master(current),
-            previous: Some(SigningKeys::from_master(previous)),
+            current: SigningKeys::from_master(&current),
+            previous: Some(SigningKeys::from_master(&previous)),
         };
         let id = SessionId::new(&MockRng::new(1));
         let cookie = cookie_signed_by(previous, id);
@@ -671,7 +785,7 @@ mod rotation_tests {
         let out = ring
             .decode_cookie(&cookie)
             .expect("previous-key cookie must verify under rotation");
-        assert_eq!(out.id, id);
+        assert_eq!(out.session.id, id);
         assert!(
             out.verified_by_previous,
             "previous-key match MUST flag fallback so caller re-signs under current"
@@ -687,8 +801,8 @@ mod rotation_tests {
         let previous = [0xAA; 32];
         let unknown = [0xCC; 32];
         let ring = SigningKeyRing {
-            current: SigningKeys::from_master(current),
-            previous: Some(SigningKeys::from_master(previous)),
+            current: SigningKeys::from_master(&current),
+            previous: Some(SigningKeys::from_master(&previous)),
         };
         let id = SessionId::new(&MockRng::new(1));
         let cookie = cookie_signed_by(unknown, id);
@@ -712,8 +826,8 @@ mod rotation_tests {
         // After the second rotation, the ring holds (current=k2, previous=k1).
         // k0 is gone.
         let ring_after_two_rotations = SigningKeyRing {
-            current: SigningKeys::from_master(k2),
-            previous: Some(SigningKeys::from_master(k1)),
+            current: SigningKeys::from_master(&k2),
+            previous: Some(SigningKeys::from_master(&k1)),
         };
 
         let id = SessionId::new(&MockRng::new(1));
@@ -739,12 +853,12 @@ mod rotation_tests {
     /// operator-facing introspection.
     #[test]
     fn ring_has_previous_reflects_state() {
-        let no_rotation = SigningKeyRing::from_master([0xAA; 32]);
+        let no_rotation = SigningKeyRing::from_master(&[0xAA; 32]);
         assert!(!no_rotation.has_previous());
 
         let rotation_active = SigningKeyRing {
-            current: SigningKeys::from_master([0xBB; 32]),
-            previous: Some(SigningKeys::from_master([0xAA; 32])),
+            current: SigningKeys::from_master(&[0xBB; 32]),
+            previous: Some(SigningKeys::from_master(&[0xAA; 32])),
         };
         assert!(rotation_active.has_previous());
     }
@@ -760,8 +874,8 @@ mod rotation_tests {
         let new = [0xBB; 32];
         let id = SessionId::new(&MockRng::new(1));
 
-        let mut ring = SigningKeyRing::from_master(new);
-        ring.set_previous(old);
+        let mut ring = SigningKeyRing::from_master(&new);
+        ring.set_previous(&old);
         assert!(ring.has_previous());
 
         let cookie_from_old = cookie_signed_by(old, id);
@@ -776,3 +890,6 @@ mod rotation_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod cookie_session_tests;

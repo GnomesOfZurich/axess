@@ -4,11 +4,12 @@
 use super::test_support::{fixture_tenant, fixture_user, test_config};
 use super::*;
 use crate::testing::{MemoryRefreshTokenStore, mock_random::MockRng};
+use axess_clock::testing::Shift;
 
 /// A fixed sign-in time, far from the real clock.
-fn login_time() -> DateTime<Utc> {
-    use chrono::TimeZone;
-    Utc.with_ymd_and_hms(2031, 3, 1, 12, 0, 0).unwrap()
+fn login_time() -> Timestamp {
+    use axess_clock::Timestamp;
+    Timestamp::from_utc(2031, 3, 1, 12, 0, 0).unwrap()
 }
 
 /// A store whose clock is the sign-in time, so row expiry does not depend on
@@ -38,7 +39,7 @@ async fn issue_at_login(store: &MemoryRefreshTokenStore, rng: &MockRng) -> Strin
     plaintext
 }
 
-fn authn_time_of(session: &SessionData) -> DateTime<Utc> {
+fn authn_time_of(session: &SessionData) -> Timestamp {
     match &session.auth_state {
         AuthState::Authenticated { authn_time, .. } => *authn_time,
         other => panic!("expected an authenticated session, got {other:?}"),
@@ -55,8 +56,13 @@ async fn refreshed_session_keeps_the_login_time_across_a_long_rotation_chain() {
     // Refresh every ten days, three times: the chain is 29 days old at the end.
     let mut now = login_time();
     for _ in 0..3 {
-        now += Duration::days(10) - Duration::hours(8);
+        now = now.plus(
+            SignedDuration::days(10)
+                .checked_sub(SignedDuration::hours(8))
+                .unwrap(),
+        );
         let (session, next) = Refresh::any_tenant(&plaintext, |_| async { true })
+            .without_device_check()
             .run(&store, &config, &rng, now)
             .await
             .unwrap();
@@ -70,7 +76,7 @@ async fn refreshed_session_keeps_the_login_time_across_a_long_rotation_chain() {
         assert!(next_record.issued_at > login_time());
         plaintext = next_plaintext;
     }
-    assert!(now - login_time() > Duration::days(20));
+    assert!(now.since(login_time()) > SignedDuration::days(20));
 }
 
 #[tokio::test]
@@ -81,7 +87,13 @@ async fn a_row_without_authn_time_reads_as_its_issue_time() {
     let plaintext = issue_at_login(&store, &rng).await;
 
     let (session, _) = Refresh::any_tenant(&plaintext, |_| async { true })
-        .run(&store, &config, &rng, login_time() + Duration::days(2))
+        .without_device_check()
+        .run(
+            &store,
+            &config,
+            &rng,
+            login_time().plus(SignedDuration::days(2)),
+        )
         .await
         .unwrap();
     assert_eq!(authn_time_of(&session), login_time());
@@ -90,9 +102,7 @@ async fn a_row_without_authn_time_reads_as_its_issue_time() {
 #[tokio::test]
 async fn an_extreme_ttl_never_panics_issuance() {
     for extreme in axess_testing::durations::extreme_durations() {
-        let Ok(ttl) = Duration::from_std(extreme.value) else {
-            continue;
-        };
+        let ttl = extreme.value;
         if ttl.is_zero() {
             continue;
         }

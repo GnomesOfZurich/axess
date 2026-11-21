@@ -1,0 +1,20 @@
+{
+  "tenant_id": "c0e2ff60-da26-523d-b293-59e478d659ac",
+  "name": "sso",
+  "issuer": "https://idp.example",
+  "client_id": "confidential-app",
+  "redirect_url": "https://rp.example/callback",
+  "scopes": [
+    "openid",
+    "email"
+  ],
+  "credential": {
+    "Secret": {
+      "key_id": "7a086922636735fe",
+      "nonce": "ZNxQ9-ym-u7DPOU3",
+      "ciphertext": "_ftlGZIn6xlVjDdmr_T_j9na4JDv5g"
+    }
+  },
+  "dpop": "Advertised",
+  "revision": 1
+}

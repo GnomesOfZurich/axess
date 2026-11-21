@@ -25,7 +25,7 @@ fn expected(token: &str, cap: usize) -> Option<serde_json::Value> {
         return None;
     }
     let mut segments = token.split('.');
-    let (_header, payload, _signature) = (segments.next()?, segments.next()?, segments.next()?);
+    let (_, payload, _) = (segments.next()?, segments.next()?, segments.next()?);
     if segments.next().is_some() {
         return None;
     }

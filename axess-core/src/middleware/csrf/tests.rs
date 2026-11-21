@@ -1,8 +1,5 @@
-//! Unit tests for the CSRF middleware.
-//!
-//! Extracted from `csrf.rs` per the 200-LoC inline-test rule in
-//! AGENTS.md: the production file carried 1003 lines of tests around
-//! 698 lines of logic.
+//! Unit tests for the CSRF middleware, kept beside `csrf.rs` per the
+//! 200-line inline-test rule in AGENTS.md.
 
 use super::*;
 use base64::Engine as _;
@@ -25,9 +22,8 @@ const SID: &[u8] = b"session-a";
 /// one can be replayed under a handle built from the same seed); distinct
 /// seeds yield distinct ids (so the cross-session tests can prove
 /// isolation).
-fn session_handle(seed: u64) -> SessionHandle {
-    use crate::session::data::SessionData;
-    use crate::session::id::SessionId;
+pub(super) fn session_handle(seed: u64) -> SessionHandle {
+    use crate::session::layer::CookieSession;
     use crate::session::layer::SessionInner;
     use crate::testing::mock_random::MockRng;
     use std::sync::Arc;
@@ -35,16 +31,8 @@ fn session_handle(seed: u64) -> SessionHandle {
 
     let rng = MockRng::new(seed);
     let inner = SessionInner {
-        id: SessionId::new(&rng),
-        data: SessionData::default(),
-        modified: false,
-        needs_persist: false,
-        regenerate: false,
-        pre_cycle_id: None,
-        rng: std::sync::Arc::new(axess_rng::SystemRng),
-        pending_fingerprint: None,
-        max_custom_bytes: 64 * 1024,
-        consume: None,
+        session: CookieSession::mint(&rng),
+        ..SessionInner::detached(std::sync::Arc::new(axess_rng::SystemRng))
     };
     SessionHandle(Arc::new(RwLock::new(inner)))
 }
@@ -232,7 +220,7 @@ fn extract_cookie_token_accepts_value_at_cap() {
     );
 }
 
-// ── Mutation-coverage tests ──────────────────────────────────────
+// ── Accessors, boundaries and single branches ────────────────────
 
 /// `CsrfToken::as_str` returns the inner string verbatim;
 /// pins both `-> ""` and `-> "xyzzy"` body replacements.
@@ -262,7 +250,7 @@ async fn extract_presented_token_returns_header_value() {
         .header(config.header_name.as_ref(), "presented-csrf-value")
         .body(Body::empty())
         .unwrap();
-    let (extracted, _req) = extract_presented_token(req, &config).await.unwrap();
+    let (extracted, _) = extract_presented_token(req, &config).await.unwrap();
     assert_eq!(
         extracted,
         Some("presented-csrf-value".to_string()),
@@ -271,7 +259,7 @@ async fn extract_presented_token_returns_header_value() {
 
     // Header absent → None (and no urlencoded body to fall back to).
     let req = Request::builder().body(Body::empty()).unwrap();
-    let (extracted, _req) = extract_presented_token(req, &config).await.unwrap();
+    let (extracted, _) = extract_presented_token(req, &config).await.unwrap();
     assert!(
         extracted.is_none(),
         "missing header must return None, not Some(...)"
@@ -283,7 +271,7 @@ async fn extract_presented_token_returns_header_value() {
         .header(config.header_name.as_ref(), "")
         .body(Body::empty())
         .unwrap();
-    let (extracted, _req) = extract_presented_token(req, &config).await.unwrap();
+    let (extracted, _) = extract_presented_token(req, &config).await.unwrap();
     assert!(extracted.is_none(), "empty header must return None");
 }
 
@@ -335,7 +323,7 @@ async fn extract_presented_token_skips_multipart_body() {
         )
         .body(Body::from(b"unused".as_slice()))
         .unwrap();
-    let (extracted, _req) = extract_presented_token(req, &config).await.unwrap();
+    let (extracted, _) = extract_presented_token(req, &config).await.unwrap();
     assert!(
         extracted.is_none(),
         "multipart Content-Type must skip form-field extraction"
@@ -548,13 +536,27 @@ fn require_origin_panics_when_all_inputs_are_malformed() {
     let _ = CsrfConfig::new([0u8; 32]).require_origin(["not-a-url", "javascript:alert(1)"]);
 }
 
-/// The empty iterator is legitimate ("no Origin gate configured")
-/// and must NOT panic: that's the default state.
+/// An empty list is refused as loudly: it would leave the gate off under a
+/// call that says "require", and on a config that already named origins it
+/// would turn the check off. A config that never calls `require_origin` is
+/// the one with no Origin gate.
 #[test]
-fn require_origin_with_no_inputs_stays_disabled() {
+#[should_panic(expected = "no origin was supplied")]
+fn require_origin_panics_on_an_empty_list() {
     let empty: [&str; 0] = [];
-    let config = CsrfConfig::new([0u8; 32]).require_origin(empty);
-    assert!(config.allowed_origins.is_empty());
+    let _ = CsrfConfig::new([0u8; 32])
+        .require_origin(["https://app.example.com"])
+        .require_origin(empty);
+}
+
+/// The origins read back canonicalized, and a config that never named any
+/// reads back none.
+#[test]
+fn allowed_origins_reads_back_what_require_origin_set() {
+    assert!(CsrfConfig::new([0u8; 32]).allowed_origins().is_empty());
+    let config = CsrfConfig::new([0u8; 32]).require_origin(["HTTPS://App.Example.com:443"]);
+    let origins: Vec<&str> = config.allowed_origins().iter().map(|o| &**o).collect();
+    assert_eq!(origins, ["https://app.example.com"]);
 }
 
 /// Drives `CsrfService` end-to-end via the full tower
@@ -569,7 +571,7 @@ fn require_origin_with_no_inputs_stays_disabled() {
 ///   silently break token persistence).
 /// - **POST with valid cookie+header pair** must reach the inner
 ///   service (pins `delete !` on the `if !validate_pair(...)`
-///   guard at line 201; the mutant would 403 every successful
+///   guard; the mutant would 403 every successful
 ///   request).
 /// - **POST with no token** must return 403 (additional pin on
 ///   the validate-and-reject path).
@@ -728,7 +730,7 @@ async fn csrf_service_rejects_token_replayed_under_different_session() {
     use std::convert::Infallible;
     use tower::{Layer, ServiceExt, service_fn};
 
-    let echo_body = service_fn(|_req: Request<Body>| async move {
+    let echo_body = service_fn(|_: Request<Body>| async move {
         Ok::<_, Infallible>(Response::builder().status(200).body(Body::empty()).unwrap())
     });
 
@@ -814,7 +816,7 @@ async fn csrf_service_fails_closed_without_session_handle() {
     use std::convert::Infallible;
     use tower::{Layer, ServiceExt, service_fn};
 
-    let echo_body = service_fn(|_req: Request<Body>| async move {
+    let echo_body = service_fn(|_: Request<Body>| async move {
         Ok::<_, Infallible>(Response::builder().status(200).body(Body::empty()).unwrap())
     });
 
@@ -858,7 +860,7 @@ async fn csrf_service_remints_stale_cookie_on_safe_verb() {
     use std::convert::Infallible;
     use tower::{Layer, ServiceExt, service_fn};
 
-    let echo_body = service_fn(|_req: Request<Body>| async move {
+    let echo_body = service_fn(|_: Request<Body>| async move {
         Ok::<_, Infallible>(Response::builder().status(200).body(Body::empty()).unwrap())
     });
 
@@ -909,7 +911,7 @@ async fn csrf_service_remints_stale_cookie_on_safe_verb() {
 
     // The refreshed cookie must validate against session A (the id
     // on the handle at request time), not the stale binding.
-    let sid_a = handle_a.0.read().await.id;
+    let sid_a = *handle_a.0.read().await.session.key();
     assert!(
         validate_token(&refreshed, sid_a.as_bytes(), &key),
         "refreshed cookie must be HMAC-bound to the current session id"
@@ -945,7 +947,7 @@ async fn csrf_service_remints_when_handler_rotates_session() {
     let service = CsrfLayer::new(config.clone()).layer(rotating_body);
 
     let handle = session_handle(1);
-    let sid_before = handle.0.read().await.id;
+    let sid_before = *handle.0.read().await.session.key();
     let token_before = mint(sid_before.as_bytes(), &key);
 
     let req = Request::builder()
@@ -961,7 +963,7 @@ async fn csrf_service_remints_when_handler_rotates_session() {
     let resp = service.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), 200);
 
-    let sid_after = handle.0.read().await.id;
+    let sid_after = *handle.0.read().await.session.key();
     assert_ne!(
         sid_before, sid_after,
         "test precondition: inner service rotated the session id"
@@ -998,10 +1000,10 @@ async fn csrf_service_remints_when_handler_rotates_session() {
 /// token is HMAC-bound to the session id the request ran under, so the
 /// response cookie MUST carry that same id.
 ///
-/// Regression guard for the 0.3.3 fix: pre-fix, `finalize_session` minted a
-/// *second*, different id for a fresh guest's response cookie (it took the
-/// id-cycle branch on `existing_id.is_none()`), so the token was bound to
-/// one id while `axess.sid` carried another and this POST returned `403`.
+/// A `finalize_session` that minted a *second*, different id for a fresh
+/// guest's response cookie (by taking the id-cycle branch on
+/// `existing_id.is_none()`) would bind the token to one id while
+/// `axess.sid` carried another, and this POST would return `403`.
 /// The mock-handle tests above stub the session id and so cannot see this
 /// cross-layer interaction; stacking the real `SessionLayer` here is what
 /// exposes it. Runs under `cargo test --lib`.
@@ -1018,6 +1020,7 @@ async fn csrf_token_for_fresh_guest_survives_session_finalize() {
         MemorySessionStore::new(),
         crate::testing::test_key(42),
         crate::MemorySessionRegistry::new().handle(),
+        std::sync::Arc::new(crate::session::UnrecordedSessionEnds),
     )
     .with_secure(false);
     let csrf_layer = CsrfLayer::new(CsrfConfig::new([7u8; 32]).secure(false));
@@ -1152,7 +1155,7 @@ async fn csrf_service_hands_the_handler_a_valid_token_when_cookie_is_stale() {
         .unwrap();
     let embedded = String::from_utf8(body.to_vec()).unwrap();
 
-    let sid = handle.0.read().await.id;
+    let sid = *handle.0.read().await.session.key();
     assert_ne!(
         embedded, stale_token,
         "the stale cookie must not reach the form"
@@ -1282,5 +1285,100 @@ async fn an_unverifiable_cookie_is_not_handed_to_handlers_as_the_token() {
         body.as_ref(),
         b"",
         "the token handlers see must be empty, not the client's cookie"
+    );
+}
+
+/// The token is bound to the session's key: a state-changing request whose
+/// token was minted over the key of the request's session passes, one
+/// minted over another session's key is refused, and so is one minted over
+/// the 16 bytes of the session's own id. The token a safe request hands the
+/// handler verifies for the key and not for the id.
+#[tokio::test]
+async fn a_token_is_bound_to_the_sessions_key_and_not_to_its_id() {
+    use crate::session::id::{SessionId, SessionKey};
+    use crate::session::layer::{CookieSession, SessionInner};
+    use crate::testing::mock_random::MockRng;
+    use axum::http::{Method, Request};
+    use std::convert::Infallible;
+    use tokio::sync::RwLock;
+    use tower::{Layer, ServiceExt, service_fn};
+
+    let echo = service_fn(|req: Request<Body>| async move {
+        let token = req
+            .extensions()
+            .get::<CsrfToken>()
+            .map(|t| t.as_str().to_owned())
+            .unwrap_or_default();
+        Ok::<_, Infallible>(
+            Response::builder()
+                .status(200)
+                .body(Body::from(token))
+                .unwrap(),
+        )
+    });
+    let key = [43u8; 32];
+    let config = CsrfConfig::new(key);
+    let service = CsrfLayer::new(config.clone()).layer(echo);
+
+    let id = SessionId::new(&MockRng::new(5));
+    let handle = SessionHandle(std::sync::Arc::new(RwLock::new(SessionInner {
+        session: CookieSession::of_id(id),
+        ..SessionInner::detached(std::sync::Arc::new(axess_rng::SystemRng))
+    })));
+    let own = SessionKey::of(&id);
+    let another = SessionKey::of(&SessionId::new(&MockRng::new(6)));
+
+    let post = |token: String| {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/state-changing")
+            .header(
+                "cookie",
+                format!("{}={}", config.effective_cookie_name(), token),
+            )
+            .header(config.header_name.as_ref(), &token)
+            .extension(handle.clone())
+            .body(Body::empty())
+            .unwrap()
+    };
+    for (bound_to, token, status) in [
+        (
+            "the session's key",
+            mint(own.as_bytes(), &key),
+            StatusCode::OK,
+        ),
+        (
+            "another session's key",
+            mint(another.as_bytes(), &key),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "the session's id",
+            mint(id.as_bytes(), &key),
+            StatusCode::FORBIDDEN,
+        ),
+    ] {
+        let resp = service.clone().oneshot(post(token)).await.unwrap();
+        assert_eq!(resp.status(), status, "a token bound to {bound_to}");
+    }
+
+    let get = Request::builder()
+        .method(Method::GET)
+        .uri("/form")
+        .extension(handle.clone())
+        .body(Body::empty())
+        .unwrap();
+    let resp = service.clone().oneshot(get).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let handed = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        validate_token(&handed, own.as_bytes(), &key),
+        "handed out for the key"
+    );
+    assert!(
+        !validate_token(&handed, id.as_bytes(), &key),
+        "not for the id"
     );
 }

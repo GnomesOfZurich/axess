@@ -199,7 +199,7 @@ async fn a_source_that_hangs_is_cut_off_and_counted() {
     let metrics = Arc::new(Counting::default());
     let a = Arc::new(store("doc1", &metrics).with_coordinator(bus()));
     let source = ScriptedSource::new(vec![Step::Hang]);
-    let _follower = a
+    let follower = a
         .follow_reloads(source.clone(), Duration::from_millis(50))
         .await
         .unwrap();
@@ -213,6 +213,7 @@ async fn a_source_that_hangs_is_cut_off_and_counted() {
         source.reads.load(Ordering::SeqCst) >= 2
     })
     .await;
+    drop(follower);
 }
 
 #[tokio::test]
@@ -220,7 +221,7 @@ async fn a_source_that_fails_is_counted_and_the_set_holds() {
     let metrics = Arc::new(Counting::default());
     let a = Arc::new(store("doc1", &metrics).with_coordinator(bus()));
     let source = ScriptedSource::new(vec![Step::Fail]);
-    let _follower = a
+    let follower = a
         .follow_reloads(source, Duration::from_millis(50))
         .await
         .unwrap();
@@ -230,6 +231,7 @@ async fn a_source_that_fails_is_counted_and_the_set_holds() {
     })
     .await;
     assert_eq!(a.policy_digest(), Some(digest_of("doc1")));
+    drop(follower);
 }
 
 #[tokio::test]
@@ -331,7 +333,7 @@ async fn a_follower_does_not_go_back_to_an_older_bundle() {
     let metrics = Arc::new(Counting::default());
     let b = Arc::new(store("doc1", &metrics).with_coordinator(bus()));
     let source = ScriptedSource::new(vec![Step::Serve(gen_bundle("doc2", 2))]);
-    let _follower = b
+    let follower = b
         .follow_reloads(source.clone(), Duration::from_millis(50))
         .await
         .unwrap();
@@ -356,6 +358,7 @@ async fn a_follower_does_not_go_back_to_an_older_bundle() {
         b.policy_digest() == Some(digest_of("doc3"))
     })
     .await;
+    drop(follower);
 }
 
 #[tokio::test]
@@ -363,7 +366,7 @@ async fn an_unversioned_bundle_is_applied_whatever_came_before() {
     let metrics = Arc::new(Counting::default());
     let b = Arc::new(store("doc1", &metrics).with_coordinator(bus()));
     let source = ScriptedSource::new(vec![Step::Serve(gen_bundle("doc2", 5))]);
-    let _follower = b
+    let follower = b
         .follow_reloads(source.clone(), Duration::from_millis(50))
         .await
         .unwrap();
@@ -377,6 +380,7 @@ async fn an_unversioned_bundle_is_applied_whatever_came_before() {
         b.policy_digest() == Some(digest_of("doc1"))
     })
     .await;
+    drop(follower);
 }
 
 #[tokio::test]
@@ -384,7 +388,7 @@ async fn a_local_reload_not_written_to_the_source_is_replaced_by_the_sources_bun
     let metrics = Arc::new(Counting::default());
     let b = Arc::new(store("doc1", &metrics).with_coordinator(bus()));
     let source = ScriptedSource::new(vec![Step::Serve(VersionedBundle::new(bundle("doc1")))]);
-    let _follower = b
+    let follower = b
         .follow_reloads(source, Duration::from_millis(50))
         .await
         .unwrap();
@@ -397,4 +401,106 @@ async fn a_local_reload_not_written_to_the_source_is_replaced_by_the_sources_bun
         b.policy_digest() == Some(digest_of("doc1"))
     })
     .await;
+    drop(follower);
+}
+
+/// Only a lower generation is refused: a different bundle at the generation
+/// in force is applied, and nothing is counted as refused.
+#[tokio::test]
+async fn a_different_bundle_at_the_generation_in_force_is_applied() {
+    let metrics = Arc::new(Counting::default());
+    let b = Arc::new(store("doc1", &metrics).with_coordinator(bus()));
+    let source = ScriptedSource::new(vec![Step::Serve(gen_bundle("doc2", 2))]);
+    let follower = b
+        .follow_reloads(source.clone(), Duration::from_millis(50))
+        .await
+        .unwrap();
+    eventually("generation 2 is applied", || {
+        b.policy_digest() == Some(digest_of("doc2"))
+    })
+    .await;
+
+    source.replace(vec![Step::Serve(gen_bundle("doc3", 2))]);
+    eventually("the other bundle of generation 2 is applied", || {
+        b.policy_digest() == Some(digest_of("doc3"))
+    })
+    .await;
+    assert_eq!(metrics.refused.load(Ordering::SeqCst), 0);
+    drop(follower);
+}
+
+/// A follower reads as running while its task runs and as finished once the
+/// runtime it ran on is gone, which is what a health check polls it for.
+#[test]
+fn a_follower_reads_as_finished_once_its_runtime_has_shut_down() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let metrics = Arc::new(Counting::default());
+    let follower = runtime.block_on(async {
+        let a = Arc::new(store("doc1", &metrics).with_coordinator(bus()));
+        a.follow_reloads(
+            ScriptedSource::new(vec![Step::Hang]),
+            Duration::from_secs(3600),
+        )
+        .await
+        .unwrap()
+    });
+    assert!(!follower.is_finished(), "the follower is running");
+
+    drop(runtime);
+
+    assert!(follower.is_finished());
+}
+
+/// A source whose read waits at a gate before it serves `doc`'s bundle.
+struct HeldSource {
+    gate: axess_testing::stall::Gate,
+    doc: &'static str,
+}
+
+impl PolicySource for HeldSource {
+    fn load(&self) -> ReloadFuture<'_, Result<PolicyBundle, AuthzError>> {
+        Box::pin(async move {
+            self.gate.wait().await;
+            Ok(bundle(self.doc))
+        })
+    }
+}
+
+/// A read that is under way when the follower is stopped ends with it: the
+/// bundle it was about to serve is not applied afterwards.
+#[tokio::test]
+async fn a_read_under_way_when_the_follower_stops_applies_nothing_afterwards() {
+    let metrics = Arc::new(Counting::default());
+    let a = Arc::new(
+        store("doc1", &metrics)
+            .with_reload_timeouts(ReloadTimeouts {
+                source_read: Duration::from_secs(30),
+                ..fast()
+            })
+            .with_coordinator(bus()),
+    );
+    let gate = axess_testing::stall::Gate::new();
+    let source = Arc::new(HeldSource {
+        gate: gate.clone(),
+        doc: "doc2",
+    });
+    let follower = a
+        .follow_reloads(source, Duration::from_secs(3600))
+        .await
+        .unwrap();
+    gate.until_entered().await;
+
+    follower.stop();
+    axess_testing::stall::settle_spawned().await;
+    gate.open();
+    axess_testing::stall::settle_spawned().await;
+
+    assert_eq!(
+        a.policy_digest(),
+        Some(digest_of("doc1")),
+        "the stopped follower's read applied its bundle"
+    );
 }

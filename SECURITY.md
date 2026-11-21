@@ -89,7 +89,7 @@ let app = Router::new()
 
 #### Rate limiting is required in front of login routes
 
-- [ ] Apply the rate-limit layer to every route that reaches `begin_login`. Axess does **not** enforce it inside the service, and since 0.6.0 every failed login, including for identifiers that do not exist, writes an audit row, while a failed audit write fails the login. Without a limit, an unauthenticated caller can drive unbounded writes at your audit store, and exhausting it turns every login into a failure for every user. Your sink can also shed under load by returning `AuditOutcome::Shed`, but shed on a global rate or watermark, never on anything derived from which identifier was tried, or the drop becomes a user-enumeration signal.
+- [ ] Apply the rate-limit layer to every route that reaches `begin_login`. Axess does **not** enforce it inside the service, and every failed login, including for identifiers that do not exist, writes an audit row, while a failed audit write fails the login. Without a limit, an unauthenticated caller can drive unbounded writes at your audit store, and exhausting it turns every login into a failure for every user. Your sink can also shed under load by returning `AuditOutcome::Shed`, but shed on a global rate or watermark, never on anything derived from which identifier was tried, or the drop becomes a user-enumeration signal.
 - [ ] Alert on `AuditMetrics::audit_store_outage`. It fires on exactly that path.
 - [ ] Put the audit sink behind something durable: write locally, ship asynchronously, rather than a remote service on the request path.
 
@@ -128,7 +128,7 @@ let app = Router::new()
 - [ ] **Pin the trust domain** at resolver construction. Every shipped resolver (`JwtSvidResolver`, `MtlsResolver`, `WorkloadResolver`) accepts an expected `TrustDomain`. `MtlsResolver` rejects certs whose SPIFFE ID lives under a different one; `WorkloadResolver` builds the `WorkloadId` itself under the pinned domain (the claim mapper cannot name another). The separation between issuers sharing a JWKS is the verifier's `iss` and `aud` pins.
 - [ ] Give `WorkloadResolver` and `MtlsResolver` a slug-to-`TenantId` lookup that answers `None` for a tenant you do not know; the resolver calls it on the verified claims' or certificate's own slug and refuses the request when it is `None`.
 - [ ] For the generic `WorkloadResolver`, keep adopter-supplied claim mappers **strict** about which `subject` paths the application admits. The recipes in [`examples/workload-identity/`](examples/workload-identity/) are templates, not policy.
-- [ ] When fetching SVIDs from a local SPIRE agent, use the `spire-workload` crate today; see [`docs/workload-identity/jwt-svid.md`](docs/workload-identity/jwt-svid.md) for the fetch-side recipe.
+- [ ] When fetching SVIDs from a local SPIRE agent (feature `spire`), reach the agent over its Unix domain socket (a TCP endpoint is clear text, and off the loopback interface it is refused unless built with `Endpoint::tcp_clear_text`), read SVIDs and bundles from a source rather than caching them yourself, alert on `workload_credential_refresh_failed` and `workload_credential_expired`, and name the trust domains each verifier admits; see [`docs/workload-identity/spire.md`](docs/workload-identity/spire.md).
 
 #### Dependencies
 
@@ -155,14 +155,14 @@ proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 
 #### What axess does with these headers
 
-Since 0.6.0 axess **does** walk the forwarded chain and **does** maintain a trusted-proxy allowlist. `trusted.client_ip(headers, peer)`:
+Axess **does** walk the forwarded chain and **does** maintain a trusted-proxy allowlist. `trusted.client_ip(headers, peer)`:
 
 1. Returns the TCP peer immediately if the peer is not itself a trusted proxy: an unproxied client's headers are never read.
 2. Otherwise joins **every** `X-Forwarded-For` field line in order (RFC 9110 §5.3 makes repeated lines one comma-joined list) and walks it **right to left**, skipping hops that are themselves trusted, returning the first address that is not.
 3. Stops at a malformed entry and returns the peer, rather than trusting past it.
 4. Reads `X-Real-IP` only when no `X-Forwarded-For` is present, and only when there is exactly one such line: more than one means something appended rather than overwrote, so the first is whatever the client sent.
 
-Rightmost-untrusted is the only correct reading: `X-Forwarded-For` is append-only, so the **leftmost** entry is whatever the client chose to put there. Axess took the leftmost entry before 0.6.0, which was spoofable through a correctly configured proxy.
+Rightmost-untrusted is the only correct reading: `X-Forwarded-For` is append-only, so the **leftmost** entry is whatever the client chose to put there, and reading it is spoofable through a correctly configured proxy.
 
 Build the allowlist with exact addresses or CIDR ranges:
 
@@ -176,7 +176,7 @@ let trusted = TrustedProxies::loopback_only();
 
 A spec with bits set below the prefix is rejected rather than widened: `10.0.0.5/8` is an error, because it reads like one host and would mean sixteen million. Write `10.0.0.0/8` or `10.0.0.5/32`.
 
-Since 0.7.0 you do not usually call the walk yourself. `client_ip::layer` runs it once per request, outside every route, and hands each handler a `ClientIp`:
+You do not usually call the walk yourself. `client_ip::layer` runs it once per request, outside every route, and hands each handler a `ClientIp`:
 
 ```rust,ignore
 let app = axess::client_ip::layer(app, trusted);
@@ -184,7 +184,7 @@ let app = axess::client_ip::layer(app, trusted);
 
 `ClientIp` has a private field and the layer is the only thing that fills it, so no amount of header reading produces one. Everything that wants an address takes it from there: the audit context, the Cedar request context, the rate limiter's `KeyExtractor::ClientIp`, the device gate, and lockout.
 
-There is no longer a function that reads a forwarded header and believes it. The untrusted forms were removed in 0.7.0: a name carrying its own warning was tried twice and lost both times, once to a consumer that moved seven call sites onto one because its documentation recommended it.
+There is no function that reads a forwarded header and believes it: a name carrying its own warning does not stop a consumer from moving its call sites onto it when its documentation recommends it.
 
 ## Feature inventory
 
@@ -242,6 +242,7 @@ The shipped security surface, grouped by area. Caveats live in the Notes column.
 | `WorkloadResolver<C, F, R>` | Generic JWT-bearer workload resolver covering GitHub Actions OIDC, Kubernetes service accounts, GitLab CI, Okta, Azure AD, Auth0, `LocalIdP`, and any other JWT-issuer via an adopter-supplied claim parser + mapping closure. Ready-made recipes for GitHub Actions + k8s SA ship in [`examples/workload-identity/`](examples/workload-identity/). |
 | Cloud STS exchange | `aws-sts`, `gcp-wif`, `azure-fic` adapters for exchanging federated workload identity for short-lived cloud credentials. |
 | Outbound identity | `outbound-oauth` (axess as OAuth client with `client_credentials` / `private_key_jwt`) and `outbound-mtls` (axess presenting an mTLS identity to downstream services). |
+| SPIRE Workload API client | `spire`: `SpireClient` fetches X.509 and JWT SVIDs and trust bundles from a local SPIRE agent and rotates them on the injected clock; an expired SVID is never served, a bundle set the agent has stopped confirming goes stale and fails closed, and each verifier names the trust domains it admits. |
 
 ### OAuth / OIDC ceremonies
 
@@ -254,7 +255,7 @@ The shipped security surface, grouped by area. Caveats live in the Notes column.
 | FAPI 2.0 Baseline Profile | Pushed Authorization Requests (PAR, RFC 9126), DPoP (RFC 9449), JARM, RP-initiated logout. Strict `nbf` enforcement on ID tokens with clock-injected validation. |
 | Back-Channel Logout | JWT signature verified via cached JWKS; `sid`-based session invalidation. |
 | Front-Channel Logout | `GET` handler with `sid` query parameter; shared `SidMap` with back-channel. |
-| Plain-OAuth-2.0 social login | `SocialProvider` (gated on `social`, off by default) for IdPs that don't support OIDC (GitHub user login, Twitter/X, Discord, Reddit, Spotify, …). **Weaker security model than OIDC**; identity comes from a TLS-trusted userinfo endpoint, not from a signed assertion. Parallel types (`SocialClaims` vs `IdTokenClaims`) keep the distinction visible at the call site. PKCE on by default. |
+| Plain-OAuth-2.0 social login | `SocialProvider` (gated on `social`, off by default) for IdPs that don't support OIDC (GitHub user login, Twitter/X, Discord, Reddit, Spotify, …). **Weaker security model than OIDC**; identity comes from a TLS-trusted userinfo endpoint, not from a signed assertion. Parallel types (`SocialClaims` vs `OAuthClaims`) keep the distinction visible at the call site. PKCE on by default. |
 | LocalIdpFixture | In-process IdP minting workload JWTs against an in-memory RSA-2048 keypair + matching JWKS endpoint. RS256 + ES256, RFC 8414 discovery, multi-key rotation. |
 
 ### On-behalf-of (OBO)
@@ -304,7 +305,7 @@ Axess processes personal data as part of authentication. This section documents 
 |---|---|---|---|
 | `user_id` | Structured log spans, `AuthEvent` | Correlate events to accounts | **Pseudonymous**; opaque ID, not directly identifying |
 | `tenant_id` | Structured log spans, `AuthEvent` | Multi-tenant correlation | No |
-| `session_id` | `AuthEvent`, tracing spans | Session correlation | No (random UUID) |
+| `session_id` | `AuthEvent`, the session layer's session-end record | Session correlation | No: a digest of the session id (64 hexadecimal characters), not a credential; no span carries it, and a log line prints its first eight characters |
 | `IP address` | `AuditContext` (extracted from headers) | Geo/fraud detection, compliance | **Yes**; personal data under GDPR |
 | `User-Agent` | `AuditContext`, session binding | Client identification, hijack detection | **Indirect**; device fingerprint |
 | `event_type` | `AuthEvent` | Audit trail (login, factor verified, logout) | No |
@@ -336,7 +337,7 @@ Axess processes personal data as part of authentication. This section documents 
 
 - **Encrypt at rest**: pass a `SessionCrypto::new(key)` to the SQL session-store constructors (`SqliteSessionStore::new(pool, crypto)`, same for Postgres / MySQL) or use `ValkeySessionStore::new(client, key)` so session data (which contains `user_id`) is AES-256-GCM protected. The explicit `::plaintext_insecure(pool)` constructor opts out and is dev/test only.
 - **Log retention**: configure your log aggregator to retain auth events per your compliance requirements (MiFID II: 5 years; GDPR: minimize).
-- **Right to erasure**: deleting a user's sessions (`SessionRegistry::invalidate_user`) and database records satisfies GDPR erasure for axess-managed data. The `custom` session field is the application's responsibility.
+- **Right to erasure**: `RequestAuthnService::delete_user` (or `delete_user_across_tenants`) ends the user's sessions, revokes every refresh token, then calls `IdentityAdmin::delete_user`, which must erase the user row, factor configs, refresh tokens, persisted sessions and password history and pseudonymise any audit rows it retains. The `custom` session field is the application's responsibility.
 
 ## Compliance framework mapping
 
@@ -346,7 +347,7 @@ Axess processes personal data as part of authentication. This section documents 
 |---|---|
 | Lawful basis for processing | Application's responsibility. Axess processes only what the app sends. |
 | Data minimization | Sessions store only `user_id`, `tenant_id`, `auth_state`, and `fingerprint` (HMAC hash). |
-| Right to erasure | `SessionRegistry::invalidate_user()` + database record deletion. |
+| Right to erasure | `RequestAuthnService::delete_user()`: ends sessions, revokes refresh tokens, then `IdentityAdmin::delete_user()` erases the user's records. |
 | Data protection by design | AES-256-GCM encryption at rest, zeroization of secrets in memory. |
 | Breach notification | Application responsibility. Axess provides audit trail via `AuthEvent`. |
 | DPA (Data Processing Agreement) | Not applicable; Axess is a library, not a service. |

@@ -15,12 +15,12 @@
 //! when a concurrent load re-sealed it under the same revision (see the
 //! stores' `cas_by_revision` driver), so at most two reads and two writes
 //! per attempt. One write therefore costs at most `SWAP_ATTEMPTS` (3) layer
-//! attempts of up to four store round trips each, plus two reads between
-//! them; past that the concurrent writers win and this request's changes
+//! attempts of up to four store round trips each, plus a read after each
+//! one that lost; past that the concurrent writers win and this request's changes
 //! are discarded.
 
 use crate::session::data::{SessionData, cap_custom, merge_concurrent};
-use crate::session::id::SessionId;
+use crate::session::id::SessionKey;
 use crate::session::store::{ConditionalUpdate, SessionStore};
 use std::future::Future;
 use std::pin::Pin;
@@ -40,13 +40,15 @@ type StoreFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, StoreError>> + S
 /// state does not carry the store's type. Implemented for every
 /// [`SessionStore`]; the store's own error is kept as the source.
 pub(crate) trait SwapStore: Send + Sync {
-    /// [`SessionStore::load`].
-    fn load_row<'a>(&'a self, id: &'a SessionId) -> StoreFuture<'a, Option<SessionData>>;
+    /// [`SessionStore::load`], refusing a row below the current schema
+    /// version as an error
+    /// ([`load_current`](super::lifecycle::load_current)).
+    fn load_row<'a>(&'a self, key: &'a SessionKey) -> StoreFuture<'a, Option<SessionData>>;
 
     /// [`SessionStore::update_if_revision`].
     fn swap_row<'a>(
         &'a self,
-        id: &'a SessionId,
+        key: &'a SessionKey,
         expected_revision: u64,
         data: &'a SessionData,
         ttl: Duration,
@@ -54,19 +56,19 @@ pub(crate) trait SwapStore: Send + Sync {
 }
 
 impl<S: SessionStore> SwapStore for S {
-    fn load_row<'a>(&'a self, id: &'a SessionId) -> StoreFuture<'a, Option<SessionData>> {
-        Box::pin(async move { self.load(id).await.map_err(StoreError::from) })
+    fn load_row<'a>(&'a self, key: &'a SessionKey) -> StoreFuture<'a, Option<SessionData>> {
+        Box::pin(super::lifecycle::load_current(self, key))
     }
 
     fn swap_row<'a>(
         &'a self,
-        id: &'a SessionId,
+        key: &'a SessionKey,
         expected_revision: u64,
         data: &'a SessionData,
         ttl: Duration,
     ) -> StoreFuture<'a, ConditionalUpdate> {
         Box::pin(async move {
-            self.update_if_revision(id, expected_revision, data, ttl)
+            self.update_if_revision(key, expected_revision, data, ttl)
                 .await
                 .map_err(StoreError::from)
         })
@@ -90,8 +92,8 @@ pub(crate) enum Swapped {
 
 /// The row a write starts from and the changes it carries.
 pub(crate) struct Swap<'a> {
-    /// The row's id in the store.
-    pub(crate) row: &'a SessionId,
+    /// The key the row is stored under.
+    pub(crate) row: &'a SessionKey,
     /// The row as this request last saw it stored: as loaded, or as this
     /// request's previous write left it. `None` when the request has no
     /// stored row to merge from, and a conflict then discards the write.
@@ -118,6 +120,12 @@ pub(crate) struct Swap<'a> {
 /// a concurrent request wrote and a third one removed between two attempts
 /// is not written back. The written row carries the next revision, the later
 /// of the two refresh stamps, and a custom bag within the cap.
+///
+/// A row read after a conflict may carry the layer's claim to end the
+/// session ([`SessionData::ending`]). The changes are merged onto it like
+/// any other and the claim is left in place, so a write that was under way
+/// when the session was claimed is not lost, and the request that ends the
+/// session still finds its claim.
 ///
 /// `prepare` sees each row read after a conflict before the merge and may
 /// change it (a consumption takes its value out of it); returning `false`

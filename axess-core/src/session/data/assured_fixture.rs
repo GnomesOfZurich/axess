@@ -7,8 +7,8 @@ use crate::authn::assurance::FactorAssurance;
 /// user-verified, device-bound passkey, at fixed whole-second times so every
 /// backend's encoding round-trips it exactly.
 pub(crate) fn assured_session() -> SessionData {
-    let login = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).expect("valid time");
-    let step_up = DateTime::<Utc>::from_timestamp(1_700_000_060, 0).expect("valid time");
+    let login = Timestamp::from_unix_seconds(1_700_000_000).expect("valid time");
+    let step_up = Timestamp::from_unix_seconds(1_700_000_060).expect("valid time");
     let mut data = SessionData::default();
     data.auth_state.begin_authenticating(
         axess_identity::testing::user("assured"),

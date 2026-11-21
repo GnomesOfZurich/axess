@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+ --> tests/ui/recorded_session_id_from_session_id.rs:6:35
+  |
+6 |     let _ = EventSubject::Session(SessionId::NIL);
+  |             --------------------- ^^^^^^^^^^^^^^ expected `RecordedSessionId`, found `SessionId`
+  |             |
+  |             arguments to this enum variant are incorrect
+  |
+note: tuple variant defined here
+ --> src/subject.rs
+  |
+  |         Session(RecordedSessionId),
+  |         ^^^^^^^

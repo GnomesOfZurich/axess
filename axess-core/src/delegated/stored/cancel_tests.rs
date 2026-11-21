@@ -1,9 +1,10 @@
 //! A cancelled refresh does not lose the rotated refresh token.
 
 use super::*;
+use axess_clock::Timestamp;
 use axess_clock::testing::MockClock;
+use axess_clock::testing::Shift;
 use axess_identity::{TenantId, UserId};
-use chrono::{DateTime, Utc};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,8 +12,8 @@ use url::Url;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-fn t0() -> DateTime<Utc> {
-    DateTime::from_timestamp(1_700_000_000, 0).expect("fixed t0")
+fn t0() -> Timestamp {
+    Timestamp::from_unix_seconds(1_700_000_000).expect("fixed t0")
 }
 
 /// The IdP redeems the token (and rotates it) after the caller has gone: the
@@ -42,7 +43,7 @@ async fn a_dropped_refresh_still_saves_the_rotated_token() {
         Url::parse(&format!("{}/token", idp.uri())).unwrap(),
         "client",
         "secret",
-        Url::parse("https://gnomes.local/callback").unwrap(),
+        Url::parse("https://example.org/callback").unwrap(),
     ));
     let store = Arc::new(MemoryDelegatedCredentialStore::new());
     let (tenant, user) = (TenantId::from_bytes([1; 16]), UserId::from_bytes([2; 16]));
@@ -52,9 +53,10 @@ async fn a_dropped_refresh_still_saves_the_rotated_token() {
             &user,
             StoredDelegation {
                 provider: provider.name.clone(),
+                registration: Some(GrantRegistration::of(&provider)),
                 access_token: "stale".into(),
                 refresh_token: Some("spent-on-redeem".into()),
-                expires_at: Some(t0() - chrono::Duration::seconds(60)),
+                expires_at: Some(t0().minus(axess_clock::SignedDuration::seconds(60))),
                 scopes: vec![],
                 token_type: "Bearer".to_string(),
             },

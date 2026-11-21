@@ -3,7 +3,8 @@
 //! looks like a bad token, a bad ttl is refused for everyone alike, and an
 //! unknown identifier costs the same store calls as a known one.
 
-mod common;
+use axess_clock::testing::Shift;
+use axess_core::testing::fixtures as common;
 
 use axess_core::testing::AuthSessionTestExt;
 use std::time::Duration;
@@ -18,8 +19,10 @@ use common::{test_tenant, test_user, uid};
 type Svc = RequestAuthnService<MockIdentityStore, MockFactorStore>;
 
 fn world(log: Option<&CallLog>) -> (Svc, MockIdentityStore) {
+    let clock = common::test_clock();
     let user = test_user("u1", "alice");
     let mut identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(user.clone())
         .with_password_rules(
@@ -33,7 +36,9 @@ fn world(log: Option<&CallLog>) -> (Svc, MockIdentityStore) {
         identity = identity.with_call_log(log);
     }
     let handle = identity.clone();
-    let svc = AuthnService::new(identity, MockFactorStore::new())
+    let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build()
         .with_audit_context(AuditContext::default());
     (svc, handle)
 }
@@ -161,7 +166,7 @@ async fn the_dummy_token_of_an_unknown_identifier_cannot_be_redeemed() {
             .check_reset_token(
                 &sentinel,
                 "any",
-                chrono::Utc::now() + chrono::Duration::seconds(1)
+                common::start().plus(axess_clock::SignedDuration::seconds(1))
             )
             .await
             .unwrap()
@@ -190,8 +195,7 @@ async fn a_token_issued_before_the_tenant_was_suspended_resets_nothing_and_is_ke
         .expect("token");
 
     let mut tenant = test_tenant();
-    tenant.status =
-        EntityState::Suspended(StatusDetail::administrative("test", chrono::Utc::now()));
+    tenant.status = EntityState::Suspended(StatusDetail::administrative("test", common::start()));
     let active = test_tenant();
     let _ = identity.clone().with_tenant(tenant.clone());
 
@@ -221,6 +225,7 @@ async fn a_token_issued_before_the_tenant_was_suspended_resets_nothing_and_is_ke
 /// active again.
 #[tokio::test]
 async fn a_tenant_suspended_during_the_hash_is_refused_at_the_commit() {
+    let clock = common::test_clock();
     use axess_core::authn::event::{AuthEventStatus, AuthEventType};
     use axess_core::authn::factor::FactorKind;
     use axess_core::authn::store::FactorStore;
@@ -234,6 +239,7 @@ async fn a_tenant_suspended_during_the_hash_is_refused_at_the_commit() {
         user_id: user.id,
     };
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(user.clone())
         .with_password_rules(
@@ -245,7 +251,9 @@ async fn a_tenant_suspended_during_the_hash_is_refused_at_the_commit() {
         )
         .with_call_log(&log);
     let factors = MockFactorStore::new();
-    let svc = AuthnService::new(identity.clone(), factors.clone())
+    let svc = AuthnService::builder(identity.clone(), factors.clone())
+        .with_clock(clock.clone())
+        .build()
         .with_audit_context(AuditContext::default());
     let token = svc
         .begin_password_reset("alice", "default", Duration::from_secs(300))
@@ -257,7 +265,7 @@ async fn a_tenant_suspended_during_the_hash_is_refused_at_the_commit() {
     // the hash; the tenant is suspended right there, once.
     let mut suspended = test_tenant();
     suspended.status =
-        EntityState::Suspended(StatusDetail::administrative("test", chrono::Utc::now()));
+        EntityState::Suspended(StatusDetail::administrative("test", common::start()));
     let flip = identity.clone();
     let once = AtomicBool::new(true);
     log.on("password_history", move || {
@@ -307,74 +315,50 @@ mod cancelled_reset {
 
     use super::*;
     use axess_core::session::store::{MemorySessionRegistry, SessionRegistry};
+    use axess_core::testing::registry_double::{RegistryDouble, RegistryOp, Step};
     use axess_core::testing::test_session;
     use std::sync::Arc;
 
-    /// A registry whose `invalidate_user` announces itself and then takes a
-    /// while, so a test can drop the caller in the middle of it.
-    #[derive(Clone)]
-    struct Slow {
-        inner: MemorySessionRegistry,
-        entered: Arc<tokio::sync::Notify>,
-    }
-
-    impl SessionRegistry for Slow {
-        type Error = axess_core::session::store::MemoryRegistryError;
-        async fn register(
-            &self,
-            u: &axess_core::authn::UserId,
-            s: &axess_core::session::id::SessionId,
-        ) -> Result<(), Self::Error> {
-            self.inner.register(u, s).await
-        }
-        async fn is_valid(
-            &self,
-            u: &axess_core::authn::UserId,
-            s: &axess_core::session::id::SessionId,
-        ) -> Result<bool, Self::Error> {
-            self.inner.is_valid(u, s).await
-        }
-        async fn invalidate_user(&self, u: &axess_core::authn::UserId) -> Result<(), Self::Error> {
-            self.entered.notify_one();
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            self.inner.invalidate_user(u).await
-        }
-        async fn invalidate_session(
-            &self,
-            u: &axess_core::authn::UserId,
-            s: &axess_core::session::id::SessionId,
-        ) -> Result<(), Self::Error> {
-            self.inner.invalidate_session(u, s).await
-        }
-        async fn active_sessions(
-            &self,
-            u: &axess_core::authn::UserId,
-        ) -> Result<Vec<axess_core::session::id::SessionId>, Self::Error> {
-            self.inner.active_sessions(u).await
-        }
+    /// A registry whose `invalidate_user` announces itself on `entered` and
+    /// then takes a while, so a test can drop the caller in the middle of it.
+    fn slow(inner: MemorySessionRegistry, entered: Arc<tokio::sync::Notify>) -> RegistryDouble {
+        RegistryDouble::over(inner).before(move |call, _| {
+            let entered = entered.clone();
+            async move {
+                if call.op() == RegistryOp::InvalidateUser {
+                    entered.notify_one();
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Step::Forward
+            }
+        })
     }
 
     #[tokio::test]
     async fn a_reset_dropped_while_ending_sessions_still_ends_them() {
-        let registry = Slow {
-            inner: MemorySessionRegistry::new(),
-            entered: Arc::new(tokio::sync::Notify::new()),
-        };
+        let clock = common::test_clock();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let registry = slow(
+            MemorySessionRegistry::new().with_clock(std::sync::Arc::new(clock.clone())),
+            entered.clone(),
+        );
         let user = test_user("u1", "alice");
         let identity = MockIdentityStore::new()
+            .with_clock(clock.clone())
             .with_tenant(test_tenant())
             .with_user(user.clone());
         let svc = AuthnService::builder(identity.clone(), MockFactorStore::new())
+            .with_clock(clock.clone())
             .with_registry(registry.clone())
             .build()
             .with_audit_context(AuditContext::default());
         let session = test_session();
         session
-            .set_authenticated(user.id, user.tenant_id, chrono::Utc::now())
+            .set_authenticated(user.id, user.tenant_id, common::start())
             .await;
-        let sid = session.session_id().await;
+        let sid = session.session_key().await;
         registry.register(&user.id, &sid).await.unwrap();
-        assert!(registry.inner.is_valid(&user.id, &sid).await.unwrap());
+        assert!(registry.inner().is_valid(&user.id, &sid).await.unwrap());
         let token = svc
             .begin_password_reset("alice", "default", Duration::from_secs(300))
             .await
@@ -385,7 +369,7 @@ mod cancelled_reset {
         // there (the block ends): the client went away in the middle of the
         // invalidation.
         {
-            let entered = registry.entered.notified();
+            let entered = entered.notified();
             let reset = svc.complete_password_reset(&user.id, &token, "New-password-123");
             let mut reset = std::pin::pin!(reset);
             tokio::select! {
@@ -396,7 +380,7 @@ mod cancelled_reset {
         tokio::time::sleep(Duration::from_millis(400)).await;
 
         assert!(
-            !registry.inner.is_valid(&user.id, &sid).await.unwrap(),
+            !registry.inner().is_valid(&user.id, &sid).await.unwrap(),
             "the password changed, so the user's sessions must end even though the caller left"
         );
     }
@@ -407,57 +391,35 @@ mod masked_failures {
     //! do after the password was installed.
 
     use super::*;
-    use axess_core::session::store::SessionRegistry;
+    use axess_core::session::store::MemorySessionRegistry;
+    use axess_core::testing::registry_double::{RegistryDouble, RegistryOp, Step};
 
     /// A registry whose `invalidate_user` fails: the sessions stay open.
-    #[derive(Clone)]
-    struct Stuck;
-
-    impl SessionRegistry for Stuck {
-        type Error = std::io::Error;
-        async fn register(
-            &self,
-            _: &axess_core::authn::UserId,
-            _: &axess_core::session::id::SessionId,
-        ) -> Result<(), Self::Error> {
-            Ok(())
-        }
-        async fn is_valid(
-            &self,
-            _: &axess_core::authn::UserId,
-            _: &axess_core::session::id::SessionId,
-        ) -> Result<bool, Self::Error> {
-            Ok(true)
-        }
-        async fn invalidate_user(&self, _: &axess_core::authn::UserId) -> Result<(), Self::Error> {
-            Err(std::io::Error::other("registry unreachable"))
-        }
-        async fn invalidate_session(
-            &self,
-            _: &axess_core::authn::UserId,
-            _: &axess_core::session::id::SessionId,
-        ) -> Result<(), Self::Error> {
-            Ok(())
-        }
-        async fn active_sessions(
-            &self,
-            _: &axess_core::authn::UserId,
-        ) -> Result<Vec<axess_core::session::id::SessionId>, Self::Error> {
-            Ok(vec![])
-        }
+    fn stuck(inner: MemorySessionRegistry) -> RegistryDouble {
+        RegistryDouble::over(inner).before(|call, _| async move {
+            match call.op() {
+                RegistryOp::InvalidateUser => Step::Fail("registry unreachable"),
+                _ => Step::Forward,
+            }
+        })
     }
 
     /// The registry could not end the sessions and the audit store could
-    /// not take the row. The caller used to see the audit error alone; the
+    /// not take the row. The caller does not see the audit error alone: the
     /// sessions left open are the costlier failure and are reported first.
     #[tokio::test]
     async fn a_registry_failure_is_reported_even_when_the_audit_row_fails() {
+        let clock = common::test_clock();
         let user = test_user("u1", "alice");
         let identity = MockIdentityStore::new()
+            .with_clock(clock.clone())
             .with_tenant(test_tenant())
             .with_user(user.clone());
         let svc = AuthnService::builder(identity.clone(), MockFactorStore::new())
-            .with_registry(Stuck)
+            .with_clock(clock.clone())
+            .with_registry(stuck(
+                MemorySessionRegistry::new().with_clock(std::sync::Arc::new(clock.clone())),
+            ))
             .build()
             .with_audit_context(AuditContext::default());
         let token = svc
@@ -487,12 +449,12 @@ async fn an_unknown_identifier_does_not_overwrite_the_system_users_token() {
     use axess_core::authn::store::IdentityPasswordReset;
     let (svc, identity) = world(None);
     let system = axess_core::authn::ids::UserId::SYSTEM;
-    let now = chrono::Utc::now();
+    let now = common::start();
     identity
         .store_reset_token(
             &system,
             "real-token-hash",
-            now + chrono::Duration::hours(1),
+            now.plus(axess_clock::SignedDuration::hours(1)),
             now,
             3,
         )

@@ -12,7 +12,7 @@ use crate::authn::ids::{DeviceId, TenantId};
 use crate::device::store::DeviceStore;
 use crate::device::types::DeviceTrustLevel;
 use crate::session::refresh::{DeviceTokenRevocation, RefreshTokenStore};
-use chrono::{DateTime, Utc};
+use axess_clock::Timestamp;
 
 /// Why [`revoke_device`] could not finish. Either failure leaves the other
 /// half done, so the call is safe to repeat.
@@ -57,13 +57,15 @@ where
 /// Sessions already issued to the device are not touched: a session ends
 /// at its own expiry or when it is revoked through the session store, and
 /// carries the device id (`SessionData::device_id`) for an application that
-/// wants to check the device on each request.
+/// wants to check the device on each request. A session bound to the
+/// device's key stops being served once its last proof runs out: the
+/// revoked device refreshes none, and a request proof is refused at once.
 pub async fn revoke_device<D, R>(
     device_store: &D,
     refresh_store: &R,
     tenant_id: &TenantId,
     device_id: &DeviceId,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<u64, RevokeDeviceError<D::Error, R::Error>>
 where
     D: DeviceStore,
@@ -84,8 +86,10 @@ where
 
 /// Transition a list of devices to [`DeviceTrustLevel::Revoked`].
 ///
-/// Designed to be called from a refresh-token-store override of
-/// [`RefreshTokenStore::on_token_compromise`].
+/// The device-only step of [`cascade_revoke_devices_and_tokens`], which is
+/// what a refresh-token-store override of
+/// [`RefreshTokenStore::on_token_compromise`] calls: this one leaves the
+/// refresh tokens bound to the devices as they are.
 /// Each `(tenant, device)` pair triggers an independent
 /// [`DeviceStore::set_trust_level`] call; per-target failures are logged
 /// at `warn` level and do not abort the overall cascade. The
@@ -96,19 +100,20 @@ where
 ///
 /// Returns the count of targets the underlying [`DeviceStore`] reported
 /// as successfully revoked (i.e. did not return an error). The count is
-/// upper-bounded by `targets.len()` and equals it on a healthy backend.
+/// upper-bounded by `targets.len()`; a target whose row no longer exists
+/// is an error from the store and is not counted.
 ///
 /// # Idempotency
 ///
 /// Re-revoking a device that is already
 /// [`DeviceTrustLevel::Revoked`] is a no-op at the trust-level layer
-/// (the store will simply re-stamp `revoked_at`). Idempotency at the
+/// (the store keeps the row's first `revoked_at`). Idempotency at the
 /// audit-event level (do not emit duplicate `DeviceRevoked` events) is
 /// the responsibility of the audit-event integration.
 pub async fn cascade_revoke_devices<D: DeviceStore>(
     device_store: &D,
     targets: &[(TenantId, DeviceId)],
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> u64 {
     let mut revoked = 0u64;
     for (tenant_id, device_id) in targets {
@@ -145,7 +150,7 @@ pub async fn cascade_revoke_devices_and_tokens<D, R>(
     device_store: &D,
     refresh_store: &R,
     targets: &[(TenantId, DeviceId)],
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> u64
 where
     D: DeviceStore,
@@ -166,42 +171,6 @@ where
     revoked
 }
 
-/// Revoke every device bound to a given refresh-token family, and only the
-/// devices.
-///
-/// Composes [`DeviceStore::find_by_refresh_family`] +
-/// [`cascade_revoke_devices`]. It marks each device
-/// [`Revoked`](DeviceTrustLevel::Revoked) and nothing else: a refresh token
-/// of another family bound to the same device keeps refreshing unless the
-/// refresh is checked against the device
-/// ([`Refresh::device_store`](crate::session::refresh::Refresh::device_store)).
-/// What to wire into [`RefreshTokenStore::on_token_compromise`] is
-/// [`cascade_revoke_by_refresh_family_and_tokens`], which also revokes the
-/// tokens.
-///
-/// Returns `Ok(count)` where `count` is the number of devices the
-/// underlying [`DeviceStore`] reported as successfully revoked. Errors
-/// from the lookup are propagated; errors from individual revoke calls
-/// are logged and counted as misses (same best-effort semantic as
-/// [`cascade_revoke_devices`]).
-///
-/// `family_id` is `&str` rather than
-/// [`TokenFamilyId`](crate::session::refresh::TokenFamilyId) to keep
-/// the device subsystem free of a refresh-token-store import. Callers
-/// convert via `family_id.to_string().as_str()` or similar.
-pub async fn cascade_revoke_by_refresh_family<D: DeviceStore>(
-    device_store: &D,
-    tenant_id: &TenantId,
-    family_id: &str,
-    now: DateTime<Utc>,
-) -> Result<u64, D::Error> {
-    let devices = device_store
-        .find_by_refresh_family(tenant_id, family_id)
-        .await?;
-    let targets: Vec<(TenantId, DeviceId)> = devices.iter().map(|d| (d.tenant_id, d.id)).collect();
-    Ok(cascade_revoke_devices(device_store, &targets, now).await)
-}
-
 /// Revoke every device bound to a given refresh-token family, and every
 /// refresh token bound to those devices.
 ///
@@ -216,15 +185,18 @@ pub async fn cascade_revoke_by_refresh_family<D: DeviceStore>(
 /// Returns `Ok(count)`, the number of devices whose row and tokens were both
 /// revoked. A lookup error is propagated; a failure on one device is logged
 /// and counted as a miss. A refresh store that cannot revoke by device
-/// ([`DeviceTokenRevocation::Unsupported`]) fails every device; use
-/// [`cascade_revoke_by_refresh_family`] there. See that function for why
-/// `family_id` is a `&str`.
+/// ([`DeviceTokenRevocation::Unsupported`]) fails every device; compose
+/// [`DeviceStore::find_by_refresh_family`] with [`cascade_revoke_devices`]
+/// there, knowing the tokens of the devices' other families stay live.
+/// `family_id` is a `&str` rather than
+/// [`TokenFamilyId`](crate::session::refresh::TokenFamilyId) to keep the
+/// device subsystem free of a refresh-token-store import.
 pub async fn cascade_revoke_by_refresh_family_and_tokens<D, R>(
     device_store: &D,
     refresh_store: &R,
     tenant_id: &TenantId,
     family_id: &str,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<u64, D::Error>
 where
     D: DeviceStore,
@@ -248,7 +220,8 @@ mod tests {
     }
 
     fn d(id: &str, fp: u8, tenant: &TenantId) -> Device {
-        let now = crate::device::store::whole_second(Utc::now());
+        let now =
+            crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time());
         Device {
             id: axess_identity::testing::device(id),
             tenant_id: *tenant,
@@ -273,7 +246,8 @@ mod tests {
         store.save(&dev_b, crate::device::test_now()).await.unwrap();
 
         let targets = vec![(tenant, dev_a.id), (tenant, dev_b.id)];
-        let now = crate::device::store::whole_second(Utc::now());
+        let now =
+            crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time());
         let count = cascade_revoke_devices(&store, &targets, now).await;
         assert_eq!(count, 2);
 
@@ -298,7 +272,12 @@ mod tests {
             (tenant, dev_a.id),
             (tenant, axess_identity::testing::device("dev-missing")),
         ];
-        let count = cascade_revoke_devices(&store, &targets, Utc::now()).await;
+        let count = cascade_revoke_devices(
+            &store,
+            &targets,
+            axess_clock::testing::MockClock::reference_time(),
+        )
+        .await;
         assert_eq!(count, 1, "only dev-a was actually present in the store");
 
         let after_a = store.load(&tenant, &dev_a.id).await.unwrap().unwrap();
@@ -308,7 +287,12 @@ mod tests {
     #[tokio::test]
     async fn cascade_handles_empty_target_list() {
         let store = MemoryDeviceStore::new();
-        let count = cascade_revoke_devices::<MemoryDeviceStore>(&store, &[], Utc::now()).await;
+        let count = cascade_revoke_devices::<MemoryDeviceStore>(
+            &store,
+            &[],
+            axess_clock::testing::MockClock::reference_time(),
+        )
+        .await;
         assert_eq!(count, 0);
     }
 }

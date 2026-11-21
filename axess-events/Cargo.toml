@@ -6,7 +6,6 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 documentation = "https://docs.rs/axess-events"
 readme = "README.md"
 description = """
@@ -25,6 +24,9 @@ exclude = ["tests/", "benches/"]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
+[lints]
+workspace = true
+
 [dependencies]
 axess-identity = { workspace = true, default-features = false }
 axess-strings = { workspace = true, default-features = false }
@@ -42,6 +44,9 @@ uuid = { workspace = true, default-features = false }
 aes-gcm = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, default-features = false, features = ["rt", "macros", "sync"] }
+# Holds the compiler to the errors that keep a recorded session id
+# unconstructible (`tests/recorded_session_id_unconstructible.rs`).
+trybuild = "1.0.122"
 
 [features]
 # `serde` on by default: JSON is the dominant external surface. `rkyv` is

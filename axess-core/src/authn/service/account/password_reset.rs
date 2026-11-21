@@ -80,7 +80,10 @@ where
     /// * `identifier`: the user's login identifier (email, username).
     /// * `tenant_identifier`: the tenant slug/domain.
     /// * `ttl`: how long the token is valid.
-    #[tracing::instrument(skip(self, identifier, ttl), fields(tenant = %tenant_identifier))]
+    #[tracing::instrument(
+        skip(self, identifier, tenant_identifier, ttl),
+        fields(tenant = %crate::authn::service::log_text::logged_request_text(tenant_identifier))
+    )]
     pub async fn begin_password_reset(
         &self,
         identifier: &str,
@@ -221,15 +224,16 @@ where
     /// When a reset token issued at `now` for `ttl` expires. A `ttl` of zero,
     /// or one longer than `cap`, is refused.
     fn reset_token_expiry(
-        now: chrono::DateTime<chrono::Utc>,
+        now: axess_clock::Timestamp,
         ttl: std::time::Duration,
         cap: std::time::Duration,
-    ) -> Result<chrono::DateTime<chrono::Utc>, AuthnError<I::Error>> {
-        let cap = chrono::Duration::from_std(cap).unwrap_or(chrono::Duration::MAX);
-        chrono::Duration::from_std(ttl)
+    ) -> Result<axess_clock::Timestamp, AuthnError<I::Error>> {
+        let cap =
+            axess_clock::SignedDuration::try_from(cap).unwrap_or(axess_clock::SignedDuration::MAX);
+        axess_clock::SignedDuration::try_from(ttl)
             .ok()
-            .filter(|d| *d > chrono::Duration::zero() && *d <= cap)
-            .and_then(|d| now.checked_add_signed(d))
+            .filter(|d| *d > axess_clock::SignedDuration::ZERO && *d <= cap)
+            .and_then(|d| now.checked_add(d))
             .ok_or_else(|| {
                 AuthnError::Internal(
                     "password reset ttl must be positive and at most the configured cap"

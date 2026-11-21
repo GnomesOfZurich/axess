@@ -50,6 +50,17 @@ where
     /// wrong password. The session is left `Authenticating` only while a
     /// further factor is required.
     ///
+    /// Every other answer that is not `Authenticated`, an error included,
+    /// ends the login this call began: the session is cleared to a fresh
+    /// guest and its id rotated ([`AuthSession::clear`]), for an identifier
+    /// that exists and for one that does not. A wrong password for a real
+    /// account would otherwise leave that account's login open in the
+    /// session, under a rotated id, where an unknown identifier leaves the
+    /// session untouched: the session's state, and the cookie the session
+    /// layer sets for a changed session, would say which identifiers exist.
+    /// It follows that a refused attempt on a session that was signed in
+    /// signs it out, whoever the attempt named.
+    ///
     /// What is equalised is the hash: the store round trips of the two
     /// paths differ. A known user's password check reads the factor,
     /// writes the failure counter and the audit row, where the paths above
@@ -59,8 +70,37 @@ where
     /// store round trips beside an Argon2id run of tens of milliseconds.
     /// A deployment that must close it puts the same fixed delay on every
     /// answer in front of the route.
-    #[tracing::instrument(skip(self, identifier, password, session), fields(tenant = %tenant_identifier))]
+    #[tracing::instrument(
+        skip(self, identifier, tenant_identifier, password, session),
+        fields(tenant = %crate::authn::service::log_text::logged_request_text(tenant_identifier))
+    )]
     pub async fn login_with_password(
+        &self,
+        identifier: &str,
+        tenant_identifier: &str,
+        password: &str,
+        session: &AuthSession,
+    ) -> Result<FactorOutcome, AuthnError<I::Error>> {
+        let outcome = self
+            .verify_password_entry(identifier, tenant_identifier, password, session)
+            .await;
+        // The login this call began is this call's to end. Only an answer
+        // that continues it keeps the session; every other one leaves the
+        // same fresh guest, whichever path refused.
+        let continues = matches!(
+            outcome,
+            Ok(FactorOutcome::Authenticated | FactorOutcome::FactorRequired(_))
+        );
+        if !continues {
+            session.clear().await;
+        }
+        outcome
+    }
+
+    /// The body of [`login_with_password`](Self::login_with_password): begin
+    /// the login and verify the password, spending one hash on every path.
+    /// What it leaves in the session on a refusal is for the caller to end.
+    async fn verify_password_entry(
         &self,
         identifier: &str,
         tenant_identifier: &str,
@@ -77,9 +117,19 @@ where
                 match self.verify_factor(&credential, session).await {
                     // Refused before any hash ran: spend the one hash every
                     // other path spends, and say what a wrong password says.
-                    Ok(FactorOutcome::Throttled { .. })
-                    | Err(AuthnError::Locked { .. } | AuthnError::NotActive(_)) => {
+                    Ok(FactorOutcome::Throttled { .. }) | Err(AuthnError::Locked { .. }) => {
                         self.burn_password_check(password).await?;
+                        Ok(FactorOutcome::InvalidCredential)
+                    }
+                    // `NotActive` comes from the check before the step,
+                    // which leaves the flow in place and ran no hash, or
+                    // from the status read after a right password
+                    // registered the session, which cleared it: only the
+                    // first spends the hash, so neither spends two.
+                    Err(AuthnError::NotActive(_)) => {
+                        if session.authenticating_state().await.is_some() {
+                            self.burn_password_check(password).await?;
+                        }
                         Ok(FactorOutcome::InvalidCredential)
                     }
                     // The attempt that crossed the limit, or one that raced
@@ -90,29 +140,96 @@ where
                     result => result,
                 }
             }
-            other => {
-                // A first factor other than a password leaves the session
-                // `Authenticating`; this entry point does not continue it.
-                if matches!(other, LoginOutcome::FactorRequired(_)) {
-                    session.clear().await;
-                }
+            // An unknown identifier, a refused one, or a first factor other
+            // than a password, which this entry point does not continue.
+            LoginOutcome::FactorRequired(_)
+            | LoginOutcome::Locked { .. }
+            | LoginOutcome::InvalidCredentials
+            | LoginOutcome::StepUpRequired { .. } => {
                 self.burn_password_check(password).await?;
                 Ok(FactorOutcome::InvalidCredential)
             }
         }
     }
 
-    /// Spend one Argon2id verification of `password` against a fixed dummy
-    /// hash, on the service's KDF executor, and discard the result.
+    /// Spend the Argon2id work of a password refusal on `password`: one
+    /// verification against a fixed dummy hash at the configured
+    /// [`Argon2Cost`](axess_factors::Argon2Cost), and one at the previous
+    /// cost when the service has one (see
+    /// [`with_previous_argon2_cost`](crate::authn::AuthnServiceBuilder::with_previous_argon2_cost)),
+    /// each its own job on the service's KDF executor; the results are
+    /// discarded.
     ///
     /// What [`login_with_password`](Self::login_with_password) runs on the
     /// paths that have no stored hash to check, so their cost matches the
-    /// path that has one. The dummy hash is made once per service under the
-    /// configured [`Argon2Cost`](axess_factors::Argon2Cost), inside the first
-    /// call, which is therefore still one executor job.
+    /// path that has one. A password over
+    /// [`MAX_PASSWORD_BYTES`](crate::validation::MAX_PASSWORD_BYTES) runs no
+    /// Argon2 in its jobs, as the stored-hash path refuses it before Argon2
+    /// runs. Each dummy hash is made once per service, inside
+    /// the first job that needs it, which is therefore still one job.
     pub async fn burn_password_check(&self, password: &str) -> Result<(), AuthnError<I::Error>> {
-        let dummy_hash = std::sync::Arc::clone(&self.inner.hardening.dummy_password_hash);
-        let cost = self.inner.hardening.argon2_cost;
+        self.spend_dummy_check(password, false).await?;
+        if self.inner.hardening.previous_argon2_cost().is_some() {
+            self.spend_dummy_check(password, true).await?;
+        }
+        Ok(())
+    }
+
+    /// After a wrong password was checked against `verified_hash`, spend
+    /// the rest of a refusal's work (see
+    /// [`burn_password_check`](Self::burn_password_check)): a run at each of
+    /// the current and the previous cost but the one the check itself ran
+    /// at. A hash under neither cost spends both, and is reported once.
+    pub(crate) async fn burn_password_work_after(
+        &self,
+        password: &str,
+        verified_hash: &str,
+    ) -> Result<(), AuthnError<I::Error>> {
+        let hardening = &self.inner.hardening;
+        let under = |cost| !axess_factors::password_needs_rehash_for(verified_hash, cost);
+        let current = under(hardening.argon2_cost);
+        let previous = hardening.previous_argon2_cost();
+        let at_previous = previous.is_some_and(under);
+        if !current
+            && !at_previous
+            && !hardening
+                .unknown_cost_reported
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::warn!(
+                "a wrong password was checked against a hash under an Argon2 cost that is \
+                 neither the current nor the previous one, so that refusal costs more than \
+                 the others; name the cost with AuthnServiceBuilder::with_previous_argon2_cost \
+                 (reported once per service)"
+            );
+        }
+        if !current {
+            self.spend_dummy_check(password, false).await?;
+        }
+        if previous.is_some() && !at_previous {
+            self.spend_dummy_check(password, true).await?;
+        }
+        Ok(())
+    }
+
+    /// One verification of `password` against the dummy hash at the current
+    /// cost, or at the previous one, as one executor job.
+    async fn spend_dummy_check(
+        &self,
+        password: &str,
+        previous: bool,
+    ) -> Result<(), AuthnError<I::Error>> {
+        let hardening = &self.inner.hardening;
+        let (dummy_hash, cost) = match (previous, hardening.previous_argon2_cost()) {
+            (true, Some(cost)) => (
+                std::sync::Arc::clone(&hardening.previous_dummy_password_hash),
+                cost,
+            ),
+            _ => (
+                std::sync::Arc::clone(&hardening.dummy_password_hash),
+                hardening.argon2_cost,
+            ),
+        };
         let salt = axess_factors::generate_password_salt(&self.inner.rng);
         let candidate = zeroize::Zeroizing::new(password.to_owned());
         self.inner
@@ -125,7 +242,13 @@ where
                         cost,
                     )
                 });
-                let _ = axess_factors::verify_password(candidate.as_str(), dummy);
+                // The stored-hash path refuses a password over
+                // `MAX_PASSWORD_BYTES` before Argon2 runs, so the dummy
+                // refuses it the same way, in the same job: an over-length
+                // password costs a known user and an unknown one alike.
+                if candidate.len() <= crate::validation::MAX_PASSWORD_BYTES {
+                    let _ = axess_factors::verify_password(candidate.as_str(), dummy);
+                }
             })
             .await?;
         Ok(())

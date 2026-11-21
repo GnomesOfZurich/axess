@@ -1,6 +1,6 @@
 //! The retention sweep of the Valkey device store.
 
-use chrono::{DateTime, Utc};
+use axess_clock::Timestamp;
 use fred::prelude::*;
 
 use super::apply::{Applied, Step};
@@ -17,12 +17,13 @@ impl ValkeyDeviceStore {
     /// Native key TTLs would eventually evict stale rows on their own, but
     /// TTL alone cannot move a Trusted device to Seen; only the explicit
     /// demotion ladder can. Hence the walk. A row that cannot be decoded is
-    /// logged and left alone, so one damaged row does not stop retention for
-    /// the rest of the tenant.
+    /// logged, counted as skipped and left alone, so one damaged row does
+    /// not stop retention for the rest of the tenant; so is a due row whose
+    /// swap stays contended. The next sweep meets both again.
     pub(super) async fn sweep_tenant(
         &self,
         tenant: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Result<SweepCounts, ValkeyDeviceStoreError> {
         let mut counts = SweepCounts::default();
         let tenant_idx = tenant_index_key(&self.prefix, tenant);
@@ -38,6 +39,7 @@ impl ValkeyDeviceStore {
             // Rows already TTL-evicted: clean the tenant index.
             self.prune_absent(&tenant_idx, tenant, &read.gone).await;
             for (member, error) in &read.undecodable {
+                counts.skipped += 1;
                 tracing::warn!(device = %member, error = %error, "device row skipped by the sweep: it cannot be decoded");
             }
             for row in read.live {
@@ -92,8 +94,12 @@ impl ValkeyDeviceStore {
                     }
                     Ok(Applied::Removed) => counts.revoked_purged += 1,
                     // A row that stays contended is retried by the next
-                    // sweep; it must not abort the rest of the walk.
-                    Err(ValkeyDeviceStoreError::Contended { .. }) => {}
+                    // sweep; it must not abort the rest of the walk. It was
+                    // due and was not moved, so the caller is told.
+                    Err(ValkeyDeviceStoreError::Contended { .. }) => {
+                        counts.skipped += 1;
+                        tracing::warn!(device = %member, "device row skipped by the sweep: its write stayed contended");
+                    }
                     // The row was readable in the chunk read and is not when
                     // the swap reads it again (it was rewritten under another
                     // key, or damaged): skip it like an undecodable row of
@@ -102,6 +108,7 @@ impl ValkeyDeviceStore {
                         error @ (ValkeyDeviceStoreError::Crypto(_)
                         | ValkeyDeviceStoreError::Decode(_)),
                     ) => {
+                        counts.skipped += 1;
                         tracing::warn!(device = %member, %error, "device row skipped by the sweep: it cannot be decoded");
                     }
                     Err(e) => return Err(e),

@@ -1,6 +1,6 @@
 # Axess Examples
 
-Six crates, each a runnable starting point you can copy from. Pick by what
+Seven crates, each a runnable starting point you can copy from. Pick by what
 you are building:
 
 | Crate | Run with | What it shows |
@@ -12,8 +12,10 @@ you are building:
 | [`oauth/`](oauth/) | `cargo run -p axess-example-oauth` | **Sign in with an OpenID Connect provider** (Google, Keycloak, Auth0, …): discovery, PKCE, ID-token validation. |
 | | `cargo run -p axess-example-oauth --bin social` | **Sign in with a provider that lacks OIDC** (GitHub, Discord, Twitter/X, …), and why that is weaker. |
 | [`fapi/`](fapi/) | `cargo run -p axess-example-fapi` | **Financial-grade API security (FAPI 2.0).** `private_key_jwt` client authentication, PAR, DPoP sender-constrained tokens, form_post, RP-initiated logout, revocation. Ships a Keycloak realm; `FAPI_MOCK=1` runs a mock provider. |
+| [`fido2/`](fido2/) | `cargo run -p axess-example-fido2` | **Passkeys and security keys (FIDO2 / WebAuthn).** Browser-side JavaScript and the server behind it: passkey, security-key and attested registration, username-first and passwordless sign-in, a passkey on another device (cross-device authentication), and a step-up the page runs when a Cedar policy answers `step_up_required`. In memory, no database. |
 | [`workload-identity/`](workload-identity/) | `cargo test -p axess-example-workload-identity` | **Machine callers.** Recipes for GitHub Actions and Kubernetes service accounts, and, as the last resort for a caller with no identity of its own, signed requests over a shared secret. Each recipe is tested. |
 | | `cargo run -p axess-example-workload-identity --bin local-idp` | **An in-process identity provider** minting workload JWTs from a file-backed, rotating key store, for flows without a real IdP. |
+| | `cargo run -p axess-example-workload-identity --bin spire` | **A workload on a SPIRE node.** It takes its X.509 and JWT SVIDs from the local agent's socket and follows the agent's rotation. Needs a SPIRE agent. |
 
 ## Which one should I look at?
 
@@ -24,11 +26,20 @@ you are building:
 - **"I want to add access control / permissions"** → `authz/`
 - **"I want Google or any OIDC single sign-on"** → `oauth/`
 - **"I want Login with GitHub (or another non-OIDC provider)"** → `oauth/`, `--bin social`
+- **"I want passkeys, or a hardware key as a second step"** → `fido2/`
+- **"I want a sensitive action to ask for a stronger login first"** → `fido2/`
 - **"I need financial-grade security (PSD2, Open Banking)"** → `fapi/`
 - **"I want CI or Kubernetes workloads to call my service"** → `workload-identity/`
 - **"An internal job or relay can only be given a secret"** → `workload-identity/src/shared_secret.rs`, after reading why it is the last resort
 - **"I need an IdP for integration tests"** → `workload-identity/`, `--bin local-idp`
+- **"My workload gets its identity from a SPIRE agent"** → `workload-identity/`, `--bin spire`
 - **"I want to combine them"** → read them independently, then combine
+
+The `sqlite/` and `fapi/` examples run their authentication service under
+`SecurityProfile::Strict` (`axess::profile`), applied before their own
+settings so those stay as written; read `docs/production/strict-profile.md`
+for each value and why. The `oauth/` example refuses to provision a user
+whose e-mail address the provider did not verify.
 
 ## Running
 
@@ -59,7 +70,8 @@ let client = Client::new(config, None, None, None);
 client.init().await?;
 
 let session_store = ValkeySessionStore::new(client.clone(), encryption_key);
-let registry = ValkeySessionRegistry::new(client);
+// The registry refuses to start on a server that does not run scripts.
+let registry = ValkeySessionRegistry::new(client).await?;
 let authn = AuthnService::builder(identity, factors)
     .with_registry(registry.clone())
     .build();

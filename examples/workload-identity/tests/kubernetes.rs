@@ -4,8 +4,10 @@
 //! generic `WorkloadResolver` with `k8s_sa_mapper`, and asserts the
 //! produced `Principal::Workload` matches the claims.
 
-mod common;
+mod signing;
+mod verifier;
 
+use axess_clock::testing::MockClock;
 use axess_example_workload_identity::kubernetes::{K8sCustomClaims, k8s_sa_mapper};
 use axess_factors::federation::workload::WorkloadResolver;
 use axess_identity::{Issuer, Principal, PrincipalResolver, TenantId, TrustDomain};
@@ -41,16 +43,17 @@ fn k8s_claims(now: i64, exp: i64) -> serde_json::Value {
 
 #[tokio::test]
 async fn recipe_resolves_real_k8s_shape_token() {
-    let (der, jwks) = common::rsa_keypair("k8s-1");
-    let (now, exp) = common::now_and_exp();
-    let token = common::sign(&k8s_claims(now, exp), "k8s-1", &der);
-    let verifier = common::build_verifier(jwks, ISSUER, AUDIENCE);
+    let clock = MockClock::at_reference();
+    let (der, jwks) = signing::rsa_keypair("k8s-1");
+    let (now, exp) = signing::now_and_exp();
+    let token = signing::sign(&k8s_claims(now, exp), "k8s-1", &der);
+    let verifier = verifier::build_verifier(&clock, jwks, ISSUER, AUDIENCE);
     let trust = TrustDomain::new(TRUST_DOMAIN).unwrap();
 
     let resolver = WorkloadResolver::<K8sCustomClaims, _, _>::new(
         verifier,
         trust.clone(),
-        |_slug: &str| Some(sample_tenant()),
+        |_: &str| Some(sample_tenant()),
         Issuer::custom("kubernetes").unwrap(),
         token,
         k8s_sa_mapper(),
@@ -85,11 +88,12 @@ async fn recipe_resolves_real_k8s_shape_token() {
 
 #[tokio::test]
 async fn recipe_resolves_minimal_token_without_pod_block() {
+    let clock = MockClock::at_reference();
     // The pod block is optional in `K8sCustomClaims`. Tokens issued
     // by clusters that don't project pod info should still resolve.
-    let (der, jwks) = common::rsa_keypair("k8s-min");
-    let (now, exp) = common::now_and_exp();
-    let token = common::sign(
+    let (der, jwks) = signing::rsa_keypair("k8s-min");
+    let (now, exp) = signing::now_and_exp();
+    let token = signing::sign(
         &serde_json::json!({
             "iss": ISSUER,
             "sub": "system:serviceaccount:default:lonely",
@@ -104,13 +108,13 @@ async fn recipe_resolves_minimal_token_without_pod_block() {
         "k8s-min",
         &der,
     );
-    let verifier = common::build_verifier(jwks, ISSUER, AUDIENCE);
+    let verifier = verifier::build_verifier(&clock, jwks, ISSUER, AUDIENCE);
     let trust = TrustDomain::new(TRUST_DOMAIN).unwrap();
 
     let resolver = WorkloadResolver::<K8sCustomClaims, _, _>::new(
         verifier,
         trust.clone(),
-        |_slug: &str| Some(sample_tenant()),
+        |_: &str| Some(sample_tenant()),
         Issuer::custom("kubernetes").unwrap(),
         token,
         k8s_sa_mapper(),
@@ -139,21 +143,22 @@ async fn recipe_resolves_minimal_token_without_pod_block() {
 
 #[tokio::test]
 async fn wrong_issuer_rejected_before_mapper_runs() {
+    let clock = MockClock::at_reference();
     // JWT carries the right shape but is signed by a different
     // issuer. `JwtVerifier` rejects on the `iss` check before the
     // mapper ever runs; defense at the right layer.
-    let (der, jwks) = common::rsa_keypair("k8s-bad");
-    let (now, exp) = common::now_and_exp();
+    let (der, jwks) = signing::rsa_keypair("k8s-bad");
+    let (now, exp) = signing::now_and_exp();
     let mut claims = k8s_claims(now, exp);
     claims["iss"] = serde_json::json!("https://attacker.example");
-    let token = common::sign(&claims, "k8s-bad", &der);
-    let verifier = common::build_verifier(jwks, ISSUER, AUDIENCE);
+    let token = signing::sign(&claims, "k8s-bad", &der);
+    let verifier = verifier::build_verifier(&clock, jwks, ISSUER, AUDIENCE);
     let trust = TrustDomain::new(TRUST_DOMAIN).unwrap();
 
     let resolver = WorkloadResolver::<K8sCustomClaims, _, _>::new(
         verifier,
         trust.clone(),
-        |_slug: &str| Some(sample_tenant()),
+        |_: &str| Some(sample_tenant()),
         Issuer::custom("kubernetes").unwrap(),
         token,
         k8s_sa_mapper(),
@@ -166,21 +171,22 @@ async fn wrong_issuer_rejected_before_mapper_runs() {
 }
 
 async fn resolve_pinned(
+    clock: &MockClock,
     edit: impl FnOnce(&mut serde_json::Value),
     pins: axess_example_workload_identity::kubernetes::SaUidPins,
 ) -> Result<Principal, axess_identity::IdentityError> {
     use axess_example_workload_identity::kubernetes::k8s_sa_mapper_pinned;
-    let (der, jwks) = common::rsa_keypair("k8s-pin");
-    let (now, exp) = common::now_and_exp();
+    let (der, jwks) = signing::rsa_keypair("k8s-pin");
+    let (now, exp) = signing::now_and_exp();
     let mut claims = k8s_claims(now, exp);
     edit(&mut claims);
-    let token = common::sign(&claims, "k8s-pin", &der);
-    let verifier = common::build_verifier(jwks, ISSUER, AUDIENCE);
+    let token = signing::sign(&claims, "k8s-pin", &der);
+    let verifier = verifier::build_verifier(clock, jwks, ISSUER, AUDIENCE);
     let trust = TrustDomain::new(TRUST_DOMAIN).unwrap();
     WorkloadResolver::<K8sCustomClaims, _, _>::new(
         verifier,
         trust.clone(),
-        |_slug: &str| Some(sample_tenant()),
+        |_: &str| Some(sample_tenant()),
         Issuer::custom("kubernetes").unwrap(),
         token,
         k8s_sa_mapper_pinned(pins),
@@ -192,15 +198,17 @@ async fn resolve_pinned(
 #[tokio::test]
 async fn pinned_mapper_refuses_a_recreated_service_account() {
     use axess_example_workload_identity::kubernetes::SaUidPins;
+    let clock = MockClock::at_reference();
     let pins = SaUidPins::new().pin(
         "tenant-acme",
         "billing-api",
         "11111111-2222-3333-4444-555555555555",
     );
-    assert!(resolve_pinned(|_| {}, pins.clone()).await.is_ok());
+    assert!(resolve_pinned(&clock, |_| {}, pins.clone()).await.is_ok());
 
     // Same namespace and name, new UID: the account was deleted and recreated.
     let recreated = resolve_pinned(
+        &clock,
         |c| c["kubernetes.io"]["serviceaccount"]["uid"] = serde_json::json!("ffff"),
         pins.clone(),
     )
@@ -209,6 +217,7 @@ async fn pinned_mapper_refuses_a_recreated_service_account() {
 
     // No UID claim at all.
     let no_uid = resolve_pinned(
+        &clock,
         |c| {
             c["kubernetes.io"]["serviceaccount"]
                 .as_object_mut()
@@ -221,5 +230,9 @@ async fn pinned_mapper_refuses_a_recreated_service_account() {
     assert!(no_uid.is_err(), "{no_uid:?}");
 
     // An account nobody pinned.
-    assert!(resolve_pinned(|_| {}, SaUidPins::new()).await.is_err());
+    assert!(
+        resolve_pinned(&clock, |_| {}, SaUidPins::new())
+            .await
+            .is_err()
+    );
 }

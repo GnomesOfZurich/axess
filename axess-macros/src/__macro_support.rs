@@ -59,17 +59,25 @@ pub fn refusal(
     }
 }
 
-/// Whether `require_authz!` must refuse because the policies read `context`
-/// and no `RequestContextProvider` extension is installed; logs the refusal
-/// at error level when it must.
+/// Whether `require_authz!` must refuse because the policies in force read
+/// `context` and the installation holds no context provider; logs the
+/// refusal at error level when it must. The caller asks only for an
+/// installation without a provider.
+///
+/// `AuthzInstallation::new` refuses such a pair where the installation is
+/// built, which covers the policies known at that moment. This refusal is
+/// for what a reload can change afterwards: the installation holds the
+/// store by `Arc`, a reload replaces the set behind it, and a set that
+/// begins to read `context` then meets an installation built without a
+/// provider. That is the only way here, and it is decided per request
+/// because the next reload can take the read out again.
 ///
 /// Such a policy set would decide on an empty context: a rule that requires
 /// `context.mfa_verified` denies every request, and a `forbid` written as
 /// `context has mfa_verified && !context.mfa_verified` stops matching, so the
-/// `permit` beside it allows. Either is almost always a missing or mistyped
-/// `Extension<Arc<dyn RequestContextProvider>>`, so the gate answers 500 as
-/// it does for a missing `PolicyStore`. A store that never reads `context`
-/// keeps the empty-context path.
+/// `permit` beside it allows. The gate answers 500, as it does without an
+/// installation. A store that does not read `context` keeps the
+/// empty-context path.
 pub fn refuse_without_context_provider(
     store: &axess_core::authz::PolicyStore,
     action: &str,
@@ -80,9 +88,9 @@ pub fn refuse_without_context_provider(
     crate::tracing::error!(
         macro_name = "require_authz!",
         action,
-        "missing RequestContextProvider extension while the policies read `context`; \
-         install Extension(Arc<dyn RequestContextProvider>) earlier in the middleware chain \
-         (the trait object, not the concrete provider type)"
+        "the policies in force read `context` and the AuthzInstallation holds no \
+         RequestContextProvider (a policy reload brought the read in after it was built); \
+         build the AuthzInstallation with a context provider"
     );
     true
 }
@@ -294,6 +302,16 @@ pub fn build_uids(
     Ok((principal, action, resource))
 }
 
+/// The characters a value under a template's only placeholder may not
+/// hold: the separators a template with several placeholders puts between
+/// them. An id with one placeholder has fixed text around its value and
+/// cannot be misread within its own template, but another route of the
+/// same resource type may split the id with one of these, and `Doc:{id}`
+/// with `t1/x` would then be the resource `Doc:{$tenant}/{id}` renders
+/// for `t1` and `x`. Keeping these out of a single value keeps the two
+/// layouts apart.
+const SINGLE_VALUE_SEPARATORS: &str = "/:";
+
 /// Why an id built from `id_template` and `params` could be read back as a
 /// different set of values, or `None` when it cannot.
 ///
@@ -303,8 +321,10 @@ pub fn build_uids(
 /// template's literal text uses as a separator: then a value ends exactly
 /// where a separator character begins. Without that, tenant `t1` with id
 /// `a/b` and tenant `t1/a` with id `b` both give `t1/a/b` under
-/// `{$tenant}/{id}`. An id with one placeholder has fixed text around its
-/// value and needs no check.
+/// `{$tenant}/{id}`. An id with one placeholder may not hold
+/// [`SINGLE_VALUE_SEPARATORS`], so it never equals an id another template
+/// of the same type builds from several values. A template that opens a
+/// placeholder and never closes it is ambiguous too, not a literal brace.
 fn ambiguous_id(id_template: &str, params: &HashMap<String, String>) -> Option<String> {
     let mut names: Vec<&str> = Vec::new();
     let mut separators = String::new();
@@ -313,27 +333,34 @@ fn ambiguous_id(id_template: &str, params: &HashMap<String, String>) -> Option<S
     while let Some(open) = rest.find('{') {
         separators.push_str(&rest[..open]);
         let after = &rest[open + 1..];
-        let close = after.find('}')?;
+        let Some(close) = after.find('}') else {
+            return Some("opens a placeholder it never closes".to_string());
+        };
         names.push(&after[..close]);
         rest = &after[close + 1..];
         touching |= rest.starts_with('{');
     }
     separators.push_str(rest);
-    if names.len() < 2 {
-        return None;
-    }
     if touching {
         return Some(
             "puts two placeholders next to each other; put a literal separator between them"
                 .to_string(),
         );
     }
+    let (separators, which) = if names.len() < 2 {
+        (
+            SINGLE_VALUE_SEPARATORS.to_string(),
+            "`/` or `:`, which templates of several placeholders use as separators",
+        )
+    } else {
+        (separators, "a separator character of the template")
+    };
     names.iter().find_map(|name| {
         let value = params.get(*name)?;
         value
             .chars()
             .any(|c| separators.contains(c))
-            .then(|| format!("cannot take the value of `{name}`: it holds a separator character of the template, so the id could be read as other values"))
+            .then(|| format!("cannot take the value of `{name}`: it holds {which}, so the id could be read as other values"))
     })
 }
 
@@ -410,195 +437,4 @@ pub fn interpolate_path_params(template: &str, params: &HashMap<String, String>)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const GUARDED_SCHEMA: &str = r#"{"App": {"entityTypes": {"User": {}, "Doc": {}},
-        "actions": {"View": {"appliesTo": {"principalTypes": ["User"],
-        "resourceTypes": ["Doc"], "context": {"type": "Record",
-        "attributes": {"mfa": {"type": "Boolean", "required": false}}}}}}}}"#;
-
-    #[test]
-    fn a_missing_context_provider_is_refused_only_when_policies_read_the_context() {
-        let guarded = axess_core::authz::PolicyStore::from_text(
-            "permit(principal, action, resource) when { context has mfa && context.mfa };",
-            GUARDED_SCHEMA,
-        )
-        .unwrap();
-        let plain = axess_core::authz::PolicyStore::from_text(
-            "permit(principal, action, resource);",
-            GUARDED_SCHEMA,
-        )
-        .unwrap();
-
-        assert!(!refuse_without_context_provider(&plain, "View"));
-        assert!(refuse_without_context_provider(&guarded, "View"));
-        assert!(refuse_without_context_provider(&guarded, "View"));
-    }
-
-    #[test]
-    fn unicode_escape_in_user_id_stays_data() {
-        let p = params(&[("id", "x")]);
-        let (principal, _, _) =
-            build_uids("App", "Read", "Doc:{id}", &p, r"al\u{69}ce", "t1").unwrap();
-        assert_eq!(principal.id().unescaped(), r"al\u{69}ce");
-        assert_ne!(principal.id().unescaped(), "alice");
-    }
-
-    #[test]
-    fn quote_and_escape_in_path_param_stay_data() {
-        let p = params(&[("id", r#"a" } \u{41}"#)]);
-        let (_, _, resource) = build_uids("App", "Read", "Doc:{id}", &p, "u1", "t1").unwrap();
-        assert_eq!(resource.id().unescaped(), r#"a" } \u{41}"#);
-        assert_eq!(resource.type_name().to_string(), "App::Doc");
-    }
-
-    #[test]
-    fn colon_in_param_does_not_move_the_split() {
-        let p = params(&[("id", "Admin:1")]);
-        let (_, _, resource) = build_uids("App", "Read", "Doc:{id}", &p, "u1", "t1").unwrap();
-        assert_eq!(resource.type_name().to_string(), "App::Doc");
-        assert_eq!(resource.id().unescaped(), "Admin:1");
-    }
-
-    #[test]
-    fn namespaced_type_keeps_its_whole_namespace() {
-        let p = params(&[("id", "d1")]);
-        let (_, _, r) = build_uids("Gnomes", "Read", "Sub::Document:{id}", &p, "u1", "t1").unwrap();
-        assert_eq!(r.type_name().to_string(), "Gnomes::Sub::Document");
-        assert_eq!(r.id().unescaped(), "d1");
-    }
-
-    #[test]
-    fn two_level_namespace_argument_is_kept() {
-        let p = params(&[("id", "d1")]);
-        let (principal, action, r) =
-            build_uids("Gnomes::Sub", "Read", "Document:{id}", &p, "u1", "t1").unwrap();
-        assert_eq!(r.type_name().to_string(), "Gnomes::Sub::Document");
-        assert_eq!(principal.type_name().to_string(), "Gnomes::Sub::User");
-        assert_eq!(action.type_name().to_string(), "Gnomes::Sub::Action");
-    }
-
-    #[test]
-    fn path_value_with_double_colon_or_quote_cannot_change_the_type() {
-        for value in ["Admin::Root", r#"x"::A::"y"#, "A::B:C", "::"] {
-            let p = params(&[("id", value)]);
-            let (_, _, r) = build_uids("App", "Read", "Doc:{id}", &p, "u1", "t1").unwrap();
-            assert_eq!(r.type_name().to_string(), "App::Doc", "{value}");
-            assert_eq!(r.id().unescaped(), value);
-        }
-    }
-
-    #[test]
-    fn placeholder_in_the_type_position_is_refused() {
-        let p = params(&[("kind", "Admin"), ("id", "1")]);
-        assert!(build_uids("App", "Read", "{kind}:{id}", &p, "u1", "t1").is_err());
-        assert!(build_uids("App", "Read", "Pre{kind}:{id}", &p, "u1", "t1").is_err());
-        assert!(build_uids("App", "Read", "Doc:{id}", &p, "u1", "t1").is_ok());
-    }
-
-    #[test]
-    fn parameterless_template_builds_from_the_attribute_alone() {
-        let (_, _, r) =
-            build_uids("App", "Manage", "Platform:global", &params(&[]), "u1", "t1").unwrap();
-        assert_eq!(r.type_name().to_string(), "App::Platform");
-        assert_eq!(r.id().unescaped(), "global");
-    }
-
-    #[test]
-    fn const_check_accepts_literal_types_and_ids_with_placeholders() {
-        const _: () = assert_resource_type_is_literal("Doc:{id}");
-        const _: () = assert_resource_type_is_literal("Sub::Doc:{id}");
-        const _: () = assert_resource_type_is_literal("Platform:global");
-        assert_eq!(type_id_separator("A::B:c"), Some(4));
-        assert_eq!(type_id_separator("A::B"), None);
-    }
-
-    #[test]
-    fn unknown_placeholder_is_refused() {
-        assert!(build_uids("App", "Read", "Doc:{id}", &params(&[]), "u1", "t1").is_err());
-    }
-
-    #[test]
-    fn template_without_colon_is_refused() {
-        assert!(build_uids("App", "Read", "Doc", &params(&[]), "u1", "t1").is_err());
-    }
-
-    #[test]
-    fn session_placeholders_come_from_the_session_not_the_route() {
-        let p = params(&[("id", "d1"), ("$tenant", "evil")]);
-        let (_, _, r) = build_uids("App", "Read", "Doc:{$tenant}/{id}", &p, "u1", "t1").unwrap();
-        assert_eq!(r.id().unescaped(), "t1/d1");
-        let (_, _, r) = build_uids(
-            "App",
-            "Read",
-            "Doc:{$tenant}:{$user}",
-            &params(&[]),
-            "u1",
-            "t1",
-        )
-        .unwrap();
-        assert_eq!(r.id().unescaped(), "t1:u1");
-    }
-
-    /// Two request values joined by a literal can be re-split by the caller,
-    /// so the template is refused.
-    #[test]
-    fn two_path_placeholders_in_one_id_are_refused() {
-        let p = params(&[("a", "x/y"), ("b", "z")]);
-        assert!(build_uids("App", "Read", "Doc:{a}/{b}", &p, "u1", "t1").is_err());
-        assert!(build_uids("App", "Read", "Doc:{a}", &p, "u1", "t1").is_ok());
-    }
-
-    #[test]
-    fn const_check_counts_only_path_placeholders() {
-        const _: () = assert_one_path_placeholder("Doc:{id}");
-        const _: () = assert_one_path_placeholder("Doc:{$tenant}/{id}");
-        const _: () = assert_one_path_placeholder("Platform:global");
-    }
-
-    fn params(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs
-            .iter()
-            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
-            .collect()
-    }
-
-    #[test]
-    fn substitutes_single_placeholder() {
-        let p = params(&[("id", "abc-123")]);
-        assert_eq!(interpolate_path_params("Ledger:{id}", &p), "Ledger:abc-123");
-    }
-
-    #[test]
-    fn substitutes_multiple_placeholders() {
-        let p = params(&[("tenant", "t1"), ("id", "x")]);
-        assert_eq!(interpolate_path_params("Doc:{tenant}/{id}", &p), "Doc:t1/x");
-    }
-
-    #[test]
-    fn leaves_unknown_placeholder_literal() {
-        let p = params(&[]);
-        assert_eq!(
-            interpolate_path_params("Ledger:{id}", &p),
-            "Ledger:{id}",
-            "missing key should leave placeholder literal so Cedar parse fails loudly"
-        );
-    }
-
-    #[test]
-    fn handles_no_placeholders() {
-        let p = params(&[]);
-        assert_eq!(interpolate_path_params("Platform", &p), "Platform");
-    }
-
-    #[test]
-    fn handles_unmatched_open_brace() {
-        let p = params(&[]);
-        assert_eq!(
-            interpolate_path_params("Bad:{unterm", &p),
-            "Bad:{unterm",
-            "unmatched '{{' preserved literally"
-        );
-    }
-}
+mod macro_support_tests;

@@ -5,6 +5,9 @@
 //! trait methods on [`OAuthProviderConfig`](super::OAuthProviderConfig)
 //! are thin wrappers that delegate here.
 
+/// Longest refusal text kept from the token endpoint's `error_description`.
+const MAX_DENIAL_BYTES: usize = 512;
+
 use super::super::types::{
     DeviceAuthResponse, DeviceTokenOutcome, DpopKey, DpopSigner, OAuthError,
 };
@@ -51,10 +54,9 @@ pub(super) async fn request_device_code(
         })?;
 
     if !status.is_success() {
-        let error_code = serde_json::from_slice::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|v| v.get("error")?.as_str().map(String::from))
-            .unwrap_or_else(|| format!("HTTP {status}"));
+        // The code is the IdP's text and is logged: escaped and cut, as
+        // every other upstream error text.
+        let error_code = crate::http_body::log_safe_error_code(&body, status);
         tracing::warn!(
             status = status.as_u16(),
             error_code = %error_code,
@@ -64,7 +66,10 @@ pub(super) async fn request_device_code(
     }
 
     serde_json::from_slice(&body).map_err(|e| {
-        OAuthError::DeviceAuthorization(format!("failed to parse device response: {e}"))
+        OAuthError::DeviceAuthorization(format!(
+            "failed to parse device response: {}",
+            crate::remote_text::parse_error(&e)
+        ))
     })
 }
 
@@ -106,7 +111,10 @@ pub(super) async fn poll_device_token(
         // Token granted; extract claims from the ID token.
         let token_response: openidconnect::core::CoreTokenResponse = serde_json::from_slice(&body)
             .map_err(|e| {
-                OAuthError::TokenExchange(format!("failed to parse token response: {e}"))
+                OAuthError::TokenExchange(format!(
+                    "failed to parse token response: {}",
+                    crate::remote_text::parse_error(&e)
+                ))
             })?;
         if let Some(signer) = dpop {
             OAuthProviderConfig::check_bound_response(&token_response, signer.key)?;
@@ -138,17 +146,15 @@ pub(super) async fn poll_device_token(
         return Err(OAuthError::transient(Some(status.as_u16())));
     }
 
-    // Check for standard OAuth error codes.
-    let error: serde_json::Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!("device token poll: invalid JSON in error response: {e}");
-            serde_json::Value::Null
-        }
-    };
-    let error_code = error.get("error").and_then(|v| v.as_str()).unwrap_or("");
+    // Check for standard OAuth error codes, read member by member so a long
+    // description, before the code or after it, does not cost the code.
+    let error_code = crate::http_body::string_member(&body, "error");
+    if error_code.is_none() {
+        tracing::warn!("device token poll: the error response carries no `error` code");
+    }
+    let error_code = error_code.unwrap_or_default();
 
-    match error_code {
+    match error_code.as_str() {
         "authorization_pending" => Ok(DeviceTokenOutcome::Pending),
         // RFC 8628 §3.5: distinct outcome so the caller can
         // increase its polling interval. The new interval is the prior
@@ -156,12 +162,13 @@ pub(super) async fn poll_device_token(
         "slow_down" => Ok(DeviceTokenOutcome::SlowDown {
             new_interval: current_interval.saturating_add(5),
         }),
-        _ => Ok(DeviceTokenOutcome::Denied(
-            error
-                .get("error_description")
-                .and_then(|v| v.as_str())
-                .unwrap_or(error_code)
-                .to_string(),
-        )),
+        // The text is the IdP's and is usually logged or shown: control
+        // characters and the Unicode line separators are escaped and the
+        // text is cut, as every other upstream error text.
+        _ => Ok(DeviceTokenOutcome::Denied(crate::http_body::log_safe(
+            &crate::http_body::string_member(&body, "error_description")
+                .unwrap_or_else(|| error_code.clone()),
+            MAX_DENIAL_BYTES,
+        ))),
     }
 }

@@ -15,4 +15,7 @@
 //! constructor surface (`new<R: SecureRng>`, `from_uuid`,
 //! `from_namespaced_str`, `from_bytes`, `try_new`).
 
-pub use axess_identity::{DeviceId, EventId, SessionId, TenantId, UserId};
+pub use axess_identity::{
+    DeviceId, EventId, SESSION_KEY_DOMAIN, SessionId, SessionKey, SessionKeyError,
+    SessionKeyPrefix, TenantId, UserId,
+};

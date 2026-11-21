@@ -1,5 +1,6 @@
 use super::*;
 use crate::device::types::DeviceBinding;
+use axess_clock::testing::Shift;
 
 fn t() -> TenantId {
     axess_identity::testing::tenant("tenant-1")
@@ -9,7 +10,7 @@ fn u() -> UserId {
     axess_identity::testing::user("user-1")
 }
 
-fn d(id: &str, fp: u8, last_seen: DateTime<Utc>) -> Device {
+fn d(id: &str, fp: u8, last_seen: Timestamp) -> Device {
     Device {
         id: axess_identity::testing::device(id),
         tenant_id: t(),
@@ -27,7 +28,11 @@ fn d(id: &str, fp: u8, last_seen: DateTime<Utc>) -> Device {
 #[tokio::test]
 async fn save_then_load_round_trips() {
     let store = MemoryDeviceStore::new();
-    let device = d("dev-1", 0xaa, whole_second(Utc::now()));
+    let device = d(
+        "dev-1",
+        0xaa,
+        whole_second(axess_clock::testing::MockClock::reference_time()),
+    );
     store
         .save(&device, crate::device::test_now())
         .await
@@ -40,7 +45,7 @@ async fn save_then_load_round_trips() {
 #[tokio::test]
 async fn find_by_fingerprint_is_tenant_scoped() {
     let store = MemoryDeviceStore::new();
-    let now = whole_second(Utc::now());
+    let now = whole_second(axess_clock::testing::MockClock::reference_time());
     store
         .save(&d("dev-1", 0xaa, now), crate::device::test_now())
         .await
@@ -66,9 +71,17 @@ async fn find_by_fingerprint_is_tenant_scoped() {
 #[tokio::test]
 async fn find_for_user_returns_newest_first_and_respects_limit() {
     let store = MemoryDeviceStore::new();
-    let t0 = whole_second(Utc::now());
-    let older = d("dev-old", 0x11, t0 - chrono::Duration::days(2));
-    let newer = d("dev-new", 0x22, t0 - chrono::Duration::hours(1));
+    let t0 = whole_second(axess_clock::testing::MockClock::reference_time());
+    let older = d(
+        "dev-old",
+        0x11,
+        t0.minus(axess_clock::SignedDuration::days(2)),
+    );
+    let newer = d(
+        "dev-new",
+        0x22,
+        t0.minus(axess_clock::SignedDuration::hours(1)),
+    );
     store.save(&older, crate::device::test_now()).await.unwrap();
     store.save(&newer, crate::device::test_now()).await.unwrap();
 
@@ -84,14 +97,14 @@ async fn find_for_user_returns_newest_first_and_respects_limit() {
 #[tokio::test]
 async fn record_sighting_touches_last_seen() {
     let store = MemoryDeviceStore::new();
-    let initial = whole_second(Utc::now());
+    let initial = whole_second(axess_clock::testing::MockClock::reference_time());
     let device = d("dev-1", 0xaa, initial);
     store
         .save(&device, crate::device::test_now())
         .await
         .unwrap();
 
-    let later = initial + chrono::Duration::hours(1);
+    let later = initial.plus(axess_clock::SignedDuration::hours(1));
     store
         .record_sighting(&t(), &device.id, later)
         .await
@@ -105,14 +118,14 @@ async fn record_sighting_touches_last_seen() {
 #[tokio::test]
 async fn set_trust_level_to_revoked_stamps_revoked_at() {
     let store = MemoryDeviceStore::new();
-    let now = whole_second(Utc::now());
+    let now = whole_second(axess_clock::testing::MockClock::reference_time());
     let device = d("dev-1", 0xaa, now);
     store
         .save(&device, crate::device::test_now())
         .await
         .unwrap();
 
-    let revoked_at = now + chrono::Duration::minutes(5);
+    let revoked_at = now.plus(axess_clock::SignedDuration::minutes(5));
     store
         .set_trust_level(&t(), &device.id, DeviceTrustLevel::Revoked, revoked_at)
         .await
@@ -129,7 +142,7 @@ async fn set_trust_level_to_non_revoked_clears_revoked_at() {
     // otherwise a stale timestamp lingers and downstream filters
     // ("active devices = revoked_at IS NULL") quietly miss the row.
     let store = MemoryDeviceStore::new();
-    let now = whole_second(Utc::now());
+    let now = whole_second(axess_clock::testing::MockClock::reference_time());
     let device = d("dev-1", 0xaa, now);
     store
         .save(&device, crate::device::test_now())
@@ -153,7 +166,11 @@ async fn set_trust_level_to_non_revoked_clears_revoked_at() {
 #[tokio::test]
 async fn delete_removes_both_primary_and_fingerprint_index() {
     let store = MemoryDeviceStore::new();
-    let device = d("dev-1", 0xaa, whole_second(Utc::now()));
+    let device = d(
+        "dev-1",
+        0xaa,
+        whole_second(axess_clock::testing::MockClock::reference_time()),
+    );
     store
         .save(&device, crate::device::test_now())
         .await
@@ -180,7 +197,7 @@ async fn len_and_is_empty_track_save_and_delete() {
     assert_eq!(store.len(), 0);
     assert!(store.is_empty());
 
-    let now = whole_second(Utc::now());
+    let now = whole_second(axess_clock::testing::MockClock::reference_time());
     store
         .save(&d("dev-1", 0xaa, now), crate::device::test_now())
         .await
@@ -219,7 +236,7 @@ async fn find_for_user_filters_out_cross_tenant_rows_for_same_user_id() {
     // covers the fingerprint index; this asserts the tenant
     // boundary on the `find_for_user` listing path.
     let store = MemoryDeviceStore::new();
-    let now = whole_second(Utc::now());
+    let now = whole_second(axess_clock::testing::MockClock::reference_time());
     let other_tenant = axess_identity::testing::tenant("tenant-2");
 
     // tenant-1: real device for u.
@@ -254,11 +271,18 @@ async fn find_for_user_filters_out_cross_tenant_rows_for_same_user_id() {
     );
 }
 
+/// A sweep with no row to move answers zero counts: an answer, not a
+/// refusal.
 #[tokio::test]
-async fn sweep_default_returns_zero_counts() {
-    // The trait default is intentionally a no-op (backends override).
+async fn a_sweep_of_an_empty_store_answers_zero_counts() {
     let store = MemoryDeviceStore::new();
-    let counts = store.sweep(&t(), whole_second(Utc::now())).await.unwrap();
+    let counts = store
+        .sweep(
+            &t(),
+            whole_second(axess_clock::testing::MockClock::reference_time()),
+        )
+        .await
+        .unwrap();
     assert_eq!(counts, SweepCounts::default());
 }
 
@@ -270,7 +294,7 @@ async fn sweep_default_returns_zero_counts() {
 #[tokio::test]
 async fn find_active_for_user_excludes_revoked_devices() {
     let store = MemoryDeviceStore::new();
-    let now = whole_second(Utc::now());
+    let now = whole_second(axess_clock::testing::MockClock::reference_time());
 
     let mut trusted = d("dev-trusted", 0xaa, now);
     trusted.trust_level = DeviceTrustLevel::Trusted;
@@ -309,14 +333,14 @@ async fn find_active_for_user_excludes_revoked_devices() {
 #[test]
 fn sweep_config_builder_carries_setters_into_build() {
     let cfg = SweepConfig::builder()
-        .trusted_idle(chrono::Duration::days(7))
-        .seen_idle(chrono::Duration::days(3))
-        .revoked_grace(chrono::Duration::days(1))
+        .trusted_idle(std::time::Duration::from_hours(7 * 24))
+        .seen_idle(std::time::Duration::from_hours(3 * 24))
+        .revoked_grace(std::time::Duration::from_hours(24))
         .build()
         .unwrap();
-    assert_eq!(cfg.trusted_idle, chrono::Duration::days(7));
-    assert_eq!(cfg.seen_idle, chrono::Duration::days(3));
-    assert_eq!(cfg.revoked_grace, chrono::Duration::days(1));
+    assert_eq!(cfg.trusted_idle(), std::time::Duration::from_hours(7 * 24));
+    assert_eq!(cfg.seen_idle(), std::time::Duration::from_hours(3 * 24));
+    assert_eq!(cfg.revoked_grace(), std::time::Duration::from_hours(24));
     assert_ne!(
         cfg,
         SweepConfig::default(),
@@ -337,14 +361,14 @@ async fn with_sweep_config_overrides_default_windows() {
     // demote Trusted→Seen under the custom config; under the
     // default it would not.
     let tight = SweepConfig::builder()
-        .trusted_idle(chrono::Duration::seconds(1))
-        .seen_idle(chrono::Duration::days(30))
-        .revoked_grace(chrono::Duration::days(7))
+        .trusted_idle(std::time::Duration::from_secs(1))
+        .seen_idle(std::time::Duration::from_hours(30 * 24))
+        .revoked_grace(std::time::Duration::from_hours(7 * 24))
         .build()
         .unwrap();
     let store = MemoryDeviceStore::new().with_sweep_config(tight);
 
-    let t0 = whole_second(Utc::now());
+    let t0 = whole_second(axess_clock::testing::MockClock::reference_time());
     let mut device = d("dev-trusted", 0xaa, t0);
     device.trust_level = DeviceTrustLevel::Trusted;
     store
@@ -354,7 +378,7 @@ async fn with_sweep_config_overrides_default_windows() {
 
     // Sweep 2s later; past the 1s trusted window.
     let counts = store
-        .sweep(&t(), t0 + chrono::Duration::seconds(2))
+        .sweep(&t(), t0.plus(axess_clock::SignedDuration::seconds(2)))
         .await
         .unwrap();
     assert_eq!(
@@ -369,22 +393,26 @@ async fn with_sweep_config_overrides_default_windows() {
 /// and returns the right `SweepCounts`. Pins the comparison
 /// boundaries (`>` and `==` mutations), the `+=` counter
 /// arithmetic, the trust-level guards, and the tenant-scoping
-/// `!=` predicate at line 479.
+/// `!=` predicate.
 #[tokio::test]
 async fn sweep_walks_retention_ladder_and_counts_transitions() {
     let cfg = SweepConfig::builder()
-        .trusted_idle(chrono::Duration::days(1))
-        .seen_idle(chrono::Duration::days(1))
-        .revoked_grace(chrono::Duration::days(1))
+        .trusted_idle(std::time::Duration::from_hours(24))
+        .seen_idle(std::time::Duration::from_hours(24))
+        .revoked_grace(std::time::Duration::from_hours(24))
         .build()
         .unwrap();
     let store = MemoryDeviceStore::new().with_sweep_config(cfg);
-    let t0 = whole_second(Utc::now());
+    let t0 = whole_second(axess_clock::testing::MockClock::reference_time());
     let other_tenant = axess_identity::testing::tenant("tenant-other");
 
     // Trusted, idle 3 days → demote to Seen, and no further: a row moves
     // one level per sweep even though 3 days > trusted_idle + seen_idle.
-    let mut trusted = d("dev-trusted", 0xaa, t0 - chrono::Duration::days(3));
+    let mut trusted = d(
+        "dev-trusted",
+        0xaa,
+        t0.minus(axess_clock::SignedDuration::days(3)),
+    );
     trusted.trust_level = DeviceTrustLevel::Trusted;
     store
         .save(&trusted, crate::device::test_now())
@@ -392,14 +420,18 @@ async fn sweep_walks_retention_ladder_and_counts_transitions() {
         .unwrap();
 
     // Seen, idle 3 days → demote to Revoked.
-    let mut seen = d("dev-seen", 0xbb, t0 - chrono::Duration::days(3));
+    let mut seen = d(
+        "dev-seen",
+        0xbb,
+        t0.minus(axess_clock::SignedDuration::days(3)),
+    );
     seen.trust_level = DeviceTrustLevel::Seen;
     store.save(&seen, crate::device::test_now()).await.unwrap();
 
     // Revoked 2 days ago → past the 1-day grace → purge.
     let mut revoked_old = d("dev-revoked-old", 0xcc, t0);
     revoked_old.trust_level = DeviceTrustLevel::Revoked;
-    revoked_old.revoked_at = Some(t0 - chrono::Duration::days(2));
+    revoked_old.revoked_at = Some(t0.minus(axess_clock::SignedDuration::days(2)));
     store
         .save(&revoked_old, crate::device::test_now())
         .await
@@ -415,8 +447,12 @@ async fn sweep_walks_retention_ladder_and_counts_transitions() {
         .unwrap();
 
     // Different tenant, would-be-demoted; must be skipped by
-    // the `device.tenant_id != *tenant_id` guard on line 479.
-    let mut foreign = d("dev-foreign", 0xee, t0 - chrono::Duration::days(3));
+    // the `device.tenant_id != *tenant_id` guard.
+    let mut foreign = d(
+        "dev-foreign",
+        0xee,
+        t0.minus(axess_clock::SignedDuration::days(3)),
+    );
     foreign.tenant_id = other_tenant;
     foreign.trust_level = DeviceTrustLevel::Trusted;
     store
@@ -475,20 +511,24 @@ async fn sweep_walks_retention_ladder_and_counts_transitions() {
 
 /// Boundary: at exactly the window threshold the device is NOT
 /// transitioned. The predicate is strict `>`, not `>=`. Pins
-/// every `>` mutation on line 486 (trusted_idle window).
+/// every `>` mutation (trusted_idle window).
 #[tokio::test]
 async fn sweep_window_boundary_is_strict_greater() {
     let cfg = SweepConfig::builder()
-        .trusted_idle(chrono::Duration::seconds(60))
-        .seen_idle(chrono::Duration::seconds(60))
-        .revoked_grace(chrono::Duration::seconds(60))
+        .trusted_idle(std::time::Duration::from_secs(60))
+        .seen_idle(std::time::Duration::from_secs(60))
+        .revoked_grace(std::time::Duration::from_secs(60))
         .build()
         .unwrap();
     let store = MemoryDeviceStore::new().with_sweep_config(cfg);
-    let t0 = whole_second(Utc::now());
+    let t0 = whole_second(axess_clock::testing::MockClock::reference_time());
 
     // Last seen exactly 60s ago; sit right on the boundary.
-    let mut trusted = d("dev-edge", 0xab, t0 - chrono::Duration::seconds(60));
+    let mut trusted = d(
+        "dev-edge",
+        0xab,
+        t0.minus(axess_clock::SignedDuration::seconds(60)),
+    );
     trusted.trust_level = DeviceTrustLevel::Trusted;
     store
         .save(&trusted, crate::device::test_now())
@@ -503,7 +543,7 @@ async fn sweep_window_boundary_is_strict_greater() {
 
     // One second past (the comparison is on whole seconds); must demote.
     let counts = store
-        .sweep(&t(), t0 + chrono::Duration::seconds(1))
+        .sweep(&t(), t0.plus(axess_clock::SignedDuration::seconds(1)))
         .await
         .unwrap();
     assert_eq!(
@@ -513,7 +553,7 @@ async fn sweep_window_boundary_is_strict_greater() {
 }
 
 /// Strict-`>` boundary on the Seen→Revoked window. Pins
-/// `> → >=` on line 495. The cascade test above masks this
+/// `> → >=`. The cascade test above masks this
 /// because cascaded devices have already transitioned through
 /// Seen, so the `&&` arm is always satisfied. This test isolates
 /// the Seen-window boundary by starting the device already in
@@ -522,15 +562,19 @@ async fn sweep_window_boundary_is_strict_greater() {
 async fn sweep_seen_idle_boundary_is_strict_greater() {
     // A never-trusted Seen row is revoked past `seen_idle` = 60 s.
     let cfg = SweepConfig::builder()
-        .trusted_idle(chrono::Duration::seconds(1))
-        .seen_idle(chrono::Duration::seconds(60))
-        .revoked_grace(chrono::Duration::days(7))
+        .trusted_idle(std::time::Duration::from_secs(1))
+        .seen_idle(std::time::Duration::from_secs(60))
+        .revoked_grace(std::time::Duration::from_hours(7 * 24))
         .build()
         .unwrap();
     let store = MemoryDeviceStore::new().with_sweep_config(cfg);
-    let t0 = whole_second(Utc::now());
+    let t0 = whole_second(axess_clock::testing::MockClock::reference_time());
 
-    let mut seen = d("dev-seen-edge", 0xcd, t0 - chrono::Duration::seconds(60));
+    let mut seen = d(
+        "dev-seen-edge",
+        0xcd,
+        t0.minus(axess_clock::SignedDuration::seconds(60)),
+    );
     seen.trust_level = DeviceTrustLevel::Seen;
     store.save(&seen, crate::device::test_now()).await.unwrap();
 
@@ -541,28 +585,28 @@ async fn sweep_seen_idle_boundary_is_strict_greater() {
     );
 
     let counts = store
-        .sweep(&t(), t0 + chrono::Duration::seconds(1))
+        .sweep(&t(), t0.plus(axess_clock::SignedDuration::seconds(1)))
         .await
         .unwrap();
     assert_eq!(counts.seen_to_revoked, 1);
 }
 
 /// Strict-`>` boundary on the Revoked→Purge grace window.
-/// Pins `> → >=` on line 506.
+/// Pins `> → >=`.
 #[tokio::test]
 async fn sweep_revoked_grace_boundary_is_strict_greater() {
     let cfg = SweepConfig::builder()
-        .trusted_idle(chrono::Duration::days(365))
-        .seen_idle(chrono::Duration::days(365))
-        .revoked_grace(chrono::Duration::seconds(60))
+        .trusted_idle(std::time::Duration::from_hours(365 * 24))
+        .seen_idle(std::time::Duration::from_hours(365 * 24))
+        .revoked_grace(std::time::Duration::from_secs(60))
         .build()
         .unwrap();
     let store = MemoryDeviceStore::new().with_sweep_config(cfg);
-    let t0 = whole_second(Utc::now());
+    let t0 = whole_second(axess_clock::testing::MockClock::reference_time());
 
     let mut revoked = d("dev-revoked-edge", 0xef, t0);
     revoked.trust_level = DeviceTrustLevel::Revoked;
-    revoked.revoked_at = Some(t0 - chrono::Duration::seconds(60));
+    revoked.revoked_at = Some(t0.minus(axess_clock::SignedDuration::seconds(60)));
     store
         .save(&revoked, crate::device::test_now())
         .await
@@ -576,7 +620,7 @@ async fn sweep_revoked_grace_boundary_is_strict_greater() {
     assert!(store.load(&t(), &revoked.id).await.unwrap().is_some());
 
     let counts = store
-        .sweep(&t(), t0 + chrono::Duration::seconds(1))
+        .sweep(&t(), t0.plus(axess_clock::SignedDuration::seconds(1)))
         .await
         .unwrap();
     assert_eq!(counts.revoked_purged, 1);
@@ -592,17 +636,21 @@ async fn sweep_revoked_grace_boundary_is_strict_greater() {
 #[tokio::test]
 async fn sweep_seen_revoked_guard_requires_both_conditions() {
     let cfg = SweepConfig::builder()
-        .trusted_idle(chrono::Duration::days(365))
-        .seen_idle(chrono::Duration::seconds(60))
-        .revoked_grace(chrono::Duration::days(365))
+        .trusted_idle(std::time::Duration::from_hours(365 * 24))
+        .seen_idle(std::time::Duration::from_secs(60))
+        .revoked_grace(std::time::Duration::from_hours(365 * 24))
         .build()
         .unwrap();
     let store = MemoryDeviceStore::new().with_sweep_config(cfg);
-    let t0 = whole_second(Utc::now());
+    let t0 = whole_second(axess_clock::testing::MockClock::reference_time());
 
     // Already-Revoked device with stale last_seen. Elapsed
     // predicate is satisfied; level predicate is not.
-    let mut revoked = d("dev-stale-revoked", 0x99, t0 - chrono::Duration::days(2));
+    let mut revoked = d(
+        "dev-stale-revoked",
+        0x99,
+        t0.minus(axess_clock::SignedDuration::days(2)),
+    );
     revoked.trust_level = DeviceTrustLevel::Revoked;
     revoked.revoked_at = Some(t0);
     store
@@ -625,7 +673,7 @@ async fn sweep_seen_revoked_guard_requires_both_conditions() {
 #[tokio::test]
 async fn resave_with_new_fingerprint_drops_old_index_entry() {
     let store = MemoryDeviceStore::new();
-    let now = whole_second(Utc::now());
+    let now = whole_second(axess_clock::testing::MockClock::reference_time());
     store
         .save(&d("dev-1", 0xaa, now), crate::device::test_now())
         .await
@@ -658,7 +706,7 @@ async fn resave_with_new_fingerprint_drops_old_index_entry() {
 #[tokio::test]
 async fn delete_keeps_index_entry_owned_by_another_device() {
     let store = MemoryDeviceStore::new();
-    let now = whole_second(Utc::now());
+    let now = whole_second(axess_clock::testing::MockClock::reference_time());
     store
         .save(&d("dev-1", 0xaa, now), crate::device::test_now())
         .await
@@ -679,14 +727,18 @@ async fn delete_keeps_index_entry_owned_by_another_device() {
 #[tokio::test]
 async fn sweep_purge_keeps_index_entry_owned_by_another_device() {
     let cfg = SweepConfig::builder()
-        .revoked_grace(chrono::Duration::seconds(1))
+        .revoked_grace(std::time::Duration::from_secs(1))
         .build()
         .unwrap();
     let store = MemoryDeviceStore::new().with_sweep_config(cfg);
-    let t0 = whole_second(Utc::now());
-    let mut old = d("dev-old", 0xcc, t0 - chrono::Duration::days(1));
+    let t0 = whole_second(axess_clock::testing::MockClock::reference_time());
+    let mut old = d(
+        "dev-old",
+        0xcc,
+        t0.minus(axess_clock::SignedDuration::days(1)),
+    );
     old.trust_level = DeviceTrustLevel::Revoked;
-    old.revoked_at = Some(t0 - chrono::Duration::days(1));
+    old.revoked_at = Some(t0.minus(axess_clock::SignedDuration::days(1)));
     store.save(&old, crate::device::test_now()).await.unwrap();
     store
         .save(&d("dev-live", 0xcc, t0), crate::device::test_now())
@@ -706,16 +758,20 @@ async fn sweep_purge_keeps_index_entry_owned_by_another_device() {
 #[tokio::test]
 async fn find_active_for_user_applies_limit_after_dropping_revoked() {
     let store = MemoryDeviceStore::new();
-    let now = whole_second(Utc::now());
+    let now = whole_second(axess_clock::testing::MockClock::reference_time());
     store
         .save(
-            &d("active", 0x01, now - chrono::Duration::days(3)),
+            &d(
+                "active",
+                0x01,
+                now.minus(axess_clock::SignedDuration::days(3)),
+            ),
             crate::device::test_now(),
         )
         .await
         .unwrap();
     for (name, fp, age) in [("rev-1", 0x02, 1), ("rev-2", 0x03, 2)] {
-        let mut dev = d(name, fp, now - chrono::Duration::days(age));
+        let mut dev = d(name, fp, now.minus(axess_clock::SignedDuration::days(age)));
         dev.trust_level = DeviceTrustLevel::Revoked;
         store.save(&dev, crate::device::test_now()).await.unwrap();
     }
@@ -733,13 +789,21 @@ async fn find_active_for_user_applies_limit_after_dropping_revoked() {
     assert_eq!(all.len(), 1);
 }
 
-/// A store that implements only the required methods, so the trait's
-/// provided `claim_owner` is what runs.
+/// A store that implements only the required methods, each forwarded to
+/// the store beneath, so the trait's provided lookups are what run.
 #[derive(Clone, Default)]
-struct RequiredOnly(MemoryDeviceStore);
+struct RequiredOnly<S>(S);
 
-impl DeviceStore for RequiredOnly {
-    type Error = <MemoryDeviceStore as DeviceStore>::Error;
+impl<S: DeviceStore> DeviceStore for RequiredOnly<S> {
+    type Error = S::Error;
+
+    fn load_fresh(
+        &self,
+        t: &TenantId,
+        id: &DeviceId,
+    ) -> impl Future<Output = Result<Option<Device>, Self::Error>> + Send {
+        self.0.load_fresh(t, id)
+    }
 
     fn load(
         &self,
@@ -773,14 +837,14 @@ impl DeviceStore for RequiredOnly {
     fn save(
         &self,
         d: &Device,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         self.0.save(d, now)
     }
     fn create_or_find(
         &self,
         d: &Device,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<Device, Self::Error>> + Send {
         self.0.create_or_find(d, now)
     }
@@ -788,7 +852,7 @@ impl DeviceStore for RequiredOnly {
         &self,
         t: &TenantId,
         id: &DeviceId,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<DeviceTrustLevel, Self::Error>> + Send {
         self.0.record_sighting(t, id, now)
     }
@@ -797,9 +861,38 @@ impl DeviceStore for RequiredOnly {
         t: &TenantId,
         id: &DeviceId,
         level: DeviceTrustLevel,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         self.0.set_trust_level(t, id, level, now)
+    }
+    fn set_trust_level_if(
+        &self,
+        t: &TenantId,
+        id: &DeviceId,
+        expected: DeviceTrustLevel,
+        level: DeviceTrustLevel,
+        now: Timestamp,
+    ) -> impl Future<Output = Result<TrustTransition, Self::Error>> + Send {
+        self.0.set_trust_level_if(t, id, expected, level, now)
+    }
+    fn replace_bindings(
+        &self,
+        t: &TenantId,
+        id: &DeviceId,
+        expected: &[DeviceBinding],
+        bindings: &[DeviceBinding],
+        now: Timestamp,
+    ) -> impl Future<Output = Result<BindingsUpdate, Self::Error>> + Send {
+        self.0.replace_bindings(t, id, expected, bindings, now)
+    }
+    fn claim_owner(
+        &self,
+        t: &TenantId,
+        id: &DeviceId,
+        user: &UserId,
+        now: Timestamp,
+    ) -> impl Future<Output = Result<OwnerClaim, Self::Error>> + Send {
+        self.0.claim_owner(t, id, user, now)
     }
     fn delete(
         &self,
@@ -811,18 +904,29 @@ impl DeviceStore for RequiredOnly {
     fn sweep(
         &self,
         t: &TenantId,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<SweepCounts, Self::Error>> + Send {
         self.0.sweep(t, now)
     }
 }
 
-/// The provided `claim_owner` on a revoked, ownerless device writes nothing
-/// (a save never un-revokes), so it must not report `Claimed`.
+/// A store with nothing but the required methods keeps the contract of the
+/// three conditional writes, with its calls made to interleave.
 #[tokio::test]
-async fn the_provided_claim_owner_refuses_a_revoked_device() {
-    let store = RequiredOnly::default();
-    let now = whole_second(Utc::now());
+async fn a_store_of_required_methods_keeps_the_conditional_writes_single() {
+    use super::interleaving::Interleaved;
+    let store = || RequiredOnly(Interleaved(MemoryDeviceStore::new()));
+    consistency::two_swaps_from_one_read_have_one_winner(store()).await;
+    consistency::two_trust_changes_from_one_level_have_one_winner(store()).await;
+    consistency::two_claims_of_one_unowned_device_have_one_winner(store()).await;
+}
+
+/// A claim of a revoked, ownerless device writes nothing (a revoked row is
+/// never changed), so it is not answered `Claimed`.
+#[tokio::test]
+async fn a_claim_of_a_revoked_ownerless_device_is_refused() {
+    let store = RequiredOnly(MemoryDeviceStore::new());
+    let now = whole_second(axess_clock::testing::MockClock::reference_time());
     let mut device = d("dev-1", 0xaa, now);
     device.user_id = None;
     store.save(&device, now).await.unwrap();
@@ -845,12 +949,18 @@ async fn the_provided_claim_owner_refuses_a_revoked_device() {
 /// scan limit, so a user with many devices does not get a duplicate minted.
 #[tokio::test]
 async fn the_provided_own_fingerprint_lookup_finds_a_device_past_the_scan_limit() {
-    let store = RequiredOnly::default();
-    let now = whole_second(Utc::now());
-    let oldest = d("dev-oldest", 0xee, now - chrono::Duration::days(400));
+    let store = RequiredOnly(MemoryDeviceStore::new());
+    let now = whole_second(axess_clock::testing::MockClock::reference_time());
+    let oldest = d(
+        "dev-oldest",
+        0xee,
+        now.minus(axess_clock::SignedDuration::days(400)),
+    );
     store.save(&oldest, now).await.unwrap();
     for n in 0..(OWN_DEVICE_SCAN_LIMIT + 5) {
-        let seen = now - chrono::Duration::minutes(n as i64);
+        let seen = now.minus(axess_clock::SignedDuration::minutes(
+            i32::try_from(n as i64).unwrap(),
+        ));
         store
             .save(&d(&format!("dev-{n}"), 0x01, seen), now)
             .await

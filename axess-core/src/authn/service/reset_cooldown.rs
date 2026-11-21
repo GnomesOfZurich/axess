@@ -11,8 +11,7 @@
 //! costs little, because what bounds the mail an account can be sent is the
 //! store's limit on live reset tokens per account, not this record.
 
-use axess_clock::Clock;
-use chrono::{DateTime, Utc};
+use axess_clock::{Clock, SignedDuration, Timestamp, Until};
 use sha2::Digest as _;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -35,7 +34,7 @@ pub(crate) struct ResetCooldowns {
     /// both pass.
     state: Mutex<Cooling>,
     capacity: usize,
-    cooldown: chrono::Duration,
+    cooldown: Duration,
     clock: Arc<dyn Clock>,
 }
 
@@ -43,10 +42,10 @@ pub(crate) struct ResetCooldowns {
 /// so the order they were started in is the order they end in.
 #[derive(Default)]
 struct Cooling {
-    until: HashMap<[u8; 32], DateTime<Utc>>,
-    ending: VecDeque<([u8; 32], DateTime<Utc>)>,
+    until: HashMap<[u8; 32], Until>,
+    ending: VecDeque<([u8; 32], Until)>,
     /// When the table-full warning last sounded.
-    alarmed: Option<DateTime<Utc>>,
+    alarmed: Option<Timestamp>,
 }
 
 impl ResetCooldowns {
@@ -54,7 +53,7 @@ impl ResetCooldowns {
         Self {
             state: Mutex::default(),
             capacity: capacity.max(1),
-            cooldown: chrono::Duration::from_std(cooldown).unwrap_or(chrono::Duration::MAX),
+            cooldown,
             clock,
         }
     }
@@ -81,7 +80,7 @@ impl ResetCooldowns {
         // A poisoned lock guards no invariant a panic can break half-way.
         let mut cooling = self.state.lock().unwrap_or_else(|e| e.into_inner());
         while let Some((expired, until)) = cooling.ending.front().copied() {
-            if until > now {
+            if until > Until::At(now) {
                 break;
             }
             cooling.ending.pop_front();
@@ -102,7 +101,7 @@ impl ResetCooldowns {
             }
             if cooling
                 .alarmed
-                .is_none_or(|at| now.signed_duration_since(at) >= chrono::Duration::seconds(1))
+                .is_none_or(|at| now.since(at) >= SignedDuration::seconds(1))
             {
                 cooling.alarmed = Some(now);
                 tracing::warn!(
@@ -111,9 +110,7 @@ impl ResetCooldowns {
                 );
             }
         }
-        let until = now
-            .checked_add_signed(self.cooldown)
-            .unwrap_or(DateTime::<Utc>::MAX_UTC);
+        let until = Until::after(now, self.cooldown);
         cooling.until.insert(key, until);
         cooling.ending.push_back((key, until));
         Asked::Fresh
@@ -141,7 +138,7 @@ mod tests {
     /// is itself cooling down is refused.
     #[test]
     fn a_flood_of_made_up_identifiers_does_not_refuse_a_real_user() {
-        let clock = MockClock::now();
+        let clock = MockClock::at_reference();
         let cooldowns = cooldowns(3, &clock);
         for n in 0..10 {
             let _ = cooldowns.ask("t1", &format!("made-up-{n}@example.com"));
@@ -161,62 +158,64 @@ mod tests {
 
     #[test]
     fn a_cooldown_ends_with_its_time() {
-        let clock = MockClock::now();
+        let clock = MockClock::at_reference();
         let cooldowns = cooldowns(3, &clock);
         assert!(!cooldowns.asked("t1", "a@example.com"));
         assert!(cooldowns.asked("t1", "a@example.com"));
-        clock.advance(chrono::Duration::seconds(61));
-        assert!(!cooldowns.asked("t1", "a@example.com"));
+        clock.advance(axess_clock::SignedDuration::seconds(59));
+        assert!(
+            cooldowns.asked("t1", "a@example.com"),
+            "a second before its time it still holds"
+        );
+        clock.advance(axess_clock::SignedDuration::seconds(1));
+        assert!(
+            !cooldowns.asked("t1", "a@example.com"),
+            "at its time it has ended"
+        );
     }
 
     /// Once the cooldowns that ran out are forgotten, there is room again.
     #[test]
     fn expired_cooldowns_make_room() {
-        let clock = MockClock::now();
+        let clock = MockClock::at_reference();
         let cooldowns = cooldowns(2, &clock);
         assert!(!cooldowns.asked("t1", "a@example.com"));
         assert!(!cooldowns.asked("t1", "b@example.com"));
-        clock.advance(chrono::Duration::seconds(61));
+        clock.advance(axess_clock::SignedDuration::seconds(61));
         assert!(!cooldowns.asked("t1", "c@example.com"));
         assert!(cooldowns.asked("t1", "c@example.com"));
     }
 
-    #[derive(Clone, Default)]
-    struct Buf(Arc<Mutex<Vec<u8>>>);
+    /// A full record drops its oldest cooldown for a new one, so it never
+    /// holds more than its capacity.
+    #[test]
+    fn a_full_record_drops_its_oldest_cooldown_for_a_new_one() {
+        let clock = MockClock::at_reference();
+        let cooldowns = cooldowns(2, &clock);
+        assert!(!cooldowns.asked("t1", "a@example.com"));
+        assert!(!cooldowns.asked("t1", "b@example.com"));
+        assert!(!cooldowns.asked("t1", "c@example.com"));
 
-    impl std::io::Write for Buf {
-        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(b);
-            Ok(b.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
-        type Writer = Buf;
-        fn make_writer(&'a self) -> Buf {
-            self.clone()
-        }
+        assert_eq!(cooldowns.state.lock().unwrap().until.len(), 2);
+        assert!(cooldowns.asked("t1", "b@example.com"), "b still holds");
+        assert!(
+            !cooldowns.asked("t1", "a@example.com"),
+            "the oldest was dropped for c"
+        );
     }
 
     /// A full record says so at warn level, once a second at most.
     #[test]
     fn a_full_record_sounds_a_warning_throttled_to_once_a_second() {
-        let buf = Buf::default();
+        let buf = axess_testing::mock_tracing::PrintedLines::new();
         let subscriber = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::TRACE)
             .with_ansi(false)
             .with_writer(buf.clone())
             .finish();
-        let clock = MockClock::now();
-        let alarms = |buf: &Buf| {
-            String::from_utf8(buf.0.lock().unwrap().clone())
-                .unwrap()
-                .matches("WARN")
-                .count()
-        };
+        let clock = MockClock::at_reference();
+        let alarms =
+            |buf: &axess_testing::mock_tracing::PrintedLines| buf.text().matches("WARN").count();
         tracing::subscriber::with_default(subscriber, || {
             let cooldowns = cooldowns(1, &clock);
             assert!(!cooldowns.asked("t1", "a@example.com"));
@@ -228,7 +227,7 @@ mod tests {
                 1,
                 "five evictions in one instant, one warning"
             );
-            clock.advance(chrono::Duration::seconds(2));
+            clock.advance(axess_clock::SignedDuration::seconds(2));
             assert!(!cooldowns.asked("t1", "c@example.com"));
             assert_eq!(
                 alarms(&buf),

@@ -12,18 +12,7 @@ mod custom_bag_tests {
     use tokio::sync::RwLock;
 
     fn make_session() -> AuthSession {
-        let inner = SessionInner {
-            id: SessionId::new(&axess_rng::SystemRng),
-            data: SessionData::default(),
-            modified: false,
-            needs_persist: false,
-            regenerate: false,
-            pre_cycle_id: None,
-            rng: std::sync::Arc::new(axess_rng::SystemRng),
-            pending_fingerprint: None,
-            max_custom_bytes: 64 * 1024,
-            consume: None,
-        };
+        let inner = SessionInner::detached(std::sync::Arc::new(axess_rng::SystemRng));
         AuthSession(crate::session::layer::SessionHandle(Arc::new(RwLock::new(
             inner,
         ))))
@@ -42,7 +31,7 @@ mod custom_bag_tests {
                 crate::session::data::WorkflowState::new(
                     crate::session::data::WorkflowKind::Signup,
                     2,
-                    chrono::Utc::now(),
+                    axess_clock::testing::MockClock::reference_time(),
                 ),
             )
             .await;
@@ -60,22 +49,22 @@ mod custom_bag_tests {
         let tenant = axess_identity::testing::tenant("t-rot");
 
         let session = make_session();
-        let before = session.peek_session_id().await;
+        let before = session.peek_session_key().await;
         session.set_identifying(user, tenant).await;
         {
             let g = session.0.0.read().await;
             assert!(g.regenerate, "identifying must rotate the id");
-            assert_eq!(g.pre_cycle_id, Some(before));
+            assert_eq!(g.pre_cycle, Some(before));
         }
 
         let session = make_session();
-        let before = session.peek_session_id().await;
+        let before = session.peek_session_key().await;
         session
             .begin_authenticating(user, tenant, "password".into(), vec![])
             .await;
         let g = session.0.0.read().await;
         assert!(g.regenerate, "authenticating must rotate the id");
-        assert_eq!(g.pre_cycle_id, Some(before));
+        assert_eq!(g.pre_cycle, Some(before));
     }
 
     /// Becoming authenticated drops what the visitor put in the session
@@ -98,7 +87,7 @@ mod custom_bag_tests {
             .set_authenticated(
                 axess_identity::testing::user("alice"),
                 axess_identity::testing::tenant("acme"),
-                chrono::Utc::now(),
+                axess_clock::testing::MockClock::reference_time(),
             )
             .await;
 
@@ -123,7 +112,7 @@ mod custom_bag_tests {
             .set_authenticated_keeping(
                 axess_identity::testing::user("alice"),
                 axess_identity::testing::tenant("acme"),
-                chrono::Utc::now(),
+                axess_clock::testing::MockClock::reference_time(),
                 None,
                 &["locale".to_owned()],
             )
@@ -154,7 +143,7 @@ mod custom_bag_tests {
             .advance_factor(
                 crate::authn::assurance::FactorAssurance::for_kind(
                     FactorKind::Password,
-                    chrono::Utc::now(),
+                    axess_clock::testing::MockClock::reference_time(),
                 ),
                 &[],
             )
@@ -172,13 +161,13 @@ mod custom_bag_tests {
             .set_authenticated(
                 axess_identity::testing::user("alice"),
                 axess_identity::testing::tenant("acme"),
-                chrono::Utc::now(),
+                axess_clock::testing::MockClock::reference_time(),
             )
             .await;
-        let before = session.session_id().await;
+        let before = session.session_key().await;
         session.clear().await;
         assert!(session.auth_state().await.is_guest());
-        assert_ne!(session.session_id().await, before);
+        assert_ne!(session.session_key().await, before);
     }
 
     /// A bag stored as a non-object (an array here) is replaced by an object
@@ -289,7 +278,7 @@ mod custom_bag_tests {
             let mut g = session.0.0.write().await;
             g.modified = false;
         }
-        session.mutate_custom(|_obj| { /* noop */ }).await;
+        session.mutate_custom(|_| { /* noop */ }).await;
         let modified = { session.0.0.read().await.modified };
         assert!(!modified, "no-op mutate_custom should not mark modified");
     }
@@ -316,7 +305,7 @@ mod custom_bag_tests {
             "an equal-length change must be persisted"
         );
         session.0.0.write().await.modified = false;
-        session.mutate_custom(|_bag| {}).await;
+        session.mutate_custom(|_| {}).await;
         assert!(!session.0.0.read().await.modified, "no change, no write");
     }
 }
@@ -328,25 +317,14 @@ mod extractor_tests {
     use tokio::sync::RwLock;
 
     fn make_session() -> AuthSession {
-        let inner = SessionInner {
-            id: SessionId::new(&axess_rng::SystemRng),
-            data: SessionData::default(),
-            modified: false,
-            needs_persist: false,
-            regenerate: false,
-            pre_cycle_id: None,
-            rng: std::sync::Arc::new(axess_rng::SystemRng),
-            pending_fingerprint: None,
-            max_custom_bytes: 64 * 1024,
-            consume: None,
-        };
+        let inner = SessionInner::detached(std::sync::Arc::new(axess_rng::SystemRng));
         AuthSession(crate::session::layer::SessionHandle(Arc::new(RwLock::new(
             inner,
         ))))
     }
 
     /// `snapshot()` returns `Some(AuthSnapshot)` for an
-    /// `Authenticated` state with the live `(user, tenant, session_id,
+    /// `Authenticated` state with the live `(user, tenant, session_key,
     /// authn_time)` quadruple. Pins the function body and the
     /// `Authenticated` match arm against `-> None` and
     /// `delete match arm` mutations.
@@ -355,7 +333,7 @@ mod extractor_tests {
         let session = make_session();
         let user = axess_identity::testing::user("u-1");
         let tenant = axess_identity::testing::tenant("t-1");
-        let now = chrono::Utc::now();
+        let now = axess_clock::testing::MockClock::reference_time();
         session.set_authenticated(user, tenant, now).await;
 
         let snap = session
@@ -365,7 +343,11 @@ mod extractor_tests {
         assert_eq!(snap.user_id, user);
         assert_eq!(snap.tenant_id, tenant);
         assert_eq!(snap.authn_time, now);
-        assert_eq!(snap.session_id, session.session_id().await);
+        assert_eq!(
+            snap.signed_in_at, now,
+            "a direct transition is its own login"
+        );
+        assert_eq!(snap.session_key, session.session_key().await);
         assert_eq!(snap.impersonation, None);
     }
 
@@ -374,7 +356,7 @@ mod extractor_tests {
     #[tokio::test]
     async fn snapshot_carries_the_impersonation() {
         let session = make_session();
-        let now = chrono::Utc::now();
+        let now = axess_clock::testing::MockClock::reference_time();
         session
             .set_authenticated(
                 axess_identity::testing::user("u-1"),
@@ -414,7 +396,7 @@ mod extractor_tests {
             .begin_authenticating(user, tenant, Arc::from("password"), vec![])
             .await;
 
-        let t1 = chrono::Utc::now();
+        let t1 = axess_clock::testing::MockClock::reference_time();
         for expected_count in 1u32..=3 {
             session.record_attempt_at(t1).await;
             let count = session
@@ -574,7 +556,11 @@ mod extractor_tests {
         let user = axess_identity::testing::user("u-isauth");
         let tenant = axess_identity::testing::tenant("t-isauth");
         session
-            .set_authenticated(user, tenant, chrono::Utc::now())
+            .set_authenticated(
+                user,
+                tenant,
+                axess_clock::testing::MockClock::reference_time(),
+            )
             .await;
         assert!(session.is_authenticated().await);
     }
@@ -588,7 +574,11 @@ mod extractor_tests {
         let user = axess_identity::testing::user("u-state");
         let tenant = axess_identity::testing::tenant("t-state");
         session
-            .set_authenticated(user, tenant, chrono::Utc::now())
+            .set_authenticated(
+                user,
+                tenant,
+                axess_clock::testing::MockClock::reference_time(),
+            )
             .await;
         let state = session.auth_state().await;
         assert!(matches!(state, AuthState::Authenticated { .. }));
@@ -614,7 +604,11 @@ mod extractor_tests {
         let user = axess_identity::testing::user("u-ids");
         let tenant = axess_identity::testing::tenant("t-ids");
         session
-            .set_authenticated(user, tenant, chrono::Utc::now())
+            .set_authenticated(
+                user,
+                tenant,
+                axess_clock::testing::MockClock::reference_time(),
+            )
             .await;
         let ids = session.authenticated_ids().await;
         assert_eq!(ids, Some((user, tenant)));
@@ -635,7 +629,11 @@ mod extractor_tests {
         let session = make_session();
         let user = axess_identity::testing::user("u-pend");
         let tenant = axess_identity::testing::tenant("t-pend");
-        let workflow = WorkflowState::new(WorkflowKind::Signup, 3, chrono::Utc::now());
+        let workflow = WorkflowState::new(
+            WorkflowKind::Signup,
+            3,
+            axess_clock::testing::MockClock::reference_time(),
+        );
         session.set_pending_workflow(user, tenant, workflow).await;
         let state = session.auth_state().await;
         assert!(matches!(state, AuthState::PendingWorkflow { .. }));
@@ -648,14 +646,18 @@ mod extractor_tests {
     async fn set_pending_workflow_rotates_the_session_id() {
         use crate::session::data::{WorkflowKind, WorkflowState};
         let session = make_session();
-        let before = session.session_id().await;
+        let before = session.session_key().await;
         let user = axess_identity::testing::user("u-pend");
         let tenant = axess_identity::testing::tenant("t-pend");
-        let workflow = WorkflowState::new(WorkflowKind::Signup, 3, chrono::Utc::now());
+        let workflow = WorkflowState::new(
+            WorkflowKind::Signup,
+            3,
+            axess_clock::testing::MockClock::reference_time(),
+        );
 
         session.set_pending_workflow(user, tenant, workflow).await;
 
-        assert_ne!(session.session_id().await, before);
+        assert_ne!(session.session_key().await, before);
     }
 
     /// `clear()` resets the session to Guest with empty data. The
@@ -666,7 +668,11 @@ mod extractor_tests {
         let user = axess_identity::testing::user("u-clr");
         let tenant = axess_identity::testing::tenant("t-clr");
         session
-            .set_authenticated(user, tenant, chrono::Utc::now())
+            .set_authenticated(
+                user,
+                tenant,
+                axess_clock::testing::MockClock::reference_time(),
+            )
             .await;
         session.set_custom("k", serde_json::json!("v")).await;
         session.clear().await;
@@ -727,6 +733,29 @@ mod extractor_tests {
     /// HTTP response: specifically a 500-equivalent. The mutation
     /// `-> Default::default()` would produce an empty 200 OK, hiding
     /// the misconfiguration (missing `SessionLayer`) from operators.
+    /// The key is the session's name everywhere but the cookie: it is the
+    /// key the cookie's session holds. Reading it marks the session as
+    /// needed beyond the request; the observers' read does not.
+    #[tokio::test]
+    async fn the_key_names_the_cookies_session_and_only_the_handlers_read_marks_it() {
+        let session = make_session();
+        let key = session.peek_session_key().await;
+        assert!(
+            !session.0.0.read().await.needs_persist,
+            "an observer's read does not store a session"
+        );
+        assert_eq!(
+            key,
+            *session.0.0.read().await.session.key(),
+            "the key is the cookie's session's key"
+        );
+        assert_eq!(session.session_key().await, key);
+        assert!(
+            session.0.0.read().await.needs_persist,
+            "a handler that reads the key keys something on it"
+        );
+    }
+
     #[test]
     fn session_missing_into_response_is_internal_server_error() {
         use axum::response::IntoResponse;

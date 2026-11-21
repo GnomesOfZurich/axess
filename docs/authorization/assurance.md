@@ -1,12 +1,11 @@
 # Authentication assurance and ceremonies
 
-Before this, a Cedar policy could ask one thing about how a user proved who
-they are: `context.mfa_verified`, a flag the application computed for the
-whole session. It could not ask whether the user was verified by the
-authenticator, whether the passkey was synced or bound to one device, whether
-the authenticator was attested, or how long ago any of it happened. And the
-WebAuthn ceremony that ran was always the passkey one, whatever the operation
-needed. This page is the design: what a session records, what Cedar sees,
+A Cedar policy can ask how a user proved who they are, factor by factor,
+rather than read one flag the application computes for the whole session:
+whether the authenticator verified the user, whether the passkey is synced
+or bound to one device, whether the authenticator was attested, and how
+long ago each happened. The WebAuthn ceremony that runs is the one the
+operation needs. This page covers what a session records, what Cedar sees,
 how a gate asks for a step-up, how the ceremony is chosen per operation, the
 invariants, how it fails, and what an adopter changes.
 
@@ -25,7 +24,7 @@ invariants, how it fails, and what an adopter changes.
   satisfy it, never the policy text.
 - The FIDO2 ceremony is chosen per operation: registration and login in
   `Fido2Options`, a step-up for a named action from the `@step_up`
-  annotation on the very Cedar rule that requires it.
+  annotation on the Cedar rule that requires it.
 
 ## What a factor proved
 
@@ -34,7 +33,7 @@ invariants, how it fails, and what an adopter changes.
 | Field | Type | Meaning |
 |---|---|---|
 | `kind` | `FactorKind` | the factor that was verified |
-| `at` | `DateTime<Utc>` | when, from the service's `Clock` (never `Utc::now`) |
+| `at` | `Timestamp` | when, from the service's `Clock` (never a read of the system clock) |
 | `user_verified` | `bool` | the factor proved the person, not only a device or a channel |
 | `trust_anchor` | `Option<Arc<str>>` | the trust anchor an attested ceremony verified the authenticator against; `None` unless one ran |
 | `credential` | `CredentialBinding` | `DeviceBound`, `Synced` or `NotApplicable` |
@@ -74,10 +73,10 @@ one entry per kind (a few hundred bytes for the largest session), and it is
 what a policy reads anyway. A later, weaker proof of a kind hides an earlier,
 stronger one; the effect is a denial and a step-up, never an allow.
 
-The session is stored as MessagePack with field names
-(`rmp_serde::to_vec_named`) by every encrypted backend and kept as a value by
-the in-memory one, and the field is skipped when empty, so a session written
-by 0.17 reads with an empty list and a session with no proof costs nothing.
+Every encrypted backend stores the session as MessagePack with field names
+(`rmp_serde::to_vec_named`); the in-memory backend keeps it as a value. The
+field is skipped when empty, so a session written by 0.17 reads with an
+empty list and a session with no proof costs nothing.
 Each backend's tests round-trip a session carrying assurance (SQLite and the
 in-memory store always, Postgres, MySQL and Valkey against live servers).
 
@@ -85,10 +84,11 @@ in-memory store always, Postgres, MySQL and Valkey against live servers).
 
 A session created before this release has no `assurance` field and reads as
 an empty list. An empty list emits an `assurance` record with no factor in
-it, so every policy that asks for a factor (`context.assurance has fido2`)
-is false and denies: such a session satisfies no assurance policy until it
-steps up. Impersonation, signup completion and every other direct
-transition to `Authenticated` record nothing either, for the same reason.
+it, so every check for a factor (`context.assurance has fido2`) is false:
+such a session satisfies no assurance policy until it steps up.
+Impersonation, signup completion and a session rebuilt from a refresh token
+record nothing either, because no factor is verified on those paths. A
+federated login records its one `Federated` proof.
 
 ## What Cedar sees
 
@@ -135,14 +135,15 @@ the attribute as required:
 }
 ```
 
-Required, because a policy that guards an optional `assurance` with
+It is required because a policy that guards an optional `assurance` with
 `context has assurance` and treats absence as allowed would permit when the
-provider forgot it.
+provider omitted it.
 
 ### Getting it into the context
 
 - `AssuranceContextProvider::new(clock)` is a `RequestContextProvider` for
-  `require_authz!` that emits `assurance` alone.
+  `require_authz!` that emits `assurance` alone. Pass it to
+  `AuthzInstallation::new` as the context provider.
 - `StandardRequestContext::with_assurance(AssuranceContext)` adds it beside
   `mfa_verified`, `ip_address` and `timestamp`, for an `AuthzSession` or a
   provider of your own.
@@ -165,16 +166,16 @@ permit (
 
 It permits a session whose latest passkey was user-verified, device-bound
 and verified within five minutes, and denies a password-only session, one
-whose passkey is six minutes old and one whose passkey is synced; the test
-`a_fresh_device_bound_passkey_is_the_only_session_the_rule_permits` holds
+whose passkey is six minutes old and one whose passkey is synced. The test
+`a_fresh_device_bound_passkey_is_the_only_session_the_rule_permits` covers
 each case. Add `&& context.assurance.fido2.trust_anchor == "vendor-roots"`
 (after `context.assurance.fido2 has trust_anchor`) to require an attested
 authenticator.
 
 ## Asking for a step-up
 
-A denial is either a denial or a shortfall. To tell them apart without
-reading the policy, the gate asks Cedar a second question: would this
+A deny is either a plain deny or an assurance shortfall. To tell them apart
+without reading the policy, the gate asks Cedar a second question: would this
 request be permitted if the session had just completed a given step-up?
 
 - A policy names the step-up that satisfies it with the annotation
@@ -231,6 +232,15 @@ name comes back from the client, and a client may send a weaker one; that
 gains nothing, because the action is decided again by Cedar on the
 assurance the step-up actually recorded.
 
+A step-up and a login in progress are both a session waiting for a factor,
+and both finish through `verify_factor`. `verify_factor` does not tell
+them apart, so a route that finishes a step-up must read
+`AuthSession::step_up_pending` first and refuse when it is false. Then it
+never verifies a factor (a password, say) for a login another route
+began. `step_up_pending` reads a field of the pending state, `AuthFlow` (`Login` or
+`StepUp`), set by the call that opened the step; no method name decides it,
+and a login method may be called anything.
+
 ## Choosing the ceremony
 
 WebAuthn fixes user verification and attestation in the challenge, before
@@ -253,18 +263,17 @@ authenticate (`Fido2Ceremony::accepts`) and is refused with
 `AuthnError::NoFlow` when there are none. Nothing is built on
 `webauthn-rs-core`'s `WebauthnCore::new_unsafe_experts_only`, whose
 signature may change within minor versions and whose invariants would
-become axess's, and axess enables no danger feature of `webauthn-rs`
-beyond the state serialisation it already used.
+become axess's. Axess enables no danger feature of `webauthn-rs`
+beyond the state serialisation it already uses.
 
 `DefaultFido2Provider` holds the trust anchors by name
 (`with_trust_anchor(name, AttestationCaList)`); a ceremony naming one it
 does not hold is refused at its start. UV-discouraged security keys need a
 `Webauthn` built with `webauthn-rs`'s
 `danger_set_user_presence_only_security_keys`, which the adopter enables in
-their own build and hands over with `with_presence_only_security_keys`; the
-provider checks that the instance really discourages verification and
-refuses it otherwise, and a discouraged ceremony on a provider without one
-is refused.
+their own build and hands over with `with_presence_only_security_keys`. The
+provider refuses an instance that does not discourage verification, and
+refuses a discouraged ceremony when it holds no such instance.
 
 ### Per operation
 
@@ -272,7 +281,9 @@ is refused.
   choice with `begin_fido2_registration_with(user, session, ceremony)`.
 - **Login**: `Fido2Options::login_ceremony`, for the FIDO2 step of a login
   method. The discoverable (passwordless) ceremony is its own operation and
-  keeps its own ceremony.
+  keeps its own ceremony; how the browser presents it, cross-device
+  authentication included, is a `DiscoverablePrompt` (see
+  [FIDO2 and WebAuthn passkeys](../factors/fido2.md)).
 - **Step-up for a named action**: the `@step_up` annotation on the rule that
   requires the assurance. The refusal names it, and
   `begin_step_up_for(session, &step_up)` begins the step-up for that factor

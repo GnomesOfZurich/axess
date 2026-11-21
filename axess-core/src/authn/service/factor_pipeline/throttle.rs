@@ -45,7 +45,7 @@ where
     /// is not installed (`ip_source` is `Unknown`) that is a deployment
     /// fault, reported once per service.
     fn resolve_throttle(&self, user_id: &UserId, tenant_id: &TenantId) -> Option<ResolvedThrottle> {
-        let policy = self.inner.identity.lockout_policy_for_tenant(tenant_id);
+        let policy = self.lockout_policy(tenant_id);
         let throttle = policy.throttle?;
         if throttle.key == ThrottleKey::AccountAndAddress
             && self.audit.ip_address.is_none()
@@ -171,7 +171,7 @@ where
         let mut builder = AuthEventBuilder::failure(AuthEventType::FactorVerified)
             .attributed_to(user_id, tenant_id)
             .with_error(AuthFailureReason::Throttled)
-            .with_session(session.session_id().await);
+            .with_session(session.session_key().await);
         if let Some(k) = next_kind {
             builder = builder.with_factor(k);
         }

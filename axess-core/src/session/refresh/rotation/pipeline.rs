@@ -13,8 +13,8 @@ use super::{
 use crate::authn::ids::DeviceId;
 use crate::authn::ids::{TenantId, UserId};
 use crate::session::data::{AuthState, SessionData};
+use axess_clock::{Timestamp, Until};
 use axess_rng::SecureRng;
-use chrono::{DateTime, Utc};
 use std::future::Future;
 #[cfg(feature = "device")]
 use std::pin::Pin;
@@ -27,13 +27,52 @@ use std::pin::Pin;
 #[cfg(feature = "device")]
 pub(in crate::session::refresh) trait DeviceGate: Send + Sync {
     /// Refuse the refresh when the token's device may no longer refresh for
-    /// `user`.
+    /// `user`. A device that passes answers whether it holds a device key:
+    /// such a device refreshes only where the key is checked.
     fn check<'a>(
         &'a self,
         tenant: &'a TenantId,
         device: &'a DeviceId,
         user: &'a UserId,
-    ) -> Pin<Box<dyn Future<Output = Result<(), DeviceRefusal>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Keyed, DeviceRefusal>> + Send + 'a>>;
+}
+
+/// Whether the device a refresh checked holds a device key.
+#[cfg(feature = "device")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::session::refresh) struct Keyed(pub(in crate::session::refresh) bool);
+
+/// The key check a refresh runs on a token that carries a device id, when it
+/// was given the device-key service: a device that has a key refreshes only
+/// with a proof by it. Implemented by the gate of `Refresh::device_key`.
+#[cfg(feature = "device-keys")]
+pub(in crate::session::refresh) trait KeyGate: Send + Sync {
+    /// The thumbprint of the key the caller proved, `None` when the device
+    /// has no key and so is held to none.
+    fn prove<'a>(
+        &'a self,
+        tenant: &'a TenantId,
+        device: &'a DeviceId,
+        now: Timestamp,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<KeyBound>, KeyRefusal>> + Send + 'a>>;
+}
+
+/// The key a refresh proved.
+#[cfg(feature = "device-keys")]
+pub(in crate::session::refresh) type KeyBound = crate::device_key::KeyThumbprint;
+
+/// Why a [`KeyGate`] refused.
+#[cfg(feature = "device-keys")]
+pub(in crate::session::refresh) enum KeyRefusal {
+    /// The proof is the key's and answers a challenge that is not current:
+    /// the text of the challenge to sign.
+    Required(String),
+    /// No proof, or one that is not the key's.
+    Invalid,
+    /// The device is revoked or no longer exists.
+    Ended,
+    /// The device store could not answer; carries its message.
+    Store(String),
 }
 
 /// Why a [`DeviceGate`] refused.
@@ -84,11 +123,22 @@ pub(in crate::session::refresh) enum DeviceRefusal {
 /// refuses with [`RefreshError::AccountInactive`]; the device gate refuses
 /// with [`RefreshError::DeviceRevoked`], [`RefreshError::DeviceMismatch`] (a
 /// device of another user) or [`RefreshError::DeviceStore`]; the device
-/// binding refuses with [`RefreshError::DeviceMismatch`]; then the session
-/// is built and the token rotated (or, without rotation, re-stored under the
-/// current pepper when it was found under the previous one). Every refusal
-/// before the rotation leaves the token as it was: an inactive account's
-/// family is kept for a later reactivation.
+/// binding refuses with [`RefreshError::DeviceMismatch`]; the key check
+/// comes last, because it is the one that consumes something (a proof that
+/// stands replaces the device's challenge): a device that holds a key
+/// refuses with [`RefreshError::KeyCheckMissing`] when the refresh was not
+/// given the key service, with [`RefreshError::KeyProofRequired`] for the
+/// key's proof over a challenge that is not the current one, and with
+/// [`RefreshError::KeyProofInvalid`] for no proof or one that is not the
+/// key's; then the session is built and the token rotated (or, without
+/// rotation, re-stored under the current pepper when it was found under the
+/// previous one).
+///
+/// Every refusal before the rotation leaves the token as it was (an
+/// inactive account's family is kept for a later reactivation), with two
+/// exceptions that are compromise signals and revoke the token's family: a
+/// revoked token that comes back, and [`RefreshError::KeyProofInvalid`],
+/// the token of a keyed device presented without its key.
 ///
 /// `Revoked` runs first so a compromise signal on a revoked token still
 /// triggers the family revocation even for an inactive account. The status
@@ -105,13 +155,71 @@ pub(in crate::session::refresh) enum DeviceRefusal {
 /// every registered session, and the next request through
 /// [`AuthnService::check_session`](crate::authn::service::AuthnService::check_session)
 /// sees the rotated session as invalid.
-pub struct Refresh<'a, F> {
+///
+/// # The device a token names
+///
+/// A refresh must say what it does about the device a token names before it
+/// can [`run`](Self::run): there is no default. Give it the device store
+/// ([`device_store`](Self::device_store)), which refuses a revoked device,
+/// a device of another user and, where the key is not checked too, a device
+/// that holds a key; or write [`without_device_check`](Self::without_device_check),
+/// which says at the call site that a token naming a device is refreshed
+/// without looking at the device. A refresh that says neither does not
+/// compile.
+pub struct Refresh<'a, F, D = DeviceCheckUndecided> {
     plaintext: &'a str,
     tenant: Option<&'a TenantId>,
     device_info: Option<&'a str>,
     #[cfg(feature = "device")]
     device: Option<Box<dyn DeviceGate + 'a>>,
+    #[cfg(feature = "device-keys")]
+    key: Option<Box<dyn KeyGate + 'a>>,
     status: F,
+    decided: std::marker::PhantomData<D>,
+}
+
+/// The state of a [`Refresh`] that has not said what it does about the
+/// device a token names. It cannot run.
+#[derive(Debug, Clone, Copy)]
+pub struct DeviceCheckUndecided(());
+
+/// The state of a [`Refresh`] that has said what it does about the device a
+/// token names: it was given the device store, or the named opt-out.
+#[derive(Debug, Clone, Copy)]
+pub struct DeviceCheckDecided(());
+
+impl<'a, F, D> Refresh<'a, F, D> {
+    /// The same refresh, with its choice about devices made.
+    fn decided(self) -> Refresh<'a, F, DeviceCheckDecided> {
+        Refresh {
+            plaintext: self.plaintext,
+            tenant: self.tenant,
+            device_info: self.device_info,
+            #[cfg(feature = "device")]
+            device: self.device,
+            #[cfg(feature = "device-keys")]
+            key: self.key,
+            status: self.status,
+            decided: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<'a, F> Refresh<'a, F> {
+    /// Refresh without looking at the device the token names.
+    ///
+    /// The named opt-out from the device check, for a deployment whose
+    /// tokens name no device or that has no device store to ask. What it
+    /// gives up, for a token that does name a device: the device is not
+    /// loaded, so a revoked or purged device still refreshes, a device
+    /// another user owns still refreshes, and a device that holds a key
+    /// refreshes into a session that is not bound to the key, unless the
+    /// refresh was also given the key service (`Refresh::device_key`). A
+    /// refresh built this way is the one place a token that names a device
+    /// is refreshed unchecked.
+    pub fn without_device_check(self) -> Refresh<'a, F, DeviceCheckDecided> {
+        self.decided()
+    }
 }
 
 impl<'a, F> Refresh<'a, F> {
@@ -139,7 +247,10 @@ impl<'a, F> Refresh<'a, F> {
             device_info: None,
             #[cfg(feature = "device")]
             device: None,
+            #[cfg(feature = "device-keys")]
+            key: None,
             status: status_check,
+            decided: std::marker::PhantomData,
         }
     }
 
@@ -159,10 +270,15 @@ impl<'a, F> Refresh<'a, F> {
             device_info: None,
             #[cfg(feature = "device")]
             device: None,
+            #[cfg(feature = "device-keys")]
+            key: None,
             status: status_check,
+            decided: std::marker::PhantomData,
         }
     }
+}
 
+impl<'a, F, D> Refresh<'a, F, D> {
     /// The device fingerprint the request presents. A token issued with a
     /// device binding refreshes only for a matching one
     /// ([`RefreshError::DeviceMismatch`] otherwise); the replacement token
@@ -172,17 +288,27 @@ impl<'a, F> Refresh<'a, F> {
         self
     }
 
+    /// Set the key gate; kept to this module tree so the only way in is
+    /// `Refresh::device_key`.
+    #[cfg(feature = "device-keys")]
+    pub(in crate::session::refresh) fn key_gate(mut self, gate: Box<dyn KeyGate + 'a>) -> Self {
+        self.key = Some(gate);
+        self
+    }
+
     /// Check, before anything is rotated, the device a token was issued to,
     /// against the gate the device-check module builds.
     #[cfg(feature = "device")]
     pub(in crate::session::refresh) fn device_gate(
         mut self,
         gate: Box<dyn DeviceGate + 'a>,
-    ) -> Self {
+    ) -> Refresh<'a, F, DeviceCheckDecided> {
         self.device = Some(gate);
-        self
+        self.decided()
     }
+}
 
+impl<'a, F> Refresh<'a, F, DeviceCheckDecided> {
     /// Validate the token, run the checks, and produce the new session, with
     /// the replacement token when rotation is on (the old token is then
     /// revoked atomically with the replacement's insert). See the
@@ -199,7 +325,7 @@ impl<'a, F> Refresh<'a, F> {
         store: &S,
         config: &RefreshTokenConfig,
         rng: &impl SecureRng,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Result<(SessionData, Option<(String, RefreshToken)>), RefreshError<S::Error>>
     where
         S: RefreshTokenStore,
@@ -223,10 +349,22 @@ impl<'a, F> Refresh<'a, F> {
         check_expiry(&record, config, now)?;
         check_status(&record, self.status).await?;
         #[cfg(feature = "device")]
-        check_device(&record, self.device.as_deref()).await?;
+        let keyed = check_device(&record, self.device.as_deref()).await?;
+        // A build that cannot check a key refreshes no keyed device's token.
+        #[cfg(all(feature = "device", not(feature = "device-keys")))]
+        if keyed.0 {
+            return Err(RefreshError::KeyCheckMissing);
+        }
         let child_device_info = check_binding(&record, self.device_info, stored_under, config)?;
+        // Last of the checks, because it is the one that consumes something:
+        // a proof that stands replaces the device's challenge.
+        #[cfg(feature = "device-keys")]
+        let proven_key = check_key(&record, self.key.as_deref(), keyed, store, now).await?;
 
+        #[cfg(not(feature = "device-keys"))]
         let session = session_for(&record);
+        #[cfg(feature = "device-keys")]
+        let session = bound_to(session_for(&record), &record, proven_key, now);
         let Some((new_plaintext, new_record)) = replacement_for(
             self.plaintext,
             config,
@@ -268,7 +406,7 @@ async fn check_revoked<S: RefreshTokenStore>(
     record: &RefreshToken,
     store: &S,
     config: &RefreshTokenConfig,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<(), RefreshError<S::Error>> {
     if record.revoked {
         return Err(handle_revoked_reuse(record, store, config, now).await);
@@ -280,7 +418,7 @@ async fn check_revoked<S: RefreshTokenStore>(
 fn check_expiry<E>(
     record: &RefreshToken,
     config: &RefreshTokenConfig,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<(), RefreshError<E>>
 where
     E: std::error::Error + Send + Sync + 'static,
@@ -313,26 +451,86 @@ where
 }
 
 /// A token that carries a device id is refused when the device gate, if the
-/// refresh has one, refuses that device for the token's user.
+/// refresh has one, refuses that device for the token's user. Answers
+/// whether the gate found the device to hold a key.
 #[cfg(feature = "device")]
 async fn check_device<E>(
     record: &RefreshToken,
     device: Option<&(dyn DeviceGate + '_)>,
-) -> Result<(), RefreshError<E>>
+) -> Result<Keyed, RefreshError<E>>
 where
     E: std::error::Error + Send + Sync + 'static,
 {
-    if let (Some(device_id), Some(device)) = (record.device_id.as_ref(), device) {
-        device
-            .check(&record.tenant_id, device_id, &record.user_id)
-            .await
-            .map_err(|refusal| match refusal {
-                DeviceRefusal::Revoked => RefreshError::DeviceRevoked,
-                DeviceRefusal::OtherOwner => RefreshError::DeviceMismatch,
-                DeviceRefusal::Store(message) => RefreshError::DeviceStore(message),
-            })?;
+    let (Some(device_id), Some(device)) = (record.device_id.as_ref(), device) else {
+        return Ok(Keyed(false));
+    };
+    device
+        .check(&record.tenant_id, device_id, &record.user_id)
+        .await
+        .map_err(|refusal| match refusal {
+            DeviceRefusal::Revoked => RefreshError::DeviceRevoked,
+            DeviceRefusal::OtherOwner => RefreshError::DeviceMismatch,
+            DeviceRefusal::Store(message) => RefreshError::DeviceStore(message),
+        })
+}
+
+/// A token whose device has a key refreshes only with a proof by that key.
+/// A proof that is not the key's, or none at all, means the token is held
+/// without the key: its family is revoked and the compromise hook runs, as
+/// for a rotated-out token that comes back.
+///
+/// A refresh that was not given the key service cannot check the key: when
+/// its device check found the device to hold one (`keyed`), the refresh is
+/// refused by name and never builds an unbound session for it.
+#[cfg(feature = "device-keys")]
+async fn check_key<S: RefreshTokenStore>(
+    record: &RefreshToken,
+    key: Option<&(dyn KeyGate + '_)>,
+    keyed: Keyed,
+    store: &S,
+    now: Timestamp,
+) -> Result<Option<KeyBound>, RefreshError<S::Error>> {
+    let (Some(device_id), Some(key)) = (record.device_id.as_ref(), key) else {
+        return match keyed {
+            Keyed(true) => Err(RefreshError::KeyCheckMissing),
+            Keyed(false) => Ok(None),
+        };
+    };
+    match key.prove(&record.tenant_id, device_id, now).await {
+        Ok(proven) => Ok(proven),
+        Err(KeyRefusal::Required(challenge)) => Err(RefreshError::KeyProofRequired { challenge }),
+        Err(KeyRefusal::Invalid) => {
+            tracing::warn!(
+                user_id = %record.user_id,
+                "a refresh token of a keyed device was presented without its key; revoking \
+                 the family (compromise signal)"
+            );
+            super::revoke_compromised_family(record, store).await;
+            Err(RefreshError::KeyProofInvalid)
+        }
+        Err(KeyRefusal::Ended) => Err(RefreshError::DeviceRevoked),
+        Err(KeyRefusal::Store(message)) => Err(RefreshError::DeviceStore(message)),
     }
-    Ok(())
+}
+
+/// The session a refresh builds, bound to the key the refresh proved.
+#[cfg(feature = "device-keys")]
+fn bound_to(
+    mut session: SessionData,
+    record: &RefreshToken,
+    proven: Option<KeyBound>,
+    now: Timestamp,
+) -> SessionData {
+    if let (Some(thumbprint), Some(device_id)) = (proven, record.device_id) {
+        session.key_binding = Some(crate::device_key::SessionKeyBinding {
+            owner: record.user_id,
+            tenant_id: record.tenant_id,
+            device_id,
+            thumbprint,
+            bound_at: now,
+        });
+    }
+    session
 }
 
 /// Device binding check: if the stored record has device info, the caller
@@ -371,8 +569,9 @@ fn session_for(record: &RefreshToken) -> SessionData {
             tenant_id: record.tenant_id,
             // The authentication the token descends from, not the refresh:
             // a 29-day-old token must not yield a session that passes
-            // "recent login".
+            // "recent login", nor one whose absolute age cap starts again.
             authn_time: record.authenticated_at(),
+            signed_in_at: record.authenticated_at(),
             // Refresh-token rotation re-establishes the same authn level
             // implicitly; no per-factor record carried across rotation.
             factors_completed: Vec::new(),
@@ -390,9 +589,13 @@ fn session_for(record: &RefreshToken) -> SessionData {
         // A refresh token record says which device it was issued to, not
         // that this request proved it; the next request resolves it again.
         device_proven: false,
+        device_key: None,
+        key_proven: false,
+        key_binding: None,
         custom: serde_json::Value::default(),
         revision: 0,
         touched_at: None,
+        ending: None,
     }
 }
 
@@ -406,7 +609,7 @@ fn replacement_for(
     plaintext: &str,
     config: &RefreshTokenConfig,
     rng: &impl SecureRng,
-    now: DateTime<Utc>,
+    now: Timestamp,
     record: &RefreshToken,
     child_device_info: Option<String>,
     under_previous_pepper: bool,
@@ -445,7 +648,7 @@ fn replacement_for(
 async fn rotate<S: RefreshTokenStore>(
     store: &S,
     config: &RefreshTokenConfig,
-    now: DateTime<Utc>,
+    now: Timestamp,
     record: &RefreshToken,
     new_record: &RefreshToken,
 ) -> Result<(), RefreshError<S::Error>> {
@@ -505,8 +708,8 @@ fn child_of(record: &RefreshToken, device_info: Option<String>) -> IssueRequest<
 /// Whether `record` can no longer be refreshed at `now`: past its own
 /// `expires_at`, or past the family's absolute
 /// [`RefreshTokenConfig::max_lifetime`].
-fn token_expired(record: &RefreshToken, config: &RefreshTokenConfig, now: DateTime<Utc>) -> bool {
-    now >= record.expires_at
+fn token_expired(record: &RefreshToken, config: &RefreshTokenConfig, now: Timestamp) -> bool {
+    Until::At(now) >= record.expires_at
         || config
             .lifetime_end(record.authenticated_at())
             .is_some_and(|end| now >= end)

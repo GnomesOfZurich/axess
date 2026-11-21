@@ -3,10 +3,9 @@
 //! signature verification.
 
 use super::*;
-use crate::session::id::SessionId;
+use crate::session::id::{SessionId, SessionKey};
 use crate::session::store::{MemorySessionRegistry, SessionRegistry, SessionRegistryAdapter};
 use crate::testing::mock_random::MockRng;
-use axess_clock::SystemClock;
 use axess_factors::oauth::MockOAuthProvider;
 use axess_factors::oidc::logout_token::BACKCHANNEL_LOGOUT_EVENT;
 use axum::extract::{Form, State};
@@ -18,7 +17,7 @@ fn token(client_id: &str, extra: serde_json::Value) -> String {
     let mut payload = serde_json::json!({
         "iss": ISS,
         "aud": client_id,
-        "iat": chrono::Utc::now().timestamp(),
+        "iat": axess_clock::testing::MockClock::reference_time().unix_seconds(),
         "events": { BACKCHANNEL_LOGOUT_EVENT: {} },
     });
     payload
@@ -50,7 +49,7 @@ fn handler(registry: &MemorySessionRegistry, sid_map: SidMap) -> BackChannelLogo
         &providers,
         Arc::new(SessionRegistryAdapter(registry.clone())),
         sid_map,
-        Arc::new(SystemClock),
+        Arc::new(axess_clock::testing::MockClock::at_reference()),
     )
     .expect("handler")
 }
@@ -71,7 +70,10 @@ async fn a_token_with_sub_and_sid_ends_only_the_sid_session() {
     let sid_map = SidMap::new();
     let h = handler(&registry, sid_map.clone());
     let rng = MockRng::new(3);
-    let (x, y) = (SessionId::new(&rng), SessionId::new(&rng));
+    let (x, y) = (
+        SessionKey::of(&SessionId::new(&rng)),
+        SessionKey::of(&SessionId::new(&rng)),
+    );
     let user = axess_identity::testing::user("user-1");
     let sub = "idp-subject-s";
     for s in [&x, &y] {
@@ -84,7 +86,7 @@ async fn a_token_with_sub_and_sid_ends_only_the_sid_session() {
         None,
         user,
         x,
-        chrono::Utc::now(),
+        axess_clock::testing::MockClock::reference_time(),
     );
 
     let t = token(
@@ -171,7 +173,7 @@ async fn azp_picks_the_provider_among_the_clients_in_aud() {
     let sid_map = SidMap::new();
     let h = handler(&registry, sid_map.clone());
     let rng = MockRng::new(5);
-    let session = SessionId::new(&rng);
+    let session = SessionKey::of(&SessionId::new(&rng));
     let user = axess_identity::testing::user("user-2");
     registry.register(&user, &session).await.unwrap();
     sid_map.insert(
@@ -180,7 +182,7 @@ async fn azp_picks_the_provider_among_the_clients_in_aud() {
         None,
         user,
         session,
-        chrono::Utc::now(),
+        axess_clock::testing::MockClock::reference_time(),
     );
 
     let t = token(

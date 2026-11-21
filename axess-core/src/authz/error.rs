@@ -39,6 +39,8 @@ impl IntoResponse for AuthzDenied {
 /// | `NoPrincipal` | 401 | Unauthenticated, no session |
 /// | `Provider` | 502 | Upstream entity provider failure |
 /// | `Context` | 500 | Request context build error |
+/// | `ContextProviderRequired` | none (startup) | The installation was built without the provider its policies need |
+/// | `ContextRequired` | 500 | The handler began a session without the context its policies read |
 #[derive(Debug, thiserror::Error)]
 pub enum AuthzError {
     /// Cedar policy text failed to parse at startup.
@@ -78,6 +80,29 @@ pub enum AuthzError {
     /// Constructing the per-request Cedar context failed.
     #[error("Request context error: {0}")]
     Context(String),
+
+    /// [`AuthzInstallation::new`](super::installation::AuthzInstallation::new)
+    /// was given a policy store whose policies read `context`, and no
+    /// context provider. Raised where the installation is built, so the
+    /// router is never served with gates that could not decide.
+    #[error(
+        "the policies read `context` and no context provider was given: pass \
+         Some(Arc<dyn RequestContextProvider>) as the third argument of \
+         AuthzInstallation::new (None is for a policy store that never reads `context`)"
+    )]
+    ContextProviderRequired,
+
+    /// An [`AuthzStore`](super::session::AuthzStore) was asked for a session
+    /// without a request context while the policies in force read `context`.
+    /// Such a session would be decided on an empty context, on which a
+    /// `forbid` that guards an optional attribute with `context has ..`
+    /// stops applying, so it is not begun.
+    #[error(
+        "the policies read `context` and this authorization session was begun without one: \
+         begin it with for_user_id_with_context, for_user_in_tenant_with_context or \
+         for_session, and a context that carries what the policies read"
+    )]
+    ContextRequired,
 }
 
 impl AuthzError {

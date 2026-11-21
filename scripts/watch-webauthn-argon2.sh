@@ -33,7 +33,7 @@ fail() {
 
 api() {
   curl --fail --silent --show-error --retry 3 --max-time 30 \
-    --user-agent "$USER_AGENT" "$API/$1" || fail "request failed: $API/$1"
+    --user-agent "$USER_AGENT" --url "$API/$1" || fail "request failed: $API/$1"
 }
 
 # The normal-kind requirement on `$2` in a dependencies answer `$1`, or empty

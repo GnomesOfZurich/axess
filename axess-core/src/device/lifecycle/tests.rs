@@ -1,6 +1,6 @@
 use super::*;
 use crate::device::store::MemoryDeviceStore;
-use chrono::TimeZone;
+use axess_clock::Timestamp;
 
 fn ids() -> (TenantId, UserId, DeviceId) {
     (
@@ -10,8 +10,13 @@ fn ids() -> (TenantId, UserId, DeviceId) {
     )
 }
 
-fn now_at(h: u32, m: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 1, 1, h, m, 0).unwrap()
+/// The proven device `id`, for user `u` of tenant `t`.
+fn of_user(t: TenantId, u: UserId, id: DeviceId) -> UserDevice {
+    UserDevice::for_tests(t, u, ProvenDevice::for_tests(id))
+}
+
+fn now_at(h: u8, m: u8) -> Timestamp {
+    Timestamp::from_utc(2026, 1, 1, h, m, 0).unwrap()
 }
 
 fn fingerprint(byte: u8) -> FingerprintHash {
@@ -97,7 +102,7 @@ async fn promote_unknown_transitions_to_seen() {
 
     let after_login = now_at(10, 5);
     let new_level = svc
-        .promote_on_authn(&t, &id, after_login)
+        .promote_on_authn(&of_user(t, u, id), after_login)
         .await
         .unwrap()
         .expect("device exists");
@@ -121,12 +126,15 @@ async fn promote_seen_is_noop_but_bumps_last_seen() {
         .await
         .unwrap();
     // Take it to Seen first.
-    let _ = svc.promote_on_authn(&t, &id, now_at(10, 5)).await.unwrap();
+    let _ = svc
+        .promote_on_authn(&of_user(t, u, id), now_at(10, 5))
+        .await
+        .unwrap();
 
     // Now another authn; should stay Seen, bump last_seen.
     let later = now_at(11, 0);
     let level = svc
-        .promote_on_authn(&t, &id, later)
+        .promote_on_authn(&of_user(t, u, id), later)
         .await
         .unwrap()
         .expect("present");
@@ -151,7 +159,7 @@ async fn promote_trusted_stays_trusted() {
         .unwrap();
 
     let level = svc
-        .promote_on_authn(&t, &id, now_at(11, 0))
+        .promote_on_authn(&of_user(t, u, id), now_at(11, 0))
         .await
         .unwrap()
         .expect("present");
@@ -181,7 +189,7 @@ async fn promote_revoked_never_re_elevates_or_bumps() {
     let last_seen_before = svc.store.load(&t, &id).await.unwrap().unwrap().last_seen_at;
 
     let level = svc
-        .promote_on_authn(&t, &id, now_at(11, 0))
+        .promote_on_authn(&of_user(t, u, id), now_at(11, 0))
         .await
         .unwrap()
         .expect("present");
@@ -202,8 +210,11 @@ async fn promote_revoked_never_re_elevates_or_bumps() {
 #[tokio::test]
 async fn promote_unknown_id_returns_none() {
     let svc = DeviceLifecycleService::new(MemoryDeviceStore::new());
-    let (t, _u, id) = ids();
-    let result = svc.promote_on_authn(&t, &id, now_at(10, 0)).await.unwrap();
+    let (t, u, id) = ids();
+    let result = svc
+        .promote_on_authn(&of_user(t, u, id), now_at(10, 0))
+        .await
+        .unwrap();
     assert!(
         result.is_none(),
         "absent device_id must yield Ok(None), not error"
@@ -227,7 +238,7 @@ async fn promote_if_authenticated_fires_only_on_authenticated_arm() {
     // FactorRequired → no-op, returns Ok(None).
     let outcome = FactorOutcome::FactorRequired(FactorKind::Totp);
     let r = svc
-        .promote_if_authenticated(&outcome, &t, &id, now_at(10, 1))
+        .promote_if_authenticated(&outcome, &of_user(t, u, id), now_at(10, 1))
         .await
         .unwrap();
     assert!(r.is_none(), "FactorRequired must not promote");
@@ -240,7 +251,11 @@ async fn promote_if_authenticated_fires_only_on_authenticated_arm() {
 
     // InvalidCredential → no-op.
     let r = svc
-        .promote_if_authenticated(&FactorOutcome::InvalidCredential, &t, &id, now_at(10, 2))
+        .promote_if_authenticated(
+            &FactorOutcome::InvalidCredential,
+            &of_user(t, u, id),
+            now_at(10, 2),
+        )
         .await
         .unwrap();
     assert!(r.is_none(), "InvalidCredential must not promote");
@@ -249,8 +264,7 @@ async fn promote_if_authenticated_fires_only_on_authenticated_arm() {
     let r = svc
         .promote_if_authenticated(
             &FactorOutcome::Locked { until: None },
-            &t,
-            &id,
+            &of_user(t, u, id),
             now_at(10, 3),
         )
         .await
@@ -259,7 +273,11 @@ async fn promote_if_authenticated_fires_only_on_authenticated_arm() {
 
     // Authenticated → fires promote, returns Some(Seen).
     let r = svc
-        .promote_if_authenticated(&FactorOutcome::Authenticated, &t, &id, now_at(10, 4))
+        .promote_if_authenticated(
+            &FactorOutcome::Authenticated,
+            &of_user(t, u, id),
+            now_at(10, 4),
+        )
         .await
         .unwrap();
     assert_eq!(r, Some(DeviceTrustLevel::Seen));
@@ -319,7 +337,7 @@ async fn ensure_device_emits_device_first_seen_on_create_only() {
         assert_eq!(events[0].tenant_id.as_ref(), Some(&t));
         assert_eq!(
             events[0].event_time,
-            now_at(10, 0).timestamp_micros(),
+            now_at(10, 0).unix_micros(),
             "the event is stamped with the caller's `now`, not the wall clock"
         );
     }
@@ -357,6 +375,54 @@ async fn ensure_device_supports_guest_sessions() {
     );
 }
 
+/// A device first seen by a guest has no owner. Trusting it on the request
+/// that completes the sign-in claims it for the user in the same call, and
+/// the trust grant's audit row names that user, not the snapshot's empty
+/// owner, so a query by user finds the grant.
+#[tokio::test]
+async fn a_trust_grant_that_claims_a_guest_device_names_the_user() {
+    use crate::authn::event::AuthEventType;
+
+    let sink = std::sync::Arc::new(LifecycleCaptureSink::new());
+    let svc = DeviceLifecycleService::new(MemoryDeviceStore::new()).with_event_sink(sink.clone());
+    let (t, u, id) = ids();
+    let _ = svc
+        .ensure_device(&t, None, fingerprint(11), now_at(10, 0), || id)
+        .await
+        .unwrap();
+    assert!(
+        svc.store
+            .load(&t, &id)
+            .await
+            .unwrap()
+            .unwrap()
+            .user_id
+            .is_none()
+    );
+
+    let level = svc
+        .grant_trust(&of_user(t, u, id), now_at(10, 1))
+        .await
+        .unwrap();
+    assert_eq!(level, Some(DeviceTrustLevel::Trusted));
+    let row = svc.store.load(&t, &id).await.unwrap().unwrap();
+    assert_eq!(
+        row.user_id.as_ref(),
+        Some(&u),
+        "the grant claimed the device"
+    );
+
+    let events = sink.events.lock().unwrap();
+    let granted: Vec<_> = events
+        .iter()
+        .filter(|event| event.event_type == AuthEventType::DeviceTrustGranted)
+        .collect();
+    assert_eq!(granted.len(), 1);
+    assert_eq!(granted[0].user_id.as_ref(), Some(&u));
+    assert_eq!(granted[0].tenant_id.as_ref(), Some(&t));
+    assert_eq!(granted[0].device_id.as_ref(), Some(&id));
+}
+
 // ── WebAuthn binding tests ─────────────────────────────────────
 
 #[cfg(feature = "fido2")]
@@ -383,7 +449,7 @@ mod webauthn_binding {
     /// Pin: bind_webauthn_credential adds a WebAuthn binding to the device.
     #[tokio::test]
     async fn bind_adds_webauthn_binding() {
-        let (svc, t, _u, id) = setup_device().await;
+        let (svc, t, _, id) = setup_device().await;
 
         let added = svc
             .bind_webauthn_credential(
@@ -418,7 +484,7 @@ mod webauthn_binding {
     /// Pin: duplicate credential_id is idempotent: returns false, no second binding.
     #[tokio::test]
     async fn bind_deduplicates_same_credential() {
-        let (svc, t, _u, id) = setup_device().await;
+        let (svc, t, _, id) = setup_device().await;
 
         let first = svc
             .bind_webauthn_credential(
@@ -475,7 +541,7 @@ mod webauthn_binding {
     /// Pin: record_webauthn_usage updates last_used_at on the matching binding.
     #[tokio::test]
     async fn usage_updates_last_used_at() {
-        let (svc, t, _u, id) = setup_device().await;
+        let (svc, t, _, id) = setup_device().await;
         svc.bind_webauthn_credential(
             &t,
             &id,
@@ -502,7 +568,7 @@ mod webauthn_binding {
     /// Pin: record_webauthn_usage is a no-op for nonexistent device or credential.
     #[tokio::test]
     async fn usage_noop_for_missing_device_or_credential() {
-        let (svc, t, _u, id) = setup_device().await;
+        let (svc, t, _, id) = setup_device().await;
 
         // No binding exists yet; should be silent no-op.
         svc.record_webauthn_usage(&t, &id, "no-such-cred", now_at(11, 0))
@@ -553,7 +619,7 @@ mod webauthn_binding {
     /// Pin: multiple different credentials can coexist on the same device.
     #[tokio::test]
     async fn multiple_credentials_on_same_device() {
-        let (svc, t, _u, id) = setup_device().await;
+        let (svc, t, _, id) = setup_device().await;
 
         svc.bind_webauthn_credential(
             &t,
@@ -578,14 +644,14 @@ mod webauthn_binding {
         assert_eq!(device.bindings.len(), 2);
     }
 
-    /// line 365 `==` → `!=` in `record_webauthn_usage`:
+    /// `==` → `!=` in `record_webauthn_usage`:
     /// the credential-id match must update ONLY the matching
     /// binding. Mutation flips the comparator so we touch every
     /// other binding instead. Setup with two WebAuthn credentials
     /// and observe which `last_used_at` advanced.
     #[tokio::test]
     async fn record_webauthn_usage_updates_only_matching_credential() {
-        let (svc, t, _u, id) = setup_device().await;
+        let (svc, t, _, id) = setup_device().await;
         let bind_time = now_at(10, 0);
         svc.bind_webauthn_credential(&t, &id, "cred-A".into(), AttestationClass::Basic, bind_time)
             .await
@@ -600,8 +666,8 @@ mod webauthn_binding {
             .unwrap();
 
         let device = svc.store().load(&t, &id).await.unwrap().unwrap();
-        let mut a_last_used: Option<DateTime<Utc>> = None;
-        let mut b_last_used: Option<DateTime<Utc>> = None;
+        let mut a_last_used: Option<Timestamp> = None;
+        let mut b_last_used: Option<Timestamp> = None;
         for b in &device.bindings {
             if let DeviceBinding::WebAuthn {
                 credential_id,
@@ -633,3 +699,4 @@ mod ownership;
 mod races;
 mod settling;
 mod sighting;
+mod trust;

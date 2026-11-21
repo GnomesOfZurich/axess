@@ -2,8 +2,8 @@
 //! test and the increment are one statement, so concurrent guesses cannot
 //! pass the limit, and a verified guess gives its reservation back.
 
-use axess::SystemClock;
 use axess::authn::{IdentityAuthnLog, LockoutPolicy, UserId};
+use axess_clock::testing::MockClock;
 use axess_example_sqlite::models::backend::{OurBackend, seed};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::str::FromStr;
@@ -15,7 +15,7 @@ fn limit(max_attempts: u32) -> LockoutPolicy {
     }
 }
 
-async fn backend() -> (OurBackend, UserId) {
+async fn backend(clock: &MockClock) -> (OurBackend, UserId) {
     let opts = SqliteConnectOptions::from_str("sqlite::memory:")
         .expect("in-memory url")
         .create_if_missing(true);
@@ -26,9 +26,10 @@ async fn backend() -> (OurBackend, UserId) {
         .expect("connect in-memory sqlite");
     sqlx::migrate!().run(&pool).await.expect("migrations");
     seed(
-        &SystemClock,
+        clock,
         &pool,
-        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF"),
+        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF")
+            .with_clock(std::sync::Arc::new(clock.clone())),
     )
     .await
     .expect("seed");
@@ -37,14 +38,15 @@ async fn backend() -> (OurBackend, UserId) {
         .await
         .expect("a seeded user");
     (
-        OurBackend::new(pool),
+        OurBackend::new(pool).with_clock(std::sync::Arc::new(clock.clone())),
         UserId::try_new(&id).expect("a user id"),
     )
 }
 
 #[tokio::test]
 async fn a_reservation_is_refused_once_the_count_reaches_the_limit() {
-    let (backend, user) = backend().await;
+    let clock = MockClock::at_reference();
+    let (backend, user) = backend(&clock).await;
     for expected in 1..=3 {
         assert_eq!(
             backend.reserve_attempt(&user, &limit(3)).await.unwrap(),
@@ -64,7 +66,8 @@ async fn a_reservation_is_refused_once_the_count_reaches_the_limit() {
 
 #[tokio::test]
 async fn parallel_reservations_cannot_pass_the_limit() {
-    let (backend, user) = backend().await;
+    let clock = MockClock::at_reference();
+    let (backend, user) = backend(&clock).await;
     let mut set = tokio::task::JoinSet::new();
     for _ in 0..12 {
         let backend = backend.clone();
@@ -82,7 +85,8 @@ async fn parallel_reservations_cannot_pass_the_limit() {
 
 #[tokio::test]
 async fn releasing_gives_one_back_and_clears_the_time_at_zero() {
-    let (backend, user) = backend().await;
+    let clock = MockClock::at_reference();
+    let (backend, user) = backend(&clock).await;
     backend.reserve_attempt(&user, &limit(5)).await.unwrap();
     backend.reserve_attempt(&user, &limit(5)).await.unwrap();
     backend.release_attempt(&user).await.unwrap();
@@ -100,7 +104,8 @@ async fn releasing_gives_one_back_and_clears_the_time_at_zero() {
 
 #[tokio::test]
 async fn an_ended_lockout_starts_the_count_over() {
-    let (backend, user) = backend().await;
+    let clock = MockClock::at_reference();
+    let (backend, user) = backend(&clock).await;
     let policy = LockoutPolicy {
         max_attempts: 2,
         duration: Some(std::time::Duration::from_secs(0)),
@@ -127,29 +132,12 @@ mod lockout_outlives_the_window {
     //! run out or the counter is reset, however old the last failure is.
 
     use super::*;
-    use axess::Clock;
-    use chrono::{DateTime, Utc};
-    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    /// A clock the test moves by hand, so a two-hour gap is two hours.
-    #[derive(Clone)]
-    struct MockClock(Arc<Mutex<DateTime<Utc>>>);
-
-    impl MockClock {
-        fn at(time: DateTime<Utc>) -> Self {
-            Self(Arc::new(Mutex::new(time)))
-        }
-
-        fn advance(&self, by: chrono::Duration) {
-            *self.0.lock().unwrap() += by;
-        }
-    }
-
-    impl Clock for MockClock {
-        fn now(&self) -> DateTime<Utc> {
-            *self.0.lock().unwrap()
-        }
+    /// The clock these tests run on, moved by hand, so a two-hour gap is
+    /// two hours.
+    fn window_clock() -> MockClock {
+        MockClock::at(axess_clock::Timestamp::from_unix_seconds(1_700_000_000).unwrap())
     }
 
     fn policy(duration: Option<Duration>) -> LockoutPolicy {
@@ -161,10 +149,8 @@ mod lockout_outlives_the_window {
         }
     }
 
-    async fn locked_backend(policy: &LockoutPolicy) -> (OurBackend, MockClock, UserId) {
-        let (backend, user) = backend().await;
-        let clock = MockClock::at(chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap());
-        let backend = backend.with_clock(Arc::new(clock.clone()));
+    async fn locked_backend(clock: &MockClock, policy: &LockoutPolicy) -> (OurBackend, UserId) {
+        let (backend, user) = backend(clock).await;
         let max = policy.effective_max_attempts();
         for expected in 1..=max {
             assert_eq!(
@@ -177,14 +163,15 @@ mod lockout_outlives_the_window {
             None,
             "the case this module refuses: the account is at its limit"
         );
-        (backend, clock, user)
+        (backend, user)
     }
 
     #[tokio::test]
     async fn an_indefinite_lockout_is_not_ended_by_the_window() {
         let policy = policy(None);
-        let (backend, clock, user) = locked_backend(&policy).await;
-        clock.advance(chrono::Duration::hours(2));
+        let clock = window_clock();
+        let (backend, user) = locked_backend(&clock, &policy).await;
+        clock.advance(axess_clock::SignedDuration::hours(2));
         assert_eq!(
             backend.reserve_attempt(&user, &policy).await.unwrap(),
             None,
@@ -196,17 +183,13 @@ mod lockout_outlives_the_window {
     async fn the_raw_count_is_reported_at_the_limit_after_the_window() {
         // The read uses the store's own policy (five attempts, one hour),
         // so the count is driven to that limit.
-        let (backend, user) = backend().await;
+        let clock = window_clock();
+        let (backend, user) = backend(&clock).await;
         let own = backend.lockout_policy();
-        let (backend, clock, user) = {
-            let clock = MockClock::at(chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap());
-            let backend = backend.with_clock(Arc::new(clock.clone()));
-            for _ in 0..own.effective_max_attempts() {
-                backend.reserve_attempt(&user, &own).await.unwrap().unwrap();
-            }
-            (backend, clock, user)
-        };
-        clock.advance(chrono::Duration::hours(2));
+        for _ in 0..own.effective_max_attempts() {
+            backend.reserve_attempt(&user, &own).await.unwrap().unwrap();
+        }
+        clock.advance(axess_clock::SignedDuration::hours(2));
         let (count, last) = backend.failed_attempts(&user).await.unwrap();
         assert_eq!(
             (count, last.is_some()),
@@ -219,16 +202,18 @@ mod lockout_outlives_the_window {
     #[tokio::test]
     async fn a_lockout_longer_than_the_window_outlives_it() {
         let policy = policy(Some(Duration::from_secs(3 * 60 * 60)));
-        let (backend, clock, user) = locked_backend(&policy).await;
-        clock.advance(chrono::Duration::hours(2));
+        let clock = window_clock();
+        let (backend, user) = locked_backend(&clock, &policy).await;
+        clock.advance(axess_clock::SignedDuration::hours(2));
         assert_eq!(backend.reserve_attempt(&user, &policy).await.unwrap(), None);
     }
 
     #[tokio::test]
     async fn an_ended_timed_lockout_starts_the_count_over() {
         let policy = policy(Some(Duration::from_secs(15 * 60)));
-        let (backend, clock, user) = locked_backend(&policy).await;
-        clock.advance(chrono::Duration::hours(2));
+        let clock = window_clock();
+        let (backend, user) = locked_backend(&clock, &policy).await;
+        clock.advance(axess_clock::SignedDuration::hours(2));
         assert_eq!(
             backend.reserve_attempt(&user, &policy).await.unwrap(),
             Some(1)
@@ -238,15 +223,14 @@ mod lockout_outlives_the_window {
     #[tokio::test]
     async fn a_count_below_the_limit_still_expires_with_the_window() {
         let policy = policy(None);
-        let (backend, user) = backend().await;
-        let clock = MockClock::at(chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap());
-        let backend = backend.with_clock(Arc::new(clock.clone()));
+        let clock = window_clock();
+        let (backend, user) = backend(&clock).await;
         backend.reserve_attempt(&user, &policy).await.unwrap();
         assert_eq!(
             backend.reserve_attempt(&user, &policy).await.unwrap(),
             Some(2)
         );
-        clock.advance(chrono::Duration::hours(2));
+        clock.advance(axess_clock::SignedDuration::hours(2));
         assert_eq!(
             backend.reserve_attempt(&user, &policy).await.unwrap(),
             Some(1)
@@ -256,12 +240,91 @@ mod lockout_outlives_the_window {
     #[tokio::test]
     async fn reset_clears_an_indefinite_lockout() {
         let policy = policy(None);
-        let (backend, clock, user) = locked_backend(&policy).await;
-        clock.advance(chrono::Duration::hours(2));
+        let clock = window_clock();
+        let (backend, user) = locked_backend(&clock, &policy).await;
+        clock.advance(axess_clock::SignedDuration::hours(2));
         backend.reset_failed_attempts(&user).await.unwrap();
         assert_eq!(
             backend.reserve_attempt(&user, &policy).await.unwrap(),
             Some(1)
         );
+    }
+}
+
+mod extreme_policy_values {
+    //! An attempt window or a lockout duration an operator set to an
+    //! extreme value never panics the counter, and follows the library's
+    //! reading: a window too long for a date never expires a failure, a
+    //! duration too long for a date is a lockout that never ends.
+
+    use super::*;
+    use axess_clock::Timestamp;
+    use axess_testing::durations::extreme_durations;
+
+    #[tokio::test]
+    async fn an_extreme_attempt_window_never_panics_and_never_expires_a_failure() {
+        for extreme in extreme_durations() {
+            let clock = MockClock::at(Timestamp::from_unix_seconds(1_700_000_000).unwrap());
+            let (backend, user) = backend(&clock).await;
+            let policy = LockoutPolicy {
+                max_attempts: 5,
+                attempt_window: extreme.value,
+                ..LockoutPolicy::default()
+            };
+            backend
+                .record_failed_attempt(&user)
+                .await
+                .unwrap_or_else(|e| panic!("{}: {e}", extreme.name));
+            clock.advance(axess_clock::SignedDuration::hours(2));
+            let count = backend
+                .reserve_attempt(&user, &policy)
+                .await
+                .unwrap_or_else(|e| panic!("{}: {e}", extreme.name));
+            // A window two hours exceed expires the first failure; one they
+            // cannot reach, or one no date holds, keeps it.
+            let expires = axess_clock::SignedDuration::try_from(policy.attempt_window)
+                .is_ok_and(|window| window < axess_clock::SignedDuration::hours(2));
+            assert_eq!(
+                count,
+                Some(if expires { 1 } else { 2 }),
+                "{}: the count after the gap",
+                extreme.name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_extreme_lockout_duration_never_panics_and_never_ends() {
+        for extreme in extreme_durations() {
+            let clock = MockClock::at(Timestamp::from_unix_seconds(1_700_000_000).unwrap());
+            let (backend, user) = backend(&clock).await;
+            let policy = LockoutPolicy {
+                max_attempts: 1,
+                duration: Some(extreme.value),
+                ..LockoutPolicy::default()
+            };
+            assert_eq!(
+                backend
+                    .reserve_attempt(&user, &policy)
+                    .await
+                    .unwrap_or_else(|e| panic!("{}: {e}", extreme.name)),
+                Some(1),
+                "{}: the first guess",
+                extreme.name
+            );
+            clock.advance(axess_clock::SignedDuration::hours(2));
+            let slot = backend
+                .reserve_attempt(&user, &policy)
+                .await
+                .unwrap_or_else(|e| panic!("{}: {e}", extreme.name));
+            let ended = axess_clock::SignedDuration::try_from(extreme.value)
+                .is_ok_and(|duration| duration <= axess_clock::SignedDuration::hours(2));
+            assert_eq!(
+                slot,
+                if ended { Some(1) } else { None },
+                "{}: at the limit after the gap",
+                extreme.name
+            );
+        }
     }
 }

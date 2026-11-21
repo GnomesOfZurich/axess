@@ -25,14 +25,14 @@ fn human_principal_tenant_id_accessor() {
 #[test]
 fn workload_principal_tenant_id_accessor() {
     let tenant = sample_tenant();
-    let trust = TrustDomain::new("gnomes.local").unwrap();
-    let wid = WorkloadId::build(&trust, "compute-worker", "gnomes").unwrap();
+    let trust = TrustDomain::new("example.org").unwrap();
+    let wid = WorkloadId::build(&trust, "compute-worker", "acme").unwrap();
     let workload = WorkloadPrincipal {
         workload_id: wid,
         trust_domain: trust,
         issuer: Issuer::Cli,
         tenant_id: tenant,
-        tenant_slug: "gnomes".to_string(),
+        tenant_slug: "acme".to_string(),
         service_name: "compute-worker".to_string(),
         attributes: BTreeMap::new(),
     };
@@ -42,14 +42,14 @@ fn workload_principal_tenant_id_accessor() {
 
 #[test]
 fn attributes_accessor_returns_empty_by_default() {
-    let trust = TrustDomain::new("gnomes.local").unwrap();
-    let wid = WorkloadId::build(&trust, "feed-worker", "gnomes").unwrap();
+    let trust = TrustDomain::new("example.org").unwrap();
+    let wid = WorkloadId::build(&trust, "feed-worker", "acme").unwrap();
     let workload = WorkloadPrincipal {
         workload_id: wid,
         trust_domain: trust,
         issuer: Issuer::Cli,
         tenant_id: sample_tenant(),
-        tenant_slug: "gnomes".to_string(),
+        tenant_slug: "acme".to_string(),
         service_name: "feed-worker".to_string(),
         attributes: BTreeMap::new(),
     };
@@ -79,8 +79,8 @@ fn attributes_accessor_returns_populated_human_map() {
 
 #[test]
 fn attributes_accessor_returns_populated_workload_map() {
-    let trust = TrustDomain::new("gnomes.local").unwrap();
-    let wid = WorkloadId::build(&trust, "feed-worker", "gnomes").unwrap();
+    let trust = TrustDomain::new("example.org").unwrap();
+    let wid = WorkloadId::build(&trust, "feed-worker", "acme").unwrap();
     let mut attrs = BTreeMap::new();
     attrs.insert("region".to_string(), serde_json::json!("eu-west-1"));
     let workload = WorkloadPrincipal {
@@ -88,7 +88,7 @@ fn attributes_accessor_returns_populated_workload_map() {
         trust_domain: trust,
         issuer: Issuer::Cli,
         tenant_id: sample_tenant(),
-        tenant_slug: "gnomes".to_string(),
+        tenant_slug: "acme".to_string(),
         service_name: "feed-worker".to_string(),
         attributes: attrs,
     };
@@ -162,7 +162,7 @@ fn principal_serde_round_trip_human() {
 #[cfg(feature = "serde")]
 #[test]
 fn principal_serde_round_trip_workload() {
-    let trust = TrustDomain::new("gnomes.local").unwrap();
+    let trust = TrustDomain::new("example.org").unwrap();
     let wid = WorkloadId::build(&trust, "market-worker", "world_cup").unwrap();
     let workload = WorkloadPrincipal {
         workload_id: wid,
@@ -222,7 +222,7 @@ fn issuer_deserialize_validates_custom_label() {
 #[cfg(feature = "serde")]
 #[test]
 fn workload_principal_with_custom_issuer_round_trips() {
-    let trust = TrustDomain::new("gnomes.local").unwrap();
+    let trust = TrustDomain::new("example.org").unwrap();
     let workload = WorkloadPrincipal {
         workload_id: WorkloadId::build(&trust, "ci", "acme").unwrap(),
         trust_domain: trust,
@@ -257,8 +257,8 @@ fn issuer_deserialization_refuses_a_custom_label_naming_a_built_in() {
 }
 
 /// Every label that can be held is a label the constructor accepts: the
-/// refused ones never become an issuer, and an accepted one survives a
-/// round trip.
+/// refused ones never become an issuer, and, with `serde`, an accepted one
+/// survives a round trip.
 #[test]
 fn issuer_custom_label_always_valid() {
     for bad in [
@@ -276,7 +276,10 @@ fn issuer_custom_label_always_valid() {
     for good in ["github_actions", "a", "k8s_prod", &"a".repeat(32)] {
         let issuer = Issuer::custom(good).unwrap();
         assert_eq!(issuer.as_str(), good);
-        let json = serde_json::to_string(&issuer).unwrap();
-        assert_eq!(serde_json::from_str::<Issuer>(&json).unwrap(), issuer);
+        #[cfg(feature = "serde")]
+        {
+            let json = serde_json::to_string(&issuer).unwrap();
+            assert_eq!(serde_json::from_str::<Issuer>(&json).unwrap(), issuer);
+        }
     }
 }

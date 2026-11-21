@@ -5,12 +5,11 @@ configurations, sessions, devices, policies, and audit events all
 carry a `TenantId`, and the library refuses to leak data across
 tenants by construction.
 
-The mechanism is on by default, and no feature flag exists to
-toggle tenancy; the `TenantId` field is present on every relevant
-record. A single-tenant deployment uses one well-known
-`TenantId` (`"default"` is the convention) and effectively gets
-the multi-tenant machinery for free, ready to expand when a
-second tenant is added.
+Tenancy is always on: no feature flag toggles it, and the `TenantId`
+field is present on every relevant record. A single-tenant deployment uses one fixed `TenantId` (a
+UUID, like every id; `"default"` is a common choice for the tenant's
+lookup `identifier`, not for its id) and runs the same
+multi-tenant machinery, ready for a second tenant.
 
 ## The model
 
@@ -27,23 +26,26 @@ pub struct Tenant {
     pub display_name: Arc<str>,
     pub status: EntityState,       // same lifecycle enum a user's status uses
     pub created_by: UserId,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     pub updated_by: UserId,
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 ```
 
-Note what is *not* on it. There is no per-tenant lockout policy field,
-no fingerprint pepper, no retention setting. Per-tenant policy is
+The struct carries no per-tenant lockout policy, no fingerprint pepper
+and no retention setting. Per-tenant policy is
 resolved through `IdentityLookup`, not stored on the struct:
 `lockout_policy_for_tenant`, `password_rules_for_tenant` and
-`ip_policy_for_tenant` are trait methods with defaults, and a
-deployment that sells a stricter tier overrides them against its own
+`ip_policy_for_tenant` are required trait methods, with no default, so
+no decorator can drop a tenant's policy by forgetting to forward it. A
+deployment with one policy returns it from each; one that sells a
+stricter tier answers from its own
 table. That keeps `Tenant` a row an adopter can map onto whatever they
 already have, rather than a schema axess imposes.
 
 `status` is `EntityState` (`Guest`, `Candidate`, `Pending`, `Active`,
-`Suspended`, and the closed state), shared with users rather than a
+`Suspended`, and the two closed states, `Terminated` and `Archived`),
+shared with users rather than a
 tenant-specific enum, which is what makes "is this principal usable"
 one question at both levels.
 
@@ -54,36 +56,35 @@ admin.
 
 
 The `TenantId` is a typed UUID (the convention in axess-identity).
-The `status` carries the tenant's lifecycle state, covered below.
-The `fingerprint_pepper` is the per-tenant device pepper from
-*Device identity*. The `lockout_policy` is the tenant-scoped
-override of the global lockout configuration, covered in the
-*Three-lever lockout* section below. The `device_retention_days`
-is the per-tenant GDPR-shaped retention period for device records.
+The settings that vary per tenant live outside the struct: the device
+fingerprint pepper comes from the `TenantPepperResolver` of *Device
+identity*, the lockout policy from `lockout_policy_for_tenant`
+(covered in the lockout section below), and device retention from the
+`SweepConfig` the deployment passes to the device store.
 
 ### Cross-tenant refusal as a structural rule
 
 Every operation in axess that touches a user, a session, a device,
 a factor, or an event carries a tenant scope. The library checks
-the scope before performing the operation, and refuses any
-operation where the scopes do not align.
+the scope first and refuses any operation whose scopes do not
+match.
 
 The pattern is uniform across the API. A `begin_login` call
-takes a tenant id; the user lookup is scoped to that tenant; a
+takes the tenant's lookup identifier and resolves the tenant from it;
+the user lookup is scoped to that tenant; a
 user with the same username in a different tenant is not
 returned. A `verify_factor` call works against the session's
 tenant id; a factor configuration registered in a different
-tenant is not consulted. A `find_sessions_for_user` call takes
-a user id and a limit, not a tenant id: it lists the sessions of that one
-user (the memory store does; the SQL and Valkey stores return an
-`Unsupported` error).
+tenant is not consulted. `find_sessions_for_user` is an exception: it
+takes a user id and a limit, not a tenant id, and lists the sessions
+that carry that user id, whatever their tenant, so it is scoped only as
+far as user ids are unique across tenants (the memory store implements
+it; the SQL and Valkey stores return an `Unsupported` error).
 
-The structural defence is what lets a multi-tenant deployment
-make the strongest possible authorisation claim: not only does
-the application not leak across tenants, the library underneath
-cannot. The Cedar policy layer can then add a top-level `forbid`
-rule that catches the rare case of an application bug that tries
-to authorise across tenants:
+The structural defence lets a multi-tenant deployment claim more than
+that the application does not leak across tenants: the library
+underneath cannot. A top-level Cedar `forbid` rule can then catch an
+application bug that tries to authorise across tenants:
 
 ```cedar,ignore
 forbid (
@@ -95,17 +96,15 @@ forbid (
 };
 ```
 
-The rule applies to every action on every resource, and the
-combination of "library refuses cross-tenant lookups" and "policy
-denies cross-tenant decisions" produces a deployment where a
-cross-tenant access is structurally impossible.
+The rule applies to every action on every resource. With the library
+refusing cross-tenant lookups and the policy denying cross-tenant
+decisions, a cross-tenant access is structurally impossible.
 
 ## Provisioning
 
 A tenant comes into existence through `create_tenant`, the verb behind
 any "sign up a new organisation" or "administrator provisions a new
-tenant" flow. It is a free function rather than an `AuthnService`
-method, for the reason given below: it needs both stores.
+tenant" flow.
 
 ```rust,ignore
 use axess_core::authn::provisioning::{TenantBootstrap, create_tenant};
@@ -114,6 +113,7 @@ let tenant = Tenant::new(
     tenant_id,
     "acme",                      // lookup identifier
     "Acme Inc.",                 // display name
+    EntityState::Active,         // status
     UserId::system(),            // created_by
     clock.now(),
 )?;
@@ -133,6 +133,7 @@ let (tenant, method) = create_tenant(
                 FactorStep::Required(FactorKind::Password),
                 FactorStep::Required(FactorKind::Totp),
             ],
+            scope: AuthnScope::Tenant(tenant_id),
         }),
     },
 )
@@ -145,20 +146,20 @@ touches both and belongs to neither. It returns the tenant and the
 `AuthMethod` it installed.
 
 The bootstrap creates no administrator. Creating the first
-user is a separate `create_user` call, which means a caller who wants
-"tenant plus admin, or neither" wraps both in their own transaction.
+user is a separate `create_user` call; a caller who wants "tenant plus
+admin, or neither" wraps both in its own transaction.
 Bootstrapping with an empty `factors` list is refused outright
 (`ProvisioningError::NoFactorsSpecified`), because a tenant whose users
 cannot present any factor cannot be logged into.
 
-A partially-provisioned tenant is a landmine, so the order of the
-steps is chosen to make the partial states the least harmful ones. A
+A partially provisioned tenant is dangerous, so the steps run in the
+order that leaves the least harmful partial states. A
 tenant that exists in the tenant table but has no configured method
 admits any user with the system default method, which may not be what
 the new tenant wants. A tenant with a method but no factor
 configurations for the admin user produces an immediate lockout.
 
-`create_tenant` is four store calls in sequence (the tenant row, one
+`create_tenant` is a sequence of store calls (the tenant row, one
 `save_factor` per template, then `save_method`), not a transaction.
 If one fails it returns the error and leaves whatever the earlier calls
 wrote; retry or compensate. A backend that wants all-or-nothing makes
@@ -174,39 +175,34 @@ to whatever creates the first user.
 
 ## The three-lever lockout
 
-Lockout is the mechanism that prevents an attacker from
-brute-forcing credentials. Axess has three levers, applied at
-three scopes, that compose.
+Lockout stops an attacker from brute-forcing credentials. Axess has three levers that compose: two
+in the login path, and one you mount in front of it.
 
 The first lever is per-user lockout. After a configurable number
 of failed factor verifications against the same user account,
 that account is locked for a configurable interval. The default
-is three failed attempts followed by a fifteen-minute lockout
-with exponential backoff on repeated failure.
+is five failed attempts within an hour, followed by a
+fifteen-minute lockout of fixed length.
 
-The second lever is per-tenant lockout. After a configurable
-number of failed factor verifications across any user in the
-tenant within a short window, the tenant's login surface as a
-whole is throttled. The default is high enough that legitimate
-traffic does not trigger it; the lever exists to catch
-distributed brute-forcing across many accounts in the same
-tenant.
+The second lever is the throttle, which acts before the lockout.
+Each failure against an account from one address earns a delay
+before the next guess from that pair is taken: one second,
+doubling to sixty-four by default. It slows a guesser without
+locking the account's owner out from another address.
 
-The third lever is per-IP lockout. After a configurable number
-of failed verifications from the same source IP within a short
-window, that IP is throttled or blocked outright. The default is
-ten attempts per minute, beyond which the requests are rejected
-without engaging the factor verifier. The lever catches a single
-attacker source attempting many accounts.
+The third lever is the rate limiter, `RateLimitLayer`, which is
+middleware and not part of the login path: nothing limits by
+address or by tenant unless you mount it. Its default is a hundred
+requests per minute for each peer address, and its key can be the
+resolved client address or the tenant instead. It rejects requests
+without engaging the factor verifier, which is what catches a single
+source attempting many accounts.
 
-The three levers compose multiplicatively. A successful attack
-needs to dodge all three: stay below the per-user threshold,
-stay below the per-tenant threshold, and either spread across
-many source IPs or stay below the per-IP threshold. The cost of
-the attack grows as a product of the three.
+A successful attack needs to dodge all three: stay below the
+per-user threshold, wait out the throttle, and either spread across
+many source addresses or stay below the rate limit.
 
-The lockout configuration is in `LockoutPolicy`, and it is one scale,
-not three:
+`LockoutPolicy` holds the lockout configuration:
 
 ```rust,ignore
 pub struct LockoutPolicy {
@@ -227,7 +223,7 @@ failures count, so five failures spread over two hours do not lock an
 account whose window is one hour.
 
 The lock's scoping is per user only. Per-tenant and per-IP lockout
-scales do not exist on this type, and adding one would be the wrong place for it: a
+scales do not exist on this type, and this type is the wrong place for them: a
 per-IP threshold that locks *accounts* is a denial-of-service tool in
 an attacker's hands. Rate-limit by IP instead, at the middleware layer,
 where the response is a 429 rather than a locked account
@@ -268,12 +264,12 @@ this path, or pick `Allow` knowingly.
 
 Neither setting changes what an attacker sees for an identifier that
 does not exist. Those are refused at `begin_login` with timing
-equalization and never reach the counter.
+equalisation and never reach the counter.
 
 The policy is resolved per tenant through
-`IdentityLookup::lockout_policy_for_tenant`, which defaults to
-`lockout_policy()`, which defaults to `LockoutPolicy::default()`.
-Override either where your tenants differ.
+`IdentityLookup::lockout_policy_for_tenant`, a required method: a
+store with one policy returns `LockoutPolicy::default()` (or its own)
+for every tenant, and one whose tenants differ looks the policy up.
 
 ## Tenant lifecycle
 
@@ -297,8 +293,8 @@ compliance review" now, it is yours to build: set the tenant's status
 through your own `IdentityStore` implementation, and invalidate the
 sessions of its users yourself. Doing it inside axess would mean new
 required methods on both `IdentityStore` and the session registry,
-which every adopter would have to implement, so it is a deliberate
-decision rather than an oversight to leave it out.
+which every adopter would have to implement, so leaving it out is
+deliberate.
 
 Whatever drives the status, a tenant that is not `Active` refuses its
 users before factor verification. That is a state the application may
@@ -308,8 +304,8 @@ the tenant's status rather than inferring it from the login outcome.
 
 ### Tenant deletion
 
-The same gap as suspension, one step further along. `EntityState` has a
-closed state, so a deleted tenant is representable, and **axess ships
+The same gap as suspension, one step further along. `EntityState` has
+closed states (`Terminated`, `Archived`), so a deleted tenant is representable, and **axess ships
 no operation to delete one and no cascade to run.** `IdentityAdmin` has
 `delete_user`, which is the GDPR erasure primitive for a single user;
 there is no tenant equivalent.
@@ -323,7 +319,7 @@ audit events in place, to be retained under an independent lawful basis
 with identifying columns pseudonymised. A tenant-level erasure inherits
 both.
 
-If you build it, two things a naive cascade will not do:
+If you build it, do two things a naive cascade will not:
 
 - **Mark the tenant `Suspended` first**, then remove. The cascade is
   expensive on a large tenant, and the gap between the two is the only
@@ -345,30 +341,33 @@ and `default_tenant` read, `IdentityAdmin::create_tenant` writes, and
 the three `*_for_tenant` policy methods resolve per-tenant
 configuration from wherever you keep it.
 
-That is a deliberate consolidation rather than a gap. A separate tenant
+A separate tenant
 trait would be a second surface every adopter has to implement, against
 the same database, with its own error type and its own transaction
 boundary. Provisioning a tenant already has to touch users and
 factors, so it could not stay inside that boundary anyway.
 
 The practical consequence is that per-tenant policy has no prescribed
-schema. A deployment with one policy for everyone implements nothing
-and takes the defaults. A deployment that varies policy per tenant adds
+schema. A deployment with one policy for everyone returns it from the
+three policy methods, which are a line each. A deployment that varies policy per tenant adds
 a column or a table of its own and returns it from
-`lockout_policy_for_tenant` and friends. Axess never reads that storage
+`lockout_policy_for_tenant` and the other two. Axess never reads that storage
 directly, which is why it cannot dictate its shape.
 
 ### Reserved principals
 
 A handful of principals are reserved across all tenants. The
-`system()` principal is the one axess uses for its own internal
-operations (retention sweeps, scheduled rotations, audit pipeline
-ingestion). The principal carries no `TenantId`; its actions are
-attributed to the system itself, not to any tenant or user.
+`system()` principal is the actor of work no person performs: the rows
+that seeding or operator onboarding writes carry it as `created_by` and
+`updated_by`, as do the tenant and user rows the in-memory backend
+installs. The device retention sweep takes no actor and is run by the
+deployment. It is `UserId::system()`, and it pairs with the reserved
+`TenantId::SYSTEM`; its actions are attributed to the system itself,
+not to any customer tenant or user.
 
-The reservation prevents an application from creating a user named
-"system" and inadvertently granting that user the permissions axess
-reserves for its background work. `UserId::is_system` and
+The reservation prevents an application from creating a user that
+carries the reserved id, whose actions would then read as the system's
+own. `UserId::is_system` and
 `TenantId::is_system` are the predicates, and
 `ensure_user_id_not_reserved(user_id, tenant_id)` is the guard,
 returning `IdError::Reserved` for either.
@@ -385,11 +384,12 @@ The set of reserved principals is small and stable. The chapter
 ## What a SaaS gets from this
 
 Multi-tenancy in axess is what lets a SaaS application provision
-new organisations without restructuring the data model, suspend
-problematic ones without affecting the rest, and delete departed
-ones cleanly with an audit trail. The fingerprint pepper rotates
-per-tenant; the lockout policy varies per-tenant; the device
-retention complies per-tenant; the policies scope per-tenant. The
+new organisations without restructuring the data model. Suspending
+and deleting a tenant are the application's to build on the per-user
+primitives, as the lifecycle section says. The fingerprint pepper is
+per tenant; the lockout policy varies per tenant; device retention
+can vary per tenant where the deployment keeps a `SweepConfig` for
+each; the policies are scoped per tenant. The
 multi-tenant deployment is the single-tenant deployment with
 N>1.
 

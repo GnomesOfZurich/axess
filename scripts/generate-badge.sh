@@ -35,8 +35,8 @@ label_w=$(( ${#label} * 7 + 10 ))
 message_w=$(( ${#message} * 7 + 10 ))
 total_w=$(( label_w + message_w ))
 
-label_x=$(awk "BEGIN { printf \"%.1f\", $label_w / 2 }")
-message_x=$(awk "BEGIN { printf \"%.1f\", $label_w + $message_w / 2 }")
+label_x=$(awk -v label="$label_w" 'BEGIN { printf "%.1f", label / 2 }')
+message_x=$(awk -v label="$label_w" -v message="$message_w" 'BEGIN { printf "%.1f", label + message / 2 }')
 
 mkdir -p "$(dirname "$output")"
 cat > "$output" <<EOF

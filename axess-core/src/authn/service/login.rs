@@ -50,7 +50,10 @@ where
     /// difference. A username-and-password form should call
     /// [`login_with_password`](Self::login_with_password), which answers
     /// every path as a wrong password does.
-    #[tracing::instrument(skip(self, identifier, session), fields(tenant = %tenant_identifier))]
+    #[tracing::instrument(
+        skip(self, identifier, tenant_identifier, session),
+        fields(tenant = %super::log_text::logged_request_text(tenant_identifier))
+    )]
     pub async fn begin_login(
         &self,
         identifier: &str,
@@ -258,8 +261,8 @@ where
         // usable method would otherwise be the one outcome that leaves no
         // audit row, and during an audit-store outage the one that still
         // succeeds while every other path fails, which is an enumeration
-        // signal, narrow but of exactly the shape this flow was rewritten
-        // to remove.
+        // signal, narrow but of exactly the shape this flow exists to
+        // remove.
         let Some((method_name, steps)) = usable else {
             self.inner.metrics.auth_flow.auth_failure();
             self.emit_audit(
@@ -344,7 +347,13 @@ where
     ///   [`PrepareOutcome::SendOtp`] with the plaintext code and the
     ///   destination email. The application is responsible for delivering the
     ///   code (via SMTP, SendGrid, etc.).
-    /// - **Fido2** → placeholder, currently returns `Ready`.
+    /// - **Fido2** → starts a WebAuthn authentication ceremony over the
+    ///   user's credentials that the step's ceremony accepts (the one a
+    ///   step-up named, or `Fido2Options::login_ceremony`) and returns
+    ///   [`PrepareOutcome::Fido2Challenge`] with the challenge for the
+    ///   browser; [`AuthnError::NoFlow`] when no credential of the user fits
+    ///   the ceremony. A service with no FIDO2 provider answers
+    ///   [`PrepareOutcome::Ready`], and the step then verifies no assertion.
     ///
     /// The session must be in [`AuthState::Authenticating`](crate::session::data::AuthState::Authenticating).
     #[tracing::instrument(skip(self, session))]
@@ -475,6 +484,12 @@ where
         tenant_id: &crate::authn::ids::TenantId,
         user_id: &crate::authn::ids::UserId,
     ) -> Result<PrepareOutcome, AuthnError<I::Error>> {
+        // An earlier challenge for this step ends here: whatever becomes of
+        // this one, the assertion the browser may already hold for the
+        // earlier challenge verifies nothing.
+        self.clear_ceremony_state(session, fido2_keys::AUTH_STATE)
+            .await;
+
         let fido2 = self.inner.fido2.load_full();
         let webauthn = match &fido2 {
             Some(w) => w,
@@ -533,8 +548,15 @@ where
             // it could never be finished.
             return Err(AuthnError::NoFlow);
         }
-        self.stamp_ceremony_start(session, fido2_keys::AUTH_STATE)
-            .await?;
+        if let Err(unstamped) = self
+            .stamp_ceremony_start(session, fido2_keys::AUTH_STATE)
+            .await
+        {
+            // A ceremony that cannot be timed does not stay behind.
+            self.clear_ceremony_state(session, fido2_keys::AUTH_STATE)
+                .await;
+            return Err(unstamped);
+        }
 
         let challenge_json = serde_json::to_value(&challenge).map_err(|_| AuthnError::NoFlow)?;
         Ok(PrepareOutcome::Fido2Challenge {
@@ -643,7 +665,9 @@ where
     /// Only this session ends. The user's other sessions (another browser, a
     /// phone) stay signed in; use
     /// [`invalidate_user_sessions`](crate::authn::service::RequestAuthnService::invalidate_user_sessions)
-    /// to end all of them.
+    /// to end all of them. The registry entry ended is the one the registry
+    /// holds for the session ([`AuthSession::registered_key`]), also after
+    /// a rotation earlier in the same request.
     ///
     /// The session is cleared and its id rotated **whatever the audit store
     /// does**: the registry entry is dropped, the session is cleared, and
@@ -661,11 +685,16 @@ where
             return Ok(());
         };
         self.inner.metrics.session.session_invalidated();
-        let sid = session.session_id().await;
+        // The key the registry holds the session under, which a rotation
+        // earlier in this request has not moved yet: the session's own key
+        // may name no entry at all. It is the entry this logout ends, and the
+        // key its audit row names, as a kick's row names the key the session
+        // was under when it ended.
+        let held = session.registered_key().await;
         let tenant_id = session.pending_tenant_id().await;
         if let Some(reg) = &self.inner.registry {
             note_revocation(
-                reg.invalidate_session(&user_id, &sid).await,
+                reg.invalidate_session(&user_id, &held).await,
                 "logout or a refused login",
             );
         }
@@ -688,55 +717,9 @@ where
         self.emit_audit(
             AuthEventBuilder::success(AuthEventType::LogoutAttempt)
                 .maybe_attributed_to(Some(&user_id), tenant_id.as_ref())
-                .with_session(sid),
+                .with_session(held),
         )
         .await
-    }
-
-    /// Rotate the session id of an authenticated session and keep the
-    /// registry in step.
-    ///
-    /// [`AuthSession::regenerate`] alone changes the id the client carries
-    /// but leaves the registry holding the old one, so a registry check would
-    /// then find the session revoked. This registers the new id, drops the
-    /// old one, and fails closed: when the registry cannot register the new
-    /// id the session is cleared and the call returns
-    /// [`AuthnError::NoFlow`]. Without a registry it is just a rotation. Use
-    /// it at the privilege boundaries `regenerate` documents (factor added,
-    /// password changed, tenant switched).
-    ///
-    /// A session layer built with a registry moves the entry itself when a
-    /// handler calls `regenerate`; this method does it without relying on
-    /// that, and works with the validator middleware alone.
-    #[tracing::instrument(skip(self, session))]
-    pub async fn rotate_session(&self, session: &AuthSession) -> Result<(), AuthnError<I::Error>> {
-        let user = if session.is_authenticated().await {
-            session.user_id().await
-        } else {
-            None
-        };
-        let old = session.session_id().await;
-        session.regenerate().await;
-        if let (Some(user_id), Some(reg)) = (user, &self.inner.registry) {
-            let new = session.session_id().await;
-            if !reg.register(&user_id, &new).await {
-                tracing::error!(
-                    user_id = %user_id,
-                    "rotate_session: registering the new session id failed; clearing the session"
-                );
-                note_revocation(
-                    reg.invalidate_session(&user_id, &old).await,
-                    "logout or a refused login",
-                );
-                session.clear().await;
-                return Err(AuthnError::NoFlow);
-            }
-            note_revocation(
-                reg.invalidate_session(&user_id, &old).await,
-                "logout or a refused login",
-            );
-        }
-        Ok(())
     }
 }
 

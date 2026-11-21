@@ -1,0 +1,12 @@
+error[E0423]: cannot initialize a tuple struct which contains private fields
+ --> tests/ui/replayed_jti_private_field.rs:6:13
+  |
+6 |     let _ = ReplayedJti(String::from("the key as the token wrote it"));
+  |             ^^^^^^^^^^^
+  |
+  = note: a struct named `ReplayedJti` exists in another namespace
+note: constructor is not visible here due to private fields
+ --> src/jwt/verifier.rs
+  |
+  | pub struct ReplayedJti(String);
+  |                        ^^^^^^ private field

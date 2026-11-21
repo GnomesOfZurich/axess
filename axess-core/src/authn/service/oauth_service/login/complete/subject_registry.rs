@@ -3,20 +3,21 @@
 //! the `sid` map never hides a live session from it.
 
 use super::super::helpers::compute_claim_lock;
-use crate::authn::ids::UserId;
 use crate::authn::service::AuthnService;
 use crate::federation::backchannel_logout::{BackChannelLogoutHandler, LogoutParams};
-use crate::session::id::SessionId;
+use crate::session::id::SessionKey;
 use crate::session::{MemorySessionRegistry, SessionRegistryAdapter, store::SessionRegistry};
+use crate::testing::registry_double::{RegistryDouble, RegistryOp, Step};
 use crate::testing::{
     mock_authn::{MockFactorStore, MockIdentityStore},
-    tenant_record, test_session, user_record,
+    tenant_record_at, test_session, user_record_at,
 };
 use axess_clock::testing::MockClock;
 use axess_factors::oauth::{MockOAuthProvider, OAuthClaims, OAuthProvider, types::keys};
 use axum::{extract::State, http::StatusCode};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The mock provider's name; its issuer is `https://test-idp.example.com`.
 const PROVIDER: &str = "test-idp";
@@ -24,55 +25,21 @@ const ISSUER: &str = "https://test-idp.example.com";
 
 /// A registry that answers `is_valid` with an error while `failing` is set,
 /// and `invalidate_session` with an error while `invalidate_failing` is set.
-#[derive(Clone)]
-struct FlakyRegistry {
-    inner: MemorySessionRegistry,
-    failing: Arc<std::sync::atomic::AtomicBool>,
-    invalidate_failing: Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl SessionRegistry for FlakyRegistry {
-    type Error = std::io::Error;
-
-    async fn register(&self, u: &UserId, s: &SessionId) -> Result<(), Self::Error> {
-        self.inner
-            .register(u, s)
-            .await
-            .map_err(std::io::Error::other)
-    }
-    async fn is_valid(&self, u: &UserId, s: &SessionId) -> Result<bool, Self::Error> {
-        if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(std::io::Error::other("registry unreachable"));
+fn flaky_registry(failing: Arc<AtomicBool>, invalidate_failing: Arc<AtomicBool>) -> RegistryDouble {
+    RegistryDouble::new().before(move |call, _| {
+        let down = match call.op() {
+            RegistryOp::IsValid => failing.load(Ordering::SeqCst),
+            RegistryOp::InvalidateSession => invalidate_failing.load(Ordering::SeqCst),
+            _ => false,
+        };
+        async move {
+            if down {
+                Step::Fail("registry unreachable")
+            } else {
+                Step::Forward
+            }
         }
-        self.inner
-            .is_valid(u, s)
-            .await
-            .map_err(std::io::Error::other)
-    }
-    async fn invalidate_user(&self, u: &UserId) -> Result<(), Self::Error> {
-        self.inner
-            .invalidate_user(u)
-            .await
-            .map_err(std::io::Error::other)
-    }
-    async fn invalidate_session(&self, u: &UserId, s: &SessionId) -> Result<(), Self::Error> {
-        if self
-            .invalidate_failing
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            return Err(std::io::Error::other("registry unreachable"));
-        }
-        self.inner
-            .invalidate_session(u, s)
-            .await
-            .map_err(std::io::Error::other)
-    }
-    async fn active_sessions(&self, u: &UserId) -> Result<Vec<SessionId>, Self::Error> {
-        self.inner
-            .active_sessions(u)
-            .await
-            .map_err(std::io::Error::other)
-    }
+    })
 }
 
 struct Harness {
@@ -86,19 +53,22 @@ struct Harness {
 }
 
 fn harness(capacity: usize) -> Harness {
-    let user = user_record("u1", "t1");
+    let user = user_record_at(
+        "u1",
+        "t1",
+        axess_clock::testing::MockClock::reference_time(),
+    );
     let identity = MockIdentityStore::new()
-        .with_tenant(tenant_record("t1"))
+        .with_tenant(tenant_record_at(
+            "t1",
+            axess_clock::testing::MockClock::reference_time(),
+        ))
         .with_user(user.clone());
-    let registry = MemorySessionRegistry::new();
-    let clock = MockClock::now();
+    let clock = MockClock::at_reference();
     let failing = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let invalidate_failing = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let flaky = FlakyRegistry {
-        inner: registry.clone(),
-        failing: failing.clone(),
-        invalidate_failing: invalidate_failing.clone(),
-    };
+    let flaky = flaky_registry(failing.clone(), invalidate_failing.clone());
+    let registry = flaky.inner().clone();
     let svc = AuthnService::builder(identity, MockFactorStore::new())
         .with_registry(flaky)
         .with_clock(clock.clone())
@@ -118,7 +88,7 @@ fn harness(capacity: usize) -> Harness {
 
 impl Harness {
     /// Log in once; returns the new session's id.
-    async fn login(&self, sid: Option<&str>) -> crate::session::id::SessionId {
+    async fn login(&self, sid: Option<&str>) -> SessionKey {
         let claims = OAuthClaims {
             provider: PROVIDER.into(),
             subject: "external-sub".into(),
@@ -147,10 +117,10 @@ impl Harness {
             .await
             .expect("login");
         self.clock.advance_secs(1);
-        session.session_id().await
+        session.session_key().await
     }
 
-    async fn live(&self, id: &crate::session::id::SessionId) -> bool {
+    async fn live(&self, id: &SessionKey) -> bool {
         self.registry.is_valid(&self.user.id, id).await.unwrap()
     }
 
@@ -163,14 +133,14 @@ impl Harness {
             &providers,
             Arc::new(SessionRegistryAdapter(self.registry.clone())),
             self.svc.sid_map(),
-            Arc::new(axess_clock::SystemClock),
+            Arc::new(axess_clock::testing::MockClock::at_reference()),
         )
         .expect("handler");
         self.jti.set(self.jti.get() + 1);
         let mut payload = serde_json::json!({
             "iss": ISSUER,
             "aud": "mock-client-id",
-            "iat": chrono::Utc::now().timestamp(),
+            "iat": axess_clock::testing::MockClock::reference_time().unix_seconds(),
             "jti": format!("jti-{}", self.jti.get()),
             "events": { axess_factors::oidc::logout_token::BACKCHANNEL_LOGOUT_EVENT: {} },
         });
@@ -321,8 +291,8 @@ async fn registry_outage_does_not_drop_live_subject_entries() {
 /// A login displaces the `sid` mapping of an earlier login with the same
 /// `sid` and owes that session an end. When the registry cannot end it, the
 /// session is still live and must stay in the subject registry, where the
-/// next `sub` logout finds it; it used to be forgotten on the failed end
-/// and was then out of reach of every logout.
+/// next `sub` logout finds it; forgotten on the failed end, it would be
+/// out of reach of every logout.
 #[tokio::test]
 async fn a_session_the_registry_could_not_end_stays_reachable_by_sub() {
     let h = harness(8);
@@ -348,4 +318,37 @@ async fn a_session_the_registry_could_not_end_stays_reachable_by_sub() {
         "the sub logout reaches it once the registry is back"
     );
     assert!(!h.live(&second).await);
+}
+
+/// The line written when the registry could not end a displaced session
+/// names it by the first eight characters of its key, never by the whole
+/// key: the session is still live at that moment.
+#[tokio::test]
+async fn a_session_the_registry_could_not_end_is_logged_by_a_prefix_only() {
+    let capture = axess_testing::mock_tracing::TracingCapture::install();
+    let h = harness(8);
+    let first = h.login(Some("sid-0")).await;
+    h.invalidate_failing
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    h.login(Some("sid-0")).await;
+    assert!(h.live(&first).await, "the registry refused to end it");
+
+    let full = first.to_string();
+    let prefix = first.prefix().to_string();
+    assert_eq!(prefix, format!("{}...", &full[..8]));
+    let events = capture.events();
+    let logged: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event
+                .message
+                .contains("could not end a displaced OAuth session")
+        })
+        .collect();
+    assert_eq!(logged.len(), 1, "{events:?}");
+    assert!(logged[0].message.contains(&prefix), "{}", logged[0]);
+    assert!(
+        events.iter().all(|event| !event.message.contains(&full)),
+        "the whole session key is logged: {events:?}"
+    );
 }

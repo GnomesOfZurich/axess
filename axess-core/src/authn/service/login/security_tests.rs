@@ -9,11 +9,11 @@ use crate::authn::ids::{TenantId, UserId};
 use crate::authn::store::IdentityAuthnLog as _;
 use crate::authn::types::{EntityState, LockoutPolicy, StatusDetail, Tenant, User};
 use crate::authn::{AuditContext, RequestAuthnService};
-use crate::session::data::SessionData;
 use crate::session::extractor::AuthSession;
 use crate::session::layer::{SessionHandle, SessionInner};
 use crate::session::store::{MemorySessionRegistry, SessionRegistry};
 use crate::testing::mock_authn::{MockFactorStore, MockIdentityStore};
+use axess_clock::testing::Shift;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -26,23 +26,12 @@ fn tid() -> TenantId {
 }
 
 fn session() -> AuthSession {
-    let inner = SessionInner {
-        id: crate::session::id::SessionId::new(&axess_rng::SystemRng),
-        data: SessionData::default(),
-        modified: false,
-        needs_persist: false,
-        regenerate: false,
-        pre_cycle_id: None,
-        rng: std::sync::Arc::new(axess_rng::SystemRng),
-        pending_fingerprint: None,
-        max_custom_bytes: 64 * 1024,
-        consume: None,
-    };
+    let inner = SessionInner::detached(std::sync::Arc::new(axess_rng::SystemRng));
     AuthSession(SessionHandle(Arc::new(RwLock::new(inner))))
 }
 
 fn user(status: EntityState) -> User {
-    let now = chrono::Utc::now();
+    let now = axess_clock::testing::MockClock::reference_time();
     User {
         id: uid(),
         tenant_id: tid(),
@@ -58,7 +47,7 @@ fn user(status: EntityState) -> User {
 }
 
 fn tenant(status: EntityState) -> Tenant {
-    let now = chrono::Utc::now();
+    let now = axess_clock::testing::MockClock::reference_time();
     Tenant {
         id: tid(),
         identifier: "acme".into(),
@@ -71,26 +60,32 @@ fn tenant(status: EntityState) -> Tenant {
     }
 }
 
-fn suspended(until: Option<chrono::DateTime<chrono::Utc>>) -> EntityState {
+fn suspended(until: Option<axess_clock::Timestamp>) -> EntityState {
     EntityState::Suspended(
-        StatusDetail::administrative("hold", chrono::Utc::now() - chrono::Duration::days(2))
-            .with_until(until),
+        StatusDetail::administrative(
+            "hold",
+            axess_clock::testing::MockClock::reference_time()
+                .minus(axess_clock::SignedDuration::days(2)),
+        )
+        .with_until(until.map(axess_clock::Until::At)),
     )
 }
 
 /// A suspension a store materialised from a failed-attempt lockout.
-fn lockout_suspension(until: Option<chrono::DateTime<chrono::Utc>>) -> EntityState {
+fn lockout_suspension(until: Option<axess_clock::Timestamp>) -> EntityState {
     EntityState::Suspended(
         StatusDetail::lockout(
             "too many failures",
-            chrono::Utc::now() - chrono::Duration::days(2),
+            axess_clock::testing::MockClock::reference_time()
+                .minus(axess_clock::SignedDuration::days(2)),
         )
-        .with_until(until),
+        .with_until(until.map(axess_clock::Until::At)),
     )
 }
 
 fn identity(t: EntityState, u: EntityState) -> MockIdentityStore {
     MockIdentityStore::new()
+        .with_clock(axess_clock::testing::MockClock::at_reference())
         .with_tenant(tenant(t))
         .with_user(user(u))
         .with_lockout_policy(LockoutPolicy::default())
@@ -98,6 +93,7 @@ fn identity(t: EntityState, u: EntityState) -> MockIdentityStore {
 
 fn service(identity: MockIdentityStore) -> RequestAuthnService<MockIdentityStore, MockFactorStore> {
     AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(axess_clock::testing::MockClock::at_reference())
         .build()
         .with_audit_context(AuditContext::default())
 }
@@ -145,7 +141,8 @@ async fn suspended_tenant_answers_like_an_unknown_tenant() {
 
 #[tokio::test]
 async fn an_ended_suspension_no_longer_blocks_login() {
-    let past = chrono::Utc::now() - chrono::Duration::minutes(1);
+    let past = axess_clock::testing::MockClock::reference_time()
+        .minus(axess_clock::SignedDuration::minutes(1));
     let id = identity(EntityState::Active, suspended(Some(past)));
     let observer = id.clone();
     let outcome = service(id).begin_login("alice", "acme", &session()).await;
@@ -180,7 +177,8 @@ async fn a_running_suspension_still_blocks_login_and_answers_like_an_unknown_ide
     // account exists and that someone, perhaps they, has been guessing at
     // it. By default `begin_login` conceals the lockout behind the answer an
     // unknown identifier gets; the audit row still says `Locked`.
-    let future = chrono::Utc::now() + chrono::Duration::hours(1);
+    let future = axess_clock::testing::MockClock::reference_time()
+        .plus(axess_clock::SignedDuration::hours(1));
     let id = identity(EntityState::Active, suspended(Some(future)));
     let observer = id.clone();
     let outcome = service(id).begin_login("alice", "acme", &session()).await;
@@ -222,17 +220,19 @@ async fn a_counter_lockout_is_concealed_on_begin_by_default() {
 
 #[tokio::test]
 async fn a_revealed_lockout_names_its_end() {
-    let future = chrono::Utc::now() + chrono::Duration::hours(1);
+    let future = axess_clock::testing::MockClock::reference_time()
+        .plus(axess_clock::SignedDuration::hours(1));
     let id = identity(EntityState::Active, lockout_suspension(Some(future)));
     let observer = id.clone();
     let outcome = AuthnService::builder(id, MockFactorStore::new())
+        .with_clock(axess_clock::testing::MockClock::at_reference())
         .with_lockout_revealed_on_begin()
         .build()
         .with_audit_context(AuditContext::default())
         .begin_login("alice", "acme", &session())
         .await;
     assert!(
-        matches!(outcome, Ok(LoginOutcome::Locked { until: Some(u) }) if u == future),
+        matches!(outcome, Ok(LoginOutcome::Locked { until: Some(u) }) if u == axess_clock::Until::At(future)),
         "{outcome:?}"
     );
     assert_eq!(locked_rows(&observer), 1);
@@ -243,9 +243,11 @@ async fn a_revealed_lockout_does_not_reveal_an_administrative_suspension() {
     // The opt-in shows a lockout's end to the caller. An operator's hold is
     // not a lockout: it answers as an unknown identifier does, and its end
     // stays private.
-    let future = chrono::Utc::now() + chrono::Duration::hours(1);
+    let future = axess_clock::testing::MockClock::reference_time()
+        .plus(axess_clock::SignedDuration::hours(1));
     let id = identity(EntityState::Active, suspended(Some(future)));
     let outcome = AuthnService::builder(id, MockFactorStore::new())
+        .with_clock(axess_clock::testing::MockClock::at_reference())
         .with_lockout_revealed_on_begin()
         .build()
         .with_audit_context(AuditContext::default())
@@ -263,9 +265,14 @@ async fn logout_ends_this_session_and_leaves_the_users_others() {
     let here = session();
     let elsewhere = session();
     for s in [&here, &elsewhere] {
-        s.set_authenticated(uid(), tid(), chrono::Utc::now()).await;
+        s.set_authenticated(
+            uid(),
+            tid(),
+            axess_clock::testing::MockClock::reference_time(),
+        )
+        .await;
         registry
-            .register(&uid(), &s.session_id().await)
+            .register(&uid(), &s.session_key().await)
             .await
             .unwrap();
     }
@@ -273,12 +280,13 @@ async fn logout_ends_this_session_and_leaves_the_users_others() {
         identity(EntityState::Active, EntityState::Active),
         MockFactorStore::new(),
     )
+    .with_clock(axess_clock::testing::MockClock::at_reference())
     .with_registry(registry.clone())
     .build()
     .with_audit_context(AuditContext::default());
 
-    let here_sid = here.session_id().await;
-    let elsewhere_sid = elsewhere.session_id().await;
+    let here_sid = here.session_key().await;
+    let elsewhere_sid = elsewhere.session_key().await;
     svc.logout(&here).await.unwrap();
 
     assert!(!registry.is_valid(&uid(), &here_sid).await.unwrap());
@@ -294,20 +302,25 @@ async fn logout_ends_this_session_and_leaves_the_users_others() {
 async fn logout_clears_the_session_even_when_the_audit_write_fails() {
     let registry = MemorySessionRegistry::new();
     let here = session();
-    here.set_authenticated(uid(), tid(), chrono::Utc::now())
-        .await;
+    here.set_authenticated(
+        uid(),
+        tid(),
+        axess_clock::testing::MockClock::reference_time(),
+    )
+    .await;
     registry
-        .register(&uid(), &here.session_id().await)
+        .register(&uid(), &here.session_key().await)
         .await
         .unwrap();
     let id = identity(EntityState::Active, EntityState::Active);
     id.arm_record_event_failure();
     let svc = AuthnService::builder(id, MockFactorStore::new())
+        .with_clock(axess_clock::testing::MockClock::at_reference())
         .with_registry(registry.clone())
         .build()
         .with_audit_context(AuditContext::default());
 
-    let before = here.session_id().await;
+    let before = here.session_key().await;
     let result = svc.logout(&here).await;
 
     assert!(
@@ -318,7 +331,7 @@ async fn logout_clears_the_session_even_when_the_audit_write_fails() {
         !here.is_authenticated().await,
         "the session must be signed out whatever the audit store did"
     );
-    assert_ne!(here.session_id().await, before, "the id is rotated");
+    assert_ne!(here.session_key().await, before, "the id is rotated");
     assert!(!registry.is_valid(&uid(), &before).await.unwrap());
 }
 
@@ -327,21 +340,26 @@ async fn logout_clears_the_session_even_when_the_audit_write_fails() {
 async fn rotate_session_moves_the_registry_entry_to_the_new_id() {
     let registry = MemorySessionRegistry::new();
     let here = session();
-    here.set_authenticated(uid(), tid(), chrono::Utc::now())
-        .await;
-    let old = here.session_id().await;
+    here.set_authenticated(
+        uid(),
+        tid(),
+        axess_clock::testing::MockClock::reference_time(),
+    )
+    .await;
+    let old = here.session_key().await;
     registry.register(&uid(), &old).await.unwrap();
     let svc = AuthnService::builder(
         identity(EntityState::Active, EntityState::Active),
         MockFactorStore::new(),
     )
+    .with_clock(axess_clock::testing::MockClock::at_reference())
     .with_registry(registry.clone())
     .build()
     .with_audit_context(AuditContext::default());
 
     svc.rotate_session(&here).await.unwrap();
 
-    let new = here.session_id().await;
+    let new = here.session_key().await;
     assert_ne!(old, new);
     assert!(registry.is_valid(&uid(), &new).await.unwrap());
     assert!(!registry.is_valid(&uid(), &old).await.unwrap());

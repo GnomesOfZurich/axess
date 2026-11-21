@@ -37,13 +37,12 @@ resolver = "3"
 # Per-crate fields (`name`, `description`, `keywords`, `categories`, `exclude`)
 # stay local because they genuinely differ.
 [workspace.package]
-version = "0.19.0"
+version = "0.20.0"
 edition = "2024"
 rust-version = "1.95.0"
 authors = ["Gnomes"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/GnomesOfZurich/axess"
-homepage = "https://github.com/GnomesOfZurich/axess"
 # `documentation` is per-crate (each crate gets its own docs.rs landing page,
 # https://docs.rs/<crate-name>) so it lives in each member's `[package]`, not
 # here.
@@ -61,15 +60,16 @@ homepage = "https://github.com/GnomesOfZurich/axess"
 # control and accepted until the respective upstreams bump; the
 # `skip-tree` list in `deny.toml` gives each root's reason (the
 # backends themselves are in docs/production/security-posture.md).
-# `x509-parser` is pre-pinned for the mTLS resolver
-# work: no current direct consumer.
+# `x509-parser` has two consumers: axess-core (features `mtls` and
+# `spire`) and axess-factors (feature `mtls`).
 [workspace.dependencies]
 # Internal axess crates. Members write `axess-foo = { workspace = true }`
 # (optionally `features = [...]` or `optional = true`); path + version
-# stay declared once here. The literal "0.10.0" appears alongside
+# stay declared once here. Each entry's `version` repeats
 # `[workspace.package].version` above (Cargo schema does not let
 # `[workspace.dependencies]` entries reference `[workspace.package]`); a
-# release bump touches both lines in this file only.
+# release bump touches both places in this file only. An entry no member
+# uses is not kept: cargo warns on an unused workspace dependency.
 #
 # `default-features = false` on axess-core / axess-identity / axess-strings
 # is REQUIRED because at least one member (axess-macros, axess-events) opts
@@ -77,22 +77,25 @@ homepage = "https://github.com/GnomesOfZurich/axess"
 # override unless the workspace entry has it too. Members that want the
 # defaults restate them via `features = [...]`. The other entries leave
 # defaults enabled so the common case stays terse.
-axess-cache    = { path = "axess-cache",    version = "=0.19.0" }
-axess-clock    = { path = "axess-clock",    version = "=0.19.0" }
-axess-core     = { path = "axess-core",     version = "=0.19.0", default-features = false }
-axess-events   = { path = "axess-events",   version = "=0.19.0" }
-axess-factors  = { path = "axess-factors",  version = "=0.19.0" }
-axess-identity = { path = "axess-identity", version = "=0.19.0", default-features = false }
-axess-macros   = { path = "axess-macros",   version = "=0.19.0" }
-axess-rng      = { path = "axess-rng",      version = "=0.19.0" }
-axess-strings  = { path = "axess-strings",  version = "=0.19.0", default-features = false }
-axess-testing  = { path = "axess-testing",  version = "=0.19.0" }
+axess-cache    = { path = "axess-cache",    version = "=0.20.0" }
+axess-clock    = { path = "axess-clock",    version = "=0.20.0" }
+axess-core     = { path = "axess-core",     version = "=0.20.0", default-features = false }
+axess-factors  = { path = "axess-factors",  version = "=0.20.0" }
+axess-identity = { path = "axess-identity", version = "=0.20.0", default-features = false }
+axess-macros   = { path = "axess-macros",   version = "=0.20.0" }
+axess-rng      = { path = "axess-rng",      version = "=0.20.0" }
+axess-strings  = { path = "axess-strings",  version = "=0.20.0", default-features = false }
+axess-testing  = { path = "axess-testing",  version = "=0.20.0" }
 
 # RustCrypto family + x509-parser; see preamble above.
-aes-gcm = "0.11.1"
+# `zeroize` on the cipher and the hashes: a cipher's key schedule holds the
+# key, and the hash states an HMAC is built from hold what stands in for it.
+# With the feature each wipes itself when it is dropped, as an HMAC's
+# buffered block and output do (`hmac` has no state of its own to wipe).
+aes-gcm = { version = "0.11.1", features = ["zeroize"] }
 hmac = "0.13.0"
-sha1 = "0.11.0"
-sha2 = "0.11.1"
+sha1 = { version = "0.11.0", features = ["zeroize"] }
+sha2 = { version = "0.11.1", features = ["zeroize"] }
 x509-parser = "0.18.1"
 quick-xml = { version = "0.42.0", features = ["serialize"] }
 
@@ -112,10 +115,9 @@ base32 = "0.5.1"
 # so `oauth` and the other HTTP features) and crypto-glue (`fido2`) do.
 base64 = { version = "0.23.1", default-features = false, features = ["std"] }
 # No default features: `clock` (the wall clock, `iana-time-zone`), `wasmbind`
-# and `oldtime` are not wanted everywhere. `clock` is enabled by axess-clock
-# alone, the one crate allowed to read the wall clock
-# (`scripts/check-clock-usage.sh`), and so is present wherever a crate that
-# injects a `Clock` is.
+# and `oldtime` are not wanted. No crate of the workspace enables `clock`:
+# axess-clock, the one crate allowed to read the wall clock
+# (`scripts/check-clock-usage.sh`), reads it from the standard library.
 chrono = { version = "0.4.45", default-features = false, features = ["std", "serde"] }
 # Benchmark-only in this workspace (axess-strings compares ShortString
 # against it). Pinned to the version nomos uses so the comparison is
@@ -129,9 +131,34 @@ serde_json = { version = "1.0.154", default-features = false }
 subtle = "2.6.1"
 thiserror = { version = "2.0.21", default-features = false }
 tokio = { version = "1.54.1", default-features = false }
-tokio-test = "0.4.6"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt"] }
 url = "2.5.8"
 uuid = { version = "1.29.0", default-features = false }
 zeroize = { version = "1.9.1", features = ["zeroize_derive"] }
+
+# The lint table every member takes: each member's manifest holds `[lints]
+# workspace = true` and no `[lints.*]` table of its own
+# (scripts/check-member-lints.sh). Lint levels the crate roots set with
+# `#![forbid]` and `#![deny]` stay in the roots, where they apply to the
+# libraries and not to the examples.
+[workspace.lints.rust]
+# `cfg(loom)` is a runtime-toggled flag (set via `RUSTFLAGS='--cfg loom'`)
+# that activates axess-cache's permutation-checked tests in
+# `tests/loom_invariants.rs`. Registered here so rustc does not warn about
+# an unknown cfg name.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
+# Cargo's own lints (cargo 1.100 and later; an older cargo prints "unused
+# manifest key `lints.cargo`" and ignores the table). `unused_dependencies`
+# reports a normal or build dependency that no target of the selected build
+# uses and that no other dependency of the build pulls in anyway. It never
+# reads dev-dependencies (scripts/unused-dependencies.sh runs cargo-udeps
+# for those), and it is silent in a build of the library alone (`--lib`):
+# it reports in `cargo clippy --all-targets`, `cargo check --all-targets`
+# and the build `cargo package` verifies with, and `-D warnings` does not
+# make a warning of it an error, so it is denied here.
+# scripts/check-unused-dependency-lint.sh proves it refuses a dependency
+# no target uses.
+[workspace.lints.cargo]
+unused_dependencies = "deny"

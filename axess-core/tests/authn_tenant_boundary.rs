@@ -3,7 +3,7 @@
 //! and `begin_impersonation_in_tenant` must refuse cross-tenant targets with
 //! `AuthnError::CrossTenant` and leave session state untouched on refusal.
 
-mod common;
+use axess_core::testing::fixtures as common;
 
 use axess_core::authn::Actor;
 use axess_core::authn::{AuditContext, RequestAuthnService};
@@ -13,7 +13,6 @@ use axess_core::testing::{
     mock_authn::{MockFactorStore, MockIdentityStore},
     test_session,
 };
-use chrono::Utc;
 use common::{test_tenant, test_user_in_tenant, tid, uid};
 
 fn make_service_with_user_in(
@@ -21,11 +20,16 @@ fn make_service_with_user_in(
     identifier: &str,
     tenant: &str,
 ) -> RequestAuthnService<MockIdentityStore, MockFactorStore> {
+    let clock = common::test_clock();
     let user = test_user_in_tenant(user_id, identifier, tenant);
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(user);
-    AuthnService::new(identity, MockFactorStore::new()).with_audit_context(AuditContext::default())
+    AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build()
+        .with_audit_context(AuditContext::default())
 }
 
 #[tokio::test]
@@ -33,7 +37,7 @@ async fn suspend_user_in_tenant_rejects_cross_tenant_target() {
     // User u1 lives in tenant t1. Caller asserts expected_tenant=t2.
     // Library MUST refuse with CrossTenant.
     let svc = make_service_with_user_in("u1", "alice", "t1");
-    let detail = StatusDetail::administrative("test", Utc::now());
+    let detail = StatusDetail::administrative("test", common::start());
     let res = svc
         .suspend_user(Actor::System, &uid("u1"), &tid("t2"), detail)
         .await;
@@ -43,7 +47,7 @@ async fn suspend_user_in_tenant_rejects_cross_tenant_target() {
 #[tokio::test]
 async fn suspend_user_in_tenant_accepts_matching_tenant() {
     let svc = make_service_with_user_in("u1", "alice", "t1");
-    let detail = StatusDetail::administrative("test", Utc::now());
+    let detail = StatusDetail::administrative("test", common::start());
     let res = svc
         .suspend_user(Actor::System, &uid("u1"), &tid("t1"), detail)
         .await;
@@ -61,17 +65,21 @@ async fn activate_user_in_tenant_rejects_cross_tenant_target() {
 
 #[tokio::test]
 async fn begin_impersonation_in_tenant_rejects_cross_tenant() {
+    let clock = common::test_clock();
     let admin = test_user_in_tenant("admin", "ops", "t1");
     let target = test_user_in_tenant("u2", "bob", "t2");
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(admin.clone())
         .with_user(target.clone());
-    let svc = AuthnService::new(identity, MockFactorStore::new())
+    let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build()
         .with_audit_context(AuditContext::default());
     let session = test_session();
     session
-        .set_authenticated(admin.id, admin.tenant_id, chrono::Utc::now())
+        .set_authenticated(admin.id, admin.tenant_id, common::start())
         .await;
     let res = svc.begin_impersonation(&admin, &target, &session).await;
     assert!(matches!(res, Err(AuthnError::CrossTenant)));
@@ -81,17 +89,21 @@ async fn begin_impersonation_in_tenant_rejects_cross_tenant() {
 
 #[tokio::test]
 async fn begin_impersonation_in_tenant_accepts_same_tenant() {
+    let clock = common::test_clock();
     let admin = test_user_in_tenant("admin", "ops", "t1");
     let target = test_user_in_tenant("u2", "bob", "t1");
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(admin.clone())
         .with_user(target.clone());
-    let svc = AuthnService::new(identity, MockFactorStore::new())
+    let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build()
         .with_audit_context(AuditContext::default());
     let session = test_session();
     session
-        .set_authenticated(admin.id, admin.tenant_id, chrono::Utc::now())
+        .set_authenticated(admin.id, admin.tenant_id, common::start())
         .await;
     svc.begin_impersonation(&admin, &target, &session)
         .await

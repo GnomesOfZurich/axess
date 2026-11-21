@@ -4,28 +4,52 @@
 //! # What an implementation does
 //!
 //! Per the design in [`docs/identity/device.md`](../../../../docs/identity/device.md),
-//! a production `DeviceResolver` performs:
+//! the stock resolver,
+//! [`LifecycleDeviceResolver`](crate::device::LifecycleDeviceResolver), finds
+//! a device by proof and never by its fingerprint, which a client can copy:
 //!
-//! 1. Parse the long-lived device-binding cookie from `Cookie:` header (if
-//!    present) → candidate [`DeviceId`].
+//! 1. Read the tenant, the signed-in person (if any; see [`SessionUser`])
+//!    and the device the session was last bound to from the request
+//!    extensions, and the entries of the device cookie (if present): one
+//!    device id and token per device the browser profile holds.
 //! 2. Compute the keyed [`FingerprintHash`](super::types::FingerprintHash)
-//!    from `User-Agent`, `Accept-Language`, `Accept`, and any other inputs
-//!    configured per tenant.
-//! 3. If the cookie supplied an id, [`DeviceStore::load`](super::store::DeviceStore::load) it and verify the
-//!    stored fingerprint matches → emit `DeviceFingerprintMismatch
-//!    Suspicious` on mismatch, return `None` (caller invalidates the
-//!    session). Match → return that id and call
-//!    [`DeviceStore::record_sighting`](super::store::DeviceStore::record_sighting).
-//! 4. If no cookie, [`DeviceStore::find_by_fingerprint`](super::store::DeviceStore::find_by_fingerprint) on `(tenant, hash)`
-//!    → return that id (and emit `DeviceFirstSeen` if newly inserted).
-//! 5. If neither path resolves, [`DeviceStore::save`](super::store::DeviceStore::save) a fresh `Unknown`
-//!    [`Device`](super::types::Device) and return its id, emitting
-//!    `DeviceFirstSeen`.
+//!    of the request (`User-Agent`, the first `Accept-Language` entry and the
+//!    truncated client address, under the tenant's pepper). It is stored on
+//!    a new device row and selects no existing one. A request it cannot be
+//!    computed for (the default extractor needs a `User-Agent`) has no
+//!    device when no person is signed in, and is otherwise resolved by
+//!    steps 3 to 5; step 6 creates nothing for it, and it has no device.
+//! 3. An entry proves its device when it names a device of the tenant that
+//!    is not revoked and whose row lists the digest of the presented token
+//!    (compared in constant time). Where device keys are enforced, a device
+//!    that has a key is proven only by a request that proved that key: its
+//!    token alone proves nothing, and the entry counts as not presented.
+//!    For a signed-in person the entries are tried newest first, and the
+//!    first that proves a device the person may use (one they own, or one
+//!    with no owner) is answered as [`BoundDevice::Proven`]; this records a
+//!    sighting ([`DeviceStore::record_sighting`](super::store::DeviceStore::record_sighting))
+//!    and claims a device that has no owner. A guest's request writes
+//!    nothing, and has a device only when its entries prove exactly one:
+//!    with several proven (a profile several accounts share) it has none.
+//! 4. Otherwise a request with no signed-in person has no device:
+//!    `Ok(None)`.
+//! 5. Otherwise, if the session was already bound to a device that still
+//!    exists, is not revoked and belongs to the person, keep it and answer
+//!    it as [`BoundDevice::Unproven`]: recognised, not proven.
+//! 6. Otherwise [`DeviceStore::save`](super::store::DeviceStore::save) a new
+//!    `Unknown` [`Device`](super::types::Device) owned by the person, with
+//!    the digest of a freshly minted token on its row, emit
+//!    `DeviceFirstSeen`, hand the cookie that carries the token to the
+//!    session layer, and answer the device as [`BoundDevice::Proven`].
 //!
-//! All of (1) through (5) is application-glue: the resolver implementation owns
-//! both the [`DeviceStore`] and the per-tenant fingerprint key registry,
-//! and decides how to extract tenant context from request headers /
-//! routing / TLS SNI / extensions populated by upstream middleware.
+//! The steps are
+//! [`DeviceLifecycleService::resolve_or_keep`](crate::device::DeviceLifecycleService::resolve_or_keep).
+//! A resolver of your own decides the same things for itself: which store
+//! and which per-tenant pepper it holds, how it reads the tenant from the
+//! request (an extension an upstream middleware set, the routing, TLS SNI),
+//! and what it accepts as proof. Nothing emits `DeviceFingerprintMismatch`
+//! for you: the stock resolver compares no fingerprint, so the event is
+//! there for a resolver that does.
 //!
 //! # Layer integration
 //!
@@ -48,17 +72,25 @@ use axum::http::request::Parts;
 use std::future::Future;
 use std::pin::Pin;
 
-/// The user a session has fully authenticated, placed in the request
-/// extensions by the session layer before a [`DeviceResolver`] runs.
+/// The person at the browser of a signed-in session, placed in the request
+/// extensions by the session layer before a [`DeviceResolver`] runs: the
+/// user the session signed in, and for a session an administrator is
+/// impersonating the user in, the administrator
+/// ([`AuthSession::impersonator`](crate::session::extractor::AuthSession::impersonator)).
+/// A session in a step-up is still the signed-in session it began from and
+/// carries the same person while the step is open.
 ///
-/// Absent for a guest and for a session part-way through a login, so a
-/// resolver that reads it never attributes a device to a user who has
+/// The browser of an impersonated session is the administrator's, so the
+/// device of its requests is the administrator's own and never one of the
+/// user's. Absent for a guest and for a session part-way through a login,
+/// so a resolver that reads it never attributes a device to a user who has
 /// not proved who they are.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionUser(pub UserId);
 
-/// The tenant the session authenticated into, placed in the request
-/// extensions by the session layer before a [`DeviceResolver`] runs.
+/// The tenant the session signed in to, placed in the request extensions by
+/// the session layer before a [`DeviceResolver`] runs, for a signed-in
+/// session (in a step-up too).
 ///
 /// It is the tenant the login service stored when it authenticated the session, so an
 /// adopter whose tenant is a property of the signed-in user needs no
@@ -71,11 +103,13 @@ pub struct SessionUser(pub UserId);
 pub struct SessionTenant(pub TenantId);
 
 /// The device the session was last bound to, placed in the request
-/// extensions by the session layer for an authenticated session that has one.
+/// extensions by the session layer for a signed-in session (in a step-up
+/// too) that has one.
 ///
 /// A request that presents no device token (a cross-site navigation does not
 /// send the `SameSite=Strict` device cookie) keeps this device instead of
-/// being given a new one.
+/// being given a new one, as a device the request did not prove
+/// ([`BoundDevice::Unproven`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionDevice(pub DeviceId);
 
@@ -83,7 +117,8 @@ pub struct SessionDevice(pub DeviceId);
 /// request.
 ///
 /// Implementors hold whatever state they need (a [`DeviceStore`], a tenant
-/// fingerprint key registry, etc.) and produce a `DeviceId` per request.
+/// fingerprint key registry, etc.) and produce a [`BoundDevice`] per request:
+/// the device's id, and whether the request proved it.
 ///
 /// # Failure semantics
 ///
@@ -92,8 +127,11 @@ pub struct SessionDevice(pub DeviceId);
 /// faults the caller should propagate. The session layer stores `Ok(_)` as
 /// [`SessionData::device_id`](crate::session::SessionData::device_id)
 /// (so `Ok(None)` unbinds a session that had a device); it logs `Err(_)`
-/// and leaves the session's `device_id` as it was, so a transient fault in
-/// the device store does not strip a session of its device binding.
+/// and leaves a signed-in session's `device_id` as it was, so a transient
+/// fault in the device store does not strip a session of its device
+/// binding. A session with nobody signed in keeps no device on `Err(_)`:
+/// its device was stamped on an earlier request, and the login this
+/// request completes may be another person's.
 ///
 /// # Tenant context
 ///
@@ -112,7 +150,7 @@ pub trait DeviceResolver: Send + Sync + 'static {
 
     /// Resolve the device for `parts`. Always best-effort: returning
     /// `Ok(None)` is the documented "no device" outcome; the layer never
-    /// fails the request on `Err(_)`, it keeps the session's device.
+    /// fails the request on `Err(_)`, it keeps a signed-in session's device.
     ///
     /// Takes [`axum::http::request::Parts`] rather than the full
     /// `Request<Body>` because `axum::body::Body` is `!Sync`; borrowing
@@ -130,10 +168,16 @@ pub trait DeviceResolver: Send + Sync + 'static {
 ///
 /// [`Proven`](Self::Proven) is only constructible from a
 /// [`ProvenDevice`](crate::device::proof::ProvenDevice), which only a resolution by
-/// [`resolve_proven`](crate::device::DeviceLifecycleService::resolve_proven)
-/// yields, so a resolver cannot claim a proof it does not hold. A bare
+/// [`resolve_or_keep`](crate::device::DeviceLifecycleService::resolve_or_keep)
+/// or [`resolve_proven`](crate::device::DeviceLifecycleService::resolve_proven)
+/// yields, for a request that presented the device's token or had the device
+/// created for it, so a resolver cannot claim a proof it does not hold. A bare
 /// [`DeviceId`] converts to [`Unproven`](Self::Unproven): the session keeps it
-/// as a label for the device, and no lockout exemption reads it.
+/// as a label for the device, and no lockout exemption reads it. The device a
+/// session keeps on a request that presents no token is one of those.
+///
+/// The session layer stores the device's id and nothing else: whether it was
+/// proven is asked of the resolver again on every request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BoundDevice {
     /// A device the client proved it holds.
@@ -182,7 +226,7 @@ impl DeviceResolver for NoopDeviceResolver {
         tracing::trace!(
             target: "axess::device",
             method = %parts.method,
-            uri = %parts.uri,
+            route = %crate::logged_route::logged_route(&parts.extensions),
             "NoopDeviceResolver: device tracking disabled, returning None",
         );
         Ok(None)
@@ -216,8 +260,9 @@ pub(crate) enum DeviceResolution {
     /// The resolver answered: the request's device, or none.
     Resolved(Option<BoundDevice>),
     /// The resolver failed, so nothing is known about the request's device.
-    /// The layer keeps the session's device as it was: a fault in the device
-    /// store must not read as "no device" and strip the session's binding.
+    /// The layer keeps a signed-in session's device as it was: a fault in
+    /// the device store must not read as "no device" and strip the session's
+    /// binding. With nobody signed in, the session keeps no device.
     Failed,
 }
 
@@ -232,7 +277,7 @@ impl<R: DeviceResolver> ErasedDeviceResolver for R {
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
-                        "DeviceResolver failed; the session keeps its device"
+                        "DeviceResolver failed; a signed-in session keeps its device"
                     );
                     DeviceResolution::Failed
                 }
@@ -250,6 +295,22 @@ mod tests {
     fn empty_parts() -> Parts {
         let req: Request<Body> = Request::builder().uri("/").body(Body::empty()).unwrap();
         req.into_parts().0
+    }
+
+    /// The trace line names no part of the URI: a path or a query can
+    /// carry a credential.
+    #[tokio::test]
+    async fn the_noop_resolver_logs_no_part_of_the_uri() {
+        let printed = axess_testing::mock_tracing::LineCapture::install();
+        let req: Request<Body> = Request::builder()
+            .uri("/reset/marker-7c1e?token=marker-7c1e")
+            .body(Body::empty())
+            .unwrap();
+        let parts = req.into_parts().0;
+        assert_eq!(NoopDeviceResolver.resolve(&parts).await.unwrap(), None);
+        let text = printed.text();
+        assert!(!text.contains("marker-7c1e"), "{text}");
+        assert!(text.contains("route=-"), "{text}");
     }
 
     #[tokio::test]

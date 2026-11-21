@@ -19,10 +19,13 @@
 //! Every production caller passes its own clock to [`verify_jwt`]; the
 //! wall-clock convenience wrapper exists only for this crate's tests.
 
-use jsonwebtoken::jwk::JwkSet;
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
+use jsonwebtoken::jwk::{Jwk, JwkSet};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode_header};
+
+use super::decode;
 
 use axess_clock::Clock;
+use std::time::Duration;
 
 /// Default allowed asymmetric algorithms for JWT verification.
 ///
@@ -56,17 +59,14 @@ fn is_symmetric(alg: Algorithm) -> bool {
 /// Most bytes of a `kid` that [`JwtError::UnknownKid`] carries.
 pub const MAX_KID_ECHO_BYTES: usize = 128;
 
-/// `kid` cut to [`MAX_KID_ECHO_BYTES`] bytes at a character boundary, with an
-/// ellipsis when anything was dropped.
-fn truncate_kid(kid: &str) -> String {
-    if kid.len() <= MAX_KID_ECHO_BYTES {
-        return kid.to_string();
-    }
-    let mut end = MAX_KID_ECHO_BYTES;
-    while !kid.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}...", &kid[..end])
+/// An unverified `kid` as an error may carry it: every character
+/// [`escapes`](crate::log_text::escapes) names (control characters, the line
+/// and paragraph separators, bidirectional controls, zero-width characters,
+/// the byte order mark, the Hangul fillers) escaped, and the whole cut to
+/// [`MAX_KID_ECHO_BYTES`] bytes at a character boundary, the mark of the cut
+/// included.
+fn echo_kid(kid: &str) -> String {
+    crate::log_text::log_safe(kid, MAX_KID_ECHO_BYTES)
 }
 
 /// Errors from JWT signature verification.
@@ -94,13 +94,17 @@ pub enum JwtError {
     #[error("disallowed JWT algorithm: {0:?}")]
     DisallowedAlgorithm(Algorithm),
 
-    /// The JWT has no `kid` header field.
+    /// The JWT has no `kid` header field. Every path refuses such a token
+    /// but the JWT-SVID resolver, which tries each key of its trust domain.
     #[error("JWT has no `kid` header")]
     MissingKid,
 
     /// No key in the JWKS matches the JWT's `kid`. The `kid` is cut to
-    /// [`MAX_KID_ECHO_BYTES`] bytes: it is attacker-supplied and ends up in
-    /// logs and error responses.
+    /// [`MAX_KID_ECHO_BYTES`] bytes and every character
+    /// [`escapes`](crate::log_text::escapes) names (control characters, the
+    /// line and paragraph separators, bidirectional controls, zero-width
+    /// characters, the byte order mark, the Hangul fillers) is escaped: it is
+    /// attacker-supplied and ends up in logs and error responses.
     #[error("no key in JWKS matching kid `{0}`")]
     UnknownKid(String),
 
@@ -122,6 +126,13 @@ pub enum JwtError {
     VerificationFailed(String),
 }
 
+/// The widest clock-skew tolerance [`verify_jwt`] accepts for `exp` and
+/// `nbf`: five minutes. A larger leeway keeps an expired token valid for as
+/// long as the leeway says, so a configuration above it is refused before
+/// any token is read. Two clocks more than five minutes apart are fixed
+/// where they run, not in the verifier.
+pub const MAX_LEEWAY: Duration = Duration::from_secs(300);
+
 /// Caller-tunable claim validation knobs consumed by [`verify_jwt`].
 ///
 /// Constructed via [`ValidationConfig::new`] (sensible defaults) or by
@@ -135,8 +146,10 @@ pub struct ValidationConfig {
     /// audience against this value.
     pub audience: Option<String>,
     /// Clock-skew tolerance for `exp` and `nbf` (jsonwebtoken's `leeway`).
-    /// Default: 60 seconds.
-    pub leeway_secs: u64,
+    /// Default: 60 seconds. A whole number of seconds, as `exp` and `nbf`
+    /// are (RFC 7519 NumericDate), and at most [`MAX_LEEWAY`]: [`verify_jwt`]
+    /// refuses any other configuration by name.
+    pub leeway: Duration,
     /// When `true`, a token missing `nbf` is rejected. (jsonwebtoken
     /// validates `nbf` when present but does not require it.)
     pub require_nbf: bool,
@@ -167,7 +180,7 @@ impl ValidationConfig {
         Self {
             issuer: None,
             audience: None,
-            leeway_secs: 60,
+            leeway: Duration::from_secs(60),
             require_nbf: false,
             require_exp: true,
             allow_any_audience: false,
@@ -182,10 +195,11 @@ impl Default for ValidationConfig {
     }
 }
 
-/// Verify a JWT signature against a JWKS key set on the wall clock.
+/// Verify a JWT signature against a JWKS key set at the reference instant.
 ///
 /// Test-only convenience over [`verify_jwt`] with a default
-/// [`ValidationConfig`] and [`axess_clock::SystemClock`]. Production code
+/// [`ValidationConfig`] and a clock at
+/// [`MockClock::reference_time`](axess_clock::testing::MockClock::reference_time). Production code
 /// calls [`verify_jwt`] with the clock it was configured with, so a
 /// `MockClock` governs `exp` and `nbf` on every path.
 #[cfg(test)]
@@ -204,7 +218,7 @@ pub(crate) fn verify_jwt_signature(
         jwks,
         &config,
         allowed_algorithms,
-        &axess_clock::SystemClock,
+        &axess_clock::testing::MockClock::at_reference(),
     )
 }
 
@@ -216,7 +230,7 @@ pub(crate) fn verify_jwt_signature(
 ///
 /// Beyond signature verification it adds four knobs:
 /// 1. **Issuer pinning**: when `config.issuer` is `Some`, `iss` mismatch is rejected.
-/// 2. **Clock skew**: `config.leeway_secs` is applied to `exp` and `nbf`.
+/// 2. **Clock skew**: `config.leeway` is applied to `exp` and `nbf`.
 /// 3. **`nbf` requirement**: when `config.require_nbf` is `true`, a token without
 ///    `nbf` is rejected.
 /// 4. **Injected clock**: `exp` / `nbf` are validated against
@@ -261,29 +275,51 @@ pub fn verify_jwt_with_typ(
     clock: &dyn Clock,
     expected_typ: Option<&str>,
 ) -> Result<serde_json::Value, JwtError> {
-    // 0. A provider, before anything asks jsonwebtoken to verify: with both
-    // backends compiled in it has no default and panics. See
-    // `crate::jwt::ensure_crypto_provider`.
-    crate::jwt::ensure_crypto_provider();
+    verify_jwt_choosing(
+        token,
+        jwks,
+        config,
+        allowed_algorithms,
+        clock,
+        expected_typ,
+        KeyChoice::ByKid,
+    )
+}
 
-    // A claim nobody pinned is a claim nobody checks. Refused before any
-    // decoding, like the verifier does, unless the config says so.
-    if config.audience.is_none() && !config.allow_any_audience {
-        return Err(JwtError::VerificationFailed(
-            "no audience is pinned: a token minted for any other service of the same \
-             issuer would verify. Set `audience`, or `allow_any_audience` to state that \
-             accepting any audience is intended"
-                .to_string(),
-        ));
-    }
-    if config.issuer.is_none() && !config.allow_any_issuer {
-        return Err(JwtError::VerificationFailed(
-            "no issuer is pinned: a token signed by any key in the set would verify. \
-             Set `issuer`, or `allow_any_issuer` to state that accepting any issuer is \
-             intended"
-                .to_string(),
-        ));
-    }
+/// How the key that verifies a token is picked from the set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyChoice {
+    /// By the token's `kid`, which must be present: every path but the
+    /// JWT-SVID resolver's.
+    ByKid,
+    /// By the token's `kid` when it has one, and the same refusals as
+    /// [`ByKid`](Self::ByKid) then. Without one, each key of the set that
+    /// could have made the signature is tried in turn: the JWT-SVID standard
+    /// (section 2.2) makes `kid` optional, so a validator holding a trust
+    /// domain's bundle verifies a token that names none against the bundle.
+    #[cfg(feature = "jwt-svid")]
+    EachKey,
+}
+
+/// The most keys a token without a `kid` is tried against. A key set past
+/// it is refused before any signature is checked, so one token costs at
+/// most this many verifications. A SPIRE bundle holds one or two keys, a
+/// few more while keys rotate.
+#[cfg(feature = "jwt-svid")]
+pub(crate) const MAX_KEYLESS_KEYS: usize = 32;
+
+/// [`verify_jwt_with_typ`] with the key picked as `choice` says.
+pub(crate) fn verify_jwt_choosing(
+    token: &str,
+    jwks: &JwkSet,
+    config: &ValidationConfig,
+    allowed_algorithms: &[Algorithm],
+    clock: &dyn Clock,
+    expected_typ: Option<&str>,
+    choice: KeyChoice,
+) -> Result<serde_json::Value, JwtError> {
+    // The configuration is judged before any token is read.
+    refuse_unbounded_config(config)?;
 
     // The size bound comes first: every later step allocates in proportion
     // to the token.
@@ -295,7 +331,8 @@ pub fn verify_jwt_with_typ(
     }
 
     // 1. Decode header (no signature check).
-    let header = decode_header(token).map_err(|e| JwtError::InvalidHeader(format!("{e}")))?;
+    let header = decode_header(token)
+        .map_err(|e| JwtError::InvalidHeader(crate::remote_text::error_text(&e)))?;
 
     if let Some(expected) = expected_typ
         && !typ_matches(header.typ.as_deref(), expected)
@@ -314,18 +351,38 @@ pub fn verify_jwt_with_typ(
         return Err(JwtError::DisallowedAlgorithm(header.alg));
     }
 
-    // 3. Look up kid in JWKS.
-    let kid = header.kid.as_deref().ok_or(JwtError::MissingKid)?;
+    // 3. The rules every key must meet, whichever picks it.
+    let validation = validation_for(header.alg, allowed_algorithms, config);
 
-    let jwk = jwks
-        .find(kid)
-        .ok_or_else(|| JwtError::UnknownKid(truncate_kid(kid)))?;
+    // 4. The key, and the signature under it. A token with a `kid` takes
+    // the key of that `kid` or none: it never falls through to the others.
+    let token_data = match (header.kid.as_deref(), choice) {
+        (Some(kid), _) => {
+            let jwk = jwks
+                .find(kid)
+                .ok_or_else(|| JwtError::UnknownKid(echo_kid(kid)))?;
+            check_key_for(jwk, header.alg)?;
+            let decoding_key = DecodingKey::from_jwk(jwk)
+                .map_err(|e| JwtError::KeyConstruction(crate::remote_text::error_text(&e)))?;
+            decode::<serde_json::Value>(token, &decoding_key, &validation)
+                .map_err(|e| JwtError::VerificationFailed(crate::remote_text::error_text(&e)))?
+        }
+        (None, KeyChoice::ByKid) => return Err(JwtError::MissingKid),
+        #[cfg(feature = "jwt-svid")]
+        (None, KeyChoice::EachKey) => decode_with_each_key(token, jwks, header.alg, &validation)?,
+    };
 
+    check_time_claims(&token_data.claims, config, clock)?;
+
+    Ok(token_data.claims)
+}
+
+/// The key `jwk`, picked by `kid`, may verify a token under `alg`: it is
+/// published for signatures, and the algorithm it names, if any, is `alg`.
+fn check_key_for(jwk: &Jwk, alg: Algorithm) -> Result<(), JwtError> {
     // A key published for another use (`enc`) is not a signature key
     // (RFC 7517 §4.2). An absent `use` is unrestricted and passes.
-    if let Some(key_use) = &jwk.common.public_key_use
-        && !matches!(key_use, jsonwebtoken::jwk::PublicKeyUse::Signature)
-    {
+    if !published_for_signatures(jwk) {
         return Err(JwtError::KeyConstruction(
             "the JWK is not marked for signature use (`use` is not `sig`)".to_string(),
         ));
@@ -335,23 +392,112 @@ pub fn verify_jwt_with_typ(
     // `alg` member), require the header's alg to match it. Prevents key
     // confusion attacks across a rotating JWKS that mixes RSA and EC keys.
     if let Some(jwk_alg) = jwk.common.key_algorithm
-        && format!("{jwk_alg}") != format!("{:?}", header.alg)
+        && format!("{jwk_alg}") != format!("{alg:?}")
     {
         return Err(JwtError::AlgorithmMismatch {
-            header_alg: header.alg,
+            header_alg: alg,
             jwk_alg: format!("{jwk_alg}"),
         });
     }
+    Ok(())
+}
 
-    // 4. Build DecodingKey + Validation.
-    let decoding_key =
-        DecodingKey::from_jwk(jwk).map_err(|e| JwtError::KeyConstruction(format!("{e}")))?;
+/// Whether `jwk` is published for signatures: its `use` is `sig`, or it has
+/// none, which is unrestricted (RFC 7517 section 4.2).
+fn published_for_signatures(jwk: &Jwk) -> bool {
+    jwk.common
+        .public_key_use
+        .as_ref()
+        .is_none_or(|key_use| matches!(key_use, jsonwebtoken::jwk::PublicKeyUse::Signature))
+}
 
-    let mut validation = Validation::new(header.alg);
+/// A token without a `kid`, verified against each key of `jwks` that could
+/// have signed it under `alg`; the first under which it verifies wins.
+///
+/// The work is bounded before any is done: a set of more than
+/// [`MAX_KEYLESS_KEYS`] keys is refused whole. A key is skipped, not
+/// refused, when it cannot have made the signature, since the token names
+/// none: one published for another use, one whose `alg` member names
+/// another algorithm, one whose type or curve does not sign under `alg`,
+/// and one `jsonwebtoken` cannot build. When no key verifies, the answer is
+/// one refusal that names no key, so the set's contents are not read back
+/// one key at a time.
+#[cfg(feature = "jwt-svid")]
+fn decode_with_each_key(
+    token: &str,
+    jwks: &JwkSet,
+    alg: Algorithm,
+    validation: &Validation,
+) -> Result<jsonwebtoken::TokenData<serde_json::Value>, JwtError> {
+    if jwks.keys.len() > MAX_KEYLESS_KEYS {
+        return Err(JwtError::VerificationFailed(format!(
+            "the token names no `kid`, and the key set holds more than the \
+             {MAX_KEYLESS_KEYS} keys such a token is tried against"
+        )));
+    }
+    let candidates = jwks.keys.iter().filter(|jwk| {
+        published_for_signatures(jwk)
+            && jwk
+                .common
+                .key_algorithm
+                .is_none_or(|jwk_alg| format!("{jwk_alg}") == format!("{alg:?}"))
+            && key_type_signs(jwk, alg)
+    });
+    for jwk in candidates {
+        let Ok(key) = DecodingKey::from_jwk(jwk) else {
+            continue;
+        };
+        if let Ok(data) = decode::<serde_json::Value>(token, &key, validation) {
+            return Ok(data);
+        }
+    }
+    Err(JwtError::VerificationFailed(
+        "the token names no `kid`, and no key of the set verifies it".to_string(),
+    ))
+}
+
+/// Whether a key of `jwk`'s type and curve signs under `alg`: RSA for the
+/// `RS*` and `PS*` algorithms, P-256 for `ES256`, P-384 for `ES384`, Ed25519
+/// for `EdDSA`. Any other pairing cannot have made the signature.
+#[cfg(feature = "jwt-svid")]
+fn key_type_signs(jwk: &Jwk, alg: Algorithm) -> bool {
+    use jsonwebtoken::jwk::{AlgorithmParameters, EllipticCurve};
+    match (&jwk.algorithm, alg) {
+        (
+            AlgorithmParameters::RSA(_),
+            Algorithm::RS256
+            | Algorithm::RS384
+            | Algorithm::RS512
+            | Algorithm::PS256
+            | Algorithm::PS384
+            | Algorithm::PS512,
+        ) => true,
+        (AlgorithmParameters::EllipticCurve(ec), Algorithm::ES256) => {
+            ec.curve == EllipticCurve::P256
+        }
+        (AlgorithmParameters::EllipticCurve(ec), Algorithm::ES384) => {
+            ec.curve == EllipticCurve::P384
+        }
+        (AlgorithmParameters::OctetKeyPair(okp), Algorithm::EdDSA) => {
+            okp.curve == EllipticCurve::Ed25519
+        }
+        _ => false,
+    }
+}
+
+/// The checks `jsonwebtoken` makes beside the signature for a token under
+/// `alg`: the caller's algorithms of that family, the pinned audience and
+/// issuer, and no time checks of its own (the injected clock makes them).
+fn validation_for(
+    alg: Algorithm,
+    allowed_algorithms: &[Algorithm],
+    config: &ValidationConfig,
+) -> Validation {
+    let mut validation = Validation::new(alg);
     // jsonwebtoken 10.x requires all algorithms in the Validation list to share
     // the same family as the verifying key. Filter the caller's allowlist to the
     // header algorithm's family so mixed RSA+EC allowlists don't trip the check.
-    let family = header.alg.family();
+    let family = alg.family();
     validation.algorithms = allowed_algorithms
         .iter()
         .copied()
@@ -370,13 +516,14 @@ pub fn verify_jwt_with_typ(
     }
 
     // Disable jsonwebtoken's internal `exp` / `nbf` checks. They run
-    // against `SystemTime::now()` which is not DST-injectable; we
-    // re-implement those checks against the caller-supplied `clock`
-    // below so MockClock-driven tests can exercise the time path.
+    // against `SystemTime::now()` which is not DST-injectable;
+    // `check_time_claims` makes them against the caller-supplied `clock`
+    // once a signature verifies, so MockClock-driven tests can exercise
+    // the time path.
     // `leeway` is still set so callers reading the `Validation` struct
     // see the intended clock-skew value, but it does nothing while
     // validate_exp / validate_nbf are false.
-    validation.leeway = config.leeway_secs;
+    validation.leeway = config.leeway.as_secs();
     validation.validate_exp = false;
     validation.validate_nbf = false;
     validation.required_spec_claims.clear();
@@ -389,15 +536,7 @@ pub fn verify_jwt_with_typ(
     if config.audience.is_some() {
         validation.required_spec_claims.insert("aud".to_string());
     }
-
-    // 5. decode() with signature verification (exp/nbf checks disabled
-    //    per above; we do them manually below against the injected clock).
-    let token_data = decode::<serde_json::Value>(token, &decoding_key, &validation)
-        .map_err(|e| JwtError::VerificationFailed(format!("{e}")))?;
-
-    check_time_claims(&token_data.claims, config, clock)?;
-
-    Ok(token_data.claims)
+    validation
 }
 
 /// A media type as RFC 7515 section 4.1.9 compares it: without case, and
@@ -410,23 +549,73 @@ fn normalized_typ(typ: &str) -> String {
         .unwrap_or(lower)
 }
 
-/// Whether a header's `typ` (absent: `None`) is the type required.
-fn typ_matches(presented: Option<&str>, expected: &str) -> bool {
+/// Whether a header's `typ` (absent: `None`) is the type required, compared
+/// as RFC 7515 section 4.1.9 says: without case, and without a leading
+/// `application/` on either side. The one comparison of `typ` values in the
+/// crate.
+pub(crate) fn typ_matches(presented: Option<&str>, expected: &str) -> bool {
     presented.is_some_and(|typ| normalized_typ(typ) == normalized_typ(expected))
+}
+
+/// Refuse a configuration that would check nothing, or too little, or that
+/// the claims cannot be compared with: a leeway past [`MAX_LEEWAY`] or with
+/// a fraction of a second, or no pinned audience or issuer without the
+/// config saying so. Judged before any token is read, as the verifier does.
+fn refuse_unbounded_config(config: &ValidationConfig) -> Result<(), JwtError> {
+    // `exp` and `nbf` are whole seconds, and jsonwebtoken takes the leeway
+    // as whole seconds: a fraction would be dropped, not applied.
+    if config.leeway.subsec_nanos() != 0 {
+        return Err(JwtError::VerificationFailed(format!(
+            "leeway of {:?} is not a whole number of seconds: `exp` and `nbf` are whole \
+             seconds (RFC 7519 NumericDate), so a fraction would be dropped. Set `leeway` (or \
+             the verifier's clock skew) to whole seconds",
+            config.leeway
+        )));
+    }
+    // A leeway past the bound keeps an expired token valid for as long as
+    // it says.
+    if config.leeway > MAX_LEEWAY {
+        return Err(JwtError::VerificationFailed(format!(
+            "leeway of {} s is above the bound of {} s: a leeway that large keeps an \
+             expired token valid for as long as it says. Set `leeway` (or the verifier's \
+             clock skew) to at most {} s",
+            config.leeway.as_secs(),
+            MAX_LEEWAY.as_secs(),
+            MAX_LEEWAY.as_secs()
+        )));
+    }
+    // A claim nobody pinned is a claim nobody checks.
+    if config.audience.is_none() && !config.allow_any_audience {
+        return Err(JwtError::VerificationFailed(
+            "no audience is pinned: a token minted for any other service of the same \
+             issuer would verify. Set `audience`, or `allow_any_audience` to state that \
+             accepting any audience is intended"
+                .to_string(),
+        ));
+    }
+    if config.issuer.is_none() && !config.allow_any_issuer {
+        return Err(JwtError::VerificationFailed(
+            "no issuer is pinned: a token signed by any key in the set would verify. \
+             Set `issuer`, or `allow_any_issuer` to state that accepting any issuer is \
+             intended"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Manual `exp` / `nbf` validation against the injected clock.
 ///
-/// `leeway_secs` is `u64` and `exp` / `nbf` are `i64` Unix seconds. The cast
-/// saturates to avoid the pathological-large-leeway overflow where
-/// `u64::MAX as i64` would be negative.
+/// The leeway's whole seconds are a `u64` and `exp` / `nbf` are `i64` Unix
+/// seconds. The conversion saturates to avoid the pathological-large-leeway
+/// overflow where `u64::MAX as i64` would be negative.
 fn check_time_claims(
     claims: &serde_json::Value,
     config: &ValidationConfig,
     clock: &dyn Clock,
 ) -> Result<(), JwtError> {
-    let now = clock.now().timestamp();
-    let leeway: i64 = i64::try_from(config.leeway_secs).unwrap_or(i64::MAX);
+    let now = clock.now().unix_seconds();
+    let leeway: i64 = i64::try_from(config.leeway.as_secs()).unwrap_or(i64::MAX);
 
     // An `exp` that is present but not an integer (a float, a string) is
     // not "no exp": it is a claim this verifier cannot read, and a token it

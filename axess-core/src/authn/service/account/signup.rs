@@ -18,6 +18,11 @@ use crate::session::{
     extractor::AuthSession,
 };
 
+/// The reason on the failed `SignupCompleted` audit row written when the
+/// session registry did not register the session of a signup that was being
+/// completed: the account was not activated and the signup is still pending.
+pub const SIGNUP_SESSION_NOT_REGISTERED_REASON: &str = "session_not_registered";
+
 impl<I, F> RequestAuthnService<I, F>
 where
     I: IdentityStore,
@@ -41,9 +46,10 @@ where
     /// [`IdentityLookup::find_tenant`](crate::authn::IdentityLookup::find_tenant)).
     ///
     /// An identifier that is already taken answers [`SignupOutcome::Started`]
-    /// like a free one, creating nothing and leaving the session anonymous,
-    /// so the answer does not say who has an account; the refusal is audited
-    /// with reason `already_exists`. A service built with
+    /// like a free one and leaves the session pending a signup as a free one
+    /// does, under a user id that is never stored. Nothing is created, so
+    /// neither the answer nor the session says who has an account; the
+    /// refusal is audited with reason `already_exists`. A service built with
     /// [`with_signup_conflicts_revealed`](crate::authn::service::AuthnServiceBuilder::with_signup_conflicts_revealed)
     /// answers [`SignupOutcome::AlreadyExists`] instead; see that method for
     /// how the application tells the two apart privately. The session that
@@ -56,16 +62,21 @@ where
     /// same identifier from another session deletes it, audits the deletion
     /// and goes on as for a free identifier.
     ///
-    /// Because `Started` covers both, the handler tells them apart with
-    /// [`AuthSession::pending_user_id`](crate::session::AuthSession::pending_user_id)
-    /// after the call: `Some` means an account is in flight, `None` means the
-    /// identifier was taken. Send the verification mail only for `Some`, and
-    /// never let the response differ between the two.
+    /// Because `Started` covers both, the handler tells them apart by its
+    /// payload: `Some` is the verification secret of an account in flight,
+    /// `None` means the identifier was taken and there is no secret to mail.
+    /// It never tells them apart by
+    /// [`AuthSession::pending_user_id`](crate::session::AuthSession::pending_user_id),
+    /// which is `Some` in both cases. Send the verification mail only for a
+    /// `Some` payload, and never let the response differ between the two.
     ///
     /// # Errors
     ///
     /// Returns [`AuthnError::Store`] if the store operation fails.
-    #[tracing::instrument(skip(self, user, session), fields(tenant = %tenant_identifier))]
+    #[tracing::instrument(
+        skip(self, user, tenant_identifier, session),
+        fields(tenant = %crate::authn::service::log_text::logged_request_text(tenant_identifier))
+    )]
     pub async fn begin_signup(
         &self,
         user: crate::authn::types::User,
@@ -162,18 +173,10 @@ where
                 "already_exists",
             )
             .await?;
-            // Hidden conflicts (the default) answer as a free identifier
-            // does, so the response is not a way to learn who has an account.
-            // Nothing is created and the session holds no user; the
-            // application reads that from the session where the caller
-            // cannot. The session id rotates all the same: a free
-            // identifier rotates it (and so sets the cookie and writes the
-            // store), and a response that did not would tell the two apart.
             if self.inner.reveal_signup_conflicts {
                 return Ok(SignupOutcome::AlreadyExists);
             }
-            session.regenerate().await;
-            return Ok(SignupOutcome::Started(None));
+            return Ok(self.answer_taken_identifier(session, &tenant.id).await);
         }
 
         // 3. Create the user in the tenant that was just validated. The
@@ -245,13 +248,13 @@ where
             .inner
             .candidate_ttl
             .max(self.inner.signup_verification_ttl);
-        let ttl = chrono::Duration::from_std(ttl).unwrap_or(chrono::Duration::MAX / 4);
-        let before = self
-            .inner
-            .clock
-            .now()
-            .checked_sub_signed(ttl)
-            .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
+        // A lifetime longer than the range reaches back before every
+        // reading: no candidate is older than it, and none is deleted.
+        let now = self.inner.clock.now();
+        let before = axess_clock::SignedDuration::try_from(ttl)
+            .ok()
+            .and_then(|ttl| now.checked_sub(ttl))
+            .unwrap_or(axess_clock::Timestamp::MIN);
         let deleted = self
             .inner
             .identity
@@ -296,8 +299,9 @@ where
             .inner
             .candidate_ttl
             .max(self.inner.signup_verification_ttl);
-        let ttl = chrono::Duration::from_std(ttl).unwrap_or(chrono::Duration::MAX / 4);
-        !resuming_own && self.inner.clock.now() - user.created_at > ttl
+        let ttl =
+            axess_clock::SignedDuration::try_from(ttl).unwrap_or(axess_clock::SignedDuration::MAX);
+        !resuming_own && self.inner.clock.now().since(user.created_at) > ttl
     }
 
     /// Delete an expired candidate so its identifier is free, and leave the
@@ -332,7 +336,7 @@ where
         self.emit_audit(
             AuthEventBuilder::success(AuthEventType::SignupResumed)
                 .attributed_to(&existing_user.id, &existing_user.tenant_id)
-                .with_session(session.session_id().await),
+                .with_session(session.session_key().await),
         )
         .await?;
         let verification = self
@@ -362,8 +366,8 @@ where
         let secret =
             Zeroizing::new(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw.as_slice()));
         let now = self.inner.clock.now();
-        // A TTL past chrono's range clamps; it must not panic the signup.
-        let expires_at = crate::lifetime::expiry_after(now, self.inner.signup_verification_ttl);
+        // A TTL past the range never ends; it must not fail the signup.
+        let expires_at = axess_clock::Until::after(now, self.inner.signup_verification_ttl);
         session
             .set_pending_workflow(
                 *user_id,
@@ -372,6 +376,37 @@ where
             )
             .await;
         SignupVerification { secret, expires_at }
+    }
+
+    /// The answer to a taken identifier when conflicts are hidden (the
+    /// default): what a free identifier gets, so neither the response nor
+    /// the session says who has an account.
+    ///
+    /// The session is left as a free identifier leaves it, pending a signup
+    /// under a user id that is never stored, with a secret nobody is sent.
+    /// Every later call then answers as it does on the free path: a wrong
+    /// secret is refused the same way, and a resubmission begins the signup
+    /// again. Nothing is created; the application reads that from the
+    /// outcome, which carries no secret, where the caller cannot. Setting
+    /// the pending workflow rotates the session id, as the free path does.
+    async fn answer_taken_identifier(
+        &self,
+        session: &AuthSession,
+        tenant_id: &crate::authn::ids::TenantId,
+    ) -> SignupOutcome {
+        let now = self.inner.clock.now();
+        let never_stored = crate::authn::ids::UserId::new(&self.inner.rng);
+        // The verification is armed and its secret dropped unsent.
+        drop(
+            self.arm_signup_verification(
+                session,
+                &never_stored,
+                tenant_id,
+                WorkflowState::new(WorkflowKind::Signup, 1, now),
+            )
+            .await,
+        );
+        SignupOutcome::Started(None)
     }
 
     /// Leave a failed `SignupStarted` row for a refused signup, with the
@@ -402,12 +437,29 @@ where
     /// the secret's expiry. The secret is single use: completing the signup
     /// ends the workflow, and submitting the signup again replaces it.
     ///
+    /// # What a failure leaves
+    ///
+    /// The session is registered with the session registry before the
+    /// account is activated, so an account is never activated for a session
+    /// that could not be registered. When the registry does not register the
+    /// session, or the store does not activate the account, the account stays
+    /// as it was, the session is left pending the same signup (under a new
+    /// session id) and the same secret completes it on a later call. A
+    /// registration that was refused is recorded as a failed
+    /// `SignupCompleted` row whose reason is
+    /// [`SIGNUP_SESSION_NOT_REGISTERED_REASON`].
+    ///
     /// # Errors
     ///
     /// [`AuthnError::NoFlow`] when the session is not pending a signup;
     /// [`AuthnError::InvalidAssertion`] when `secret` is wrong or expired, or
     /// the pending signup holds no digest (one begun by an older release:
-    /// submit the signup again for a new secret).
+    /// submit the signup again for a new secret);
+    /// [`AuthnError::NotActive`] when the account is no longer waiting to be
+    /// activated; the tenant's refusal when the tenant is not active;
+    /// [`AuthnError::ExternalService`] when the session registry did not
+    /// register the session; [`AuthnError::Store`] when the store failed,
+    /// the audit write included.
     #[tracing::instrument(skip_all)]
     pub async fn complete_signup(
         &self,
@@ -428,7 +480,7 @@ where
         // The proof of control: a secret only the address's owner was sent.
         let fresh = workflow
             .verification_expires_at
-            .is_some_and(|at| self.inner.clock.now() < at);
+            .is_some_and(|at| axess_clock::Until::At(self.inner.clock.now()) < at);
         let matches = workflow
             .verification_digest
             .as_deref()
@@ -472,33 +524,63 @@ where
             return Err(refusal);
         }
 
-        // Activate the user.
-        self.inner
-            .identity
-            .activate_user(&user_id)
-            .await
-            .map_err(AuthnError::Store)?;
-
-        // Transition to Authenticated.
+        // The session is authenticated and registered before the account is
+        // activated. A session the registry never learnt about is one no
+        // `invalidate_user` call could evict, so a refused registration stops
+        // the signup; stopping it here, with the account not yet activated,
+        // leaves nothing done that no row explains. The id registered is the
+        // one `set_authenticated` rotates to, so the transition comes first
+        // and is taken back when a later step fails.
         let now = self.inner.clock.now();
         session.set_authenticated(user_id, tenant_id, now).await;
-
-        // Register in session registry if configured.
-        // React to register-failure by clearing the session and
-        // returning Err. Without this the user would walk away with an
-        // Authenticated cookie that no `invalidate_user` call could ever
-        // evict, because the registry never learnt about it.
-        let sid = session.session_id().await;
-        if let Some(reg) = &self.inner.registry
-            && !reg.register(&user_id, &sid).await
-        {
+        let sid = session.session_key().await;
+        let registered = match &self.inner.registry {
+            Some(reg) if reg.register(&user_id, &sid).await => {
+                self.note_registration(reg.as_ref(), session, &user_id, sid)
+                    .await;
+                true
+            }
+            Some(_) => false,
+            None => true,
+        };
+        if !registered {
             tracing::error!(
                 user_id = %user_id,
                 tenant_id = %tenant_id,
-                "complete_signup register failed; clearing session and refusing"
+                "complete_signup: the registry did not register the session; the account \
+                 is not activated and the signup stays pending"
             );
-            session.clear().await;
-            return Err(AuthnError::NoFlow);
+            session
+                .set_pending_workflow(user_id, tenant_id, workflow.clone())
+                .await;
+            self.emit_audit_at(
+                AuthEventBuilder::failure(AuthEventType::SignupCompleted)
+                    .attributed_to(&user_id, &tenant_id)
+                    .with_error(AuthFailureReason::from(
+                        SIGNUP_SESSION_NOT_REGISTERED_REASON,
+                    )),
+                now,
+            )
+            .await?;
+            return Err(AuthnError::ExternalService(
+                "the session registry did not register the session; the signup is still pending"
+                    .to_owned(),
+            ));
+        }
+
+        // Activate the user. When the store refuses, the registration is
+        // undone and the signup stays pending, as above.
+        if let Err(e) = self.inner.identity.activate_user(&user_id).await {
+            if let Some(reg) = &self.inner.registry {
+                crate::session::store::note_revocation(
+                    reg.invalidate_session(&user_id, &sid).await,
+                    "undoing a signup whose account was not activated",
+                );
+            }
+            session
+                .set_pending_workflow(user_id, tenant_id, workflow.clone())
+                .await;
+            return Err(AuthnError::Store(e));
         }
 
         // Record audit event. A signup that cannot be recorded does not

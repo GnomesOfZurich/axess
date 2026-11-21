@@ -9,8 +9,12 @@ use crate::authn::{
     types::AuthnScope,
 };
 
-/// How long an unfinished claim holds the cooldown slot, in seconds.
-const CLAIM_LEASE_SECS: i64 = 30;
+/// How long an unfinished claim holds the cooldown slot.
+const CLAIM_LEASE: Duration = Duration::from_secs(30);
+
+use axess_clock::Until;
+use axess_factors::{MAX_EMAIL_OTP_TTL, MIN_EMAIL_OTP_TTL};
+use std::time::Duration;
 
 /// Swaps attempted to store an issued code on its claimed row.
 const STORE_ATTEMPTS: usize = 3;
@@ -49,9 +53,9 @@ where
             .map_err(AuthnError::Store)?
             .ok_or(AuthnError::NoFlow)?;
 
-        // Take ownership of the inner cfg up front so we don't
-        // need a second destructure (which used to require an
-        // unreachable arm for "config changed kind mid-function").
+        // Take the inner cfg up front, so no second destructure is
+        // needed (it would take an unreachable arm for "config changed
+        // kind mid-function").
         let FactorConfig::EmailOtp(cfg) = &resolved.config else {
             return Err(AuthnError::NoFlow);
         };
@@ -63,7 +67,10 @@ where
         let already_sent = || PrepareOutcome::AlreadySent {
             destination: super::super::outcomes::mask_email(&cfg.email),
         };
-        if cfg.pending_until.is_some_and(|until| now < until) {
+        if cfg
+            .pending_until
+            .is_some_and(|until| Until::At(now) < until)
+        {
             return Ok(already_sent());
         }
 
@@ -77,9 +84,31 @@ where
             return Err(AuthnError::NoFlow);
         }
 
-        // `ttl_secs` is a `u32`, far inside the range `chrono::Duration`
-        // and the timestamp type represent, so neither step can overflow.
-        let expires = now + chrono::Duration::seconds(i64::from(cfg.ttl_secs));
+        // A code's life is bounded both ways: shorter than a minute and the
+        // mail has not arrived, longer than half an hour and a code sits in
+        // an inbox for a guesser to find. It is stored as a whole count of
+        // seconds, so a fraction of one cannot be kept. A config past either
+        // bound or with a fraction is refused by name here, where the
+        // operator can read why.
+        if !(MIN_EMAIL_OTP_TTL..=MAX_EMAIL_OTP_TTL).contains(&cfg.ttl) {
+            tracing::error!(
+                ttl = ?cfg.ttl,
+                min = ?MIN_EMAIL_OTP_TTL,
+                max = ?MAX_EMAIL_OTP_TTL,
+                "email OTP ttl out of bounds"
+            );
+            return Err(AuthnError::NoFlow);
+        }
+        if cfg.ttl.subsec_nanos() != 0 {
+            tracing::error!(
+                ttl = ?cfg.ttl,
+                "email OTP ttl is not a whole number of seconds, which is how it is stored"
+            );
+            return Err(AuthnError::NoFlow);
+        }
+
+        // `ttl` is bounded above, far inside the range of a reading.
+        let expires = Until::after(now, cfg.ttl);
 
         // Claim the slot with a SHORT lease, not the code's full expiry. The
         // claimed row carries no hash, so a code submitted before the hash
@@ -88,13 +117,13 @@ where
         // lapses in seconds, where a claim for the full TTL blocked the user
         // from any code for up to that long. The stored code gets the full
         // expiry.
-        let lease = chrono::Duration::seconds(i64::from(cfg.ttl_secs).min(CLAIM_LEASE_SECS));
+        let lease = cfg.ttl.min(CLAIM_LEASE);
         let mut claimed_cfg = cfg.clone();
         claimed_cfg.pending_hash = None;
         // A new code starts with a fresh allowance of guesses: the count the
         // previous code left behind must not burn this one on first use.
         claimed_cfg.attempt_count = 0;
-        claimed_cfg.pending_until = Some(now + lease);
+        claimed_cfg.pending_until = Some(Until::after(now, lease));
         let claimed = FactorConfig::EmailOtp(claimed_cfg.clone());
         let won = if resolved.resolved_from == user_scope {
             self.inner
@@ -277,6 +306,6 @@ fn same_but_for_attempts(
 ) -> bool {
     a.email == b.email
         && a.code_length == b.code_length
-        && a.ttl_secs == b.ttl_secs
+        && a.ttl == b.ttl
         && a.max_attempts == b.max_attempts
 }

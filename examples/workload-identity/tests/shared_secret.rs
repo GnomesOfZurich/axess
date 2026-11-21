@@ -2,8 +2,9 @@
 //! verifies, and what a captured request can no longer do.
 
 use axess::service_secret::{ServiceSecret, ServiceSecrets};
+use axess_clock::testing::MockClock;
 use axess_example_workload_identity::shared_secret::{
-    BOUNCE_PATH, BounceReport, bounce_routes, signed_bounce,
+    BOUNCE_PATH, BounceReport, bounce_routes_on, signed_bounce,
 };
 use axum::{
     body::Body,
@@ -13,8 +14,17 @@ use tower::ServiceExt;
 
 const SECRET: &str = "4f1c0d9a7e2b4c6d8e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b";
 
+/// The time the caller signs at: the instant the routes' clock is set to.
 fn now() -> i64 {
-    chrono::Utc::now().timestamp()
+    MockClock::reference_time().unix_seconds()
+}
+
+/// The bounce routes for `secrets`, judging signatures on a mock clock set
+/// to the reference instant.
+fn bounce_routes(
+    secrets: ServiceSecrets,
+) -> Result<axum::Router, axess::service_secret::ServiceSecretError> {
+    bounce_routes_on(secrets, std::sync::Arc::new(MockClock::at_reference()))
 }
 
 fn report() -> BounceReport {

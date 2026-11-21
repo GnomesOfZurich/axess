@@ -59,6 +59,8 @@ pub use axess_core::authz::{
     // Traits
     AuthzEntityProvider,
     AuthzError,
+    // What a `require_authz!` gate decides with, built in one call
+    AuthzInstallation,
     AuthzRefusal,
     // Concrete types
     AuthzSession,
@@ -79,11 +81,9 @@ pub use axess_core::authz::{
     reload,
 };
 
-// The trusted-proxy primitives left this module in 0.7.0. They sat behind
-// the `authz` feature, which meant the only correct way to work out a
-// caller's address required compiling Cedar, and the rate limiter read the
-// headers itself rather than pay that. They are `axess::client_ip` now,
-// ungated, with the layer that runs the walk once per request.
+// The trusted-proxy primitives are `axess::client_ip`, outside the `authz`
+// feature, so the one correct way to work out a caller's address needs no
+// Cedar; that module carries the layer that runs the walk once per request.
 pub use crate::client_ip;
 
 use cedar_policy::{Context, Entities, EntityUid};

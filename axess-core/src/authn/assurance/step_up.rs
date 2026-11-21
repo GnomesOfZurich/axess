@@ -3,7 +3,7 @@
 
 use super::FactorAssurance;
 use crate::authn::factor::{FactorKind, Fido2Ceremony, SecurityKeyVerification};
-use chrono::{DateTime, Utc};
+use axess_clock::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -64,7 +64,7 @@ impl StepUp {
     /// passkey may come back synced; its best is device-bound. A
     /// UV-discouraged security key asks the authenticator not to verify, so
     /// its best is not user-verified.
-    pub fn best_proof(&self, at: DateTime<Utc>) -> FactorAssurance {
+    pub fn best_proof(&self, at: Timestamp) -> FactorAssurance {
         match self {
             Self::Fido2(ceremony) => {
                 let (user_verified, trust_anchor) = match ceremony {

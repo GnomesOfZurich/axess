@@ -16,6 +16,11 @@
 # resolve to it. For 0.x releases the minor is the breaking unit, so
 # major.minor must match; from 1.0 on, the major must match.
 #
+# A migrating page (`docs/production/migrating/<from>-to-<to>.md`) is held
+# to the version it moves to, not to the workspace: the page about moving to
+# 0.19.0 tells its reader to take 0.19, whatever the current release is, so
+# a bump leaves it alone.
+#
 # Usage: ./scripts/check-doc-versions.sh
 # Exit 1 and lists every stale snippet, or prints the number checked.
 
@@ -25,43 +30,46 @@ AXESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$AXESS_DIR"
 
 WS_VERSION="$(sed -n '/^\[workspace.package\]/,/^\[/p' Cargo.toml \
-  | grep -m1 '^version' | sed 's/.*"\(.*\)".*/\1/')"
+  | grep '^version' | sed -n 1p | sed 's/.*"\(.*\)".*/\1/')"
 
 if [ -z "$WS_VERSION" ]; then
   echo "ERROR: could not read [workspace.package] version from Cargo.toml" >&2
   exit 1
 fi
 
-ws_major="${WS_VERSION%%.*}"
-ws_rest="${WS_VERSION#*.}"
-ws_minor="${ws_rest%%.*}"
+# compatible <version>: the part of a version cargo's rule compares.
+compatible() {
+  local major="${1%%.*}" rest="${1#*.}"
+  if [ "$rest" = "$1" ]; then rest=""; fi
+  if [ "$major" = "0" ]; then
+    echo "0.${rest%%.*}"
+  else
+    echo "$major"
+  fi
+}
 
-if [ "$ws_major" = "0" ]; then
-  required="0.${ws_minor}"
-else
-  required="${ws_major}"
-fi
+required="$(compatible "$WS_VERSION")"
 
 echo "Workspace version: ${WS_VERSION} (snippets must be compatible with ${required})"
 
 # CHANGELOG.md is excluded by design: it is a historical record, and its
 # entries are *supposed* to name the versions they shipped in.
 #
-# Only tracked files are scanned, so build output and the mutants worktree
-# cannot contribute phantom hits.
-matches="$(git ls-files '*.md' '*.rs' \
+# The files scanned are the tracked ones and the untracked ones git does not
+# ignore, so a file not yet added is checked as well, and build output and
+# the mutants worktree (both ignored) cannot contribute phantom hits.
+matches="$(git ls-files --cached --others --exclude-standard --deduplicate '*.md' '*.rs' \
   | grep -v '^CHANGELOG.md$' \
   | xargs grep -noE '(axess(-[a-z]+)?)[[:space:]]*=[[:space:]]*(\{[^}]*version[[:space:]]*=[[:space:]]*)?"[0-9][^"]*"' \
   2>/dev/null || true)"
 
-# A third shape, and the one that actually shipped wrong: prose naming the
-# release. `docs/intro/welcome.md` said "published on crates.io at `v0.3.0`"
-# three releases after 0.3.0, because the pattern above only matches a
+# A third shape: prose naming the release ("published on crates.io at
+# `v0.3.0`"), which the pattern above does not see because it only matches a
 # dependency snippet. A chapter that states the current version is wrong from
 # the next release onward, so the rule is not "keep it updated" but "do not
 # state it": link to crates.io instead. Historical statements are fine, which
 # is why this looks only for a claim about the present.
-prose="$(git ls-files '*.md' '*.rs' \
+prose="$(git ls-files --cached --others --exclude-standard --deduplicate '*.md' '*.rs' \
   | grep -v '^CHANGELOG.md$' \
   | grep -v '^docs/production/migrating.md$' \
   | xargs grep -noEi '(published|released|available|current(ly)?)[^.]{0,40}(crates\.io)?[^.]{0,20}(at|is|version)[[:space:]]+.?v?[0-9]+\.[0-9]+\.[0-9]+' \
@@ -94,25 +102,29 @@ while IFS= read -r hit; do
 
   # Placeholders such as "0.NEW.0" in the release walkthrough are templates,
   # not claims about the current version. Only real semver is judged.
-  if ! printf '%s' "$version" | grep -qE '^[0-9]+(\.[0-9]+){0,2}$'; then
+  if ! grep -qE '^[0-9]+(\.[0-9]+){0,2}$' <<<"$version"; then
     continue
   fi
 
   checked=$((checked + 1))
 
-  v_major="${version%%.*}"
-  v_rest="${version#*.}"
-  if [ "$v_rest" = "$version" ]; then v_minor=""; else v_minor="${v_rest%%.*}"; fi
+  want="$required"
+  case "$file" in
+    docs/production/migrating/*-to-*.md)
+      target="${file##*-to-}"
+      target="${target%.md}"
+      if grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' <<<"$target"; then
+        want="$(compatible "$target")"
+      else
+        stale=$((stale + 1))
+        stale_report="${stale_report}  ${file}: a migrating page whose name gives no X.Y.Z it moves to"$'\n'
+        continue
+      fi ;;
+  esac
 
-  if [ "$ws_major" = "0" ]; then
-    actual="0.${v_minor}"
-  else
-    actual="${v_major}"
-  fi
-
-  if [ "$actual" != "$required" ]; then
+  if [ "$(compatible "$version")" != "$want" ]; then
     stale=$((stale + 1))
-    stale_report="${stale_report}  ${file}:${line}: ${crate} = \"${version}\" (want ${required})"$'\n'
+    stale_report="${stale_report}  ${file}:${line}: ${crate} = \"${version}\" (want ${want})"$'\n'
   fi
 done <<< "$matches"
 
@@ -127,7 +139,7 @@ if [ "$stale" -gt 0 ]; then
   echo "ERROR: ${stale} of ${checked} documented snippets name a stale version:" >&2
   printf '%s' "$stale_report" >&2
   echo "" >&2
-  echo "Update them to ${required}, or bump [workspace.package] version." >&2
+  echo "Update them to the version named (a migrating page's own target, ${required} elsewhere)." >&2
   exit 1
 fi
 
@@ -143,7 +155,7 @@ echo "OK: all ${checked} documented dependency snippets are compatible with ${re
 # compatible range).
 
 MSRV="$(sed -n '/^\[workspace.package\]/,/^\[/p' Cargo.toml \
-  | grep -m1 '^rust-version' | sed 's/.*"\(.*\)".*/\1/')"
+  | grep '^rust-version' | sed -n 1p | sed 's/.*"\(.*\)".*/\1/')"
 
 if [ -z "$MSRV" ]; then
   echo "ERROR: could not read [workspace.package] rust-version from Cargo.toml" >&2
@@ -152,7 +164,7 @@ fi
 
 # CHANGELOG.md is exempt for the same reason as above: it records the floors
 # past releases shipped with.
-msrv_hits="$(git ls-files '*.md' \
+msrv_hits="$(git ls-files --cached --others --exclude-standard --deduplicate '*.md' \
   | grep -v '^CHANGELOG.md$' \
   | xargs grep -noE 'MSRV `[0-9]+\.[0-9]+(\.[0-9]+)?`|Rust [0-9]+\.[0-9]+(\.[0-9]+)? or later' \
   2>/dev/null || true)"

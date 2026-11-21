@@ -21,6 +21,7 @@
 
 use axess_core::authn::AuditContext;
 use axess_core::authn::service::AuthnService;
+use axess_core::authn::service::OAuthCallbackRoute;
 use axess_core::testing::{
     mock_authn::{MockFactorStore, MockIdentityStore},
     test_session,
@@ -161,50 +162,90 @@ async fn browser_leg(auth_url: &url::Url) -> (String, String, Option<String>) {
     )
 }
 
+/// Keycloak's time: the `iat` of an access token it issues now.
+///
+/// The provider stamps the tokens the test's world checks, so the world runs
+/// on the provider's clock, read from what it signs, and no test reads the
+/// machine's.
+async fn idp_now(http: &reqwest::Client) -> axess_clock::Timestamp {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    let token = admin_token(http).await;
+    let payload = token.split('.').nth(1).expect("the admin token is a JWT");
+    let claims: Value =
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).expect("base64url payload"))
+            .expect("JSON claims");
+    axess_clock::Timestamp::from_unix_seconds(claims["iat"].as_i64().expect("iat"))
+        .expect("an instant")
+}
+
+/// One login on `clock`, the world's clock, which follows the provider's
+/// time: it is set to it as the login begins and as the code comes back.
 async fn login_with(
+    clock: &axess_clock::testing::MockClock,
+    http: &reqwest::Client,
     signer: ClientAssertionSigner,
 ) -> Result<axess_factors::oauth::OAuthClaims, OAuthError> {
+    clock.set(idp_now(http).await);
     let issuer = format!("{}/realms/fapi", base());
-    let provider =
-        OAuthProviderConfig::discover_with_private_key_jwt("keycloak", &issuer, signer, REDIRECT)
-            .await
-            .expect("discovery")
-            .build()
-            .expect("build");
-    let authn = AuthnService::builder(MockIdentityStore::new(), MockFactorStore::new())
-        .with_oauth_provider(provider)
-        .build()
-        .with_audit_context(AuditContext::default());
+    let provider = OAuthProviderConfig::discover_screened_with_private_key_jwt(
+        "keycloak",
+        &issuer,
+        signer,
+        REDIRECT,
+        axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
+    )
+    .await
+    .expect("discovery")
+    .with_clock(std::sync::Arc::new(clock.clone()))
+    .build()
+    .expect("build");
+    let authn = AuthnService::builder(
+        MockIdentityStore::new().with_clock(clock.clone()),
+        MockFactorStore::new(),
+    )
+    .with_clock(clock.clone())
+    .with_oauth_provider(provider)
+    .build()
+    .with_audit_context(AuditContext::default());
     let session = test_session();
     let (auth_url, _) = authn
         .begin_oauth_login("keycloak", &OAuthLoginOptions::default(), &session)
         .await
         .expect("begin");
     let (code, state, iss) = browser_leg(&auth_url).await;
+    // The provider issued the code, and will issue the ID token, at its
+    // time since the login began: the world moves to it.
+    clock.set(idp_now(http).await);
     authn
-        .finish_oauth_login_with_iss(&code, &state, iss.as_deref(), &session)
+        .finish_oauth_login(
+            OAuthCallbackRoute::global("keycloak"),
+            &code,
+            &state,
+            iss.as_deref(),
+            &session,
+        )
         .await
 }
 
 #[tokio::test]
-#[ignore = "needs the Keycloak container; see the module documentation"]
+#[ignore = "requires a running Keycloak (KEYCLOAK_URL)"]
 async fn keycloak_authenticates_the_client_by_its_assertion() {
-    axess_factors::jwt::ensure_crypto_provider();
     let http = reqwest::Client::new();
     let admin = admin_token(&http).await;
+    let clock = axess_clock::testing::MockClock::at(idp_now(&http).await);
 
     let (der, mut jwk, _) = oauth_generate_rsa_keypair();
     jwk["kid"] = json!("live-key-1");
-    register_client(&http, &admin, "axess-r10-private-key-jwt", &jwk).await;
+    register_client(&http, &admin, "axess-private-key-jwt", &jwk).await;
     let signer = ClientAssertionSigner::new(
-        "axess-r10-private-key-jwt",
+        "axess-private-key-jwt",
         EncodingKey::from_rsa_der(&der),
         Algorithm::RS256,
     )
     .expect("the key signs under its algorithm")
     .with_key_id("live-key-1");
 
-    let claims = login_with(signer)
+    let claims = login_with(&clock, &http, signer)
         .await
         .expect("Keycloak accepted the assertion");
     assert_eq!(claims.email.as_deref(), Some("alice@bank.example.com"));
@@ -213,13 +254,13 @@ async fn keycloak_authenticates_the_client_by_its_assertion() {
     // The same client id, signed by a key Keycloak does not hold.
     let (other_der, _, _) = oauth_generate_rsa_keypair();
     let impostor = ClientAssertionSigner::new(
-        "axess-r10-private-key-jwt",
+        "axess-private-key-jwt",
         EncodingKey::from_rsa_der(&other_der),
         Algorithm::RS256,
     )
     .expect("the key signs under its algorithm")
     .with_key_id("live-key-1");
-    let refused = login_with(impostor).await;
+    let refused = login_with(&clock, &http, impostor).await;
     assert!(
         matches!(refused, Err(OAuthError::TokenExchange(_))),
         "{refused:?}"

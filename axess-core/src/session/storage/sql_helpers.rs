@@ -14,7 +14,7 @@
 //! the closed entry in `CHANGELOG.md`. Cost-prohibitive given
 //! how thin the dialect-specific bodies actually are. This module
 //! captures the slice that *does* dedupe cleanly. The
-//! `Store<SessionId, SessionData>` trait impls on each backend
+//! `Store<SessionKey, SessionData>` trait impls on each backend
 //! (`sqlite.rs` / `postgres.rs` / `mysql.rs` / `valkey.rs`) provide the
 //! cross-backend generic surface adopters can program against; each
 //! backend owns its own per-value codec (`SessionCodec` etc.) rather

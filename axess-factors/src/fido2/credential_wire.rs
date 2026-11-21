@@ -2,7 +2,7 @@
 //! earlier releases wrote and read it, and any other key under `key`.
 
 use super::{Fido2Credential, Fido2Key};
-use chrono::{DateTime, Utc};
+use axess_clock::Timestamp;
 use serde::{Deserialize, Serialize};
 use webauthn_rs::prelude::Passkey;
 
@@ -14,8 +14,8 @@ pub(super) struct Fido2CredentialWire {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     key: Option<Fido2Key>,
     name: String,
-    registered_at: DateTime<Utc>,
-    last_used_at: Option<DateTime<Utc>>,
+    registered_at: Timestamp,
+    last_used_at: Option<Timestamp>,
 }
 
 /// A stored credential that names no key, or two.

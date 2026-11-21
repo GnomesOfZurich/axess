@@ -3,14 +3,15 @@
 //! so the account is usable at once and the old failures do not lock it again.
 
 use axess::authn::{EntityState, IdentityAdmin, IdentityLookup, StatusDetail, UserId};
-use axess::{Clock, SystemClock};
+use axess_clock::testing::MockClock;
+use axess_clock::testing::Shift;
 use axess_example_sqlite::models::backend::{OurBackend, seed};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::str::FromStr;
 
 const ALICE: &str = "00000000-0000-0000-0000-000000000010";
 
-async fn pool() -> sqlx::SqlitePool {
+async fn pool(clock: &MockClock) -> sqlx::SqlitePool {
     let opts = SqliteConnectOptions::from_str("sqlite::memory:")
         .expect("in-memory url")
         .create_if_missing(true);
@@ -21,9 +22,10 @@ async fn pool() -> sqlx::SqlitePool {
         .expect("connect in-memory sqlite");
     sqlx::migrate!().run(&pool).await.expect("migrations");
     seed(
-        &SystemClock,
+        clock,
         &pool,
-        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF"),
+        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF")
+            .with_clock(std::sync::Arc::new(clock.clone())),
     )
     .await
     .expect("seed");
@@ -32,22 +34,24 @@ async fn pool() -> sqlx::SqlitePool {
 
 #[tokio::test]
 async fn activating_a_user_ends_a_timed_suspension_and_clears_the_counters() {
-    let pool = pool().await;
-    let backend = OurBackend::new(pool.clone());
+    let clock = MockClock::at_reference();
+    let pool = pool(&clock).await;
+    let backend = OurBackend::new(pool.clone()).with_clock(std::sync::Arc::new(clock.clone()));
     let alice = UserId::try_new(ALICE).expect("user id");
-    let now = SystemClock.now();
+    let now = MockClock::reference_time();
 
     backend
         .suspend_user(
             &alice,
-            StatusDetail::administrative("review", now)
-                .with_until(Some(now + chrono::Duration::hours(1))),
+            StatusDetail::administrative("review", now).with_until(Some(axess_clock::Until::At(
+                now.plus(axess_clock::SignedDuration::hours(1)),
+            ))),
         )
         .await
         .expect("suspend");
     sqlx::query("UPDATE users SET failed_attempts = 5, last_failed_at = ?2 WHERE id = ?1")
         .bind(ALICE)
-        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339_numeric_offset())
         .execute(&pool)
         .await
         .expect("failures");

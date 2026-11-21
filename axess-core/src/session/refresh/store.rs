@@ -263,7 +263,7 @@ pub trait RefreshTokenStore: Send + Sync {
     /// [`CascadingRefreshStore`](crate::device::CascadingRefreshStore) does
     /// (a store that cannot revoke tokens uses
     /// [`cascade_revoke_devices`](crate::device::cascade_revoke_devices)).
-    /// The default implementation logs the device list alongside the
+    /// The default implementation logs the number of devices alongside the
     /// family id; it does NOT perform the cascade itself because the
     /// trait has no access to a [`DeviceStore`](crate::device::DeviceStore).
     /// The cascade primitive lives outside the refresh path so a single

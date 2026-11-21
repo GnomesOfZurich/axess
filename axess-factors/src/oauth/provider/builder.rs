@@ -5,9 +5,10 @@
 //! none of them looks at another. [`build`](OAuthProviderBuilder::build) is
 //! the one place the settings meet: it checks the FAPI profile's demands,
 //! resolves DPoP, narrows the ID-token algorithm list, checks the transport
-//! of every endpoint a setter named, and puts the mTLS endpoint aliases in
-//! place last. The same calls in any order therefore give the same provider,
-//! or the same refusal, and nothing reaches a request before the check:
+//! and the egress policy of every endpoint a setter named, and puts the mTLS
+//! endpoint aliases in place last. The same calls in any order therefore
+//! give the same provider, or the same refusal, and nothing reaches a request
+//! before the check:
 //!
 //! ```text
 //! let provider = OAuthProviderConfig::discover(...).await?
@@ -108,6 +109,15 @@ impl OAuthProviderBuilder {
     pub fn with_required_logout_typ(mut self) -> Self {
         self.base.require_logout_typ = true;
         self
+    }
+
+    /// Whether the provider will require the `typ` header `logout+jwt` of a
+    /// back-channel logout token: what
+    /// [`with_required_logout_typ`](Self::with_required_logout_typ) turned
+    /// on. There is no way to turn it off again.
+    #[must_use]
+    pub fn requires_logout_typ(&self) -> bool {
+        self.base.require_logout_typ
     }
 
     /// Accept ID tokens and logout tokens signed with these algorithms only,
@@ -238,7 +248,7 @@ impl OAuthProviderBuilder {
     /// * **PAR** is required: the provider must have a PAR endpoint, from
     ///   discovery or [`with_par_endpoint`](Self::with_par_endpoint).
     /// * **ID tokens** must live no longer than
-    ///   `max_id_token_lifetime_secs`, carry no `nbf` more than 60 seconds
+    ///   `max_id_token_lifetime`, carry no `nbf` more than 60 seconds
     ///   in the future, and be signed with one of
     ///   `allowed_id_token_algs` (`PS256`, `ES256`, `EdDSA` by default),
     ///   whatever the IdP advertises, narrowed by
@@ -256,7 +266,8 @@ impl OAuthProviderBuilder {
     ///
     /// Only needed if the IdP doesn't advertise it in OIDC discovery metadata.
     /// [`build`](Self::build) refuses a URL that is not HTTPS (plain HTTP to
-    /// a loopback host aside).
+    /// a loopback host aside), or that the egress policy discovery ran under
+    /// refuses.
     #[must_use]
     pub fn with_par_endpoint(mut self, url: impl Into<String>) -> Self {
         self.par_endpoint = Some(url.into());
@@ -270,7 +281,8 @@ impl OAuthProviderBuilder {
     /// not advertise it in the standard OIDC discovery metadata under
     /// the `revocation_endpoint` field; `revoke_token` otherwise answers
     /// `Config("...does not include a revocation_endpoint")`.
-    /// [`build`](Self::build) refuses a URL that is not HTTPS.
+    /// [`build`](Self::build) refuses a URL that is not HTTPS, or that the
+    /// egress policy discovery ran under refuses.
     #[must_use]
     pub fn with_revocation_endpoint(mut self, url: impl Into<String>) -> Self {
         self.revocation_endpoint = Some(url.into());
@@ -284,7 +296,8 @@ impl OAuthProviderBuilder {
     /// many IdPs expose the endpoint without advertising it in
     /// discovery, so [`build_end_session_url`](crate::oauth::OAuthProvider::build_end_session_url)
     /// returns `None` until the URL is supplied. [`build`](Self::build)
-    /// refuses a URL that is not HTTPS.
+    /// refuses a URL that is not HTTPS, or that the egress policy discovery
+    /// ran under refuses.
     #[must_use]
     pub fn with_end_session_endpoint(mut self, url: impl Into<String>) -> Self {
         self.end_session_endpoint = Some(url.into());
@@ -315,7 +328,8 @@ impl OAuthProviderBuilder {
     ///
     /// Required for the device code flow. Not part of standard OIDC discovery;
     /// check your IdP's documentation for the URL. [`build`](Self::build)
-    /// refuses a URL that is not HTTPS.
+    /// refuses a URL that is not HTTPS, or that the egress policy discovery
+    /// ran under refuses.
     #[must_use]
     pub fn with_device_authorization_endpoint(mut self, url: impl Into<String>) -> Self {
         self.device_authorization_endpoint = Some(url.into());
@@ -369,7 +383,10 @@ impl OAuthProviderBuilder {
     /// never matters:
     ///
     /// 1. Each endpoint a setter named must be HTTPS (plain HTTP to a
-    ///    loopback host aside) and replaces the discovered one.
+    ///    loopback host aside) and pass the egress policy discovery ran under,
+    ///    as every endpoint the discovery document names did, and replaces
+    ///    the discovered one. A host that is an address in a reserved range
+    ///    is refused here; a host name is screened at connect.
     /// 2. Under the FAPI profile, the provider must have a PAR endpoint and
     ///    authenticate by `private_key_jwt` or mTLS; any client secret is
     ///    dropped, as it is whenever a `private_key_jwt` signer is set.
@@ -390,8 +407,9 @@ impl OAuthProviderBuilder {
     /// # Errors
     ///
     /// [`OAuthError::Config`] naming the first rule that fails: an endpoint
-    /// that is not secure; under FAPI no PAR endpoint, or a client that
-    /// would authenticate by a secret; a DPoP setting the profile
+    /// that is not secure or that the egress policy refuses; under FAPI no
+    /// PAR endpoint, or a client that would authenticate by a secret; a DPoP
+    /// setting the profile
     /// contradicts, or [`with_dpop`](Self::with_dpop) for an IdP that does
     /// not advertise DPoP; an algorithm list that is empty or names an
     /// algorithm that is not an asymmetric one this provider verifies, or a
@@ -434,6 +452,9 @@ impl OAuthProviderBuilder {
         ] {
             if let Some(url) = url {
                 super::endpoint::require_secure(Some(&url), what)?;
+                base.egress
+                    .check_url(&url, what)
+                    .map_err(|e| OAuthError::Config(e.to_string()))?;
                 *slot = Some(url);
             }
         }
@@ -470,7 +491,8 @@ impl OAuthProviderBuilder {
             client_key_path,
         }) = constraint
         {
-            base.http_client = fapi_profile::mtls_client(client_cert_path, client_key_path)?;
+            base.http_client =
+                fapi_profile::mtls_client(base.egress, client_cert_path, client_key_path)?;
             base.use_mtls_aliases()?;
         }
         base.fapi = fapi;

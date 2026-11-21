@@ -3,16 +3,18 @@
 //! These tests require a running PostgreSQL instance. Set `POSTGRES_URL` to
 //! the connection string (e.g. `postgres://postgres:postgres@localhost:5432/postgres`).
 //!
-//! Run with: `cargo test -p axess-core --features postgres --test postgres_store -- --ignored`
+//! Run with: `cargo test -p axess-core --features postgres,testing --test postgres_store -- --ignored`
 
-#![cfg(feature = "postgres")]
+#![cfg(all(feature = "postgres", feature = "testing"))]
+
+use axess_core::testing::fixtures as common;
 
 use axess_clock::testing::MockClock;
 use axess_core::{
     PostgresSessionStore,
     session::{
         data::SessionData,
-        id::SessionId,
+        id::{SessionId, SessionKey},
         store::{CycleOutcome, SessionStore},
     },
 };
@@ -22,14 +24,22 @@ use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
 use std::time::Duration;
 
-async fn make_store() -> Option<(PostgresSessionStore, sqlx::PgPool)> {
-    let url = std::env::var("POSTGRES_URL").ok()?;
+/// A store on the server `POSTGRES_URL` names, with an empty `sessions`
+/// table. These tests run only with `--ignored`, on purpose: a missing URL
+/// or an unreachable server fails the test, it never skips it.
+async fn make_store(clock: &MockClock) -> PostgresSessionStore {
+    let url = std::env::var("POSTGRES_URL").unwrap_or_else(|_| {
+        panic!(
+            "POSTGRES_URL is not set: these tests need a live server and run only with --ignored"
+        )
+    });
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .connect(&url)
         .await
-        .ok()?;
-    let store = PostgresSessionStore::plaintext_insecure(pool.clone());
+        .unwrap_or_else(|e| panic!("POSTGRES_URL is set but the server is unreachable: {e}"));
+    let store =
+        PostgresSessionStore::plaintext_insecure(pool.clone()).with_clock(Arc::new(clock.clone()));
 
     // init_schema is idempotent (IF NOT EXISTS). Run it every time
     // so tests work regardless of execution order.
@@ -41,31 +51,25 @@ async fn make_store() -> Option<(PostgresSessionStore, sqlx::PgPool)> {
         .await
         .unwrap();
 
-    Some((store, pool))
+    store
 }
 
-/// `make_store` variant that injects a [`MockClock`] so TTL-boundary
-/// tests advance time deterministically instead of `tokio::time::sleep`.
-/// Returns `None` when `POSTGRES_URL` is unset (same gate as
-/// `make_store`).
-async fn make_store_with_mock_clock() -> Option<(PostgresSessionStore, sqlx::PgPool, Arc<MockClock>)>
-{
-    let (store, pool) = make_store().await?;
-    let clock = Arc::new(MockClock::at(chrono::Utc::now()));
-    let store = store.with_clock(clock.clone());
-    Some((store, pool, clock))
+/// `make_store` with the clock handed back, so a TTL-boundary test
+/// advances time itself.
+async fn make_store_with_mock_clock() -> (PostgresSessionStore, Arc<MockClock>) {
+    let clock = common::test_clock();
+    let store = make_store(&clock).await;
+    (store, Arc::new(clock))
 }
 
 #[tokio::test]
-#[ignore] // Requires POSTGRES_URL
+#[ignore = "requires a running Postgres (POSTGRES_URL)"]
 #[serial]
 async fn save_and_load_roundtrip() {
-    let Some((store, _pool)) = make_store().await else {
-        eprintln!("POSTGRES_URL not set, skipping");
-        return;
-    };
+    let clock = common::test_clock();
+    let store = make_store(&clock).await;
     let rng = SystemRng;
-    let id = SessionId::new(&rng);
+    let id = SessionKey::of(&SessionId::new(&rng));
     let data = SessionData::default();
 
     store
@@ -78,27 +82,25 @@ async fn save_and_load_roundtrip() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a running Postgres (POSTGRES_URL)"]
 #[serial]
 async fn load_nonexistent_returns_none() {
-    let Some((store, _pool)) = make_store().await else {
-        return;
-    };
+    let clock = common::test_clock();
+    let store = make_store(&clock).await;
     let rng = SystemRng;
-    let id = SessionId::new(&rng);
+    let id = SessionKey::of(&SessionId::new(&rng));
     let loaded = store.load(&id).await.unwrap();
     assert!(loaded.is_none());
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a running Postgres (POSTGRES_URL)"]
 #[serial]
 async fn delete_removes_session() {
-    let Some((store, _pool)) = make_store().await else {
-        return;
-    };
+    let clock = common::test_clock();
+    let store = make_store(&clock).await;
     let rng = SystemRng;
-    let id = SessionId::new(&rng);
+    let id = SessionKey::of(&SessionId::new(&rng));
     let data = SessionData::default();
 
     store
@@ -110,32 +112,30 @@ async fn delete_removes_session() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a running Postgres (POSTGRES_URL)"]
 #[serial]
 async fn delete_nonexistent_is_idempotent() {
-    let Some((store, _pool)) = make_store().await else {
-        return;
-    };
+    let clock = common::test_clock();
+    let store = make_store(&clock).await;
     let rng = SystemRng;
-    let id = SessionId::new(&rng);
+    let id = SessionKey::of(&SessionId::new(&rng));
     store.delete(&id).await.unwrap();
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a running Postgres (POSTGRES_URL)"]
 #[serial]
 async fn cycle_replaces_old_with_new() {
-    let Some((store, _pool)) = make_store().await else {
-        return;
-    };
+    let clock = common::test_clock();
+    let store = make_store(&clock).await;
     let rng = SystemRng;
-    let old_id = SessionId::new(&rng);
+    let old_id = SessionKey::of(&SessionId::new(&rng));
     let data = SessionData::default();
     let ttl = Duration::from_secs(60);
 
     store.save(&old_id, &data, ttl).await.unwrap();
 
-    let new_id = SessionId::new(&rng);
+    let new_id = SessionKey::of(&SessionId::new(&rng));
     assert_eq!(
         store
             .cycle(&old_id, &new_id, &data, ttl, true)
@@ -149,14 +149,12 @@ async fn cycle_replaces_old_with_new() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a running Postgres (POSTGRES_URL)"]
 #[serial]
 async fn expired_session_not_returned() {
-    let Some((store, _pool, clock)) = make_store_with_mock_clock().await else {
-        return;
-    };
+    let (store, clock) = make_store_with_mock_clock().await;
     let rng = SystemRng;
-    let id = SessionId::new(&rng);
+    let id = SessionKey::of(&SessionId::new(&rng));
 
     store
         .save(&id, &SessionData::default(), Duration::from_secs(10))
@@ -169,16 +167,14 @@ async fn expired_session_not_returned() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a running Postgres (POSTGRES_URL)"]
 #[serial]
 async fn cleanup_expired_removes_old_sessions() {
-    let Some((store, _pool, clock)) = make_store_with_mock_clock().await else {
-        return;
-    };
+    let (store, clock) = make_store_with_mock_clock().await;
     let rng = SystemRng;
 
-    let id_expired = SessionId::new(&rng);
-    let id_valid = SessionId::new(&rng);
+    let id_expired = SessionKey::of(&SessionId::new(&rng));
+    let id_valid = SessionKey::of(&SessionId::new(&rng));
     let data = SessionData::default();
 
     store
@@ -198,14 +194,13 @@ async fn cleanup_expired_removes_old_sessions() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a running Postgres (POSTGRES_URL)"]
 #[serial]
 async fn save_overwrites_existing() {
-    let Some((store, _pool)) = make_store().await else {
-        return;
-    };
+    let clock = common::test_clock();
+    let store = make_store(&clock).await;
     let rng = SystemRng;
-    let id = SessionId::new(&rng);
+    let id = SessionKey::of(&SessionId::new(&rng));
 
     let data1 = SessionData {
         fingerprint: Some("first".to_string()),
@@ -235,16 +230,14 @@ async fn save_overwrites_existing() {
 /// a `&dyn SessionStore` (e.g. an ops-endpoint dispatcher) must be able
 /// to drop expired rows without downcasting to the concrete backend.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a running Postgres (POSTGRES_URL)"]
 #[serial]
 async fn prune_expired_trait_method_reclaims_orphans() {
-    let Some((store, _pool, clock)) = make_store_with_mock_clock().await else {
-        return;
-    };
+    let (store, clock) = make_store_with_mock_clock().await;
     let rng = SystemRng;
 
-    let id_expired = SessionId::new(&rng);
-    let id_valid = SessionId::new(&rng);
+    let id_expired = SessionKey::of(&SessionId::new(&rng));
+    let id_valid = SessionKey::of(&SessionId::new(&rng));
     let data = SessionData::default();
 
     store
@@ -272,14 +265,13 @@ async fn prune_expired_trait_method_reclaims_orphans() {
 /// silent fall-back to the legacy JSON encoder that the new decoder
 /// would still parse without complaint.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a running Postgres (POSTGRES_URL)"]
 #[serial]
 async fn msgpack_roundtrip_preserves_custom_bag() {
-    let Some((store, _pool)) = make_store().await else {
-        return;
-    };
+    let clock = common::test_clock();
+    let store = make_store(&clock).await;
     let rng = SystemRng;
-    let id = SessionId::new(&rng);
+    let id = SessionKey::of(&SessionId::new(&rng));
 
     let data = SessionData {
         custom: serde_json::json!({
@@ -303,24 +295,26 @@ async fn msgpack_roundtrip_preserves_custom_bag() {
 /// `cycle` that requires its old row; a never-stored old id still rotates
 /// when the row is not required.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires a running Postgres (POSTGRES_URL)"]
 #[serial]
 async fn an_ended_session_is_not_revived_by_update_or_cycle() {
-    let Some((store, _pool)) = make_store().await else {
-        return;
-    };
+    let clock = common::test_clock();
+    let store = make_store(&clock).await;
     let rng = SystemRng;
     let data = SessionData::default();
     let ttl = Duration::from_secs(60);
 
-    let id = SessionId::new(&rng);
+    let id = SessionKey::of(&SessionId::new(&rng));
     store.save(&id, &data, ttl).await.unwrap();
     assert!(store.update(&id, &data, ttl).await.unwrap());
     store.delete(&id).await.unwrap();
     assert!(!store.update(&id, &data, ttl).await.unwrap());
     assert!(store.load(&id).await.unwrap().is_none());
 
-    let (old, new) = (SessionId::new(&rng), SessionId::new(&rng));
+    let (old, new) = (
+        SessionKey::of(&SessionId::new(&rng)),
+        SessionKey::of(&SessionId::new(&rng)),
+    );
     store.save(&old, &data, ttl).await.unwrap();
     store.delete(&old).await.unwrap();
     assert_eq!(
@@ -329,7 +323,10 @@ async fn an_ended_session_is_not_revived_by_update_or_cycle() {
     );
     assert!(store.load(&new).await.unwrap().is_none());
 
-    let (fresh_old, fresh_new) = (SessionId::new(&rng), SessionId::new(&rng));
+    let (fresh_old, fresh_new) = (
+        SessionKey::of(&SessionId::new(&rng)),
+        SessionKey::of(&SessionId::new(&rng)),
+    );
     assert_eq!(
         store
             .cycle(&fresh_old, &fresh_new, &data, ttl, false)
@@ -342,11 +339,10 @@ async fn an_ended_session_is_not_revived_by_update_or_cycle() {
 
 #[cfg(feature = "testing")]
 #[tokio::test]
-#[ignore] // Requires POSTGRES_URL
+#[ignore = "requires a running Postgres (POSTGRES_URL)"]
 #[serial]
 async fn update_if_revision_keeps_the_contract() {
-    let Some((store, _pool)) = make_store().await else {
-        return;
-    };
+    let clock = common::test_clock();
+    let store = make_store(&clock).await;
     axess_core::testing::store_contract::assert_update_if_revision_contract(&store).await;
 }

@@ -5,6 +5,7 @@
 //! separately in [`super::validation`].
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use std::time::Duration;
 
 /// Maximum JWT size (8 KiB). Real OIDC tokens are typically well under
 /// 2 KiB; the larger limit allows headroom for unusual claim payloads
@@ -12,7 +13,10 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 pub const MAX_JWT_BYTES: usize = 8 * 1024;
 
 /// Maximum age of a token's `iat` claim (5 minutes).
-pub const MAX_IAT_AGE_SECS: i64 = 300;
+pub const MAX_IAT_AGE: Duration = Duration::from_secs(300);
+
+/// How far ahead of the verifier's clock a token's `iat` may be (clock skew).
+const MAX_IAT_FUTURE: Duration = Duration::from_secs(60);
 
 /// Decode the payload (second segment) of a JWT without signature verification.
 ///
@@ -36,7 +40,8 @@ pub fn decode_jwt_payload(token: &str) -> Result<serde_json::Value, String> {
         .decode(parts[1])
         .map_err(|e| format!("base64 decode failed: {e}"))?;
 
-    serde_json::from_slice(&payload_bytes).map_err(|e| format!("JSON parse failed: {e}"))
+    serde_json::from_slice(&payload_bytes)
+        .map_err(|e| format!("JSON parse failed: {}", crate::remote_text::parse_error(&e)))
 }
 
 /// Check that the JWT `aud` claim contains the expected client ID. Accepts
@@ -85,7 +90,7 @@ pub fn azp_satisfied(payload: &serde_json::Value, client_id: &str) -> bool {
 /// Outcome of `iat` (issued-at) recency validation.
 pub enum IatCheck {
     /// The `iat` claim is within tolerance: pre-dated by at most 60 s
-    /// (clock skew) and no older than [`MAX_IAT_AGE_SECS`].
+    /// (clock skew) and no older than [`MAX_IAT_AGE`].
     Ok,
     /// Missing or non-integer `iat` claim: reject.
     Missing,
@@ -104,7 +109,7 @@ pub fn check_iat(payload: &serde_json::Value, now: i64) -> IatCheck {
     let Some(iat) = payload.get("iat").and_then(|v| v.as_i64()) else {
         return IatCheck::Missing;
     };
-    if crate::iat_window::iat_within(iat, now, 60, MAX_IAT_AGE_SECS) {
+    if crate::iat_window::iat_within(iat, now, MAX_IAT_FUTURE, MAX_IAT_AGE) {
         IatCheck::Ok
     } else {
         IatCheck::OutOfRange { iat, now }

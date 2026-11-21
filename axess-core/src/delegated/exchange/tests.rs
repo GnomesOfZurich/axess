@@ -26,7 +26,7 @@ async fn exchange_happy_path_returns_downstream_token() {
             "subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Ajwt",
         ))
         .and(body_string_contains(
-            "audience=https%3A%2F%2Fcompute-worker.gnomes",
+            "audience=https%3A%2F%2Fcompute-worker.example.org",
         ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "access_token": "downstream-jwt",
@@ -39,10 +39,10 @@ async fn exchange_happy_path_returns_downstream_token() {
         .mount(&server)
         .await;
 
-    let client = TokenExchangeClient::new(token_url(&server), "gnomes-api", Some("shh".into()))
+    let client = TokenExchangeClient::new(token_url(&server), "example-api", Some("shh".into()))
         .expect("client");
     let req = TokenExchangeRequest::new("user-jwt-here", token_types::JWT)
-        .with_audience("https://compute-worker.gnomes")
+        .with_audience("https://compute-worker.example.org")
         .with_scopes(["compute.read", "compute.write"]);
     let resp = client.exchange(&req).await.expect("exchange");
 
@@ -196,13 +196,42 @@ async fn exchange_rejects_a_response_without_issued_token_type() {
     );
 }
 
+/// The error body reaches the error with control characters and the Unicode
+/// line separators escaped.
+#[tokio::test]
+async fn exchange_reports_the_error_body_log_safe() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth2/token"))
+        .respond_with(ResponseTemplate::new(400).set_body_raw(
+            "invalid_target\r\nINFO forged line\x1b[2J\u{2028}",
+            "text/plain",
+        ))
+        .mount(&server)
+        .await;
+
+    let client =
+        TokenExchangeClient::new(token_url(&server), "axess", Some("shh".into())).expect("client");
+    let req = TokenExchangeRequest::new("token", token_types::JWT);
+    let err = client.exchange(&req).await.expect_err("400 must propagate");
+    let crate::delegated::error::DelegatedError::TokenEndpoint { body, .. } = &err else {
+        panic!("expected TokenEndpoint, got {err:?}");
+    };
+    assert!(!body.chars().any(char::is_control), "{body:?}");
+    assert!(!body.contains('\u{2028}'), "{body:?}");
+    assert!(
+        body.contains("invalid_target") && body.contains("forged line"),
+        "{body}"
+    );
+}
+
 #[tokio::test]
 async fn exchange_carries_resource_when_set() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/oauth2/token"))
         .and(body_string_contains(
-            "resource=https%3A%2F%2Fapi.gnomes%2Fv1%2Fmarket",
+            "resource=https%3A%2F%2Fapi.example.org%2Fv1%2Fmarket",
         ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "token_type": "Bearer",
@@ -217,7 +246,7 @@ async fn exchange_carries_resource_when_set() {
     let client =
         TokenExchangeClient::new(token_url(&server), "axess", Some("shh".into())).expect("client");
     let req = TokenExchangeRequest::new("token", token_types::JWT)
-        .with_resource(Url::parse("https://api.gnomes/v1/market").unwrap());
+        .with_resource(Url::parse("https://api.example.org/v1/market").unwrap());
     let _ = client.exchange(&req).await.expect("resource carried");
 }
 
@@ -228,7 +257,7 @@ async fn exchange_form_encodes_basic_credentials() {
         .and(path("/oauth2/token"))
         .and(wiremock::matchers::header(
             "authorization",
-            "Basic Z25vbWVzLWFwaTphJTNBYiUyNWMlMkJk",
+            "Basic ZXhhbXBsZS1hcGk6YSUzQWIlMjVjJTJCZA==",
         ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "token_type": "Bearer",
@@ -238,8 +267,9 @@ async fn exchange_form_encodes_basic_credentials() {
         .expect(1)
         .mount(&server)
         .await;
-    let client = TokenExchangeClient::new(token_url(&server), "gnomes-api", Some("a:b%c+d".into()))
-        .expect("client");
+    let client =
+        TokenExchangeClient::new(token_url(&server), "example-api", Some("a:b%c+d".into()))
+            .expect("client");
     let req = TokenExchangeRequest::new("user-jwt", token_types::JWT);
     client.exchange(&req).await.expect("exchange");
 }
@@ -257,7 +287,7 @@ async fn exchange_bounds_the_response_bodies() {
         .up_to_n_times(1)
         .mount(&server)
         .await;
-    let client = TokenExchangeClient::new(token_url(&server), "gnomes-api", None).expect("client");
+    let client = TokenExchangeClient::new(token_url(&server), "example-api", None).expect("client");
     let req = TokenExchangeRequest::new("t", token_types::JWT);
     let err = client.exchange(&req).await.expect_err("500");
     let DelegatedError::TokenEndpoint { body, .. } = err else {
@@ -304,7 +334,7 @@ fn debug_output_redacts_both_tokens() {
 async fn a_plain_http_remote_endpoint_is_refused_before_any_request() {
     let client = TokenExchangeClient::new(
         Url::parse("http://192.0.2.1:9/token").unwrap(),
-        "gnomes-api",
+        "example-api",
         Some("shh".into()),
     )
     .expect("client");
@@ -332,7 +362,7 @@ async fn the_default_client_does_not_follow_a_redirect() {
         .expect(1)
         .mount(&first)
         .await;
-    let client = TokenExchangeClient::new(token_url(&first), "gnomes-api", Some("shh".into()))
+    let client = TokenExchangeClient::new(token_url(&first), "example-api", Some("shh".into()))
         .expect("client");
     let result = client
         .exchange(&TokenExchangeRequest::new("jwt", token_types::JWT))
@@ -350,7 +380,7 @@ async fn a_transport_error_names_no_url() {
         .unwrap()
         .port();
     let url = Url::parse(&format!("http://127.0.0.1:{port}/tenant-7f3a9c/token")).unwrap();
-    let client = TokenExchangeClient::new(url, "gnomes-api", Some("shh".into())).expect("client");
+    let client = TokenExchangeClient::new(url, "example-api", Some("shh".into())).expect("client");
     let err = client
         .exchange(&TokenExchangeRequest::new("jwt", token_types::JWT))
         .await
@@ -381,7 +411,7 @@ async fn a_response_without_scope_grants_the_requested_scopes() {
         })))
         .mount(&server)
         .await;
-    let client = TokenExchangeClient::new(token_url(&server), "gnomes-api", Some("shh".into()))
+    let client = TokenExchangeClient::new(token_url(&server), "example-api", Some("shh".into()))
         .expect("client");
     let req = TokenExchangeRequest::new("user-jwt-here", token_types::JWT)
         .with_scopes(["compute.read", "compute.write"]);

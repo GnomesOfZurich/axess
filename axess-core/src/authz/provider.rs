@@ -16,6 +16,10 @@
 //!
 //! - The **principal** entity (the authenticated user) with its attributes
 //!   (tenant, any ABAC attributes) and **parents** set to its role entity UIDs.
+//!   A session begun with
+//!   [`AuthzStore::for_principal`](super::AuthzStore::for_principal) adds the
+//!   principal's own `axess::Human` or `axess::Workload` entity itself; the
+//!   provider leaves it out, or supplies exactly that entity.
 //! - The **role** entities: one per role the principal holds, with their
 //!   own parent hierarchy if roles are hierarchical.
 //! - The **resource** entity (the specific instance being accessed) with
@@ -46,7 +50,7 @@
 //!         &self,
 //!         principal: &EntityUid,
 //!         resource_id: &uuid::Uuid,
-//!         _action: &EntityUid,
+//!         _: &EntityUid,
 //!     ) -> Result<Entities, sqlx::Error> {
 //!         // load user, roles, document from DB and build Entities
 //!         todo!()
@@ -263,8 +267,9 @@ pub trait AuthzEntityProvider: Send + Sync {
 /// great for ergonomic handler code that knows its concrete provider but
 /// makes the trait non-object-safe. `RequestEntityProvider` erases the
 /// resource type to [`EntityUid`] so it can live behind
-/// `Arc<dyn RequestEntityProvider>` in axum extensions and be consumed
-/// generically by macros and cache decorators that don't know the
+/// `Arc<dyn RequestEntityProvider>` in an
+/// [`AuthzInstallation`](super::installation::AuthzInstallation) and be
+/// consumed generically by macros and cache decorators that don't know the
 /// application's concrete provider type.
 ///
 /// # When to implement
@@ -302,14 +307,10 @@ pub trait AuthzEntityProvider: Send + Sync {
 /// `EntityUid` alone cannot convey these; the session is the natural
 /// per-request anchor for them.
 ///
-/// Implementations that don't need any session state should still take
-/// the parameter (it's part of the trait contract) and acknowledge the
-/// non-use explicitly with `let _ = session;` at the top of the method
-/// body, matching the established axess pattern for trait methods with
-/// optional inputs (e.g. `SessionStore::find_sessions_for_user`'s
-/// `let _ = (user_id, limit);`). Do NOT prefix the parameter with `_`
-/// axess forbids `_`-prefixed parameter names in trait impls, since
-/// the prefix hides the contract from readers and tooling.
+/// An implementation that needs no session state still takes the
+/// parameter, since the trait fixes it, and takes it as a bare `_`
+/// (`_: &'a AuthSession`). A name with a `_` prefix is refused by the
+/// repository's gate.
 ///
 /// # Caching contract
 ///

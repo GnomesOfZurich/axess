@@ -24,6 +24,22 @@
 //! arrives from another site carries the session cookie and not this one. The
 //! session already names the device it was last bound to, and the lifecycle
 //! keeps that device for an authenticated user instead of minting another.
+//!
+//! # One slot per device
+//!
+//! A device row has one owner, so a browser profile that several accounts
+//! sign in on holds one device per account. The cookie therefore holds one
+//! entry per device, newest first, joined by `~`:
+//!
+//! ```text
+//! __Host-axess_device = <id>.<token>~<id>.<token>
+//! ```
+//!
+//! at most [`MAX_DEVICE_COOKIE_ENTRIES`] of them. A request is resolved to the
+//! first entry that proves a device its user may use, so an account switch
+//! reuses that account's device instead of minting a new one, and minting a
+//! device for one account keeps the other accounts' entries. A value with one
+//! entry, which is what earlier releases wrote, reads as it always did.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -35,16 +51,26 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use cookie::{Cookie, SameSite, time};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
 
-use crate::authn::ids::DeviceId;
+use crate::authn::ids::{DeviceId, TenantId, UserId};
 use crate::device::types::{DeviceBinding, FingerprintHash};
 
-/// Longest cookie value read; a real one is under 100 bytes.
-pub(crate) const MAX_DEVICE_COOKIE_BYTES: usize = 256;
+/// Most device entries one cookie holds: one per account that signs in on a
+/// browser profile. A request that presents more is read up to this many, and
+/// a cookie written when it is full drops the oldest.
+pub const MAX_DEVICE_COOKIE_ENTRIES: usize = 8;
+
+/// Longest cookie value read; an entry is under 100 bytes.
+pub(crate) const MAX_DEVICE_COOKIE_BYTES: usize = 1024;
+
+/// What joins the entries of one cookie value. A cookie octet that neither an
+/// id nor a base64url token contains.
+const ENTRY_SEPARATOR: char = '~';
 
 /// A device token: 32 random bytes, shown to the browser once.
 #[derive(Clone, PartialEq, Eq)]
-pub struct DeviceToken([u8; 32]);
+pub struct DeviceToken(Zeroizing<[u8; 32]>);
 
 impl std::fmt::Debug for DeviceToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -52,17 +78,11 @@ impl std::fmt::Debug for DeviceToken {
     }
 }
 
-impl Drop for DeviceToken {
-    fn drop(&mut self) {
-        zeroize::Zeroize::zeroize(&mut self.0);
-    }
-}
-
 impl DeviceToken {
     /// Draw a fresh token from `rng`.
     pub fn mint(rng: &dyn SecureRng) -> Self {
-        let mut bytes = [0u8; 32];
-        rng.fill_bytes(&mut bytes);
+        let mut bytes = Zeroizing::new([0u8; 32]);
+        rng.fill_bytes(&mut *bytes);
         Self(bytes)
     }
 
@@ -76,12 +96,12 @@ impl DeviceToken {
     pub fn digest(&self) -> FingerprintHash {
         let mut hasher = Sha256::new();
         hasher.update(b"axess.device-token.v1\0");
-        hasher.update(self.0);
+        hasher.update(&self.0[..]);
         FingerprintHash::from_bytes(hasher.finalize().into())
     }
 
     /// The binding that lets a row recognise this token.
-    pub fn binding(&self, now: chrono::DateTime<chrono::Utc>) -> DeviceBinding {
+    pub fn binding(&self, now: axess_clock::Timestamp) -> DeviceBinding {
         DeviceBinding::Cookie {
             token_hash: self.digest(),
             issued_at: now,
@@ -105,34 +125,115 @@ impl DeviceToken {
 }
 
 /// A device the client proved it holds: it presented the secret token on the
-/// device's cookie (see [`DeviceToken`]), which a fingerprint cannot stand in
-/// for.
+/// device's cookie (see [`DeviceToken`]) or, for a device that has a key
+/// under a layer that enforces keys, proved that key. A fingerprint cannot
+/// stand in for either.
 ///
 /// The only way to get one is a resolution by
-/// [`DeviceLifecycleService::resolve_proven`](crate::device::DeviceLifecycleService::resolve_proven)
+/// [`DeviceLifecycleService::resolve_or_keep`](crate::device::DeviceLifecycleService::resolve_or_keep)
+/// or [`resolve_proven`](crate::device::DeviceLifecycleService::resolve_proven)
 /// (through [`ResolvedDevice::proven`](crate::device::ResolvedDevice::proven)),
-/// so an API that takes a `ProvenDevice` cannot be handed a device found by
-/// fingerprint. The per-account lockout's exemption for a device the account
-/// has used is one: [`AuthSession::proven_device`](crate::session::extractor::AuthSession::proven_device)
-/// answers only for a session the layer bound to a proven device.
+/// which yield one for a request that presents the token and for the device
+/// created on that request, so an API that takes a `ProvenDevice` cannot be
+/// handed a device found by fingerprint, nor one a session only kept from an
+/// earlier request. A session bound to a device key is the exception to the
+/// last: a request that proved the bound key has the bound device proven by
+/// that key, whether or not it presented the token. The per-account
+/// lockout's exemption for a device the
+/// account has used is one: [`AuthSession::proven_device`](crate::session::extractor::AuthSession::proven_device)
+/// answers only on a request that proved the session's device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ProvenDevice(DeviceId);
+pub struct ProvenDevice {
+    id: DeviceId,
+    proof: crate::device_key::DeviceProof,
+}
 
 impl ProvenDevice {
     /// The device's id.
     pub fn id(&self) -> DeviceId {
-        self.0
+        self.id
     }
 
+    /// How the request proved the device: by its token, which is a bearer
+    /// value, or by a signature of its key
+    /// ([`DeviceProof::Key`](crate::device_key::DeviceProof::Key)), which a
+    /// copy of the cookie store cannot make. Where device keys are enforced,
+    /// a device that has a key is only ever proven by it.
+    pub fn proof(&self) -> crate::device_key::DeviceProof {
+        self.proof
+    }
+
+    /// A device proven by its token, or by being created on this request.
     pub(crate) fn new(id: DeviceId) -> Self {
-        Self(id)
+        Self::by(id, crate::device_key::DeviceProof::Token)
     }
 
-    /// A proof for a test that has no cookie to present. Not available in a
-    /// production build.
+    pub(crate) fn by(id: DeviceId, proof: crate::device_key::DeviceProof) -> Self {
+        Self { id, proof }
+    }
+
+    /// A token proof for a test that has no cookie to present. Not available
+    /// in a production build.
     #[cfg(any(test, feature = "testing"))]
     pub fn for_tests(id: DeviceId) -> Self {
-        Self(id)
+        Self::new(id)
+    }
+
+    /// A key proof for a test that has no proof cookie to present. Not
+    /// available in a production build.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn for_tests_by_key(id: DeviceId, thumbprint: crate::device_key::KeyThumbprint) -> Self {
+        Self::by(id, crate::device_key::DeviceProof::Key(thumbprint))
+    }
+}
+
+/// A device a request proved, with the user and the tenant of the session
+/// that is authenticated on that request: what a trust write takes.
+///
+/// [`AuthSession::user_device`](crate::session::extractor::AuthSession::user_device)
+/// answers one, and only for an authenticated session on a request that
+/// proved a device, with the session's own user and tenant. A caller
+/// therefore cannot hand a trust write a device and a user that do not
+/// belong together; on the request that completes a sign-in the device is
+/// the one the request proved before anyone was signed in, which may be
+/// another account's, so the write still reads the row and leaves a device
+/// another user owns as it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserDevice {
+    tenant: TenantId,
+    user: UserId,
+    device: ProvenDevice,
+}
+
+impl UserDevice {
+    /// The tenant the session is authenticated in.
+    pub fn tenant(&self) -> TenantId {
+        self.tenant
+    }
+
+    /// The user the session is authenticated as.
+    pub fn user(&self) -> UserId {
+        self.user
+    }
+
+    /// The device the request proved.
+    pub fn device(&self) -> ProvenDevice {
+        self.device
+    }
+
+    pub(crate) fn new(tenant: TenantId, user: UserId, device: ProvenDevice) -> Self {
+        Self {
+            tenant,
+            user,
+            device,
+        }
+    }
+
+    /// A pairing for a test that has no session to ask. Not available in a
+    /// production build.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn for_tests(tenant: TenantId, user: UserId, device: ProvenDevice) -> Self {
+        Self::new(tenant, user, device)
     }
 }
 
@@ -147,13 +248,34 @@ pub struct PresentedDevice {
 }
 
 impl PresentedDevice {
-    /// Parse a cookie value, `None` when it is not in the form
+    /// Every entry of a cookie value that parses, newest first, at most
+    /// [`MAX_DEVICE_COOKIE_ENTRIES`] of them, one per device: an entry that
+    /// does not parse, and a second entry for a device, are left out.
+    pub fn parse_all(value: &str) -> Vec<Self> {
+        let mut entries: Vec<Self> = Vec::new();
+        for entry in value.split(ENTRY_SEPARATOR).take(MAX_DEVICE_COOKIE_ENTRIES) {
+            if let Some(entry) = Self::parse(entry)
+                && !entries.iter().any(|kept| kept.id == entry.id)
+            {
+                entries.push(entry);
+            }
+        }
+        entries
+    }
+
+    /// Parse one entry of a cookie value, `None` when it is not in the form
     /// [`cookie_value`] writes.
     pub fn parse(value: &str) -> Option<Self> {
         let (id, token) = value.split_once('.')?;
         let id = DeviceId::try_new(id).ok()?;
-        let decoded = URL_SAFE_NO_PAD.decode(token).ok()?;
-        let bytes: [u8; 32] = decoded.try_into().ok()?;
+        // The decoded bytes are the token: they live only in buffers that
+        // are zeroed when dropped, a token of the wrong length included.
+        let decoded = Zeroizing::new(URL_SAFE_NO_PAD.decode(token).ok()?);
+        if decoded.len() != 32 {
+            return None;
+        }
+        let mut bytes = Zeroizing::new([0u8; 32]);
+        bytes.copy_from_slice(&decoded);
         Some(Self {
             id,
             token: DeviceToken(bytes),
@@ -163,7 +285,7 @@ impl PresentedDevice {
 
 /// The cookie value that presents `token` for device `id`.
 pub fn cookie_value(id: &DeviceId, token: &DeviceToken) -> String {
-    format!("{id}.{}", URL_SAFE_NO_PAD.encode(token.0))
+    format!("{id}.{}", URL_SAFE_NO_PAD.encode(&token.0[..]))
 }
 
 /// How the device cookie is named and sent.
@@ -228,9 +350,25 @@ impl DeviceCookieConfig {
         self.max_age
     }
 
-    /// The `Set-Cookie` header value that stores `token` for device `id`.
-    pub(crate) fn set_cookie(&self, id: &DeviceId, token: &DeviceToken) -> Option<HeaderValue> {
-        let mut cookie = Cookie::new(self.name.to_string(), cookie_value(id, token));
+    /// The `Set-Cookie` header value that stores `token` for device `id`
+    /// first, then the entries of `kept` for other devices, up to
+    /// [`MAX_DEVICE_COOKIE_ENTRIES`] in all.
+    pub(crate) fn set_cookie(
+        &self,
+        id: &DeviceId,
+        token: &DeviceToken,
+        kept: &[PresentedDevice],
+    ) -> Option<HeaderValue> {
+        let mut value = cookie_value(id, token);
+        for entry in kept
+            .iter()
+            .filter(|entry| entry.id != *id)
+            .take(MAX_DEVICE_COOKIE_ENTRIES - 1)
+        {
+            value.push(ENTRY_SEPARATOR);
+            value.push_str(&cookie_value(&entry.id, &entry.token));
+        }
+        let mut cookie = Cookie::new(self.name.to_string(), value);
         cookie.set_http_only(true);
         cookie.set_secure(self.secure);
         cookie.set_same_site(SameSite::Strict);
@@ -241,11 +379,12 @@ impl DeviceCookieConfig {
         HeaderValue::from_str(&cookie.to_string()).ok()
     }
 
-    /// The device a request presents, read from its `Cookie` header.
-    pub(crate) fn presented(&self, headers: &axum::http::HeaderMap) -> Option<PresentedDevice> {
-        let value =
-            crate::cookies::extract_named_cookie(headers, &self.name, MAX_DEVICE_COOKIE_BYTES)?;
-        PresentedDevice::parse(&value)
+    /// The devices a request presents, read from its `Cookie` header, newest
+    /// first.
+    pub(crate) fn presented(&self, headers: &axum::http::HeaderMap) -> Vec<PresentedDevice> {
+        crate::cookies::extract_named_cookie(headers, &self.name, MAX_DEVICE_COOKIE_BYTES)
+            .map(|value| PresentedDevice::parse_all(&value))
+            .unwrap_or_default()
     }
 }
 
@@ -268,3 +407,6 @@ impl DeviceCookieSlot {
         self.0.lock().ok().and_then(|mut slot| slot.take())
     }
 }
+
+#[cfg(test)]
+mod tests;

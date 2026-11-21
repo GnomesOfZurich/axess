@@ -1,5 +1,5 @@
-//! `tests`: extracted from `request_id.rs` per the
-//! 200-LoC inline-test rule in AGENTS.md.
+//! `tests`: the unit tests of `request_id.rs`, kept beside it per the
+//! 200-line inline-test rule in AGENTS.md.
 
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -179,7 +179,7 @@ async fn test_reject_invalid_client_id() {
 
 #[cfg_attr(feature = "accept-client-id", tokio::test)]
 #[cfg(feature = "accept-client-id")]
-/// Feature gated with the `accept_client_id` feature. The service should generate its own ID
+/// Feature gated with the `accept-client-id` feature. The service should generate its own ID
 /// if the provided header value is badly formatted. This test ensures that the service
 /// correctly rejects a client-provided ID that is too short.
 async fn test_erroneous_id_length() {
@@ -219,7 +219,7 @@ async fn test_erroneous_id_length() {
 #[tokio::test]
 #[cfg(not(feature = "accept-client-id"))]
 /// Verifies that the service correctly overwrites an existing request ID if
-/// the `accept_client_id` feature is disabled.
+/// the `accept-client-id` feature is disabled.
 async fn test_request_id_overwrite() {
     let service = create_service();
     let mut req = Request::new(Body::empty());
@@ -337,7 +337,7 @@ async fn test_multiple_layers() {
 #[tokio::test]
 #[cfg(not(feature = "accept-client-id"))]
 /// Verifies that multiple header layers can be added to the service. The second layer
-/// should overwrite the first layer when `accept_client_id` feature isn't activated.
+/// should overwrite the first layer when `accept-client-id` feature isn't activated.
 async fn test_duplicate_layers_overriden_without_accept_client_id() {
     let service = tower::ServiceBuilder::new()
         .layer(RequestIdLayer::new(MockGenerator {
@@ -362,12 +362,12 @@ async fn test_duplicate_layers_overriden_without_accept_client_id() {
     assert_eq!(id, "mock8888");
 }
 
-/// (`accept_client_id` only): when an inbound request has a
+/// (`accept-client-id` only): when an inbound request has a
 /// well-formed client-supplied request ID AND a stale `RequestId`
 /// extension whose inner value differs from the header, the
 /// extension must be replaced so downstream handlers and logs see
 /// the same ID the header carries. Pins three guard mutations on
-/// `Some(ext) if ext.0 == id_str` at line 130:
+/// `Some(ext) if ext.0 == id_str`:
 /// - guard `-> true`: extension would be kept stale (skip insert).
 /// - guard `-> false`: extension would be re-inserted on every
 ///   call (this matches the desired behaviour, but the symmetric
@@ -425,9 +425,8 @@ fn ensure_request_id_replaces_stale_extension_when_header_present() {
     );
 }
 
-/// (`accept_client_id` only): pins the length check
-/// `id_str.len() == G::ID_LENGTH` against `==` → `!=` at line
-/// 126:33. The mutant flips the predicate so EVERY length-mismatch
+/// (`accept-client-id` only): pins the length check
+/// `id_str.len() == G::ID_LENGTH` against `==` → `!=`. The mutant flips the predicate so EVERY length-mismatch
 /// is accepted as a client ID, including absurdly short ones;
 /// `existing_id` would be returned instead of generating a fresh
 /// ID. This test sends a wrong-length client ID and asserts the
@@ -480,7 +479,7 @@ fn request_id_ext_returns_extension_value_or_none() {
 #[cfg_attr(feature = "accept-client-id", tokio::test)]
 #[cfg(feature = "accept-client-id")]
 /// Verifies that multiple header layers can be added to the service. The second layer
-/// should NOT overwrite the first layer when `accept_client_id` feature is activated.
+/// should NOT overwrite the first layer when `accept-client-id` feature is activated.
 async fn test_duplicate_layers_not_overriden_with_accept_client_id() {
     let service = tower::ServiceBuilder::new()
         .layer(RequestIdLayer::new(MockGenerator {
@@ -528,7 +527,7 @@ fn a_non_ascii_generator_value_falls_back_to_a_uuid_without_panicking() {
     assert_eq!(req.request_id(), Some(id));
 }
 
-/// (`accept_client_id` only): a client id of the right length is still
+/// (`accept-client-id` only): a client id of the right length is still
 /// refused when it carries anything beyond letters, digits and hyphens, so a
 /// log-injection or header-smuggling value never becomes the request id.
 #[cfg(feature = "accept-client-id")]

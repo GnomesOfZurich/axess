@@ -41,25 +41,28 @@
 //!
 //! # What this module does NOT do
 //!
-//! - **Envelope encryption.** AES-GCM encryption of `value` lives in the
-//!   SQL/Valkey backends, behind the trait. The trait
-//!   itself is encryption-agnostic.
-//! - **`Device` struct extension.** The doc-level §4.1 sketch carries
-//!   `display_name_token: PiiToken` and `fingerprint_token: PiiToken`
-//!   on the [`Device`](super::Device) row. The current implementation
-//!   keeps those out and resolves on-demand by `(subject_id, category)`
-//!   lookup; if/when a future iteration wants direct token columns on
-//!   `Device`, the mapping shape here already accommodates it.
+//! - **Envelope encryption.** The one store in the workspace,
+//!   `MemoryDevicePiiStore`, keeps `value` in memory as given. A durable
+//!   store is yours to write, and encrypting `value` at rest belongs
+//!   inside it, behind the trait. The trait itself is
+//!   encryption-agnostic.
+//! - **`Device` struct extension.** The [`Device`](super::Device) row
+//!   carries no token column: a value is resolved on demand by
+//!   `(subject_id, category)` lookup. If a future iteration wants direct
+//!   token columns on `Device`, the mapping shape here already
+//!   accommodates it.
 //! - **Cascade-on-DeviceStore-revoke.** Erasure is an explicit
 //!   data-subject-rights call, not an automatic side-effect of device
 //!   revocation. A revoked device row with un-erased PII is the
-//!   deliberate state during the 30-day Art 5(1)(e) grace window
-//!   (see [`docs/identity/device.md`](https://github.com/GnomesOfZurich/axess/blob/main/docs/identity/device.md) §5.7).
+//!   deliberate state during the revoked-row grace window
+//!   (`SweepConfig::revoked_grace`, seven days by default; see "PII
+//!   tokenisation and GDPR" in
+//!   [`docs/identity/device.md`](https://github.com/GnomesOfZurich/axess/blob/main/docs/identity/device.md)).
 
 use crate::authn::ids::{TenantId, UserId};
 use crate::locked::lock;
+use axess_clock::Timestamp;
 use axess_rng::{SecureRng, SystemRng};
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -201,13 +204,21 @@ impl DevicePiiCategory {
     }
 }
 
+/// The stable string form, as [`as_str`](DevicePiiCategory::as_str) returns
+/// it.
+impl std::fmt::Display for DevicePiiCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 // ── DevicePiiMapping ─────────────────────────────────────────────────────────
 
 /// One mapping row: token → plaintext value, scoped to a `(tenant,
 /// subject)` for cascade-erasure on Art 17 / user-delete.
 ///
 /// Backends MAY envelope-encrypt `value` at rest (recommended for
-/// production; see the SQL/Valkey impls). The trait surface is always
+/// production; the in-memory store does not). The trait surface is always
 /// plaintext: callers don't need to know whether the backend
 /// encrypts.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -227,7 +238,7 @@ pub struct DevicePiiMapping {
     pub value: String,
     /// Wall-clock instant the mapping was first recorded. Drives the
     /// per-category retention sweep when implemented.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 impl std::fmt::Debug for DevicePiiMapping {
@@ -248,8 +259,9 @@ impl std::fmt::Debug for DevicePiiMapping {
 /// Async persistence trait for device PII mappings.
 ///
 /// Implementors:
-/// - `MemoryDevicePiiStore`: single-process / DST.
-/// - SQL / Valkey impls carry envelope encryption inside the impl.
+/// - `MemoryDevicePiiStore`: single-process / DST. It is the only one in
+///   the workspace; a durable store is an implementation of your own and
+///   carries its envelope encryption inside it.
 pub trait DevicePiiStore: Send + Sync {
     /// Backend error type. `Infallible` for the in-memory impl;
     /// concrete `*StoreError` for SQL / Valkey.
@@ -266,7 +278,7 @@ pub trait DevicePiiStore: Send + Sync {
         tenant_id: &TenantId,
         category: DevicePiiCategory,
         value: String,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl std::future::Future<Output = Result<PiiToken, Self::Error>> + Send;
 
     /// Resolve a token to its plaintext value. Returns `Ok(None)` when
@@ -395,8 +407,7 @@ impl MemoryDevicePiiStore {
 
 /// Infallible error for the in-memory store. Aliased to
 /// [`std::convert::Infallible`] so `?`-propagation and exhaustive
-/// matches behave the canonical way (matches `MemoryRegistryError`
-/// and `MemoryDeviceStoreError` shape).
+/// matches behave the canonical way (the shape of `MemoryRegistryError`).
 pub type MemoryDevicePiiStoreError = std::convert::Infallible;
 
 impl DevicePiiStore for MemoryDevicePiiStore {
@@ -408,7 +419,7 @@ impl DevicePiiStore for MemoryDevicePiiStore {
         tenant_id: &TenantId,
         category: DevicePiiCategory,
         value: String,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Result<PiiToken, Self::Error> {
         let token = PiiToken::mint(&*self.rng);
         let mapping = DevicePiiMapping {

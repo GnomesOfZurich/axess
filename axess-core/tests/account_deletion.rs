@@ -3,9 +3,9 @@
 //! reach: the registered sessions and the refresh tokens go first, then the
 //! user, then an audit row names who did it.
 
-mod common;
+use axess_core::testing::fixtures as common;
 
-use axess_clock::{Clock, testing::MockClock};
+use axess_clock::Clock;
 use axess_core::authn::AuditContext;
 use axess_core::authn::error::AuthnError;
 use axess_core::authn::event::{AuthEventStatus, AuthEventType};
@@ -29,10 +29,10 @@ use std::time::Duration;
 
 #[tokio::test]
 async fn deleting_a_user_ends_their_sessions_and_tokens_then_audits() {
-    let clock = MockClock::now();
-    let registry = MemorySessionRegistry::new();
-    let rows = MemorySessionStore::new();
-    let refresh = MemoryRefreshTokenStore::new();
+    let clock = common::test_clock();
+    let registry = MemorySessionRegistry::new().with_clock(std::sync::Arc::new(clock.clone()));
+    let rows = MemorySessionStore::new().with_clock(std::sync::Arc::new(clock.clone()));
+    let refresh = MemoryRefreshTokenStore::new().with_clock(std::sync::Arc::new(clock.clone()));
     let identity = MockIdentityStore::new()
         .with_clock(clock.clone())
         .with_tenant(test_tenant())
@@ -50,7 +50,7 @@ async fn deleting_a_user_ends_their_sessions_and_tokens_then_audits() {
     session
         .set_authenticated(uid("u1"), tid("t1"), clock.now())
         .await;
-    let sid = session.session_id().await;
+    let sid = session.session_key().await;
     registry.register(&uid("u1"), &sid).await.unwrap();
     rows.save(&sid, &SessionData::default(), Duration::from_secs(600))
         .await
@@ -89,6 +89,7 @@ async fn deleting_a_user_ends_their_sessions_and_tokens_then_audits() {
     );
     assert!(
         Refresh::any_tenant(&plaintext, |_| async { true })
+            .without_device_check()
             .run(&refresh, &config, &rng, clock.now())
             .await
             .is_err(),
@@ -109,11 +110,14 @@ async fn deleting_a_user_ends_their_sessions_and_tokens_then_audits() {
 
 #[tokio::test]
 async fn deleting_across_the_tenant_rail_is_refused_and_deletes_nothing() {
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let svc = AuthnService::builder(identity.clone(), MockFactorStore::new())
-        .with_registry(MemorySessionRegistry::new())
+        .with_clock(clock.clone())
+        .with_registry(MemorySessionRegistry::new().with_clock(std::sync::Arc::new(clock.clone())))
         .build()
         .with_audit_context(AuditContext::default());
 

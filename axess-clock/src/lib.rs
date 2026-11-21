@@ -1,38 +1,56 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 //! Injectable [`Clock`] trait for deterministic simulation testing (DST).
 //!
-//! Production code depends on the trait, not on `chrono::Utc::now()` directly,
+//! Production code depends on the trait, not on a read of the system clock,
 //! so tests can swap in a [`testing::MockClock`] and advance time
-//! deterministically. This crate is a foundational primitive used by
+//! deterministically. [`SystemClock`] is the one place the system clock is
+//! read. This crate is a foundational primitive used by
 //! [`axess`](https://crates.io/crates/axess) and other crates that want their
 //! time-dependent behaviour to be reproducible.
 //!
+//! # Time types
+//!
+//! The crate also holds the base time types, on the standard library alone:
+//!
+//! - [`Timestamp`], a reading of the UTC wall clock to the nanosecond, with
+//!   its RFC 3339 text;
+//! - [`SignedDuration`], an exact signed span of elapsed time;
+//! - [`Until`], an end that comes at a reading or never;
+//! - [`UtcDate`], the calendar day in UTC a reading falls on.
+//!
+//! Their arithmetic is checked and none of them reads a clock. With the
+//! `serde` feature a `Timestamp`, an `Until` and a `UtcDate` are written as
+//! their text and read back through their readers.
+//!
 //! # Quick start
 //!
-//! ```rust
+//! ```rust,no_run
 //! use axess_clock::{Clock, SystemClock};
 //!
-//! fn timestamp_now<C: Clock>(clock: &C) -> i64 {
-//!     clock.now().timestamp()
+//! fn seconds_now<C: Clock>(clock: &C) -> i64 {
+//!     clock.now().unix_seconds()
 //! }
 //!
 //! let production = SystemClock;
-//! let _ = timestamp_now(&production);
+//! let _ = seconds_now(&production);
 //! ```
 //!
 //! And in tests (requires the `testing` feature):
 //!
-//! ```rust,ignore
-//! use axess_clock::Clock;
+#![cfg_attr(feature = "testing", doc = "```rust")]
+#![cfg_attr(not(feature = "testing"), doc = "```rust,ignore")]
 //! use axess_clock::testing::MockClock;
-//! use chrono::{TimeZone, Utc};
+//! use axess_clock::{Clock, SignedDuration, Timestamp};
 //!
-//! let clock = MockClock::at(Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap());
-//! assert_eq!(clock.now().timestamp(), 1_767_225_600);
-//! clock.advance_secs(60);
-//! assert_eq!(clock.now().timestamp(), 1_767_225_660);
+//! const NEW_YEAR: Timestamp = Timestamp::from_utc(2026, 1, 1, 0, 0, 0).unwrap();
+//!
+//! let clock = MockClock::at(NEW_YEAR);
+//! assert_eq!(clock.now().unix_seconds(), 1_767_225_600);
+//! clock.advance(SignedDuration::seconds(60));
+//! assert_eq!(clock.now().unix_seconds(), 1_767_225_660);
 //! ```
 
 // The `testing` feature compiles deterministic clocks and random sources and
@@ -51,7 +69,24 @@ compile_error!(
      `allow-testing-in-release` to keep it on purpose."
 );
 
-use chrono::{DateTime, TimeZone, Utc};
+use std::time::SystemTime;
+
+mod date;
+mod duration;
+mod error;
+mod rfc3339;
+#[cfg(test)]
+mod sample;
+#[cfg(feature = "serde")]
+mod serde_impl;
+mod timestamp;
+mod until;
+
+pub use date::UtcDate;
+pub use duration::SignedDuration;
+pub use error::TimeError;
+pub use timestamp::Timestamp;
+pub use until::Until;
 
 #[cfg(any(test, feature = "testing"))]
 #[cfg_attr(docsrs, doc(cfg(feature = "testing")))]
@@ -66,170 +101,73 @@ pub mod testing;
 #[cfg_attr(docsrs, doc(cfg(feature = "testing")))]
 pub use testing::MockClock as DeterministicClock;
 
+/// Doctests: the examples of the README compile and run.
+#[cfg(all(doctest, feature = "testing"))]
+#[doc = include_str!("../README.md")]
+struct ReadmeExamples;
+
 /// Clock trait to enable deterministic simulation/testing.
 pub trait Clock: Send + Sync + 'static {
-    /// Return the current wall-clock time in UTC.
-    fn now(&self) -> DateTime<Utc>;
+    /// Return the current reading of the wall clock in UTC.
+    fn now(&self) -> Timestamp;
 }
 
 /// A shared clock is a clock, so an `Arc<dyn Clock>` can be handed to any
 /// API that takes `impl Clock`.
 impl<C: Clock + ?Sized> Clock for std::sync::Arc<C> {
-    fn now(&self) -> DateTime<Utc> {
+    fn now(&self) -> Timestamp {
         (**self).now()
     }
 }
 
-/// Production [`Clock`] backed by [`chrono::Utc::now`].
+/// Production [`Clock`] backed by [`std::time::SystemTime::now`], the one
+/// read of the system clock in the crate.
+///
+/// A host whose clock is set outside the range of a [`Timestamp`] (before
+/// the year -262143 or after 262142) reads as the nearer end of the range,
+/// [`Timestamp::MIN`] or [`Timestamp::MAX`]: the read does not fail and
+/// does not panic ([`Timestamp::from_system_time`]).
 #[derive(Debug, Default)]
 pub struct SystemClock;
 
 impl Clock for SystemClock {
-    fn now(&self) -> DateTime<Utc> {
-        Utc::now()
+    fn now(&self) -> Timestamp {
+        Timestamp::from_system_time(SystemTime::now())
     }
 }
 
-/// Return current time as RFC3339 string (UTC).
+/// Return the current time as RFC 3339 text in UTC with the numeric offset
+/// `+00:00` ([`Timestamp::to_rfc3339_numeric_offset`]).
 pub fn now_rfc3339<C: Clock>(clock: &C) -> String {
-    clock.now().to_rfc3339()
+    clock.now().to_rfc3339_numeric_offset()
 }
 
 /// Return current time as unix epoch seconds (i64).
 pub fn now_epoch<C: Clock>(clock: &C) -> i64 {
-    clock.now().timestamp()
+    clock.now().unix_seconds()
 }
 
 /// Parse a flexible datetime representation:
-/// - If `txt` is Some and a valid RFC3339 string -> parsed `DateTime<Utc>`
+/// - If `txt` is Some and text [`Timestamp::parse_rfc3339`] reads -> the
+///   reading it names
 /// - Else if `secs` is Some -> treat as unix epoch seconds
 /// - Else -> None
-pub fn parse_datetime_flexible(txt: Option<&str>, secs: Option<i64>) -> Option<DateTime<Utc>> {
+///
+/// A count of seconds outside the range of a [`Timestamp`] is `None`.
+pub fn parse_datetime_flexible(txt: Option<&str>, secs: Option<i64>) -> Option<Timestamp> {
     if let Some(s) = txt
-        && let Ok(dt) = DateTime::parse_from_rfc3339(s)
+        && let Ok(at) = Timestamp::parse_rfc3339(s)
     {
-        return Some(dt.with_timezone(&Utc));
+        return Some(at);
     }
-    secs.and_then(|ts| Utc.timestamp_opt(ts, 0).single())
+    secs.and_then(Timestamp::from_unix_seconds)
 }
 
-/// Convert epoch seconds -> RFC3339 string
+/// Convert epoch seconds -> RFC 3339 text in UTC with the numeric offset
+/// `+00:00`, or `None` outside the range of a [`Timestamp`].
 pub fn epoch_to_rfc3339(secs: i64) -> Option<String> {
-    Utc.timestamp_opt(secs, 0)
-        .single()
-        .map(|dt| dt.to_rfc3339())
+    Timestamp::from_unix_seconds(secs).map(|at| at.to_rfc3339_numeric_offset())
 }
 
 #[cfg(test)]
-mod time_tests {
-    use super::*;
-    use chrono::Datelike;
-
-    /// `SystemClock::now()` returns a wall-clock timestamp
-    /// distinct from the unix epoch. Pins the four
-    /// `now -> DateTime::*(Default::default())` body mutations; each
-    /// would return `1970-01-01T00:00:00Z` instead of the current time,
-    /// silently breaking every consumer that relies on `Clock::now()`
-    /// monotonicity (token issuance, audit timestamps, replay caches).
-    #[test]
-    fn system_clock_now_returns_recent_wall_clock_time() {
-        let clock = SystemClock;
-        let now = clock.now();
-        // Any timestamp
-        // earlier than 2024 has either come from a Default-mutated body
-        // (`1970-01-01T00:00:00Z`) or means the host clock is broken.
-        let floor = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).single().unwrap();
-        assert!(
-            now > floor,
-            "SystemClock::now() must return wall-clock time, not Default (got {now})"
-        );
-    }
-
-    /// `now_rfc3339` produces a parseable RFC3339 string in the
-    /// current era. Pins both `String::new()` (empty body) and
-    /// `"xyzzy".into()` (literal-replace body) mutations.
-    #[test]
-    fn now_rfc3339_returns_parseable_recent_timestamp() {
-        let s = now_rfc3339(&SystemClock);
-        assert!(!s.is_empty(), "now_rfc3339 must not be empty");
-        let parsed = DateTime::parse_from_rfc3339(&s)
-            .expect("now_rfc3339 must produce a valid RFC3339 string (got: {s})");
-        let floor = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).single().unwrap();
-        assert!(
-            parsed.with_timezone(&Utc) > floor,
-            "now_rfc3339 must reflect wall-clock time, not Default"
-        );
-    }
-
-    /// `now_epoch` returns a positive Unix timestamp in the
-    /// current era. Pins the `0`, `1`, `-1` body mutations. A floor of
-    /// 1.7e9 (≈ 2023-11-15) catches all three since each constant is
-    /// orders of magnitude smaller.
-    #[test]
-    fn now_epoch_returns_recent_timestamp() {
-        let t = now_epoch(&SystemClock);
-        assert!(
-            t > 1_700_000_000,
-            "now_epoch must return wall-clock seconds (got {t})"
-        );
-    }
-
-    /// `parse_datetime_flexible` exercises every branch of
-    /// `(txt, secs)`:
-    /// - txt valid → returns parsed (uses txt path),
-    /// - txt invalid + secs Some → falls through to secs,
-    /// - txt valid + secs Some → txt wins (precedence),
-    /// - both None → None,
-    /// - txt None + secs None → None.
-    ///
-    /// Pins the body replacements (None / Some(Default)), the
-    /// `&& → ||` mutation on the let-chain (which would short-circuit
-    /// to "valid txt" on any non-None txt regardless of parse success),
-    /// and the function-body replacements.
-    #[test]
-    fn parse_datetime_flexible_branches() {
-        let valid_rfc3339 = "2026-04-01T12:00:00Z";
-        let parsed = parse_datetime_flexible(Some(valid_rfc3339), None)
-            .expect("valid RFC3339 must parse to Some");
-        assert_eq!(parsed.year(), 2026);
-        assert_eq!(parsed.month(), 4);
-
-        // txt invalid → falls through to secs.
-        let from_secs = parse_datetime_flexible(Some("not-a-date"), Some(1_700_000_000))
-            .expect("invalid txt with valid secs must fall through to secs");
-        assert_eq!(from_secs.timestamp(), 1_700_000_000);
-
-        // txt valid + secs present → txt wins (precedence).
-        let txt_wins = parse_datetime_flexible(Some(valid_rfc3339), Some(1))
-            .expect("valid txt + secs must prefer txt");
-        assert_eq!(txt_wins.year(), 2026);
-        assert_ne!(
-            txt_wins.timestamp(),
-            1,
-            "&& → || would have used the secs fallback"
-        );
-
-        // txt missing → use secs.
-        let only_secs = parse_datetime_flexible(None, Some(0))
-            .expect("txt None with valid secs must parse from secs");
-        assert_eq!(only_secs.timestamp(), 0);
-
-        // both None → None.
-        assert!(
-            parse_datetime_flexible(None, None).is_none(),
-            "both None must return None"
-        );
-    }
-
-    /// `epoch_to_rfc3339` produces a parseable RFC3339 string
-    /// for valid input. Pins the `None`, `Some(String::new())`, and
-    /// `Some("xyzzy")` body mutations.
-    #[test]
-    fn epoch_to_rfc3339_returns_parseable_iso_string() {
-        let s = epoch_to_rfc3339(1_700_000_000).expect("valid epoch must produce Some(rfc3339)");
-        let parsed = DateTime::parse_from_rfc3339(&s)
-            .expect("epoch_to_rfc3339 must produce a valid RFC3339 string");
-        assert_eq!(parsed.timestamp(), 1_700_000_000);
-        assert!(s.starts_with("2023-"), "1.7e9 maps to 2023 (got: {s})");
-    }
-}
+mod clock_tests;

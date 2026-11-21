@@ -7,8 +7,9 @@
 #![cfg(test)]
 
 use super::*;
-use crate::device::cascade::cascade_revoke_by_refresh_family;
+use crate::device::cascade::cascade_revoke_devices;
 use crate::device::types::DeviceBinding;
+use axess_clock::testing::Shift;
 use sqlx::sqlite::SqlitePoolOptions;
 
 /// In-memory SQLite store seeded with the device-store schema. Single
@@ -35,8 +36,8 @@ fn ids() -> (TenantId, UserId, DeviceId) {
     )
 }
 
-fn now_at(h: u32, m: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 1, 1, h, m, 0).unwrap()
+fn now_at(h: u8, m: u8) -> Timestamp {
+    Timestamp::from_utc(2026, 1, 1, h, m, 0).unwrap()
 }
 
 fn fingerprint(byte: u8) -> FingerprintHash {
@@ -130,7 +131,7 @@ async fn save_then_load_round_trips_full_device_record() {
 #[tokio::test]
 async fn load_unknown_tenant_or_device_returns_none() {
     let store = fresh_store().await;
-    let (t, _u, d) = ids();
+    let (t, _, d) = ids();
     assert!(store.load(&t, &d).await.unwrap().is_none());
 }
 
@@ -453,12 +454,12 @@ async fn save_replaces_refresh_index_on_upsert() {
     assert_eq!(found_new.len(), 1);
 }
 
-/// Pin: end-to-end refresh-cascade through the SQLite store.
-/// Mirrors the `MemoryDeviceStore` test in cascade.rs to give us
-/// confidence the schema correctly powers the high-stakes
-/// revocation path.
+/// Pin: end-to-end refresh-cascade through the SQLite store: the family
+/// lookup and the device cascade. Mirrors the `MemoryDeviceStore` test in
+/// cascade.rs to give us confidence the schema correctly powers the
+/// high-stakes revocation path.
 #[tokio::test]
-async fn cascade_revoke_by_refresh_family_revokes_indexed_devices() {
+async fn a_family_cascade_revokes_the_indexed_devices() {
     let store = fresh_store().await;
     let t = crate::authn::ids::testing::tenant("t");
     let u = crate::authn::ids::testing::user("u");
@@ -487,9 +488,12 @@ async fn cascade_revoke_by_refresh_family_revokes_indexed_devices() {
     }
 
     let revoked_at = now_at(13, 0);
-    let count = cascade_revoke_by_refresh_family(&store, &t, "fam-stolen", revoked_at)
+    let bound = store
+        .find_by_refresh_family(&t, "fam-stolen")
         .await
         .unwrap();
+    let targets: Vec<_> = bound.iter().map(|d| (d.tenant_id, d.id)).collect();
+    let count = cascade_revoke_devices(&store, &targets, revoked_at).await;
     assert_eq!(count, 2);
 
     let after_a = store.load(&t, &d_a).await.unwrap().unwrap();
@@ -514,7 +518,7 @@ async fn sweep_moves_a_row_one_level_per_call() {
     let mut device = build_device(&t, Some(&u), &d, 0xab, vec![]);
     device.trust_level = DeviceTrustLevel::Trusted;
     // 200 days idle; clears trusted_idle (90d) AND the later seen window.
-    device.last_seen_at = now - chrono::Duration::days(200);
+    device.last_seen_at = now.minus(axess_clock::SignedDuration::days(200));
     device.first_seen_at = device.last_seen_at;
     store
         .save(&device, crate::device::test_now())
@@ -529,7 +533,7 @@ async fn sweep_moves_a_row_one_level_per_call() {
     assert_eq!(after.trust_level, DeviceTrustLevel::Seen);
     assert_eq!(after.demoted_at, Some(now));
 
-    let later = now + chrono::Duration::days(31);
+    let later = now.plus(axess_clock::SignedDuration::days(31));
     let counts = store.sweep(&t, later).await.unwrap();
     assert_eq!((counts.trusted_to_seen, counts.seen_to_revoked), (0, 1));
     // Cannot purge in the same sweep; revoked_at = later, grace not elapsed.
@@ -560,14 +564,14 @@ async fn sweep_purges_revoked_after_grace_window() {
         0xab,
         vec![DeviceBinding::Refresh {
             family_id: "fam".into(),
-            issued_at: now - chrono::Duration::days(60),
-            last_used_at: now - chrono::Duration::days(60),
+            issued_at: now.minus(axess_clock::SignedDuration::days(60)),
+            last_used_at: now.minus(axess_clock::SignedDuration::days(60)),
         }],
     );
     device.trust_level = DeviceTrustLevel::Revoked;
     // revoked_at 8 days ago; past the 7-day default grace.
-    device.revoked_at = Some(now - chrono::Duration::days(8));
-    device.last_seen_at = now - chrono::Duration::days(60);
+    device.revoked_at = Some(now.minus(axess_clock::SignedDuration::days(8)));
+    device.last_seen_at = now.minus(axess_clock::SignedDuration::days(60));
     device.first_seen_at = device.last_seen_at;
     store
         .save(&device, crate::device::test_now())
@@ -603,7 +607,7 @@ async fn sweep_is_tenant_scoped() {
 
     let mut foreign = build_device(&t2, Some(&u), &d, 0xab, vec![]);
     foreign.trust_level = DeviceTrustLevel::Trusted;
-    foreign.last_seen_at = now - chrono::Duration::days(200);
+    foreign.last_seen_at = now.minus(axess_clock::SignedDuration::days(200));
     foreign.first_seen_at = foreign.last_seen_at;
     store
         .save(&foreign, crate::device::test_now())
@@ -625,7 +629,7 @@ async fn sweep_does_not_touch_unknown_devices() {
     let (t, u, d) = ids();
     let mut device = build_device(&t, Some(&u), &d, 0xab, vec![]);
     // Trust level is already Unknown by default; just push last_seen.
-    device.last_seen_at = now - chrono::Duration::days(365);
+    device.last_seen_at = now.minus(axess_clock::SignedDuration::days(365));
     device.first_seen_at = device.last_seen_at;
     store
         .save(&device, crate::device::test_now())
@@ -763,8 +767,10 @@ async fn a_save_racing_other_writes_lands_or_is_a_no_op() {
                         .await
                         .map(|_| ())
                 } else {
-                    copy.last_seen_at = now_at(10, writer);
-                    store.save(&copy, now_at(10, writer)).await
+                    copy.last_seen_at = now_at(10, u8::try_from(writer).unwrap());
+                    store
+                        .save(&copy, now_at(10, u8::try_from(writer).unwrap()))
+                        .await
                 }
             }));
         }

@@ -9,7 +9,7 @@ mod identity;
 
 pub use call_log::CallLog;
 use call_log::note;
-pub use factor::{MockFactorStore, make_password_service};
+pub use factor::{MockFactorStore, make_password_service, make_password_service_on};
 pub use identity::MockIdentityStore;
 
 // ── MockStoreError ─────────────────────────────────────────────────────────────

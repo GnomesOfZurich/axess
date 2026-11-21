@@ -1,10 +1,10 @@
 //! Where a login that still needs a factor is sent: to that factor's page,
 //! never to the dashboard, which a partly authenticated session cannot open.
 
-use axess::SystemClock;
 use axess::authn::FactorKind;
+use axess_clock::testing::MockClock;
 use axess_example_sqlite::models::backend::{SEED_PASSWORD, seed};
-use axess_example_sqlite::web::app::build_router;
+use axess_example_sqlite::web::app::build_router_on;
 use axess_example_sqlite::web::auth::next_factor_response;
 use axum::body::Body;
 use axum::extract::ConnectInfo;
@@ -23,6 +23,7 @@ struct Page {
 /// Bob's method asks for a password, then TOTP, then a passkey. Returns the
 /// router and bob's TOTP secret.
 async fn app_with_a_three_step_method() -> (axum::Router, String) {
+    let clock = MockClock::at_reference();
     let opts = SqliteConnectOptions::from_str("sqlite::memory:")
         .expect("url")
         .create_if_missing(true);
@@ -33,9 +34,11 @@ async fn app_with_a_three_step_method() -> (axum::Router, String) {
         .expect("connect");
     sqlx::migrate!().run(&pool).await.expect("migrations");
     let secret = seed(
-        &SystemClock,
+        &clock,
         &pool,
-        &axess_example_sqlite::web::app::factor_secret_cipher(),
+        &axess_example_sqlite::web::app::factor_secret_cipher_on(std::sync::Arc::new(
+            clock.clone(),
+        )),
     )
     .await
     .expect("seed");
@@ -47,7 +50,12 @@ async fn app_with_a_three_step_method() -> (axum::Router, String) {
     .execute(&pool)
     .await
     .expect("three steps");
-    (build_router(pool).await.0, secret)
+    (
+        build_router_on(pool, std::sync::Arc::new(clock.clone()))
+            .await
+            .0,
+        secret,
+    )
 }
 
 async fn send(
@@ -128,7 +136,7 @@ fn totp_code(secret: &str) -> String {
         .with_secret(secret)
         .build()
         .expect("totp")
-        .generate_current()
+        .generate(u64::try_from(MockClock::reference_time().unix_seconds()).expect("after 1970"))
         .to_string()
 }
 

@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::session::crypto::{BoundFormat, device_row_id_v1};
+use axess_clock::testing::Shift;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
 const KEY: [u8; 32] = crate::testing::test_key(0x42);
@@ -139,11 +140,14 @@ async fn an_unbound_blob_under_another_row_is_not_bound_to_it_by_a_read() {
         .unwrap();
     let store = SqliteDeviceStore::new(
         pool,
-        SessionCrypto::new(KEY).with_legacy_blobs(
-            crate::session::crypto::LegacyBlobs::AcceptUntil(
-                Utc::now() + chrono::Duration::hours(1),
-            ),
-        ),
+        SessionCrypto::new(KEY)
+            .with_clock(std::sync::Arc::new(
+                axess_clock::testing::MockClock::at_reference(),
+            ))
+            .with_legacy_blobs(crate::session::crypto::LegacyBlobs::AcceptUntil(
+                axess_clock::testing::MockClock::reference_time()
+                    .plus(axess_clock::SignedDuration::hours(1)),
+            )),
     );
     store.init_schema().await.unwrap();
     let (t, u, d) = ids();

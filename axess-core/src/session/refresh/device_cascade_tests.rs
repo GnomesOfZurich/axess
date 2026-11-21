@@ -17,7 +17,7 @@ fn make_device_id(name: &str) -> DeviceId {
     axess_identity::testing::device(name)
 }
 
-fn build_trusted_device(tenant: &TenantId, id: &DeviceId, fp: u8, now: DateTime<Utc>) -> Device {
+fn build_trusted_device(tenant: &TenantId, id: &DeviceId, fp: u8, now: Timestamp) -> Device {
     Device {
         id: *id,
         tenant_id: *tenant,
@@ -57,7 +57,7 @@ async fn refresh_compromise_to_device_revocation_full_cascade() {
         .unwrap();
 
     // Issue v1 carrying device_id.
-    let (plaintext_v1, _v1) = issue_refresh_token(
+    let (plaintext_v1, _) = issue_refresh_token(
         IssueRequest {
             user_id: &fixture_user(),
             tenant_id: &tenant,
@@ -75,6 +75,7 @@ async fn refresh_compromise_to_device_revocation_full_cascade() {
 
     // Rotate v1 → v2; v2 must inherit the device link.
     let (session, new_token) = Refresh::any_tenant(&plaintext_v1, |_| async { true })
+        .without_device_check()
         .run(&refresh_store, &config, &rng, ts)
         .await
         .unwrap();
@@ -83,7 +84,7 @@ async fn refresh_compromise_to_device_revocation_full_cascade() {
         Some(device_id),
         "rotated session must carry the device_id from the parent token"
     );
-    let (_plaintext_v2, v2_record) = new_token.unwrap();
+    let (_, v2_record) = new_token.unwrap();
     assert_eq!(
         v2_record.device_id,
         Some(device_id),
@@ -95,6 +96,7 @@ async fn refresh_compromise_to_device_revocation_full_cascade() {
     // step a production override would perform by collecting
     // family targets and driving the primitive directly.
     let err = Refresh::any_tenant(&plaintext_v1, |_| async { true })
+        .without_device_check()
         .run(&refresh_store, &config, &rng, ts)
         .await;
     assert!(matches!(err, Err(RefreshError::Revoked)));
@@ -152,7 +154,8 @@ async fn collect_family_targets_deduplicates_same_device_across_family() {
     )
     .await
     .unwrap();
-    let (_session, _) = Refresh::any_tenant(&plaintext_v1, |_| async { true })
+    let (_, _) = Refresh::any_tenant(&plaintext_v1, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, ts)
         .await
         .unwrap();

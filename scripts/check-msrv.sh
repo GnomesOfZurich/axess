@@ -18,10 +18,10 @@
 set -uo pipefail
 
 AXESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$AXESS_DIR"
+cd "$AXESS_DIR" || exit 1
 
 MSRV="$(sed -n '/^\[workspace.package\]/,/^\[/p' Cargo.toml \
-  | grep -m1 '^rust-version' | sed 's/.*"\(.*\)".*/\1/')"
+  | grep '^rust-version' | sed -n 1p | sed 's/.*"\(.*\)".*/\1/')"
 
 if [ -z "$MSRV" ]; then
   echo "ERROR: could not read [workspace.package] rust-version from Cargo.toml" >&2
@@ -30,11 +30,13 @@ fi
 
 echo "Declared MSRV: ${MSRV}"
 
-# The workspace root must be the only place the floor is written. Nine members
-# (the examples and the fuzz crate) once hardcoded their own `rust-version`,
-# and because cargo resolves against the *minimum* across members, correcting
-# only the root left the dependency resolver still pinned to the stale floor.
-stray="$(git ls-files '*Cargo.toml' \
+# The workspace root must be the only place the floor is written. A member
+# (an example, the fuzz crate) that writes its own `rust-version` holds the
+# dependency resolver to that floor, because cargo resolves against the
+# *minimum* across members, so correcting only the root changes nothing.
+# Tracked manifests and untracked ones git does not ignore, so a manifest
+# not yet added is checked as well.
+stray="$(git ls-files --cached --others --exclude-standard --deduplicate '*Cargo.toml' \
   | grep -v '^Cargo.toml$' \
   | xargs grep -ln '^rust-version[[:space:]]*=[[:space:]]*"' 2>/dev/null || true)"
 if [ -n "$stray" ]; then
@@ -46,7 +48,7 @@ if [ -n "$stray" ]; then
   exit 1
 fi
 
-if ! rustup toolchain list | grep -q "^${MSRV}-"; then
+if ! grep -q -- "^${MSRV}-" <<<"$(rustup toolchain list)"; then
   echo "ERROR: the ${MSRV} toolchain is not installed, so the MSRV promise" >&2
   echo "       cannot be checked. Install it and re-run:" >&2
   echo "" >&2
@@ -58,8 +60,22 @@ if ! rustup toolchain list | grep -q "^${MSRV}-"; then
   exit 1
 fi
 
-# `rust-toolchain.toml` pins the development compiler, and RUSTUP_TOOLCHAIN is
-# what overrides it (the same mechanism dtolnay/rust-toolchain uses in CI).
+# Every source Cargo.lock names is fetched by the pinned toolchain's cargo
+# first, `--locked` so nothing is resolved anew: the cargo of the MSRV then
+# builds from what is on disk and downloads and unpacks nothing itself, so
+# what it builds is what the pinned cargo fetched under the registry rules
+# of .cargo/config.toml.
+echo "Fetching Cargo.lock's sources with the pinned toolchain: $(cargo --version)"
+if ! cargo fetch --locked; then
+  echo "ERROR: cargo fetch --locked failed with the pinned toolchain, so the" >&2
+  echo "       MSRV build would fetch with the MSRV's cargo instead." >&2
+  exit 1
+fi
+
+# `rust-toolchain.toml` pins the development compiler. rustup takes that file
+# over its default toolchain and takes RUSTUP_TOOLCHAIN over the file, so the
+# variable is what selects the MSRV here; in CI the msrv job's toolchain step
+# installs that release and this line selects it the same way.
 # Confirm the override actually took effect, if the pin won instead, every
 # command below would test the wrong compiler and still pass.
 export RUSTUP_TOOLCHAIN="$MSRV"

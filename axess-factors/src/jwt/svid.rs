@@ -25,20 +25,19 @@
 //! resolver can return a typed `(service_name, tenant_slug)` pair on
 //! the [`WorkloadPrincipal`]. Adopters that use a deeper SPIFFE path
 //! (`spiffe://td/region/svc/tenant`) need a different resolver shape
-//! today; the trait is open to additional impls. This one is the
-//! Gnomes-platform-aligned one.
+//! today; the trait is open to additional impls. This one reads the
+//! two-segment shape.
 //!
 //! # Tenant id source
 //!
 //! The SPIFFE path carries the tenant *slug*; the
 //! [`WorkloadPrincipal`] also requires a typed [`TenantId`] (UUID-
 //! backed). The JWT must carry a custom `tid` claim with the
-//! UUID-string value. Production IdPs that issue JWT-SVIDs for the
-//! Gnomes platform set this claim from the same registry the
-//! `CliResolver` consults at startup; the two paths produce
-//! byte-identical principals for the same `(service, tenant)` pair.
+//! UUID-string value. An IdP that sets this claim from the same
+//! tenant registry the `CliResolver` consults at startup makes the two
+//! paths produce byte-identical principals for the same
+//! `(service, tenant)` pair.
 
-use crate::jwt::verifier::verifier_is_pinned;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -46,6 +45,7 @@ use axess_identity::{
     IdentityError, Issuer, Principal, PrincipalResolver, TenantId, TrustDomain, WorkloadId,
     WorkloadPrincipal,
 };
+use jsonwebtoken::Algorithm;
 use serde::Deserialize;
 
 use super::verifier::{JtiReplayStore, JwtVerifier, NoReplay};
@@ -71,7 +71,7 @@ struct SvidCustomClaims {
 ///         .with_issuer("https://idp.example.com")
 ///         .with_audience("axess-platform"),
 /// );
-/// let trust_domain = TrustDomain::new("gnomes.local")?;
+/// let trust_domain = TrustDomain::new("example.org")?;
 ///
 /// // Per request:
 /// let token = bearer_token_from_headers(&headers)?;
@@ -170,22 +170,30 @@ impl<R: JtiReplayStore + 'static> PrincipalResolver for JwtSvidResolver<R> {
         //    a shared issuer makes `aud` the only separation between
         //    services. A verifier that pins neither would accept a token
         //    minted for anyone, so it is refused before any token is read.
-        if !verifier_is_pinned(&self.verifier, "JwtSvidResolver") {
+        if !pinned_for_svids(&self.verifier) {
             return Err(IdentityError::NotAuthenticated);
         }
+        // The JWT-SVID standard (section 2.1) names the algorithms an SVID
+        // may be signed with, and a validator rejects a token with any
+        // other, whatever the verifier's own allowlist admits: the verifier
+        // takes only those of its algorithms the standard names. The
+        // header is read once, by the verifier, after the token's length:
+        // every step from the header on costs in proportion to the token.
+        // Without a `kid` the token is tried against each key of the trust
+        // domain's set (section 2.2 makes `kid` optional).
         let claims = self
             .verifier
-            .verify::<SvidCustomClaims>(&self.token)
+            .verify_for_svid::<SvidCustomClaims>(&self.token, &JWT_SVID_ALGORITHMS)
             .await
             .map_err(|e| {
                 tracing::debug!(error = %e, "JwtSvidResolver: JWT verification failed");
                 IdentityError::NotAuthenticated
             })?;
 
-        // 2. Parse the SPIFFE ID out of `sub`. Missing `sub` or
-        //    malformed SPIFFE URI reject as NotAuthenticated; the
-        //    token validated cryptographically but isn't a SPIFFE
-        //    JWT-SVID.
+        // 2. Parse the SPIFFE ID out of `sub`. A missing `sub` rejects as
+        //    NotAuthenticated; a `sub` that is not a SPIFFE URI rejects as
+        //    InvalidSpiffeId. Either way the token validated
+        //    cryptographically but is not a SPIFFE JWT-SVID.
         let sub = claims.sub.ok_or_else(|| {
             tracing::debug!("JwtSvidResolver: token missing `sub` claim");
             IdentityError::NotAuthenticated
@@ -194,11 +202,14 @@ impl<R: JtiReplayStore + 'static> PrincipalResolver for JwtSvidResolver<R> {
 
         // 3. Decompose the SPIFFE URI into (trust_domain, service,
         //    tenant_slug) using the platform shape. WorkloadId::parse
-        //    already validated structure; the split here cannot fail
-        //    on a parsed value but each step still returns Result so
-        //    a future loosening of the parse rules surfaces here
-        //    rather than panicking.
-        let (token_trust_domain, service, tenant_slug) = decompose_platform_spiffe(&workload_id)?;
+        //    validated it as a SPIFFE ID; one of another shape (no
+        //    path, one segment, more than two) is refused here.
+        let parts = workload_id.components()?;
+        let (token_trust_domain, service, tenant_slug) = (
+            parts.trust_domain,
+            parts.service.to_owned(),
+            parts.tenant_slug.to_owned(),
+        );
 
         // 4. Pin the trust domain. JWT-SVIDs from a different trust
         //    domain are rejected even when the JWKS happened to
@@ -222,7 +233,7 @@ impl<R: JtiReplayStore + 'static> PrincipalResolver for JwtSvidResolver<R> {
         //    registry to ask, only a named waiver lets the token through.
         if self.tenant_lookup.is_none() && !self.cross_check_waived {
             tracing::warn!(
-                slug = %tenant_slug,
+                slug = %crate::log_text::log_safe(&tenant_slug, SPIFFE_ID_LOG_BYTES),
                 "JwtSvidResolver: no tenant lookup to cross-check the tid claim against the \
                  SPIFFE tenant slug, and no without_tenant_cross_check() waiver; refusing",
             );
@@ -233,7 +244,7 @@ impl<R: JtiReplayStore + 'static> PrincipalResolver for JwtSvidResolver<R> {
                 Some(registered) if registered == claims.custom.tid => {}
                 other => {
                     tracing::warn!(
-                        slug = %tenant_slug,
+                        slug = %crate::log_text::log_safe(&tenant_slug, SPIFFE_ID_LOG_BYTES),
                         known = other.is_some(),
                         "JwtSvidResolver: tid claim disagrees with the SPIFFE tenant slug",
                     );
@@ -254,37 +265,45 @@ impl<R: JtiReplayStore + 'static> PrincipalResolver for JwtSvidResolver<R> {
     }
 }
 
-/// Split a parsed [`WorkloadId`] into its
-/// `(trust_domain, service, tenant_slug)` components per the platform
-/// shape `spiffe://<trust_domain>/<service>/<tenant_slug>`. Returns
-/// [`IdentityError::InvalidSpiffeId`] if the SPIFFE path doesn't
-/// match the platform shape.
-fn decompose_platform_spiffe(
-    id: &WorkloadId,
-) -> Result<(TrustDomain, String, String), IdentityError> {
-    let raw = id.as_str();
-    let after = raw
-        .strip_prefix("spiffe://")
-        .ok_or_else(|| IdentityError::InvalidSpiffeId(format!("missing scheme: {raw}")))?;
-    let (td_str, rest) = after.split_once('/').ok_or_else(|| {
-        IdentityError::InvalidSpiffeId(format!(
-            "SPIFFE path missing service/tenant components: {raw}"
-        ))
-    })?;
-    let mut parts = rest.split('/');
-    let service = parts.next().filter(|s| !s.is_empty()).ok_or_else(|| {
-        IdentityError::InvalidSpiffeId(format!("SPIFFE path missing service component: {raw}"))
-    })?;
-    let tenant_slug = parts.next().filter(|s| !s.is_empty()).ok_or_else(|| {
-        IdentityError::InvalidSpiffeId(format!("SPIFFE path missing tenant component: {raw}"))
-    })?;
-    if parts.next().is_some() {
-        return Err(IdentityError::InvalidSpiffeId(format!(
-            "SPIFFE path has unexpected extra components beyond service/tenant: {raw}"
-        )));
+/// The most bytes of a part of a SPIFFE identifier that a log line quotes.
+const SPIFFE_ID_LOG_BYTES: usize = 128;
+
+/// The signature algorithms a JWT-SVID may carry: RSASSA-PKCS1-v1_5, ECDSA
+/// and RSASSA-PSS (JWT-SVID standard, section 2.1). The standard lists
+/// `ES512` as well; the JOSE library has no such algorithm, so a token
+/// signed with it is refused where its header is read.
+const JWT_SVID_ALGORITHMS: [Algorithm; 8] = [
+    Algorithm::RS256,
+    Algorithm::RS384,
+    Algorithm::RS512,
+    Algorithm::ES256,
+    Algorithm::ES384,
+    Algorithm::PS256,
+    Algorithm::PS384,
+    Algorithm::PS512,
+];
+
+/// Whether `verifier` is fit to verify JWT-SVIDs: it pins `aud`, and it
+/// pins `iss` or waives it by name.
+///
+/// The audience is the only separation between the services of one trust
+/// domain, so it is always pinned. The issuer need not be: the JWT-SVID
+/// standard defines `sub`, `aud` and `exp` and no `iss`, so an SVID may
+/// carry none, and what names its signer is the key set of the trust domain
+/// in its `sub`, which the resolver pins. A verifier built on a trust
+/// domain's own keys states that with `allow_any_issuer`.
+fn pinned_for_svids<R: JtiReplayStore>(verifier: &JwtVerifier<R>) -> bool {
+    let issuer_settled = verifier.has_issuer() || verifier.allows_any_issuer();
+    if verifier.has_audience() && issuer_settled {
+        return true;
     }
-    let td = TrustDomain::new(td_str)?;
-    Ok((td, service.to_string(), tenant_slug.to_string()))
+    tracing::error!(
+        has_issuer = verifier.has_issuer(),
+        issuer_waived = verifier.allows_any_issuer(),
+        has_audience = verifier.has_audience(),
+        "JwtSvidResolver: the verifier must pin `aud`, and pin `iss` or waive it by name; refusing"
+    );
+    false
 }
 
 #[cfg(test)]

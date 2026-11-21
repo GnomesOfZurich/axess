@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use axess_clock::Timestamp;
 use axess_clock::testing::MockClock;
 use axess_core::middleware::service_secret::{
     SIGNATURE_HEADER, ServiceCaller, ServiceSecret, ServiceSecretLayer, ServiceSecrets,
@@ -17,7 +18,6 @@ use axess_testing::mock_tracing::TracingCapture;
 use axum::body::Body;
 use axum::http::{HeaderMap, Method, Request, StatusCode};
 use axum::{Router, routing::post};
-use chrono::{TimeZone, Utc};
 use tower::ServiceExt;
 
 const RELAY: &str = "relay-secret-0123456789abcdef0123456789";
@@ -25,8 +25,10 @@ const OTHER: &str = "other-secret-0123456789abcdef0123456789";
 const EPOCH: i64 = 1_790_000_000;
 const AUDIENCE: &str = "billing";
 
-fn addressed() -> SignedRequests {
-    SignedRequests::default().audience(AUDIENCE)
+fn addressed(clock: &MockClock) -> SignedRequests {
+    SignedRequests::default()
+        .clock(Arc::new(clock.clone()))
+        .audience(AUDIENCE)
 }
 
 fn secret(name: &str, value: &str) -> ServiceSecret {
@@ -64,17 +66,14 @@ fn post_with(header: Option<(&str, &str)>) -> Request<Body> {
 }
 
 fn clock() -> MockClock {
-    MockClock::at(Utc.timestamp_opt(EPOCH, 0).single().expect("valid"))
+    MockClock::at(Timestamp::from_unix_seconds(EPOCH).expect("valid"))
 }
 
-fn signed_app(clock: &MockClock, config: SignedRequests) -> Router {
+fn signed_app(config: SignedRequests) -> Router {
     let secrets: ServiceSecrets = [secret("relay", RELAY), secret("other", OTHER)]
         .into_iter()
         .collect();
-    app(
-        ServiceSecretLayer::signed(secrets, config.clock(Arc::new(clock.clone())))
-            .expect("addressed"),
-    )
+    app(ServiceSecretLayer::signed(secrets, config).expect("addressed"))
 }
 
 fn signed(value: &str, at: i64, method: Method, target: &str, body: &str) -> Request<Body> {
@@ -109,7 +108,7 @@ fn service_events(capture: &TracingCapture) -> Vec<String> {
 async fn a_replay_is_logged_once_with_the_caller_and_no_secret_material() {
     let capture = TracingCapture::install();
     let clock = clock();
-    let app = signed_app(&clock, addressed());
+    let app = signed_app(addressed(&clock));
     let req = || signed(RELAY, EPOCH, Method::POST, "/hook", "x");
     assert_eq!(send(&app, req()).await.0, StatusCode::OK);
     assert_eq!(send(&app, req()).await.0, StatusCode::UNAUTHORIZED);
@@ -141,7 +140,7 @@ async fn a_replay_is_logged_once_with_the_caller_and_no_secret_material() {
 async fn bad_credentials_are_logged_at_debug_with_their_reason() {
     let capture = TracingCapture::install();
     let clock = clock();
-    let signed_app = signed_app(&clock, addressed());
+    let signed_app = signed_app(addressed(&clock));
     let stale = signed(RELAY, EPOCH - 3600, Method::POST, "/hook", "x");
     assert_eq!(send(&signed_app, stale).await.0, StatusCode::UNAUTHORIZED);
     let forged = signed(

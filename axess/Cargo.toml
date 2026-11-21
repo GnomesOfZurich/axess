@@ -6,7 +6,6 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 documentation = "https://docs.rs/axess"
 readme = "README.md"
 description = """
@@ -19,8 +18,60 @@ categories = ["web-programming", "authentication"]
 exclude = ["/.github", "/examples", "/scripts", "tests/"]
 
 [package.metadata.docs.rs]
-all-features = true
+# Every feature but `sqlite-unbundled`, which needs libclang and the
+# system's SQLite header at build time; `sqlite` documents the same
+# stores. `all-features = true` would switch it on, on a machine this
+# project does not control. scripts/check-docsrs-features.sh holds this
+# list to `[features]`: a feature in neither it nor the script's named
+# exclusions fails the check.
+features = [
+    "authz",
+    "device",
+    "device-keys",
+    "memory",
+    "testing",
+    "allow-testing-in-release",
+    "accept-client-id",
+    "request-id",
+    "service-secret",
+    "trace-context",
+    "ws",
+    "fapi",
+    "fido2",
+    "jwt",
+    "jwt-aws-lc",
+    "jwt-rust-crypto",
+    "jwt-svid",
+    "ldap",
+    "mtls",
+    "oauth",
+    "social",
+    "aws-sts",
+    "azure-fic",
+    "cloud-sts",
+    "gcp-wif",
+    "outbound-mtls",
+    "outbound-oauth",
+    "client-assertion-rsa",
+    "delegated",
+    "delegated-exchange",
+    "delegated-stored",
+    "delegated-stored-encrypted",
+    "local-idp",
+    "spire",
+    "local-idp-rsa",
+    "mysql",
+    "postgres",
+    "sqlite",
+    "valkey",
+    "valkey-cache",
+    "audit-archive-fs",
+    "workload-id",
+]
 rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
 
 [dependencies]
 # `features` restates axess-core's defaults: the workspace entry sets
@@ -40,7 +91,6 @@ serde_json = { workspace = true }
 [dev-dependencies]
 axess-testing = { workspace = true }
 axum = { workspace = true, features = ["macros"] }
-chrono = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tower = { version = "0.5.3", features = ["util"] }
 # Compiles the program in tests/ui that names `axess::testing` without the
@@ -54,19 +104,22 @@ default = ["authz", "device"]
 # Core capabilities
 authz = ["axess-core/authz", "axess-macros/authz", "dep:cedar-policy"]
 device = ["axess-core/device"]
+# Device keys: sessions and devices held to a key the client cannot export
+# (`axess::device_key`). Needs `jwt-aws-lc` or `jwt-rust-crypto` beside it.
+device-keys = ["device", "axess-core/device-keys"]
 memory = ["axess-core/memory"]
 testing = ["axess-core/testing", "axess-factors/testing", "axess-identity/testing", "memory"]
 # The named opt-out for the release-build guard: with `testing` on and
 # debug assertions off the crate refuses to compile, because the feature
 # ships test doubles in a production binary. Enable this only for a build
 # that means it (a benchmark, a release-mode test run).
-allow-testing-in-release = ["axess-core/allow-testing-in-release", "axess-factors/allow-testing-in-release"]
+allow-testing-in-release = ["axess-core/allow-testing-in-release", "axess-factors/allow-testing-in-release", "axess-identity/allow-testing-in-release"]
 
 # HTTP middleware
 accept-client-id = ["axess-core/accept-client-id"]
 request-id = ["axess-core/request-id"]
 service-secret = ["axess-core/service-secret"]
-trace-id = ["axess-core/trace-id"]
+trace-context = ["axess-core/trace-context"]
 ws = ["axess-core/ws"]
 
 # Federated authn
@@ -99,6 +152,9 @@ cloud-sts = ["aws-sts", "azure-fic", "gcp-wif", "axess-core/cloud-sts"]
 gcp-wif = ["axess-core/gcp-wif"]
 outbound-mtls = ["axess-core/outbound-mtls"]
 outbound-oauth = ["axess-core/outbound-oauth"]
+# RSA client keys for `private_key_jwt` on `jwt-rust-crypto`, a choice that
+# signs in rsa 0.9 (RUSTSEC-2023-0071); see the feature in axess-factors.
+client-assertion-rsa = ["axess-core/client-assertion-rsa"]
 
 # OBO
 delegated = [
@@ -111,17 +167,30 @@ delegated-exchange = ["axess-core/delegated-exchange"]
 delegated-stored = ["axess-core/delegated-stored"]
 delegated-stored-encrypted = ["axess-core/delegated-stored-encrypted"]
 
-# In-process IdP
+# In-process IdP. Its keys are ES256; `local-idp-rsa` adds RSA keys and with
+# them the `rsa` crate, which carries RUSTSEC-2023-0071 (see the feature in
+# axess-core's manifest).
 local-idp = ["axess-core/local-idp"]
+local-idp-rsa = ["local-idp", "axess-core/local-idp-rsa"]
+
+# SPIFFE Workload API client: SVIDs and trust bundles from a local SPIRE
+# agent, kept current by a watcher. Needs an agent, so no umbrella enables it.
+spire = ["axess-core/spire"]
 
 # Session storage backends
 mysql = ["axess-core/mysql"]
 postgres = ["axess-core/postgres"]
 sqlite = ["axess-core/sqlite"]
+# `sqlite` linked to the system's SQLite library; enable it in place of `sqlite`.
+sqlite-unbundled = ["axess-core/sqlite-unbundled"]
 valkey = ["axess-core/valkey"]
 
 # Authz entity cache decorator (opt-in alternative to `EntityCache`)
 valkey-cache = ["axess-core/valkey-cache", "valkey"]
+
+# Audit archive: `FilesystemAuditArchiver`, the filesystem-backed reference
+# `AuditArchiver`, re-exported under `axess::authn`.
+audit-archive-fs = ["axess-core/audit-archive-fs"]
 
 # Umbrellas
 #
@@ -130,7 +199,7 @@ valkey-cache = ["axess-core/valkey-cache", "valkey"]
 # `memory` into production builds, and duplicated `--all-features`
 # without serving a real adopter shape. Pick one session backend +
 # the federation / middleware / workload features you actually need;
-# use `cargo … --all-features` for CI / docs.rs only.
+# use `cargo … --all-features` for CI only.
 workload-id = [
     "jwt",
     "jwt-svid",

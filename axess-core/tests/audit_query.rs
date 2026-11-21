@@ -3,15 +3,18 @@
 //! platform-rail flag, and cross-tenant isolation against a tiny in-memory
 //! implementor.
 
+use axess_core::testing::fixtures as common;
+
 use axess_core::authn::event::{AuthEvent, AuthEventStatus, AuthEventType};
 use axess_core::authn::ids::TenantId;
-use axess_core::authn::store::{AuditQuery, EventQueryFilter};
+use axess_core::authn::store::{AuditQuery, AuditTrail, EventQueryFilter};
 use std::sync::{Arc, Mutex};
 
 /// Tiny in-memory implementor used to prove the capability split
 /// works at type-check time and at runtime for the tenant-scoping
 /// rail. Lives in the test module: backends in the main crate are
-/// free to add the impl when they grow audit-table support.
+/// free to add the impl when they grow audit-table support. It holds
+/// events, never undecodable rows, so its answer counts none.
 #[derive(Clone, Default)]
 struct InMemAuditStore {
     events: Arc<Mutex<Vec<AuthEvent>>>,
@@ -28,7 +31,7 @@ impl AuditQuery for InMemAuditStore {
         &self,
         tenant_id: &TenantId,
         filter: &EventQueryFilter,
-    ) -> Result<Vec<AuthEvent>, Self::Error> {
+    ) -> Result<AuditTrail, Self::Error> {
         let guard = self.events.lock().unwrap();
         let mut out: Vec<AuthEvent> = guard
             .iter()
@@ -50,7 +53,10 @@ impl AuditQuery for InMemAuditStore {
         if filter.limit > 0 {
             out.truncate(filter.limit as usize);
         }
-        Ok(out)
+        Ok(AuditTrail {
+            events: out,
+            ..AuditTrail::default()
+        })
     }
 }
 
@@ -66,7 +72,7 @@ fn make_event(
         session_id: None,
         event_type: ty,
         event_status: status,
-        event_time: chrono::Utc::now().timestamp_micros(),
+        event_time: common::start().unix_micros(),
         factor_kind: None,
         ip_address: None,
         ip_source: Default::default(),
@@ -113,7 +119,7 @@ async fn includes_unscoped_when_flagged() {
         include_unscoped: true,
         ..Default::default()
     };
-    let result = store.query_events(&tenant, &filter).await.unwrap();
+    let result = store.query_events(&tenant, &filter).await.unwrap().events;
     assert_eq!(result.len(), 2);
     assert!(result.iter().any(|e| e.tenant_id.is_none()));
     assert!(
@@ -148,7 +154,7 @@ async fn excludes_unscoped_when_flag_off() {
         include_unscoped: false,
         ..Default::default()
     };
-    let result = store.query_events(&tenant, &filter).await.unwrap();
+    let result = store.query_events(&tenant, &filter).await.unwrap().events;
     assert_eq!(result.len(), 1);
     assert!(result[0].tenant_id.is_some());
 }
@@ -171,7 +177,7 @@ async fn never_leaks_across_tenants() {
             include_unscoped,
             ..Default::default()
         };
-        let result = store.query_events(&tenant, &filter).await.unwrap();
+        let result = store.query_events(&tenant, &filter).await.unwrap().events;
         assert!(
             result.is_empty(),
             "tenant-a query must not see tenant-b events (include_unscoped={include_unscoped})"

@@ -5,11 +5,10 @@
 use super::*;
 use crate::federation::replay_log::{ReplayFuture, ReplayLogError};
 use crate::federation::sid_store::{SidFuture, SidStoreError};
-use crate::session::id::SessionId;
+use crate::session::id::{SessionId, SessionKey};
 use crate::session::store::{MemorySessionRegistry, SessionRegistry, SessionRegistryAdapter};
 use crate::testing::RecordingMetrics;
 use crate::testing::mock_random::MockRng;
-use axess_clock::SystemClock;
 use axess_factors::oauth::MockOAuthProvider;
 use axess_factors::oidc::logout_token::BACKCHANNEL_LOGOUT_EVENT;
 use axum::extract::{Form, State};
@@ -22,7 +21,7 @@ fn token(extra: serde_json::Value) -> String {
     let mut payload = serde_json::json!({
         "iss": ISS,
         "aud": CLIENT,
-        "iat": chrono::Utc::now().timestamp(),
+        "iat": axess_clock::testing::MockClock::reference_time().unix_seconds(),
         "events": { BACKCHANNEL_LOGOUT_EVENT: {} },
     });
     payload
@@ -47,7 +46,7 @@ fn handler(registry: &MemorySessionRegistry, store: Arc<dyn SidStore>) -> BackCh
         &providers,
         Arc::new(SessionRegistryAdapter(registry.clone())),
         SidMap::new(),
-        Arc::new(SystemClock),
+        Arc::new(axess_clock::testing::MockClock::at_reference()),
     )
     .expect("handler")
     .with_sid_store(store)
@@ -66,9 +65,9 @@ async fn login(
     registry: &MemorySessionRegistry,
     store: &Arc<dyn SidStore>,
     sid: &str,
-) -> (UserId, SessionId) {
+) -> (UserId, SessionKey) {
     let user = axess_identity::testing::user("alice");
-    let session = SessionId::new(&MockRng::new(31));
+    let session = SessionKey::of(&SessionId::new(&MockRng::new(31)));
     registry.register(&user, &session).await.unwrap();
     store
         .register_subject_session(ISS, "idp-sub", None, user, session)
@@ -81,7 +80,7 @@ async fn login(
             None,
             user,
             session,
-            chrono::Utc::now(),
+            axess_clock::testing::MockClock::reference_time(),
         )
         .await
         .unwrap();
@@ -118,11 +117,29 @@ async fn a_token_posted_to_the_second_handler_ends_the_session_of_the_first_logi
     let (user, session) = login(&registry, &shared, "sid-1").await;
 
     let metrics = Arc::new(RecordingMetrics::default());
-    let _first = handler(&registry, Arc::clone(&shared));
+    let first = handler(&registry, Arc::clone(&shared));
     let second = handler(&registry, Arc::clone(&shared)).with_metrics(metrics.clone());
     let t = token(serde_json::json!({ "sid": "sid-1", "jti": "j1" }));
 
     assert_eq!(post(&second, t).await, Ok(StatusCode::OK));
+    assert!(!registry.is_valid(&user, &session).await.unwrap());
+    assert_eq!(metrics.count("back_channel_logout_unmatched"), 0);
+    drop(first);
+}
+
+/// A token that names only a subject ends that subject's session, and a
+/// logout that found its session is not counted as unmatched.
+#[tokio::test]
+async fn a_sub_only_token_that_ends_a_session_is_not_counted_as_unmatched() {
+    let registry = MemorySessionRegistry::new();
+    let shared: Arc<dyn SidStore> = Arc::new(SidMap::new());
+    let (user, session) = login(&registry, &shared, "sid-1").await;
+
+    let metrics = Arc::new(RecordingMetrics::default());
+    let h = handler(&registry, Arc::clone(&shared)).with_metrics(metrics.clone());
+    let t = token(serde_json::json!({ "sub": "idp-sub", "jti": "j1" }));
+
+    assert_eq!(post(&h, t).await, Ok(StatusCode::OK));
     assert!(!registry.is_valid(&user, &session).await.unwrap());
     assert_eq!(metrics.count("back_channel_logout_unmatched"), 0);
 }
@@ -151,8 +168,8 @@ impl SidStore for DownStore {
         _: &'a str,
         _: Option<TenantId>,
         _: UserId,
-        _: SessionId,
-        _: chrono::DateTime<chrono::Utc>,
+        _: SessionKey,
+        _: axess_clock::Timestamp,
     ) -> SidFuture<'a, Option<crate::federation::sid_map::DisplacedSid>> {
         Box::pin(async { Err(SidStoreError("down".into())) })
     }
@@ -173,7 +190,7 @@ impl SidStore for DownStore {
     fn remove_if_session<'a>(
         &'a self,
         _: &'a SidKey,
-        _: &'a SessionId,
+        _: &'a SessionKey,
     ) -> SidFuture<'a, Option<SidEntry>> {
         Box::pin(async { Err(SidStoreError("down".into())) })
     }
@@ -183,7 +200,7 @@ impl SidStore for DownStore {
         _: &'a str,
         _: Option<TenantId>,
         _: UserId,
-        _: SessionId,
+        _: SessionKey,
     ) -> SidFuture<'a, ()> {
         Box::pin(async { Err(SidStoreError("down".into())) })
     }
@@ -191,7 +208,7 @@ impl SidStore for DownStore {
         &'a self,
         _: &'a str,
         _: &'a UserId,
-        _: &'a SessionId,
+        _: &'a SessionKey,
     ) -> SidFuture<'a, bool> {
         Box::pin(async { Err(SidStoreError("down".into())) })
     }
@@ -200,21 +217,21 @@ impl SidStore for DownStore {
         _: &'a str,
         _: &'a str,
         _: Option<&'a TenantId>,
-    ) -> SidFuture<'a, Vec<(UserId, SessionId)>> {
+    ) -> SidFuture<'a, Vec<(UserId, SessionKey)>> {
         Box::pin(async { Err(SidStoreError("down".into())) })
     }
     fn sweep_subject_candidates(
         &self,
         _: usize,
-    ) -> SidFuture<'_, Vec<(String, UserId, SessionId)>> {
+    ) -> SidFuture<'_, Vec<(String, UserId, SessionKey)>> {
         Box::pin(async { Err(SidStoreError("down".into())) })
     }
-    fn remove_session<'a>(&'a self, _: &'a SessionId) -> SidFuture<'a, usize> {
+    fn remove_session<'a>(&'a self, _: &'a SessionKey) -> SidFuture<'a, usize> {
         Box::pin(async { Err(SidStoreError("down".into())) })
     }
     fn evict_inserted_before(
         &self,
-        _: chrono::DateTime<chrono::Utc>,
+        _: axess_clock::Timestamp,
         _: usize,
     ) -> SidFuture<'_, Vec<(SidKey, SidEntry)>> {
         Box::pin(async { Err(SidStoreError("down".into())) })
@@ -253,7 +270,7 @@ impl LogoutReplayLog for DownLog {
         &'a self,
         _: &'a str,
         _: &'a str,
-        _: chrono::DateTime<chrono::Utc>,
+        _: axess_clock::Timestamp,
     ) -> ReplayFuture<'a, Recorded> {
         Box::pin(async { Err(ReplayLogError("down".into())) })
     }

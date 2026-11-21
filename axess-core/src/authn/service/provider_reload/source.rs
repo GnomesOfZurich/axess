@@ -17,9 +17,19 @@ const TARGET: &str = "axess::authn::provider_reload";
 
 /// A provider a [`ProviderSource`] built, by category.
 pub enum BuiltProvider {
-    /// An OAuth/OIDC provider.
+    /// An OAuth/OIDC provider, with the kind its configuration names, as a
+    /// direct reload names it
+    /// ([`reload_oauth_provider_as`](crate::authn::service::RequestAuthnService::reload_oauth_provider_as)).
     #[cfg(feature = "oauth")]
-    OAuth(Arc<dyn axess_factors::oauth::OAuthProvider>),
+    OAuth {
+        /// The provider.
+        provider: Arc<dyn axess_factors::oauth::OAuthProvider>,
+        /// The [`FederatedProvider`](crate::authn::factor::FederatedProvider)
+        /// every login through it records, and the audit row of the change
+        /// names: `FederatedProvider::Custom(name)` for a provider of no
+        /// named kind.
+        kind: crate::authn::factor::FederatedProvider,
+    },
     /// The FIDO2/WebAuthn provider.
     #[cfg(feature = "fido2")]
     Fido2(Arc<dyn axess_factors::fido2::Fido2Provider>),
@@ -32,6 +42,22 @@ pub enum BuiltProvider {
     /// The LDAP provider.
     #[cfg(feature = "ldap")]
     Ldap(Arc<dyn axess_factors::ldap::LdapProvider>),
+}
+
+impl BuiltProvider {
+    /// The factor the audit row of installing this provider names: an
+    /// OAuth provider's configured kind.
+    fn factor(&self) -> crate::authn::factor::FactorKind {
+        use crate::authn::factor::FactorKind;
+        match self {
+            #[cfg(feature = "oauth")]
+            Self::OAuth { kind, .. } => FactorKind::Federated(kind.clone()),
+            #[cfg(feature = "fido2")]
+            Self::Fido2(_) | Self::Fido2AllowingRpIdChange(_) => FactorKind::Fido2,
+            #[cfg(feature = "ldap")]
+            Self::Ldap(_) => FactorKind::LdapBind,
+        }
+    }
 }
 
 /// A provider the source says should be running, with an opaque revision.
@@ -159,7 +185,11 @@ where
     /// `poll_every`: each entry whose revision moved is built and installed
     /// through the same checks as a direct reload, and not announced again;
     /// a provider of any category the follower installed earlier and the source no
-    /// longer lists is removed. Providers the source never named, such as
+    /// longer lists is removed. Each change it makes is recorded as an audit
+    /// row with no administrator and the reason
+    /// [`PROVIDER_SOURCE_REASON`](super::PROVIDER_SOURCE_REASON); a change
+    /// whose row cannot be written is undone and tried again at the next
+    /// notice or poll. Providers the source never named, such as
     /// those registered at construction, are left alone. A source that cannot
     /// be read, or a build or check that fails, is logged and counted and
     /// retried at the next notice or poll, with the previous provider serving.
@@ -272,8 +302,9 @@ where
             .cloned()
             .collect();
         for key in withdrawn {
-            self.withdraw(&key).await;
-            applied.remove(&key);
+            if self.withdraw(&key).await {
+                applied.remove(&key);
+            }
         }
     }
 
@@ -281,19 +312,79 @@ where
     async fn apply_entry(&self, source: &dyn ProviderSource, entry: &ProviderEntry) -> bool {
         let key = &entry.key;
         let built = self.candidate(key, async { source.build(key).await }).await;
-        let installed = match built {
-            Ok(built) => self.install_built(key, built).await,
+        let swapped = match built {
+            Ok(built) => {
+                let factor = built.factor();
+                self.install_built(key, built)
+                    .await
+                    .map(|swapped| (swapped, factor))
+            }
+            Err(e) => Err(e),
+        };
+        let installed = match swapped {
+            Ok((swapped, factor)) => {
+                if !self
+                    .recorded_or_undone(key, false, factor, swapped.previous)
+                    .await
+                {
+                    return false;
+                }
+                Ok(swapped.kind)
+            }
             Err(e) => Err(e),
         };
         self.settle(key, installed, false).await.is_ok()
     }
 
-    /// The source stopped listing `key`.
-    async fn withdraw(&self, key: &ProviderKey) {
-        let removed = self.remove_key(key);
-        // A provider already gone is the state the source asks for.
-        if !matches!(removed, Err(super::ProviderReloadError::NotFound { .. })) {
-            let _ = self.settle(key, removed, false).await;
+    /// The source stopped listing `key`; `true` when the provider is gone.
+    async fn withdraw(&self, key: &ProviderKey) -> bool {
+        match self.remove_key(key) {
+            // A provider already gone is the state the source asks for.
+            Err(super::ProviderReloadError::NotFound { .. }) => true,
+            Err(refused) => {
+                let _ = self.settle(key, Err(refused), false).await;
+                false
+            }
+            Ok(swapped) => {
+                let factor = swapped.previous.removed_factor();
+                if !self
+                    .recorded_or_undone(key, true, factor, swapped.previous)
+                    .await
+                {
+                    return false;
+                }
+                self.settle(key, Ok(swapped.kind), false).await.is_ok()
+            }
+        }
+    }
+
+    /// Record a change the follower made, as the source's, with `factor` as
+    /// the row's factor; when the row cannot be written, put back what the
+    /// slot held and answer `false`, so the change is tried again at the
+    /// next read.
+    async fn recorded_or_undone(
+        &self,
+        key: &ProviderKey,
+        removal: bool,
+        factor: crate::authn::factor::FactorKind,
+        previous: super::install::Previous,
+    ) -> bool {
+        let recorded = self
+            .with_audit_context(crate::authn::event::AuditContext::default())
+            .record_provider_change(None, key, removal, factor, Ok(()))
+            .await;
+        match recorded {
+            Ok(()) => true,
+            Err(reason) => {
+                self.undo(previous);
+                error!(
+                    target: TARGET,
+                    provider = %crate::authn::service::log_text::logged_request_text(&key.label()),
+                    error = %reason,
+                    "a change from the provider source was undone: its audit row could not be written",
+                );
+                false
+            }
         }
     }
 }

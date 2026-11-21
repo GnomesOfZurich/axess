@@ -179,12 +179,12 @@ impl TenantBootstrap {
 /// #     types::{EntityState, Tenant},
 /// #     ids::{TenantId, UserId},
 /// # };
-/// # use chrono::Utc;
-/// # async fn demo<I, F>(identity: &I, factors: &F) -> Result<(), Box<dyn std::error::Error>>
+/// # use axess_clock::Clock;
+/// # async fn demo<I, F>(identity: &I, factors: &F, clock: &impl Clock) -> Result<(), Box<dyn std::error::Error>>
 /// # where I: axess_core::authn::store::IdentityStore,
 /// #       F: axess_core::authn::store::FactorStore<Error = I::Error>,
 /// # {
-/// let now = Utc::now();
+/// let now = clock.now();
 /// let tenant = Tenant {
 ///     id: axess_identity::testing::tenant("acme"),
 ///     identifier: "acme".into(),
@@ -215,22 +215,29 @@ where
         return Err(ProvisioningError::NoFactorsSpecified);
     }
 
+    // The tenant is validated before anything in this function logs its
+    // identifier, so no line here carries text no rule has vouched for: a
+    // refused identifier (a control, bidirectional, zero-width or filler
+    // character) ends the call with nothing logged. Validation bounds no
+    // length, so the identifier still reaches a log line escaped and cut.
+    bootstrap
+        .tenant
+        .validate_new()
+        .map_err(ProvisioningError::InvalidTenant)?;
+
     // Refuse self-service / runtime provisioning under the reserved
     // system tenant id. The system tenant must be installed exactly once at
     // platform setup, never again at runtime through this generic path.
     if bootstrap.tenant.id.is_system() {
         tracing::warn!(
             tenant_id = %bootstrap.tenant.id,
-            identifier = %bootstrap.tenant.identifier,
+            identifier = %crate::authn::service::log_text::logged_request_text(
+                &bootstrap.tenant.identifier
+            ),
             "provisioning refused; tenant id is reserved system UUID"
         );
         return Err(ProvisioningError::ReservedTenantId);
     }
-
-    bootstrap
-        .tenant
-        .validate_new()
-        .map_err(ProvisioningError::InvalidTenant)?;
 
     let scope = AuthnScope::Tenant(bootstrap.tenant.id);
 
@@ -269,10 +276,9 @@ mod tests {
     use super::*;
     use crate::authn::ids::{TenantId, UserId};
     use crate::authn::types::EntityState;
-    use chrono::Utc;
 
     fn test_tenant() -> Tenant {
-        let now = Utc::now();
+        let now = axess_clock::testing::MockClock::reference_time();
         Tenant {
             id: axess_identity::testing::tenant("tenant-abc"),
             identifier: "acme".into(),
@@ -347,13 +353,13 @@ mod tests {
         );
     }
 
-    /// Regression: provisioning under the reserved system tenant
+    /// Provisioning under the reserved system tenant
     /// id must be refused, even when factors are valid and the rest of the
     /// bootstrap is well-formed.
     #[tokio::test]
     async fn create_tenant_refuses_reserved_system_tenant_id() {
         use crate::testing::mock_authn::{MockFactorStore, MockIdentityStore};
-        let now = Utc::now();
+        let now = axess_clock::testing::MockClock::reference_time();
         let system_tenant = Tenant {
             id: TenantId::system(),
             identifier: "attacker-claim".into(),
@@ -369,6 +375,41 @@ mod tests {
         let factors = MockFactorStore::new();
         let res = create_tenant(&identity, &factors, bootstrap).await;
         assert!(matches!(res, Err(ProvisioningError::ReservedTenantId)));
+    }
+
+    /// The reserved-tenant refusal logs the identifier, and only after the
+    /// tenant is validated: a forged line or a reordering character in it
+    /// ends the call before any line is written, and what is written is
+    /// escaped and cut.
+    #[tokio::test]
+    async fn no_unvalidated_identifier_reaches_a_log_line() {
+        use crate::testing::mock_authn::{MockFactorStore, MockIdentityStore};
+        let capture = axess_testing::mock_tracing::TracingCapture::install();
+        for identifier in ["acme\nWARN forged", "ac\u{202E}me", "acme"] {
+            let mut tenant = test_tenant();
+            tenant.id = TenantId::system();
+            tenant.identifier = identifier.into();
+            let res = create_tenant(
+                &MockIdentityStore::new(),
+                &MockFactorStore::new(),
+                TenantBootstrap::minimal(tenant),
+            )
+            .await;
+            assert!(res.is_err(), "{identifier:?}");
+        }
+        let events = capture.events();
+        assert_eq!(
+            events.len(),
+            1,
+            "only the valid identifier is logged: {events:?}"
+        );
+        for event in events {
+            assert!(
+                !event.message.chars().any(axess_identity::log_text::escapes),
+                "{:?}",
+                event.message
+            );
+        }
     }
 
     /// A look-alike identifier is refused when a tenant is created, however

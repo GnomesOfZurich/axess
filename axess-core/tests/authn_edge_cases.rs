@@ -3,7 +3,7 @@
 //! suspended users, unknown tenants, and bare ZeroizedString / AuthnScope
 //! invariants that don't fit elsewhere.
 
-mod common;
+use axess_core::testing::fixtures as common;
 
 use axess_core::authn::AuditContext;
 use axess_core::authn::{
@@ -17,13 +17,14 @@ use axess_core::testing::{
     mock_authn::{MockFactorStore, MockIdentityStore},
     test_session,
 };
-use chrono::Utc;
-use common::{password_config, test_tenant, test_user, tid, uid};
+use common::{password_config, start, test_tenant, test_user, tid, uid};
 
 /// Empty factor chain should return InvalidCredentials from begin_login.
 #[tokio::test]
 async fn empty_factor_chain() {
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new()
@@ -32,7 +33,7 @@ async fn empty_factor_chain() {
                 tenant_id: tid("t1"),
                 user_id: uid("u1"),
             },
-            password_config("Gnomes2+"),
+            password_config("Sample2+"),
         )
         .with_method(
             &uid("u1"),
@@ -46,7 +47,10 @@ async fn empty_factor_chain() {
             ),
         );
 
-    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
+    let service = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
+        .build()
+        .with_audit_context(AuditContext::default());
     let session = test_session();
 
     let outcome = service
@@ -59,9 +63,15 @@ async fn empty_factor_chain() {
 /// verify_factor on a guest session should return NoFlow.
 #[tokio::test]
 async fn verify_factor_without_begin_returns_no_flow() {
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
+    let clock = common::test_clock();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
     let factors = MockFactorStore::new();
-    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
+    let service = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
+        .build()
+        .with_audit_context(AuditContext::default());
     let session = test_session();
 
     let result = service
@@ -76,9 +86,15 @@ async fn verify_factor_without_begin_returns_no_flow() {
 /// prepare_factor on a guest session should return NoFlow.
 #[tokio::test]
 async fn prepare_factor_without_begin_returns_no_flow() {
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
+    let clock = common::test_clock();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
     let factors = MockFactorStore::new();
-    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
+    let service = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
+        .build()
+        .with_audit_context(AuditContext::default());
     let session = test_session();
 
     let result = service.prepare_factor(&session).await;
@@ -89,13 +105,14 @@ async fn prepare_factor_without_begin_returns_no_flow() {
 /// is: the suspension is in the audit row, not in the outcome.
 #[tokio::test]
 async fn suspended_user_cannot_login() {
-    let now = Utc::now();
+    let clock = common::test_clock();
+    let now = start();
     let suspended_user = User {
         id: uid("u1"),
         tenant_id: tid("t1"),
         identifier: "alice".into(),
         display_name: "Alice".into(),
-        status: EntityState::Suspended(StatusDetail::administrative("test", Utc::now())),
+        status: EntityState::Suspended(StatusDetail::administrative("test", now)),
         webauthn_id: None,
         created_by: axess_core::authn::ids::UserId::system(),
         created_at: now,
@@ -103,6 +120,7 @@ async fn suspended_user_cannot_login() {
         updated_at: now,
     };
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(suspended_user);
     let factors = MockFactorStore::new()
@@ -111,7 +129,7 @@ async fn suspended_user_cannot_login() {
                 tenant_id: tid("t1"),
                 user_id: uid("u1"),
             },
-            password_config("Gnomes2+"),
+            password_config("Sample2+"),
         )
         .with_method(
             &uid("u1"),
@@ -125,7 +143,10 @@ async fn suspended_user_cannot_login() {
             ),
         );
 
-    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
+    let service = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
+        .build()
+        .with_audit_context(AuditContext::default());
     let session = test_session();
 
     let outcome = service.begin_login("alice", "default", &session).await;
@@ -150,19 +171,29 @@ async fn suspended_user_cannot_login() {
 /// it for the wrong reason.
 #[tokio::test]
 async fn unknown_tenant_is_indistinguishable_from_bad_credentials() {
+    let clock = common::test_clock();
     let session = test_session();
 
     // No tenants at all.
-    let unknown_tenant = AuthnService::new(MockIdentityStore::new(), MockFactorStore::new())
-        .with_audit_context(AuditContext::default())
-        .begin_login("alice", "nonexistent", &session)
-        .await;
-
-    // A tenant that exists, but no matching user.
-    let known_tenant = AuthnService::new(
-        MockIdentityStore::new().with_tenant(test_tenant()),
+    let unknown_tenant = AuthnService::builder(
+        MockIdentityStore::new().with_clock(clock.clone()),
         MockFactorStore::new(),
     )
+    .with_clock(clock.clone())
+    .build()
+    .with_audit_context(AuditContext::default())
+    .begin_login("alice", "nonexistent", &session)
+    .await;
+
+    // A tenant that exists, but no matching user.
+    let known_tenant = AuthnService::builder(
+        MockIdentityStore::new()
+            .with_clock(clock.clone())
+            .with_tenant(test_tenant()),
+        MockFactorStore::new(),
+    )
+    .with_clock(clock.clone())
+    .build()
     .with_audit_context(AuditContext::default())
     .begin_login("alice", "default", &session)
     .await;

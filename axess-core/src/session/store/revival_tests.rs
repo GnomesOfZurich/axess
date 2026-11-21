@@ -3,6 +3,7 @@
 //! generic over [`SessionStore`] so every backend runs the same ones.
 
 use super::*;
+use crate::session::id::{SessionId, SessionKey};
 use axess_rng::SystemRng;
 
 const TTL: Duration = Duration::from_secs(60);
@@ -14,8 +15,11 @@ fn data(tag: &str) -> SessionData {
     }
 }
 
-fn ids() -> (SessionId, SessionId) {
-    (SessionId::new(&SystemRng), SessionId::new(&SystemRng))
+fn ids() -> (SessionKey, SessionKey) {
+    (
+        SessionKey::of(&SessionId::new(&SystemRng)),
+        SessionKey::of(&SessionId::new(&SystemRng)),
+    )
 }
 
 /// `update` replaces a stored session and refuses a deleted one.
@@ -209,11 +213,11 @@ async fn memory_store_never_revives_an_ended_session() {
 /// An expired row counts as ended for `update` and `cycle`.
 #[tokio::test]
 async fn memory_store_treats_an_expired_row_as_ended() {
-    let clock = Arc::new(axess_clock::testing::MockClock::now());
+    let clock = Arc::new(axess_clock::testing::MockClock::at_reference());
     let store = MemorySessionStore::new().with_clock(clock.clone());
     let (old, new) = ids();
     store.save(&old, &data("auth"), TTL).await.unwrap();
-    clock.advance(chrono::Duration::seconds(61));
+    clock.advance(axess_clock::SignedDuration::seconds(61));
     assert!(!store.update(&old, &data("late"), TTL).await.unwrap());
     assert_eq!(
         store

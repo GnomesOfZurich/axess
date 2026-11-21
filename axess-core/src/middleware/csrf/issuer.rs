@@ -1,7 +1,7 @@
 //! The CSRF token handed to handlers and the issuer that mints post-rotation tokens.
 
 use super::token::mint_token;
-use crate::session::id::SessionId;
+use crate::session::id::SessionKey;
 use crate::session::layer::SessionHandle;
 use axess_rng::SecureRng;
 use std::sync::Arc;
@@ -81,7 +81,7 @@ impl std::fmt::Display for CsrfToken {
     }
 }
 
-/// Hands a handler the CSRF token that is valid for the session id *as it is
+/// Hands a handler the CSRF token that is valid for the session's key *as it is
 /// now*, including after the handler has rotated the session.
 ///
 /// Injected as a request extension by [`CsrfLayer`](super::CsrfLayer) next to [`CsrfToken`].
@@ -99,9 +99,9 @@ struct IssuerState {
     rng: Arc<dyn SecureRng>,
     handle: Option<SessionHandle>,
     /// Session id observed at request entry and the token handed out for it.
-    entry: Option<(SessionId, String)>,
-    /// Token minted for a session id the handler rotated to.
-    rotated: std::sync::Mutex<Option<(SessionId, String)>>,
+    entry: Option<(SessionKey, String)>,
+    /// Token minted for a session key the handler rotated to.
+    rotated: std::sync::Mutex<Option<(SessionKey, String)>>,
     /// Set once the handler reads the token, from the extension or here.
     read: Arc<AtomicBool>,
 }
@@ -111,7 +111,7 @@ impl CsrfIssuer {
         signing_key: Arc<Zeroizing<[u8; 32]>>,
         rng: Arc<dyn SecureRng>,
         handle: Option<SessionHandle>,
-        entry: Option<(SessionId, String)>,
+        entry: Option<(SessionKey, String)>,
         read: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -126,10 +126,10 @@ impl CsrfIssuer {
         }
     }
 
-    /// The token bound to the session's current id.
+    /// The token bound to the session's current key.
     ///
-    /// Equal to the [`CsrfToken`] extension until the session id changes;
-    /// after a rotation, a token bound to the new id (minted once, then
+    /// Equal to the [`CsrfToken`] extension until the session's key changes;
+    /// after a rotation, a token bound to the new key (minted once, then
     /// returned unchanged on every later call and used for the response
     /// cookie). Empty when the request carries no session handle.
     pub async fn token(&self) -> CsrfToken {
@@ -137,13 +137,13 @@ impl CsrfIssuer {
         let Some(handle) = &self.state.handle else {
             return CsrfToken::new(String::new());
         };
-        let current = handle.0.read().await.id;
+        let current = *handle.0.read().await.session.key();
         CsrfToken::tracked(self.token_for(current), self.state.read.clone())
     }
 
-    pub(super) fn token_for(&self, current: SessionId) -> String {
-        if let Some((entry_id, token)) = &self.state.entry
-            && *entry_id == current
+    pub(super) fn token_for(&self, current: SessionKey) -> String {
+        if let Some((entry_key, token)) = &self.state.entry
+            && *entry_key == current
         {
             return token.clone();
         }

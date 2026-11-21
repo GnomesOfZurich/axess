@@ -1,0 +1,8 @@
+error[E0599]: no method named `run` found for struct `axess_core::session::refresh::Refresh<'_, {closure@$DIR/tests/ui/refresh_without_device_choice.rs:17:33: 17:36}>` in the current scope
+  --> tests/ui/refresh_without_device_choice.rs:18:10
+   |
+17 |     Refresh::new(token, tenant, |_| async { true })
+18 |         .run(store, config, &SystemRng, now)
+   |          ^^^ method not found in `axess_core::session::refresh::Refresh<'_, {closure@$DIR/tests/ui/refresh_without_device_choice.rs:17:33: 17:36}>`
+   |
+   = note: the method was found for `axess_core::session::refresh::Refresh<'a, F, DeviceCheckDecided>`

@@ -1,57 +1,15 @@
 use super::*;
-use chrono::Utc;
+use axess_clock::testing::Shift;
 use jsonwebtoken::jwk::KeyAlgorithm;
-use rsa::rand_core::RngCore;
 
-/// An imported RSA key under 2048 bits is refused.
-#[test]
-fn imported_rsa_key_below_2048_bits_is_refused() {
-    let mut adapter = SecureRngAdapter(&axess_rng::SystemRng);
-    let weak = RsaPrivateKey::new(&mut adapter, 1024).expect("1024-bit keygen");
-    let der = weak.to_pkcs1_der().expect("encode");
-    let err = LocalIdpSigningKey::from_rsa_pkcs1_der(der.as_bytes(), "weak", Algorithm::RS256)
-        .expect_err("a 1024-bit key must be refused");
-    assert!(
-        matches!(
-            err,
-            LocalIdpKeyError::WeakKey {
-                bits: 1024,
-                min: 2048
-            }
-        ),
-        "{err:?}"
-    );
-}
-
-/// An unsupported algorithm is an error from every constructor that
-/// already returns a `Result`, and from the `try_` generator; none panics.
+/// An unsupported algorithm is an error from the EC constructors, which
+/// return a `Result`; none panics. The RSA constructors' half is with them.
 #[test]
 fn unsupported_algorithm_is_an_error_not_a_panic() {
     let es = LocalIdpSigningKey::generate_es256();
     let _ = es;
     let err = LocalIdpSigningKey::from_ec_pem("x", "k", Algorithm::RS256)
         .expect_err("EC constructor with RS256");
-    assert!(
-        matches!(err, LocalIdpKeyError::UnsupportedAlgorithm(_)),
-        "{err:?}"
-    );
-    let err = LocalIdpSigningKey::from_rsa_pem("x", "k", Algorithm::ES256)
-        .expect_err("RSA constructor with ES256");
-    assert!(
-        matches!(err, LocalIdpKeyError::UnsupportedAlgorithm(_)),
-        "{err:?}"
-    );
-    let err = LocalIdpSigningKey::try_generate_rsa_with_algorithm(Algorithm::HS256)
-        .expect_err("HS256 is not an RSA algorithm");
-    assert!(
-        matches!(err, LocalIdpKeyError::UnsupportedAlgorithm(_)),
-        "{err:?}"
-    );
-    let err = LocalIdpSigningKey::try_generate_rsa_with_algorithm_and_rng(
-        Algorithm::ES256,
-        &axess_rng::SystemRng,
-    )
-    .expect_err("ES256 is not an RSA algorithm");
     assert!(
         matches!(err, LocalIdpKeyError::UnsupportedAlgorithm(_)),
         "{err:?}"
@@ -63,16 +21,17 @@ fn unsupported_algorithm_is_an_error_not_a_panic() {
 /// subject or audience under the signature.
 #[test]
 fn custom_claims_cannot_override_registered_claims() {
-    let exp = Utc::now() + chrono::Duration::minutes(5);
+    let exp = axess_clock::testing::MockClock::reference_time()
+        .plus(axess_clock::SignedDuration::minutes(5));
     let claims = MintClaims::new("worker-1", exp)
-        .with_custom_claim("exp", exp.timestamp() + 10 * 365 * 24 * 3600)
+        .with_custom_claim("exp", exp.unix_seconds() + 10 * 365 * 24 * 3600)
         .with_custom_claim("sub", "mallory")
         .with_custom_claim("aud", "other-service")
         .with_custom_claim("iss", "https://evil.example")
         .with_custom_claim("jti", "forged")
         .with_custom_claim("dept", "treasury");
     let v = build_claims_json("https://issuer.example", &claims);
-    assert_eq!(v["exp"], serde_json::json!(exp.timestamp()));
+    assert_eq!(v["exp"], serde_json::json!(exp.unix_seconds()));
     assert_eq!(v["sub"], serde_json::json!("worker-1"));
     assert_eq!(v["iss"], serde_json::json!("https://issuer.example"));
     assert!(
@@ -91,58 +50,63 @@ fn custom_claims_cannot_override_registered_claims() {
 /// shrink the apparent lifetime of a token that stays valid for years.
 #[test]
 fn max_ttl_is_measured_from_now_not_from_a_stated_iat() {
-    let now = Utc::now();
-    let claims = MintClaims::new("worker-1", now + chrono::Duration::days(3650))
-        .with_issued_at(now + chrono::Duration::days(3649));
+    let now = axess_clock::testing::MockClock::reference_time();
+    let claims = MintClaims::new(
+        "worker-1",
+        now.plus(axess_clock::SignedDuration::days(3650)),
+    )
+    .with_issued_at(now.plus(axess_clock::SignedDuration::days(3649)));
     assert!(
-        enforce_max_ttl_fallible(&claims, chrono::Duration::hours(24), now).is_err(),
+        enforce_max_ttl_fallible(&claims, std::time::Duration::from_hours(24), now).is_err(),
         "a ten-year token must exceed a one-day cap whatever its iat says"
     );
 }
 
-/// A cap that is not positive, a token that has already expired, and one
+/// A cap of no time, a token that has already expired, and one
 /// that becomes valid after it expires are refused, not minted.
 #[test]
 fn max_ttl_refuses_unusable_caps_and_claim_sets() {
-    use crate::local_idp::LifetimeFault::{AlreadyExpired, NonPositiveCap, NotBeforeAfterExpiry};
-    use chrono::Duration;
-    let now = Utc::now();
-    let ok = MintClaims::new("worker-1", now + Duration::minutes(5));
-    assert!(enforce_max_ttl_fallible(&ok, Duration::hours(1), now).is_ok());
-    for cap in [Duration::zero(), Duration::seconds(-1)] {
-        let long_gone = MintClaims::new("worker-1", now - Duration::hours(1));
+    use crate::local_idp::LifetimeFault::{AlreadyExpired, NotBeforeAfterExpiry, ZeroCap};
+    use axess_clock::SignedDuration;
+    let now = axess_clock::testing::MockClock::reference_time();
+    let ok = MintClaims::new("worker-1", now.plus(SignedDuration::minutes(5)));
+    assert!(enforce_max_ttl_fallible(&ok, std::time::Duration::from_hours(1), now).is_ok());
+    {
+        let cap = std::time::Duration::ZERO;
+        let long_gone = MintClaims::new("worker-1", now.minus(SignedDuration::hours(1)));
         assert_eq!(
             enforce_max_ttl_fallible(&long_gone, cap, now),
-            Err(TtlRefusal::Invalid(NonPositiveCap)),
-            "a cap of {cap} must not admit a token that expired an hour ago"
+            Err(TtlRefusal::Invalid(ZeroCap)),
+            "a cap of {cap:?} must not admit a token that expired an hour ago"
         );
         assert_eq!(
             enforce_max_ttl_fallible(&ok, cap, now),
-            Err(TtlRefusal::Invalid(NonPositiveCap)),
-            "a cap of {cap} admits nothing"
+            Err(TtlRefusal::Invalid(ZeroCap)),
+            "a cap of {cap:?} admits nothing"
         );
+        assert_eq!(ZeroCap.to_string(), "the max-TTL cap is no time");
     }
     let expired = MintClaims::new("worker-1", now);
     assert_eq!(
-        enforce_max_ttl_fallible(&expired, Duration::hours(1), now),
+        enforce_max_ttl_fallible(&expired, std::time::Duration::from_hours(1), now),
         Err(TtlRefusal::Invalid(AlreadyExpired)),
         "exp at now is already expired"
     );
-    let backwards = MintClaims::new("worker-1", now + Duration::minutes(5))
-        .with_not_before(now + Duration::minutes(10));
+    let backwards = MintClaims::new("worker-1", now.plus(SignedDuration::minutes(5)))
+        .with_not_before(now.plus(SignedDuration::minutes(10)));
     assert_eq!(
-        enforce_max_ttl_fallible(&backwards, Duration::hours(1), now),
+        enforce_max_ttl_fallible(&backwards, std::time::Duration::from_hours(1), now),
         Err(TtlRefusal::Invalid(NotBeforeAfterExpiry)),
         "nbf after exp is a token that is never valid"
     );
     assert!(matches!(
-        enforce_max_ttl_fallible(&ok, Duration::minutes(1), now),
+        enforce_max_ttl_fallible(&ok, std::time::Duration::from_mins(1), now),
         Err(TtlRefusal::Exceeds { .. })
     ));
 }
 
-/// Signing reuses one `EncodingKey`: each mint used to build a new one,
-/// leaving an unzeroized copy of the private key per mint.
+/// Signing reuses one `EncodingKey`: a new one for each mint would leave
+/// an unzeroized copy of the private key per mint.
 #[test]
 fn signing_reuses_one_encoding_key() {
     let key = LocalIdpSigningKey::generate_es256();
@@ -179,20 +143,18 @@ fn key_algorithm_to_algorithm_covers_every_jws_alg() {
     }
 }
 
-/// `SecureRngAdapter` must forward every RngCore call to its
-/// underlying [`axess_rng::SecureRng`]. Kills `next_u32 -> 0/1`,
-/// `next_u64 -> 0/1`, `try_fill_bytes -> Ok(())` body replacements
-/// by comparing the adapter's output against a separately-seeded
-/// reference `MockRng` driven through the same byte counts.
+/// The `rand_core` 0.10 traits `p256` generates keys through forward to
+/// the inner [`axess_rng::SecureRng`] too: each call returns the bytes an
+/// identically seeded `MockRng` hands out in the same order, so a body that
+/// answered a constant or filled nothing fails here.
 #[test]
-fn secure_rng_adapter_forwards_to_inner_rng() {
+fn secure_rng_adapter_forwards_the_rand_core_0_10_calls() {
     use axess_rng::SecureRng;
     use axess_rng::testing::MockRng;
+    use p256::elliptic_curve::rand_core::TryRng;
 
-    const SEED: u64 = 0xA110_CA7E_5EED_F00Du64;
+    const SEED: u64 = 0x0DEC_0DE5_5EED_BEEFu64;
 
-    // Reference: feed bytes through MockRng the same way the adapter
-    // does and compute expected outputs.
     let reference = MockRng::new(SEED);
     let mut buf = [0u8; 4];
     reference.fill_bytes(&mut buf);
@@ -202,39 +164,57 @@ fn secure_rng_adapter_forwards_to_inner_rng() {
     let expected_u64 = u64::from_le_bytes(buf);
     let mut expected_fill = [0u8; 32];
     reference.fill_bytes(&mut expected_fill);
-    let mut expected_try = [0u8; 32];
-    reference.fill_bytes(&mut expected_try);
 
-    // Adapter under test: driven in the same byte order against an
-    // identically-seeded MockRng.
     let inner = MockRng::new(SEED);
     let mut adapter = SecureRngAdapter(&inner as &dyn SecureRng);
-
-    let got_u32 = adapter.next_u32();
-    assert_eq!(
-        got_u32, expected_u32,
-        "next_u32 must forward to inner SecureRng (kills `-> 0` and `-> 1`)",
-    );
-
-    let got_u64 = adapter.next_u64();
-    assert_eq!(
-        got_u64, expected_u64,
-        "next_u64 must forward to inner SecureRng (kills `-> 0` and `-> 1`)",
-    );
-
+    assert_eq!(TryRng::try_next_u32(&mut adapter), Ok(expected_u32));
+    assert_eq!(TryRng::try_next_u64(&mut adapter), Ok(expected_u64));
     let mut fill = [0u8; 32];
-    adapter.fill_bytes(&mut fill);
-    assert_eq!(
-        fill, expected_fill,
-        "fill_bytes must forward to inner SecureRng",
-    );
+    assert_eq!(TryRng::try_fill_bytes(&mut adapter, &mut fill), Ok(()));
+    assert_eq!(fill, expected_fill);
+}
 
-    let mut tried = [0u8; 32];
-    adapter
-        .try_fill_bytes(&mut tried)
-        .expect("try_fill_bytes is infallible against MockRng");
-    assert_eq!(
-        tried, expected_try,
-        "try_fill_bytes must forward to inner SecureRng (kills `-> Ok(())`)",
-    );
+/// ES256 keygen is a pure function of the injected generator: two keys from
+/// identically seeded generators are the same key, and another seed gives
+/// another key.
+#[test]
+fn es256_keygen_follows_the_injected_rng() {
+    use axess_rng::testing::MockRng;
+
+    let a = LocalIdpSigningKey::generate_es256_with_rng(&MockRng::new(7));
+    let b = LocalIdpSigningKey::generate_es256_with_rng(&MockRng::new(7));
+    let c = LocalIdpSigningKey::generate_es256_with_rng(&MockRng::new(8));
+    assert_eq!(a.key_id(), b.key_id());
+    assert_ne!(a.key_id(), c.key_id());
+}
+
+/// The private key's DER bytes are held in a `Zeroizing` buffer, which
+/// wipes itself when the key is dropped, whichever kind of key it is. The
+/// key has no `Drop` of its own to keep in step with its bytes: taking the
+/// buffer out of it compiles only while it has none.
+#[test]
+fn the_private_key_bytes_are_held_in_a_zeroizing_buffer() {
+    let key = LocalIdpSigningKey::generate_es256_with_rng(&axess_rng::testing::MockRng::new(7));
+    let LocalIdpSigningKey { private_der, .. } = key;
+    let held: Zeroizing<Vec<u8>> = private_der;
+    assert!(!held.is_empty());
+}
+
+/// The registered times of a minted token are whole Unix seconds, the
+/// fraction dropped and rounded down before the epoch too.
+#[test]
+fn the_registered_times_are_whole_unix_seconds() {
+    let stamp = |text: &str| {
+        let row = format!(r#"{{"admin":"01010101-0101-0101-0101-010101010101","since":"{text}"}}"#);
+        serde_json::from_str::<crate::session::data::Impersonation>(&row)
+            .expect("reads")
+            .since
+    };
+    let claims = MintClaims::new("svc", stamp("2026-01-01T01:00:00.999Z"))
+        .with_not_before(stamp("1969-12-31T23:59:59.5Z"))
+        .with_issued_at(axess_clock::testing::MockClock::reference_time());
+    let json = build_claims_json("https://idp.example.org", &claims);
+    assert_eq!(json["exp"], serde_json::json!(1_767_229_200));
+    assert_eq!(json["nbf"], serde_json::json!(-1));
+    assert_eq!(json["iat"], serde_json::json!(1_767_225_600));
 }

@@ -13,6 +13,7 @@ use crate::otp_core::{HotpAlgorithm, hotp_value};
 use crate::{MAX_TOTP_DIGITS, MIN_OTP_DIGITS, MIN_OTP_SECRET_BYTES};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write;
+use std::time::Duration;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
@@ -69,7 +70,9 @@ fn totp_value(
 /// TOTP factor configuration (RFC 6238).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TotpConfig {
-    /// Shared secret (raw bytes, base32-encoded for provisioning URIs). Plain
+    /// Shared secret: the base32 text of the key, as
+    /// [`generate_totp_secret`] returns it and the provisioning URI carries
+    /// it; [`verify_totp`] decodes it at each check. Plain
     /// text is zeroized in memory on drop, redacted in `Debug`, and written to
     /// the store as it stands; seal it with a `FactorSecretCipher` to keep it
     /// encrypted at rest. See the OTP secret section of the password and TOTP
@@ -77,8 +80,12 @@ pub struct TotpConfig {
     pub secret: FactorSecret,
     /// Number of digits in the generated code (typically 6).
     pub digits: u8,
-    /// Length of one TOTP step in seconds (RFC 6238 default is 30).
-    pub period_secs: u32,
+    /// Length of one TOTP step (RFC 6238's time step X, 30 seconds by
+    /// default): a whole, non-zero number of seconds, since the step counter
+    /// is the Unix time in seconds divided by it. [`verify_totp`] refuses
+    /// another. Stored as a count of seconds under `period_secs`, as before.
+    #[serde(rename = "period_secs", with = "crate::whole_seconds::u32_seconds")]
+    pub period: Duration,
     /// HMAC algorithm used for code derivation.
     pub algorithm: OtpAlgorithm,
     /// Number of past steps accepted to tolerate clock drift behind the server.
@@ -94,15 +101,14 @@ impl Default for TotpConfig {
         Self {
             secret: FactorSecret::Plain(crate::secret::ZeroizedString::new("")),
             digits: 6,
-            period_secs: 30,
+            period: TOTP_PERIOD,
             algorithm: OtpAlgorithm::Sha1,
             past_window: 1,
-            // Accept one step of forward clock drift by default.
-            // Phones running a few seconds ahead of the server (very common
-            //; NTP-synced phones drift forward across time-zone changes,
-            // and the OS clock is often a few hundred ms ahead of the
-            // server) would otherwise see "wrong code" rejections on
-            // valid codes. Symmetric with `past_window: 1`.
+            // Accept one step of forward clock drift by default. A phone
+            // whose clock runs a few seconds ahead of the server's would
+            // otherwise see "wrong code" rejections on valid codes. The step
+            // is counted in Unix seconds, so a time-zone change moves
+            // nothing. Symmetric with `past_window: 1`.
             future_window: 1,
             last_step: None,
         }
@@ -111,8 +117,8 @@ impl Default for TotpConfig {
 
 /// Default TOTP code length in decimal digits (RFC 6238 §1.2 recommended 6).
 pub const TOTP_LENGTH: usize = 6;
-/// Default TOTP time-step in seconds (RFC 6238 §5.2 recommended 30).
-pub const TOTP_PERIOD: u64 = 30;
+/// Default TOTP time step (RFC 6238 §5.2 recommends 30 seconds).
+pub const TOTP_PERIOD: Duration = Duration::from_secs(30);
 
 /// Maximum TOTP time-step window in either direction. Accepting codes from
 /// more than 2 steps away (60s with a 30s period) significantly increases
@@ -125,8 +131,9 @@ const MAX_TOTP_WINDOW: u64 = 2;
 pub struct TotpVerifyParams {
     /// Number of digits in the TOTP code (default 6).
     pub length: Option<usize>,
-    /// Time step in seconds (default 30).
-    pub period: Option<u64>,
+    /// Time step (default [`TOTP_PERIOD`]): a whole, non-zero number of
+    /// seconds, or the code is refused.
+    pub period: Option<Duration>,
     /// Number of past time steps to also check (default 1).
     pub past_window: Option<u64>,
     /// Number of future time steps to also check (default 1).
@@ -161,7 +168,7 @@ impl Default for TotpVerifyParams {
 pub fn verify_totp(
     secret: &str,
     code: &str,
-    now: chrono::DateTime<chrono::Utc>,
+    now: axess_clock::Timestamp,
     params: TotpVerifyParams,
 ) -> Option<u64> {
     let TotpVerifyParams {
@@ -183,10 +190,19 @@ pub fn verify_totp(
     if !(MIN_OTP_DIGITS..=MAX_TOTP_DIGITS).contains(&length) {
         return None;
     }
-    let time_step = period.unwrap_or(TOTP_PERIOD);
-    if time_step == 0 {
+    // RFC 6238's step counter is the Unix time in whole seconds divided by
+    // the time step, so the step is a whole, non-zero number of seconds; a
+    // fraction would be dropped, and the codes would not be the ones the
+    // authenticator shows.
+    let period = period.unwrap_or(TOTP_PERIOD);
+    if period.is_zero() || period.subsec_nanos() != 0 {
+        tracing::warn!(
+            period = ?period,
+            "TOTP period refused: the time step is a whole, non-zero number of seconds"
+        );
         return None;
     }
+    let time_step = period.as_secs();
     // Clamp windows to a safe maximum. Accepting codes from more than 2
     // steps away (60s with 30s period) significantly increases replay risk.
     // Log when the configured window is silently clamped; operators
@@ -231,7 +247,7 @@ pub fn verify_totp(
 
     // Negative timestamps (pre-1970) cannot map to a TOTP step under
     // RFC 6238; reject rather than wrap silently into the future.
-    let seconds: u64 = now.timestamp().try_into().ok()?;
+    let seconds: u64 = now.unix_seconds().try_into().ok()?;
     let current_step = seconds / time_step;
 
     let check_candidate = |step: u64| -> Option<u64> {
@@ -301,16 +317,18 @@ pub fn generate_totp_secret<R: axess_rng::SecureRng>(rng: &R) -> String {
     base32::encode(base32::Alphabet::Rfc4648 { padding: false }, &*bytes)
 }
 
-/// The shortest period, in seconds, an `otpauth://` URI is built for.
-const MIN_TOTP_URI_PERIOD: u64 = 5;
+/// The shortest period an `otpauth://` URI is built for.
+const MIN_TOTP_URI_PERIOD: Duration = Duration::from_secs(5);
 
 /// Build the standard `otpauth://totp/...` URI a TOTP authenticator app
 /// scans to provision a credential, for an HMAC-SHA1 secret. `label` and
 /// `issuer` are percent-encoded per RFC 3986.
 ///
 /// Returns `None` when `digits` is outside the 6 to 8 range [`verify_totp`]
-/// accepts or `period` is under 5 seconds (authenticator apps do not take a
-/// shorter one): such a configuration is refused, not clamped into an
+/// accepts, `period` is under 5 seconds (authenticator apps do not take a
+/// shorter one) or is not a whole number of seconds (the URI writes it as
+/// one, and [`verify_totp`] refuses another): such a configuration is
+/// refused, not rounded or clamped into an
 /// authenticator whose codes the server would verify with other parameters
 /// than the ones shown to the user. See [`build_totp_uri_with_algorithm`] for
 /// SHA-256 and SHA-512 secrets.
@@ -319,7 +337,7 @@ pub fn build_totp_uri(
     issuer: &str,
     secret: &str,
     digits: usize,
-    period: u64,
+    period: Duration,
 ) -> Option<String> {
     build_totp_uri_with_algorithm(label, issuer, secret, digits, period, TotpAlgorithm::SHA1)
 }
@@ -333,12 +351,16 @@ pub fn build_totp_uri_with_algorithm(
     issuer: &str,
     secret: &str,
     digits: usize,
-    period: u64,
+    period: Duration,
     algorithm: TotpAlgorithm,
 ) -> Option<String> {
-    if !(MIN_OTP_DIGITS..=MAX_TOTP_DIGITS).contains(&digits) || period < MIN_TOTP_URI_PERIOD {
+    if !(MIN_OTP_DIGITS..=MAX_TOTP_DIGITS).contains(&digits)
+        || period < MIN_TOTP_URI_PERIOD
+        || period.subsec_nanos() != 0
+    {
         return None;
     }
+    let period = period.as_secs();
     let label_enc = percent_encode_component(label);
     let issuer_enc = percent_encode_component(issuer);
     Some(format!(

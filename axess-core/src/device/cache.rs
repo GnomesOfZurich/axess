@@ -6,8 +6,8 @@
 //!
 //! The same shape as `EntityCache<P: RequestEntityProvider>` for Cedar
 //! authz: composition over inheritance. Backend impls
-//! ([`MemoryDeviceStore`](super::MemoryDeviceStore), and the future
-//! `SqliteDeviceStore` / `PostgresDeviceStore` / `ValkeyDeviceStore`)
+//! ([`MemoryDeviceStore`](super::MemoryDeviceStore), `SqliteDeviceStore`,
+//! `PostgresDeviceStore`, `MysqlDeviceStore`, `ValkeyDeviceStore`)
 //! stay focused on storage; the cache is a separate, opt-in layer that
 //! every backend benefits from for free.
 //!
@@ -21,8 +21,9 @@
 //!   instance stops the next refresh here, not after the TTL.
 //! - **Not cached**:
 //!   - [`find_by_fingerprint`](DeviceStore::find_by_fingerprint):
-//!     cold path during first sighting before a `device_id` cookie
-//!     exists. It does not prime the by-id cache: a row read here can
+//!     cold path, read only by a lookup by fingerprint
+//!     (`ensure_device`); a resolution by the device token never calls
+//!     it. It does not prime the by-id cache: a row read here can
 //!     be overtaken by a revocation before it is stored, and a stale
 //!     `Trusted` row must never be put back.
 //!   - [`find_for_user`](DeviceStore::find_for_user): list with
@@ -37,10 +38,11 @@
 //!     revocations MUST be immediately visible.
 //!   - [`record_sighting`](DeviceStore::record_sighting): the only
 //!     mutation we deliberately do **not** invalidate on. It moves
-//!     `last_seen_at` forward by milliseconds; the cache showing a
-//!     slightly-older timestamp until TTL expiry is acceptable, and
-//!     invalidating here would defeat the entire cache because
-//!     `record_sighting` runs on every request the device appears in.
+//!     `last_seen_at` forward and changes nothing else; the cache
+//!     showing an older timestamp until TTL expiry is acceptable, and
+//!     invalidating here would empty the entry on every sighting the
+//!     lifecycle records (one per sighting granularity for a busy
+//!     device).
 //!     Read [`CachedDeviceStore::record_sighting`] for the full
 //!     reasoning.
 //!   - [`sweep`](DeviceStore::sweep): operates on storage; every
@@ -67,7 +69,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use axess_clock::Timestamp;
 
 use axess_cache::ClockTtlCache;
 use axess_clock::{Clock, SystemClock};
@@ -86,8 +88,9 @@ const DEFAULT_CAPACITY: usize = 10_000;
 /// invalidate explicitly so this only matters for cross-pod
 /// propagation, for which there is no invalidation bus: another pod
 /// sees the change in a cached [`load`](DeviceStore::load) when its entry
-/// expires. The refresh device check does not wait for that: it reads
-/// through [`load_fresh`](DeviceStore::load_fresh).
+/// expires, so a check made on every request through `load` may lag a
+/// revocation by up to this TTL. The refresh device check does not wait for
+/// that: it reads through [`load_fresh`](DeviceStore::load_fresh).
 const DEFAULT_TTL_SECS: u64 = 60;
 
 /// Cache key: `(tenant_id, device_id)`. Tenant scoping is mandatory
@@ -100,7 +103,10 @@ type CacheKey = (TenantId, DeviceId);
 /// an `await` after the store has committed. The row is invalidated after
 /// the write either way (a guard dropped on completion runs after the
 /// write, like an explicit call would), and a cancelled write can no longer
-/// leave the pre-write row cached for a full TTL.
+/// leave the pre-write row cached for a full TTL. Each write names its
+/// guard and drops it right after the call it guards, so the point of the
+/// invalidation is written where it happens; a write whose future is
+/// dropped mid-call drops the guard with it.
 struct InvalidateOnDrop {
     cache: Arc<ClockTtlCache<CacheKey, Device>>,
     key: CacheKey,
@@ -357,7 +363,7 @@ where
     fn save(
         &self,
         device: &Device,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         let key = (device.tenant_id, device.id);
         let cache = self.cache.clone();
@@ -368,15 +374,17 @@ where
             // row while the write was in flight is dropped by the
             // invalidation instead of staying cached. The invalidation
             // runs on failure too, since the stored row is then unknown.
-            let _guard = InvalidateOnDrop { cache, key };
-            inner.save(&device, now).await
+            let invalidating = InvalidateOnDrop { cache, key };
+            let outcome = inner.save(&device, now).await;
+            drop(invalidating);
+            outcome
         }
     }
 
     fn create_or_find(
         &self,
         device: &Device,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<Device, Self::Error>> + Send {
         let key = (device.tenant_id, device.id);
         let cache = self.cache.clone();
@@ -385,8 +393,10 @@ where
         async move {
             // As for `save`: the new row's key is invalidated after the
             // write, whether or not it was the one inserted.
-            let _guard = InvalidateOnDrop { cache, key };
-            inner.create_or_find(&device, now).await
+            let invalidating = InvalidateOnDrop { cache, key };
+            let outcome = inner.create_or_find(&device, now).await;
+            drop(invalidating);
+            outcome
         }
     }
 
@@ -394,7 +404,7 @@ where
         &self,
         tenant_id: &TenantId,
         id: &DeviceId,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<DeviceTrustLevel, Self::Error>> + Send {
         // Deliberately NOT invalidating on this path. `record_sighting`
         // bumps `last_seen_at` and runs on every authenticated request
@@ -415,7 +425,7 @@ where
         tenant_id: &TenantId,
         id: &DeviceId,
         level: DeviceTrustLevel,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         let key = (*tenant_id, *id);
         let cache = self.cache.clone();
@@ -423,8 +433,10 @@ where
         let tenant = *tenant_id;
         let device = *id;
         async move {
-            let _guard = InvalidateOnDrop { cache, key };
-            inner.set_trust_level(&tenant, &device, level, now).await
+            let invalidating = InvalidateOnDrop { cache, key };
+            let outcome = inner.set_trust_level(&tenant, &device, level, now).await;
+            drop(invalidating);
+            outcome
         }
     }
 
@@ -434,7 +446,7 @@ where
         id: &DeviceId,
         expected: DeviceTrustLevel,
         level: DeviceTrustLevel,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<TrustTransition, Self::Error>> + Send {
         let key = (*tenant_id, *id);
         let cache = self.cache.clone();
@@ -442,10 +454,12 @@ where
         let tenant = *tenant_id;
         let device = *id;
         async move {
-            let _guard = InvalidateOnDrop { cache, key };
-            inner
+            let invalidating = InvalidateOnDrop { cache, key };
+            let outcome = inner
                 .set_trust_level_if(&tenant, &device, expected, level, now)
-                .await
+                .await;
+            drop(invalidating);
+            outcome
         }
     }
 
@@ -455,7 +469,7 @@ where
         id: &DeviceId,
         expected: &[DeviceBinding],
         bindings: &[DeviceBinding],
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<BindingsUpdate, Self::Error>> + Send {
         let key = (*tenant_id, *id);
         let cache = self.cache.clone();
@@ -465,10 +479,12 @@ where
         let expected = expected.to_vec();
         let bindings = bindings.to_vec();
         async move {
-            let _guard = InvalidateOnDrop { cache, key };
-            inner
+            let invalidating = InvalidateOnDrop { cache, key };
+            let outcome = inner
                 .replace_bindings(&tenant, &device, &expected, &bindings, now)
-                .await
+                .await;
+            drop(invalidating);
+            outcome
         }
     }
 
@@ -477,7 +493,7 @@ where
         tenant_id: &TenantId,
         id: &DeviceId,
         user: &UserId,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<OwnerClaim, Self::Error>> + Send {
         let key = (*tenant_id, *id);
         let cache = self.cache.clone();
@@ -486,8 +502,10 @@ where
         let device = *id;
         let user = *user;
         async move {
-            let _guard = InvalidateOnDrop { cache, key };
-            inner.claim_owner(&tenant, &device, &user, now).await
+            let invalidating = InvalidateOnDrop { cache, key };
+            let outcome = inner.claim_owner(&tenant, &device, &user, now).await;
+            drop(invalidating);
+            outcome
         }
     }
 
@@ -502,15 +520,17 @@ where
         let tenant = *tenant_id;
         let device = *id;
         async move {
-            let _guard = InvalidateOnDrop { cache, key };
-            inner.delete(&tenant, &device).await
+            let invalidating = InvalidateOnDrop { cache, key };
+            let outcome = inner.delete(&tenant, &device).await;
+            drop(invalidating);
+            outcome
         }
     }
 
     fn sweep(
         &self,
         tenant_id: &TenantId,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<SweepCounts, Self::Error>> + Send {
         // The sweep demotes, revokes and purges rows the cache cannot
         // see, so drop the tenant's cached rows once it has run, also
@@ -519,8 +539,10 @@ where
         let inner = self.inner.clone();
         let tenant = *tenant_id;
         async move {
-            let _guard = InvalidateTenantOnDrop { cache, tenant };
-            inner.sweep(&tenant, now).await
+            let invalidating = InvalidateTenantOnDrop { cache, tenant };
+            let swept = inner.sweep(&tenant, now).await;
+            drop(invalidating);
+            swept
         }
     }
 }

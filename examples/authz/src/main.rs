@@ -72,7 +72,10 @@
 pub mod handlers;
 pub mod provider;
 
-use axess::authorization::{AuthzStore, PolicyStore};
+#[cfg(test)]
+mod tests;
+
+use axess::authorization::{AuthzError, AuthzStore, PolicyStore};
 use axum::{
     Router,
     routing::{delete, get, post},
@@ -89,6 +92,27 @@ pub struct AppState {
     pub data: AppData,
 }
 
+/// The application's state: the example's policies and schema, its seeded
+/// data, and the `AuthzStore` built over both.
+pub fn app_state() -> Result<AppState, AuthzError> {
+    // 1. Load Cedar policies and schema.
+    let policy_store = Arc::new(PolicyStore::from_text(
+        include_str!("../policies/app.cedar"),
+        include_str!("../policies/app.cedarschema.json"),
+    )?);
+
+    // 2. Seed in-memory data.
+    let data = AppData::seed();
+
+    // 3. Build the AuthzStore with our entity provider.
+    let namespace = "DocApp";
+    let provider = Arc::new(DocEntityProvider::new(data.clone(), namespace));
+    // `try_new` validates provider ↔ schema consistency at startup.
+    let authz = Arc::new(AuthzStore::try_new(policy_store, provider, namespace)?);
+
+    Ok(AppState { authz, data })
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The default is `info`: debug logs authorization decisions and the
@@ -102,24 +126,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Starting axess-example-authz");
 
-    // 1. Load Cedar policies and schema.
-    let policy_store = Arc::new(PolicyStore::from_text(
-        include_str!("../policies/app.cedar"),
-        include_str!("../policies/app.cedarschema.json"),
-    )?);
-    info!("Cedar policies loaded and validated");
-
-    // 2. Seed in-memory data.
-    let data = AppData::seed();
-
-    // 3. Build the AuthzStore with our entity provider.
-    let namespace = "DocApp";
-    let provider = Arc::new(DocEntityProvider::new(data.clone(), namespace));
-    // `try_new` validates provider ↔ schema consistency at startup.
-    let authz = Arc::new(AuthzStore::try_new(policy_store, provider, namespace)?);
-    info!("Entity provider validated against Cedar schema");
-
-    let state = AppState { authz, data };
+    let state = app_state()?;
+    info!("Cedar policies loaded and the entity provider validated against the schema");
 
     // 4. Build the router.
     let app = Router::new()

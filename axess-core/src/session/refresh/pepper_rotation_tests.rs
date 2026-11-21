@@ -4,6 +4,11 @@ use super::test_support::{fixture_tenant, fixture_user, now, store, test_config}
 use super::*;
 use crate::authn::ids::DeviceId;
 use crate::testing::mock_random::MockRng;
+use axess_clock::testing::Shift;
+
+/// Two peppers of the shortest accepted length, 32 bytes.
+const OLD_PEPPER: &[u8] = b"the old pepper, thirty-two bytes";
+const NEW_PEPPER: &[u8] = b"the new pepper, thirty-two bytes";
 
 fn peppered(pepper: &[u8]) -> RefreshTokenConfig {
     RefreshTokenConfig {
@@ -57,25 +62,27 @@ async fn issue_bound_under(
 async fn a_token_hashed_under_the_retired_pepper_refreshes_and_moves_to_the_new_one() {
     let store = store();
     let rng = MockRng::new(11);
-    let plaintext = issue_under(&peppered(b"old"), &store, &rng).await;
+    let plaintext = issue_under(&peppered(OLD_PEPPER), &store, &rng).await;
 
-    let config = rotated_to(b"new", b"old");
+    let config = rotated_to(NEW_PEPPER, OLD_PEPPER);
     let (session, next) = Refresh::any_tenant(&plaintext, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, now())
         .await
         .expect("the retired pepper is still accepted");
     assert!(session.auth_state.is_authenticated());
     let (next_plain, _) = next.expect("a replacement token");
 
-    let under_new = hash_token(&next_plain, Some(b"new"));
+    let under_new = hash_token(&next_plain, Some(NEW_PEPPER));
     assert!(
         store.find_token(&under_new).await.unwrap().is_some(),
         "the replacement is stored under the current pepper"
     );
 
     // From here on the current pepper alone serves it.
-    let only_new = peppered(b"new");
+    let only_new = peppered(NEW_PEPPER);
     Refresh::any_tenant(&next_plain, |_| async { true })
+        .without_device_check()
         .run(&store, &only_new, &rng, now())
         .await
         .expect("no previous pepper needed any more");
@@ -85,10 +92,11 @@ async fn a_token_hashed_under_the_retired_pepper_refreshes_and_moves_to_the_new_
 async fn without_a_previous_pepper_a_changed_pepper_loses_the_token() {
     let store = store();
     let rng = MockRng::new(12);
-    let plaintext = issue_under(&peppered(b"old"), &store, &rng).await;
+    let plaintext = issue_under(&peppered(OLD_PEPPER), &store, &rng).await;
 
     let result = Refresh::any_tenant(&plaintext, |_| async { true })
-        .run(&store, &peppered(b"new"), &rng, now())
+        .without_device_check()
+        .run(&store, &peppered(NEW_PEPPER), &rng, now())
         .await;
     assert!(matches!(result, Err(RefreshError::NotFound)));
 }
@@ -100,19 +108,20 @@ async fn without_a_previous_pepper_a_changed_pepper_loses_the_token() {
 async fn a_non_rotating_client_keeps_its_token_across_a_pepper_rotation() {
     let store = store();
     let rng = MockRng::new(13);
-    let plaintext = issue_under(&peppered(b"old"), &store, &rng).await;
+    let plaintext = issue_under(&peppered(OLD_PEPPER), &store, &rng).await;
 
     let config = RefreshTokenConfig {
         rotation: false,
-        ..rotated_to(b"new", b"old")
+        ..rotated_to(NEW_PEPPER, OLD_PEPPER)
     };
     let (_, next) = Refresh::any_tenant(&plaintext, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, now())
         .await
         .expect("refresh");
     assert!(next.is_none(), "a non-rotating client gets no new token");
     let moved = store
-        .find_token(&hash_token(&plaintext, Some(b"new")))
+        .find_token(&hash_token(&plaintext, Some(NEW_PEPPER)))
         .await
         .unwrap()
         .expect("the same token is stored under the current pepper");
@@ -123,10 +132,11 @@ async fn a_non_rotating_client_keeps_its_token_across_a_pepper_rotation() {
         &config,
         &RefreshTokenConfig {
             rotation: false,
-            ..peppered(b"new")
+            ..peppered(NEW_PEPPER)
         },
     ] {
         let again = Refresh::any_tenant(&plaintext, |_| async { true })
+            .without_device_check()
             .run(&store, cfg, &rng, now())
             .await;
         assert!(
@@ -140,21 +150,23 @@ async fn a_non_rotating_client_keeps_its_token_across_a_pepper_rotation() {
 async fn replaying_a_rotated_out_retired_pepper_token_is_still_reuse() {
     let store = store();
     let rng = MockRng::new(14);
-    let plaintext = issue_under(&peppered(b"old"), &store, &rng).await;
-    let config = rotated_to(b"new", b"old");
+    let plaintext = issue_under(&peppered(OLD_PEPPER), &store, &rng).await;
+    let config = rotated_to(NEW_PEPPER, OLD_PEPPER);
 
     let (_, next) = Refresh::any_tenant(&plaintext, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, now())
         .await
         .expect("first use");
     let (next_plain, _) = next.expect("child");
 
     let replay = Refresh::any_tenant(&plaintext, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, now())
         .await;
     assert!(matches!(replay, Err(RefreshError::Revoked)), "{replay:?}");
     let child = store
-        .find_token(&hash_token(&next_plain, Some(b"new")))
+        .find_token(&hash_token(&next_plain, Some(NEW_PEPPER)))
         .await
         .unwrap()
         .expect("child row");
@@ -165,14 +177,14 @@ async fn replaying_a_rotated_out_retired_pepper_token_is_still_reuse() {
 async fn logout_finds_a_token_on_the_retired_pepper() {
     let store = store();
     let rng = MockRng::new(15);
-    let plaintext = issue_under(&peppered(b"old"), &store, &rng).await;
-    let config = rotated_to(b"new", b"old");
+    let plaintext = issue_under(&peppered(OLD_PEPPER), &store, &rng).await;
+    let config = rotated_to(NEW_PEPPER, OLD_PEPPER);
 
     revoke_refresh_token(&plaintext, &store, &config)
         .await
         .expect("found under the previous pepper");
     let row = store
-        .find_token(&hash_token(&plaintext, Some(b"old")))
+        .find_token(&hash_token(&plaintext, Some(OLD_PEPPER)))
         .await
         .unwrap()
         .expect("row");
@@ -183,10 +195,11 @@ async fn logout_finds_a_token_on_the_retired_pepper() {
 async fn a_status_checked_refresh_also_reads_the_retired_pepper() {
     let store = store();
     let rng = MockRng::new(16);
-    let plaintext = issue_under(&peppered(b"old"), &store, &rng).await;
-    let config = rotated_to(b"new", b"old");
+    let plaintext = issue_under(&peppered(OLD_PEPPER), &store, &rng).await;
+    let config = rotated_to(NEW_PEPPER, OLD_PEPPER);
 
     let (_, next) = Refresh::any_tenant(&plaintext, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, now())
         .await
         .expect("refresh");
@@ -205,23 +218,25 @@ async fn a_token_hashed_without_a_pepper_moves_to_the_new_one_through_the_unkeye
 
     let config = RefreshTokenConfig {
         previous_hash_pepper: Some(PreviousPepper::Unkeyed),
-        ..peppered(b"new")
+        ..peppered(NEW_PEPPER)
     };
     let (_, next) = Refresh::any_tenant(&plaintext, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, now())
         .await
         .expect("the unkeyed hash is accepted as the previous one");
     let (next_plain, _) = next.expect("a replacement token");
     assert!(
         store
-            .find_token(&hash_token(&next_plain, Some(b"new")))
+            .find_token(&hash_token(&next_plain, Some(NEW_PEPPER)))
             .await
             .unwrap()
             .is_some(),
         "the replacement is stored under the current pepper"
     );
     Refresh::any_tenant(&next_plain, |_| async { true })
-        .run(&store, &peppered(b"new"), &rng, now())
+        .without_device_check()
+        .run(&store, &peppered(NEW_PEPPER), &rng, now())
         .await
         .expect("no previous pepper needed any more");
 }
@@ -232,7 +247,8 @@ async fn without_the_unkeyed_marker_a_new_pepper_loses_an_unkeyed_token() {
     let rng = MockRng::new(14);
     let plaintext = issue_under(&test_config(), &store, &rng).await;
     let result = Refresh::any_tenant(&plaintext, |_| async { true })
-        .run(&store, &peppered(b"new"), &rng, now())
+        .without_device_check()
+        .run(&store, &peppered(NEW_PEPPER), &rng, now())
         .await;
     assert!(matches!(result, Err(RefreshError::NotFound)));
 }
@@ -246,7 +262,7 @@ fn the_unkeyed_marker_needs_a_current_pepper_and_prints_without_bytes() {
     assert!(config.validate().is_err());
     let keyed = RefreshTokenConfig {
         previous_hash_pepper: Some(PreviousPepper::Unkeyed),
-        ..peppered(b"new")
+        ..peppered(NEW_PEPPER)
     };
     assert_eq!(keyed.validate(), Ok(()));
     assert!(format!("{keyed:?}").contains("previous_hash_pepper: Some(Unkeyed)"));
@@ -256,7 +272,7 @@ fn the_unkeyed_marker_needs_a_current_pepper_and_prints_without_bytes() {
 fn an_empty_previous_pepper_is_refused_and_both_peppers_are_redacted() {
     let config = RefreshTokenConfig {
         previous_hash_pepper: Some(PreviousPepper::keyed(Vec::new())),
-        ..peppered(b"new")
+        ..peppered(NEW_PEPPER)
     };
     assert!(config.validate().is_err());
 
@@ -283,10 +299,15 @@ mod device_bound {
             let store = store();
             let rng = MockRng::new(seed);
             let devices = MemoryDeviceStore::new();
-            let plaintext =
-                issue_bound_under(&peppered(b"old"), &store, &rng, Some("fp"), Some(laptop()))
-                    .await;
-            let config = rotated_to(b"new", b"old");
+            let plaintext = issue_bound_under(
+                &peppered(OLD_PEPPER),
+                &store,
+                &rng,
+                Some("fp"),
+                Some(laptop()),
+            )
+            .await;
+            let config = rotated_to(NEW_PEPPER, OLD_PEPPER);
 
             // A wrong device string is still a mismatch.
             let other = refresh_on(
@@ -320,12 +341,12 @@ mod device_bound {
             let (next_plain, child) = next.expect("a replacement token");
             assert_eq!(
                 child.device_info.as_deref(),
-                Some(device_binding::bind("fp", Some(&laptop()), Some(b"new")).as_str()),
+                Some(device_binding::bind("fp", Some(&laptop()), Some(NEW_PEPPER)).as_str()),
                 "{path}: the child is bound under the current pepper"
             );
 
             // The previous pepper is retired; the child still refreshes.
-            let only_new = peppered(b"new");
+            let only_new = peppered(NEW_PEPPER);
             let again = refresh_on(
                 path,
                 &next_plain,
@@ -374,12 +395,14 @@ mod device_bound {
             "plain" => {
                 Refresh::new(plaintext, &fixture_tenant(), |_| async { true })
                     .device_info(device_info)
+                    .without_device_check()
                     .run(store, config, rng, now())
                     .await
             }
             "status" => {
                 Refresh::any_tenant(plaintext, |_| async { true })
                     .device_info(device_info)
+                    .without_device_check()
                     .run(store, config, rng, now())
                     .await
             }
@@ -420,25 +443,26 @@ mod device_bound {
 async fn a_non_rotating_token_moved_to_the_new_pepper_keeps_its_expiry() {
     let store = store();
     let rng = MockRng::new(15);
-    let plaintext = issue_under(&peppered(b"old"), &store, &rng).await;
+    let plaintext = issue_under(&peppered(OLD_PEPPER), &store, &rng).await;
     let issued = store
-        .find_token(&hash_token(&plaintext, Some(b"old")))
+        .find_token(&hash_token(&plaintext, Some(OLD_PEPPER)))
         .await
         .unwrap()
         .expect("issued row");
 
     let config = RefreshTokenConfig {
         rotation: false,
-        ..rotated_to(b"new", b"old")
+        ..rotated_to(NEW_PEPPER, OLD_PEPPER)
     };
-    let later = now() + Duration::days(10);
+    let later = now().plus(SignedDuration::days(10));
     Refresh::any_tenant(&plaintext, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, later)
         .await
         .expect("refresh");
 
     let moved = store
-        .find_token(&hash_token(&plaintext, Some(b"new")))
+        .find_token(&hash_token(&plaintext, Some(NEW_PEPPER)))
         .await
         .unwrap()
         .expect("the same token is stored under the current pepper");

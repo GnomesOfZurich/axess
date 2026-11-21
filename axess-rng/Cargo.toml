@@ -6,7 +6,6 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 documentation = "https://docs.rs/axess-rng"
 readme = "README.md"
 description = """
@@ -22,6 +21,9 @@ exclude = ["tests/", "benches/"]
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
 
 [features]
 # Always-on test fixtures (`MockRng`) live under [`testing`]. Adopters

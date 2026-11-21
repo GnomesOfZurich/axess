@@ -5,8 +5,12 @@ use crate::authn::event::AuthEvent;
 use crate::authn::types::{Throttle, ThrottleState, ThrottleSubject};
 
 /// Wraps an [`IdentityLookup`] backend with a no-op [`IdentityAuthnLog`]
-/// impl on top, so it satisfies the `AuthnService::new` bound without
-/// the adopter writing audit + lockout impls.
+/// impl on top, for code of your own that is bounded on
+/// [`IdentityAuthnLog`] and has only a lookup to give.
+///
+/// It implements those two tiers and not [`IdentityAdmin`], so it is not an
+/// [`IdentityStore`] and cannot be the store of an `AuthnService`, which
+/// needs all three tiers.
 ///
 /// **Semantics, read carefully before reaching for this:**
 ///
@@ -24,12 +28,12 @@ use crate::authn::types::{Throttle, ThrottleState, ThrottleSubject};
 ///
 /// Appropriate uses:
 ///
-/// - Integration tests / fixtures that don't exercise the lockout or
-///   audit paths.
+/// - Tests and fixtures of code bounded on [`IdentityAuthnLog`] that don't
+///   exercise the lockout or audit paths.
 /// - Read-replica integrations where audit goes through a separate
 ///   pipeline (e.g. database CDC, a sidecar log forwarder).
-/// - Prototypes that want login working before the audit table is
-///   designed.
+/// - Code of your own on the middle tier, written before the audit table
+///   is designed.
 ///
 /// **Production deployments must override `IdentityAuthnLog` directly.**
 /// A failure counter that never accumulates (every failed attempt answered
@@ -148,22 +152,22 @@ impl<L: IdentityLookup> IdentityAuthnLog for NoopAuthnLog<L> {
 
     async fn reserve_attempt(
         &self,
-        _user_id: &UserId,
-        _policy: &crate::authn::types::LockoutPolicy,
+        _: &UserId,
+        _: &crate::authn::types::LockoutPolicy,
     ) -> Result<Option<u32>, Self::Error> {
         // Nothing is stored, so there is no count to cross: every guess is
         // granted, as every failure is counted as zero.
         Ok(Some(0))
     }
 
-    async fn release_attempt(&self, _user_id: &UserId) -> Result<(), Self::Error> {
+    async fn release_attempt(&self, _: &UserId) -> Result<(), Self::Error> {
         Ok(())
     }
 
     async fn failed_attempts(
         &self,
-        _user_id: &UserId,
-    ) -> Result<(u32, Option<chrono::DateTime<chrono::Utc>>), Self::Error> {
+        _: &UserId,
+    ) -> Result<(u32, Option<axess_clock::Timestamp>), Self::Error> {
         Ok((0, None))
     }
 
@@ -178,7 +182,7 @@ impl<L: IdentityLookup> IdentityAuthnLog for NoopAuthnLog<L> {
 
     async fn throttle_state(
         &self,
-        _key: &ThrottleSubject,
+        _: &ThrottleSubject,
     ) -> Result<Option<ThrottleState>, Self::Error> {
         // Nothing is stored, so no delay is ever earned: the throttle is off
         // with the lockout.
@@ -188,7 +192,7 @@ impl<L: IdentityLookup> IdentityAuthnLog for NoopAuthnLog<L> {
     async fn record_throttle_failure(
         &self,
         key: &ThrottleSubject,
-        _throttle: &Throttle,
+        _: &Throttle,
     ) -> Result<(), Self::Error> {
         tracing::trace!(
             target: "axess::authn::noop_log",
@@ -198,14 +202,14 @@ impl<L: IdentityLookup> IdentityAuthnLog for NoopAuthnLog<L> {
         Ok(())
     }
 
-    async fn clear_throttle(&self, _key: &ThrottleSubject) -> Result<(), Self::Error> {
+    async fn clear_throttle(&self, _: &ThrottleSubject) -> Result<(), Self::Error> {
         Ok(())
     }
 
     async fn record_last_login(
         &self,
-        _user_id: &UserId,
-        _at: chrono::DateTime<chrono::Utc>,
+        _: &UserId,
+        _: axess_clock::Timestamp,
     ) -> Result<(), Self::Error> {
         // The inner store is an `IdentityLookup` only: there is no
         // last-login column to forward to.

@@ -33,7 +33,7 @@ axess/              Facade crate. Re-exports the public API from
 
 axess-core/         Orchestrator. Session state machine, AuthnService,
                     AuthzStore (Cedar), middleware (csrf / ratelimit /
-                    request_id / trace_id / service_secret), session storage
+                    request_id / trace_context / service_secret), session storage
                     backends, principal abstraction, workload identity,
                     LocalIdp, OBO delegated access, store unification.
 
@@ -55,7 +55,9 @@ axess-factors/      Verifiers. Every per-credential algorithm:
 axess-cache/        ClockTtlCache. Asymmetric defaults: cache authz
                     decisions, do not cache authn.
 
-axess-clock/        Clock trait + SystemClock + testing::MockClock.
+axess-clock/        Clock trait + SystemClock + testing::MockClock,
+                    and the time types every crate holds: Timestamp,
+                    SignedDuration, Until, UtcDate, on std alone.
                     DST foundation; production code injects the trait.
 
 axess-rng/          SecureRng trait + SystemRng + testing::MockRng.
@@ -65,7 +67,8 @@ axess-identity/     Typed IDs (UserId, TenantId, WorkloadId,
                     Principal enum). Strict UUID parsing. Shared
                     across every other crate.
 
-axess-events/       Event types and (forthcoming) async sinks.
+axess-events/       Event types, the `EventSink` trait and the two
+                    standard sinks (`NoopEventSink`, `LogAndSwallow`).
 
 axess-strings/      Shared string newtypes / helpers.
 
@@ -85,6 +88,9 @@ examples/
   oauth/              OIDC login; --bin social for plain OAuth 2.0
   authz/              Cedar Policy authorization
   fapi/               FAPI 2.0 (PAR, DPoP, JARM, RP-initiated logout)
+  fido2/              FIDO2 / WebAuthn with browser-side JavaScript:
+                      registration, login, cross-device authentication,
+                      and a step-up asked for by a Cedar policy
   workload-identity/  machine-caller recipes (GitHub Actions, Kubernetes,
                       shared secrets); --bin local-idp, an in-process IdP
 ```
@@ -92,7 +98,7 @@ examples/
 A new example is a section of the crate its reader already uses, or a
 binary in it, before it is a crate of its own: a crate earns its place
 only when it needs setup the others do not (an outside IdP, a Keycloak
-realm).
+realm, a page that talks to an authenticator).
 
 axess-core's `src/` layout (top-level modules):
 
@@ -121,7 +127,13 @@ testing/     DST mocks + fixtures (always-on)
 - `tracing` for logging. `#[tracing::instrument]` on public async methods. Skip sensitive fields.
 - Prefer traits for abstraction over concrete types.
 - All code supports DST: depend on traits, not concrete implementations.
-- **No lint suppressions.** Never use `_` prefixes on unused variables, `#[allow(...)]`, `#[allow(clippy::...)]`, or equivalent. Fix the root cause: remove unused params/fields/code, extract structs for too-many-args, etc.
+- **Time is axess-clock's.** A reading of the clock is a `Timestamp`, taken from an injected `Clock`; the difference of two readings is a `SignedDuration`; a configured lifetime, window, grace or tolerance is a `std::time::Duration`, so it cannot be negative; an end that a lifetime may carry past the range is an `Until`, computed with `Until::after`; a calendar day is a `UtcDate`. Arithmetic is checked (`checked_add`, `checked_sub`, `since`), with no operator that could panic. No public item names chrono or another time library, and no conversion to one is offered: `scripts/check-chrono-edges.sh` admits chrono only as a private dependency of `axess-factors` under `oauth`, where `openidconnect` hands it a time, and as axess-clock's dev-dependency.
+- **No lint suppressions.** Never use `_` prefixes on names, `#[allow(...)]`, `#[allow(clippy::...)]`, `#[expect(...)]`, or equivalent. Fix the root cause: remove unused params/fields/code, extract structs for too-many-args, etc. Three forms are the rule where a name has no use:
+  - A parameter a trait fixes and the implementation does not read is a bare `_` (`fn from_request_parts(parts: &mut Parts, _: &S)`). In the trait's own declaration the parameter keeps its plain name, and a default body that reads none of them says so in one line: `let _ = (code, state);`.
+  - A value held for its `Drop` (a lock guard, a mock server, a subscription) is a plain name, ended by `drop(name)` at the point where what it guards must end. A field held for its `Drop` is ended by the `Drop` of the struct that holds it.
+  - Anything else unused is removed, or matched by a bare `_` in a pattern or a closure whose shape the caller fixes (`let (url, _) = ...`, `|_| ...`).
+  `scripts/check-underscore-names.sh` refuses an underscore-prefixed name in every Rust file and doc example; there is no allowlist.
+- **Neutral sample data.** Tests, examples, doc examples, the book and scripts use the RFC 2606 domains (`example.org`, `example.com`, `example.net`), the tenant `acme` and the client `example-api`, and name no company or person. `scripts/check-owner-names.sh` refuses the publisher's name in every text file git lists outside `scripts/owner-name-exemptions.txt`, whose every entry is a path, a pattern and its reason.
 - **No `#[non_exhaustive]`.** Bump semver instead. CI guard (`ban_non_exhaustive`) rejects PRs that add it.
 - **No `cargo-mutants` markers** in committed source. CI guard (`ban_cargo_mutants_markers`) rejects the literal `~ changed by cargo-mutants ~` string in first-party `*.rs` files. Use `scripts/mutants.sh` to run mutations in an isolated git worktree.
 
@@ -180,7 +192,7 @@ Authentication progresses through typed states: `Guest → Identifying → Authe
 Vocabulary for the load → finalize → cookie pipeline and the typed `AuthState` machine; match this shape when extending or reviewing session-related code:
 
 - **`load_session` / `finalize_session` / `build_set_cookie`**; three `pub(crate)` free helpers in `session/layer.rs` that compose `SessionService::call()`. The free-helper shape is deliberate; no `SessionLifecycle` struct or `LifecycleRequest` trait wraps them.
-- **`LoadOutcome` / `FinalizeOutcome`**; `pub(crate)` outcome types in `session/layer.rs`. The invariant "handler never runs under a client-supplied id we don't trust the data behind" lives in `existing_id: Option<SessionId>` (`Some` only when fully trusted).
+- **`LoadOutcome` / `FinalizeOutcome`**; `pub(crate)` outcome types in `session/layer.rs`. The invariant "handler never runs under a client-supplied id we don't trust the data behind" lives in `stored: bool` (`true` only when fully trusted).
 - **`SessionCodec`**; `pub(crate)` struct in `session/storage/session_codec.rs` owning MessagePack serialization + optional AES-256-GCM envelope via `SessionCrypto`. All three encrypted backends (SQLite, Postgres, Valkey) share this one codec contract.
 - **`AuthState` transition methods**; `pub(crate)` inherent methods on `AuthState` own the pure state mutation; `AuthSession`'s async wrappers hold the `RwLock`, delegate to those, and dispatch orchestration on `AdvanceOutcome { NotApplicable, StillAuthenticating, Completed }`.
 
@@ -216,9 +228,9 @@ All tests deterministic and reproducible, no flaky timing dependencies.
 
 ## Security Principles
 
-- **No `unsafe` code.** `#![forbid(unsafe_code)]` is declared at the root of all eleven published crates, with no exceptions (the `examples/*` members do not declare it). `axess-strings` was the last holdout: its `repr.rs` held an Umbra-style union behind `#![deny(unsafe_code)]` plus a scoped allow, and was replaced with a safe enum in 0.6.0. A crate that needs `unsafe` needs a decision first, not an allow.
+- **No `unsafe` code.** `#![forbid(unsafe_code)]` is declared at the root of all eleven published crates, with no exceptions (the `examples/*` members do not declare it). `axess-strings` holds its compact representation in a safe enum, not a union. A crate that needs `unsafe` needs a decision first, not an allow.
 - **Constant-time comparisons** (`subtle::ConstantTimeEq`): HMAC cookie verification, TOTP/HOTP codes, OAuth CSRF state, session fingerprint, refresh token device binding.
-- **Secret zeroization**: password hashes (`ZeroizedString`), TOTP/HOTP secrets (`Zeroizing`), signing key (`Drop` zeroing).
+- **Secret zeroization**: password hashes (`ZeroizedString`), TOTP/HOTP secrets (`Zeroizing`), signing and encryption keys (`Zeroizing`).
 - **Timing equalization**: `begin_login` runs dummy queries on the unknown-user path so its store calls match a known user's, but it is identifier-first: a known account answers `FactorRequired` (and names the factor kind) where an unknown one answers `InvalidCredentials`, so used alone it tells a caller whether an account exists. A combined username-and-password form uses `login_with_password`, which answers every path alike and spends one Argon2id run on each.
 - **Refresh token security**: SHA-256 hash-only storage, family tracking (reuse of rotated token revokes entire family); `device` feature adds cascade revocation across refresh families.
 - **Session hardening**: ID cycling (fixation prevention), HMAC fingerprint binding, `max_custom_bytes` DoS limit (64 KiB).
@@ -229,27 +241,41 @@ All tests deterministic and reproducible, no flaky timing dependencies.
 
 ### axess-core (default = `authz`, `device`, `default-error-response`, `serde`)
 
+Every feature of the crate has a row; `scripts/check-docsrs-features.sh` holds this table, the one in `axess-core/src/lib.rs` and the `axess-factors` table below to the manifests.
+
 | Feature | What it enables |
 |---------|----------------|
 | `authz` | Cedar Policy authorization (default) |
 | `device` | Device identity ladder + cascade revoke (default) |
+| `device-keys` | Device keys: sessions and devices held to a key the client cannot export (`axess_core::device_key`; pulls `axess-factors/key-proof`, needs a `jwt-*` backend) |
+| `default-error-response` | Built-in `IntoResponse` mapping for `AuthnError` (default) |
+| `serde` / `rkyv` / `sqlx` | Implementations on the typed ids, forwarded to `axess-identity` (`serde` default; the SQL backends switch `sqlx` on) |
 | `memory` | In-memory session store + registry |
-| `admin` | Administrative user/tenant management APIs |
-| `accept_client_id` | `X-Client-ID` header extraction |
-| `request_id` | `X-Request-Id` middleware |
+| `testing` | Test doubles + fixtures (implies `memory`); refused in a release build without `allow-testing-in-release` |
+| `allow-testing-in-release` | Named opt-out for the release-build guard on `testing` |
+| `accept-client-id` | With `request-id`: a well-formed request id the client sent is kept |
+| `request-id` | `X-Request-Id` middleware |
 | `service-secret` | Shared-secret check for machine callers that cannot hold a key (`ServiceSecretLayer::signed` preferred, `bearer`/`header` weakest); weaker than `jwt`/`mtls` |
-| `trace_id` | W3C Trace Context (`traceparent`) middleware |
-| `sqlite` / `postgres` / `valkey` | Encrypted session stores (AES-256-GCM) |
+| `trace-context` | W3C Trace Context (`traceparent`) middleware |
+| `sqlite` / `postgres` / `mysql` / `valkey` | Encrypted session stores (AES-256-GCM) |
+| `sqlite-unbundled` | The `sqlite` stores linked to the system's SQLite; enable it in place of `sqlite` |
+| `valkey-cache` | Valkey-backed Cedar entity cache shared across replicas (implies `authz`, `valkey`) |
+| `audit-archive-fs` | `FilesystemAuditArchiver`, a filesystem-backed reference `AuditArchiver` |
 | `fido2` | WebAuthn passkeys (pulls `axess-factors/fido2`) |
 | `ldap` | LDAP bind (pulls `axess-factors/ldap`) |
 | `oauth` | OAuth 2.0 / OIDC inbound (pulls `axess-factors/oauth`) |
 | `fapi` | An alias for `oauth`, which carries FAPI 2.0 (PAR, DPoP, JARM) |
 | `mtls` | mTLS verifier (pulls `axess-factors/mtls`) |
+| `jwt` | JWT verification primitives + `WorkloadResolver`; needs a backend beside it |
+| `jwt-aws-lc` / `jwt-rust-crypto` | `jwt` verifying with aws-lc-rs, or with RustCrypto: exactly one |
 | `jwt-svid` | SPIFFE JWT-SVID resolver (spec-bound) |
 | `social` | Plain-OAuth-2.0 user login (`SocialProvider`; weaker than OIDC, off by default) |
 | `outbound-oauth` / `outbound-mtls` | Outbound client-credential flows |
+| `client-assertion-rsa` | RSA client keys for `private_key_jwt` wherever the signature may run in `rsa` 0.9 (RUSTSEC-2023-0071): on `jwt-rust-crypto`, and where a crypto provider other than axess's aws-lc install is in place |
 | `aws-sts` / `gcp-wif` / `azure-fic` / `cloud-sts` | Cloud workload-identity exchange |
-| `local-idp` | In-process IdP (mints workload JWTs against an adopter key store) |
+| `local-idp` | In-process IdP (mints workload JWTs against an adopter key store); ES256 keys, no `rsa` crate |
+| `local-idp-rsa` | RSA keys for the local IdP (compiles `rsa` 0.9, RUSTSEC-2023-0071) |
+| `spire` | SPIFFE Workload API client (`SpireClient`): SVIDs and trust bundles from a local SPIRE agent, kept current; in no umbrella |
 | `workload-id` | Umbrella for the workload-identity feature bundle |
 | `delegated-stored` / `delegated-exchange` / `delegated-stored-encrypted` / `delegated` | OBO access |
 | `ws` | WebSocket helpers |
@@ -271,12 +297,18 @@ All tests deterministic and reproducible, no flaky timing dependencies.
 | `jwt-aws-lc` | `jwt` verifying with aws-lc-rs: FIPS-capable, needs a C toolchain |
 | `jwt-rust-crypto` | `jwt` verifying with RustCrypto: pure Rust, builds anywhere |
 | `jwt-svid` | SPIFFE JWT-SVID resolver (pulls `jwt`; spec-bound; mandatory `spiffe://` URI in `sub`) |
+| `key-proof` | Device-key proof verifier, browser draft and RFC 9449 shapes (pulls `jwt`) |
 | `oauth` | Inbound OAuth ceremony (pulls `oidc` + `jwt`) |
 | `fapi` | An alias for `oauth` |
 | `social` | Plain-OAuth-2.0 user login (`SocialProvider`; see module docs for the weaker security model vs OIDC) |
 | `bearer` | Bearer-token axum extractor |
 | `outbound-oauth` | Outbound OAuth client (pulls `jwt`) |
+| `client-assertion-rsa` | Lets a `private_key_jwt` client sign with an RSA key where the signature may run in `rsa` 0.9 (RUSTSEC-2023-0071): on `jwt-rust-crypto`, or where a crypto provider was installed before axess installed aws-lc; refused there without it |
 | `federation` | Umbrella over all federation + adjacent features |
+| `http-body` | Bounded reads of remote HTTP response bodies (`axess_factors::http_body`) |
+| `egress` | The screen on where the server may connect for a URL it was handed (`axess_factors::egress`) |
+| `testing` | Test doubles (`oauth::MockOAuthProvider`); refused in a release build without `allow-testing-in-release` |
+| `allow-testing-in-release` | Named opt-out for the release-build guard on `testing` |
 
 The generic `axess_factors::federation::workload::WorkloadResolver` is gated on `jwt` and covers every non-SPIFFE JWT-bearer workload-identity flow (GitHub Actions, k8s SA, GitLab CI, Okta, Azure AD, Auth0, `LocalIdP`, …) via an adopter-supplied claim parser + mapping closure. There are deliberately no per-company features; see `examples/workload-identity/` for ready-made recipes.
 
@@ -287,17 +319,19 @@ The generic `axess_factors::federation::workload::WorkloadResolver` is gated on 
 | Minimal authn | `memory` |
 | OAuth + FIDO2 | `memory`, `oauth`, `fido2` |
 | Workload identity | `workload-id`, `local-idp` |
+| Workload on a SPIRE node | `spire`, `outbound-mtls`, `jwt-svid` |
 | OBO mailbox integration | `delegated-stored`, `delegated-stored-encrypted` |
-| Testing/DST | `memory`, `admin` |
+| Testing/DST | `testing` (implies `memory`) |
 
 ### Choosing features (no `full` umbrella)
 
 axess intentionally ships **no `full` feature**. Pick the features your deployment actually uses:
 
 - **Exactly one session backend.** `sqlite`, `postgres`, `mysql`, or `valkey`; never two. They're mutually exclusive at the deployment level, so an umbrella that bundled them would compile dead code, balloon link size, and tempt accidental cross-backend coupling.
-- **Capability features stack additively.** `oauth`, `fido2`, `ldap`, `mtls`, `ws`, `request-id`, `trace-id`, `workload-id` (which is itself an additive umbrella over `jwt + jwt-svid + mtls + outbound-oauth + outbound-mtls`), `delegated` (over `delegated-stored + delegated-exchange`). Enable what you use.
+- **Capability features stack additively.** `oauth`, `fido2`, `ldap`, `mtls`, `ws`, `request-id`, `trace-context`, `workload-id` (which is itself an additive umbrella over `jwt + jwt-svid + mtls + outbound-oauth + outbound-mtls`), `delegated` (over `delegated-stored + delegated-exchange`). Enable what you use.
 - **`testing` and `memory` stay out of production builds.** They live behind named features specifically so they can't sneak into a release.
-- **For CI, docs.rs, local clippy:** use `cargo … --all-features`. That's the supported "compile everything" path and is what every workspace-wide script in `scripts/` does already.
+- **For CI and local clippy:** use `cargo … --all-features`. That's the supported "compile everything" path and is what every workspace-wide script in `scripts/` does already. It switches `sqlite-unbundled` on, so the build needs libclang (bindgen); the CI jobs check the runner for it first, in `.github/actions/build-prerequisites`.
+- **For docs.rs:** `all-features = true`, except in a crate with a feature docs.rs must not build (`sqlite-unbundled` in `axess-core` and `axess`), which lists its features one by one. `./scripts/check-docsrs-features.sh` fails on a feature that is in neither the list nor its named exclusions.
 
 ## Testing Expectations
 
@@ -317,13 +351,16 @@ Integration tests require a running Valkey instance at `redis://localhost:6379`.
 
 ### Documentation gates
 
-Five of them, each covering something the others cannot see. All are
-sub-second except the rustdoc build, and all run in `test-all.sh`,
-`release-preflight.sh` and CI.
+Six of them, each covering something the others cannot see. All are
+sub-second except the two documentation builds. The first five run in
+`test-all.sh`, `release-preflight.sh` and CI; the docs.rs build needs the
+dated nightly of `nightly-toolchain.toml` and runs in
+`release-preflight.sh` and CI's Docs.rs Build job.
 
 | script | reads | catches |
 |---|---|---|
 | `check-doc-links.sh` | rustdoc, `-D warnings` | broken intra-doc links in Rust source |
+| `check-docsrs-build.sh` | each published crate's docs, built on the pinned nightly with its docs.rs features and `--cfg docsrs` | documentation that builds everywhere but on docs.rs: a `doc(cfg(..))` in a crate that does not switch `doc_cfg` on in its root |
 | `check-doc-identifiers.sh` | the book's prose and its fenced blocks | a chapter naming a type, method, variant or feature the workspace does not have: 108 of the book's 112 Rust blocks are ```rust,ignore, so nothing compiles them |
 | `check-markdown-links.sh` | every tracked `.md` | a Markdown link, relative **or** an absolute `github.com/.../blob/...` URL into this repo, pointing at a file that does not exist |
 | `check-doc-versions.sh` | version and MSRV snippets in prose | a documented `axess = { version = "..." }` that has drifted from the workspace |
@@ -342,19 +379,22 @@ behavioural change.
 
 ### Test-module layout
 
-Inline `#[cfg(test)] mod tests { … }` blocks inside production files are fine when small. Once a block grows past **~200 LoC**, move it to a sibling file:
+Tests live beside the module they test, in a sibling file declared with `#[cfg(test)] mod <name>;` or in the crate's `tests/` directory. An inline `#[cfg(test)] mod <name> { ... }` block in a production file is allowed while its body is at most 200 lines.
+
+A block that grows past the limit moves to a sibling file:
 
 - For a leaf file `foo.rs` with one inline test mod, create `foo/tests.rs` and replace the inline block with `#[cfg(test)] mod tests;`.
 - For multiple inline test mods (e.g. `mod foo_tests`, `mod bar_tests`), extract each to its own sibling under `foo/`: `foo/foo_tests.rs`, `foo/bar_tests.rs`.
-- For integration-test binaries under `tests/`, prefer topic-named sibling files (one binary per topic) over deeply-nested inner mods, capping each file at the same ~200-LoC threshold per logical area.
+- For integration-test binaries under `tests/`, prefer topic-named sibling files (one binary per topic) over deeply-nested inner mods. The gate does not measure files under `tests/`.
+- Test support is used whole by every binary that compiles it, so nothing in it needs `#[allow(dead_code)]`. What many binaries share in parts is public in `axess_core::testing::fixtures`. A module under `tests/NAME/mod.rs` is for a helper every binary that declares it calls (`hotp_code`). Topics that share a larger fixture are one binary, a directory with a `main.rs` and a module per topic (`tests/impersonation/`), where the compiler reports a part of the fixture no topic uses.
 
 Rationale: production-file size grows linearly with the feature coverage of its tests, drowning the actual logic. A 1000-LoC file with 700 LoC of inline tests is harder to navigate than 300 LoC of prod plus a separate test sibling.
 
-Enforced, not remembered: `./scripts/check-inline-tests.sh` fails on any block over the limit, and `./scripts/release-preflight.sh` runs it among its cheap early gates, ahead of clippy and the test run. Note it measures a **block**, not a file: `session/layer/signing.rs` is ~690 lines across three mods of 98/118/191 and is compliant. Files that already are test siblings (`tests.rs`, anything under `tests/`) are exempt: they are where tests were moved to, not production files drowning in them.
+Enforced, not remembered: `./scripts/check-inline-tests.sh` fails on any block over the limit, and on a copy of the rule (here or in `CONTRIBUTING.md`) that no longer reads as the gate states it; `./scripts/release-preflight.sh` runs it among its cheap early gates, ahead of clippy and the test run. Note it measures a **block**, not a file: `session/layer/signing.rs` is ~690 lines across three mods of 98/118/191 and is compliant. Files that already are test siblings (`tests.rs`, anything under `tests/`) are exempt: they are where tests were moved to, not production files drowning in them.
 
 ### File and function size
 
-Production files stay under **800 lines** and production functions under **150 lines**. Test code (`tests.rs`, `tests/`, `benches/`, `examples/`, `testing/`, files reached only through `#[cfg(test)] mod name;`, and inline test blocks) is not counted.
+Production files stay under **800 lines** and production functions under **150 lines**. Test code (`tests.rs`, `tests/`, `benches/`, `examples/`, `testing/`, files reached only through `#[cfg(test)] mod name;`, and inline test blocks) is not counted. Every shell and Python script is held to the same limits, its crafted cases included: a gate's cases file grows with every form the gate learns, so it splits like any other file (`scripts/check-workflow-pins-cases/`).
 
 Enforced against a baseline: `./scripts/check-file-sizes.sh` fails on any offender that is not listed in `scripts/file-size-baseline.txt` and on any listed offender that grew; `./scripts/release-preflight.sh` runs it beside the inline-test gate. The baseline lists the offenders that predate the gate, so split them rather than raise it: when one shrinks or goes under the limit, run `./scripts/check-file-sizes.sh --bless` so the recorded size only goes down. The gate prints how many files and functions it measured and refuses to report clean when it measured none. A split keeps every public path working with `pub use` at the old path.
 
@@ -367,7 +407,7 @@ Enforced against a baseline: `./scripts/check-file-sizes.sh` fails on any offend
 5. **Session data versioning**; `SessionData` auto-migrates across schema changes without invalidating sessions.
 6. **Refresh token families**; reuse of a rotated-out token revokes the entire family (theft detection).
 7. **Three-tier scope hierarchy** (Global, Tenant, User); policies, factors, and methods configurable at each level.
-8. **No unsafe in production paths**; `#![forbid(unsafe_code)]` on every crate except `axess-strings`, which scopes its localized exception in one file.
+8. **No unsafe in production paths**; `#![forbid(unsafe_code)]` on every published crate, `axess-strings` included.
 9. **axess-core = orchestrator, axess-factors = verifiers** (boundary). OBO (on-behalf-of) lives under `axess-core/src/delegated/`. axess-cache = TTL caching. axess-clock / axess-rng = DST foundations.
 10. **Defaults run zero-infra**; infra backends are opt-in features.
 

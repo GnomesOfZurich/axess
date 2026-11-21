@@ -132,7 +132,7 @@ async fn a_reload_on_one_store_reaches_a_second_store_through_valkey() {
     let b = store("doc1", coordinator(&url, &prefix).await);
     let source = Arc::new(Source(Mutex::new(permit("doc1"))));
     // A long poll: only the notice can make B move within the test.
-    let _follower = b
+    let follower = b
         .follow_reloads(source.clone(), Duration::from_secs(3600))
         .await
         .expect("follow");
@@ -148,9 +148,11 @@ async fn a_reload_on_one_store_reaches_a_second_store_through_valkey() {
         if allowed(&b, "doc2").await {
             assert!(!allowed(&b, "doc1").await);
             assert_eq!(a.policy_digest(), b.policy_digest());
+            drop(follower);
             return;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    drop(follower);
     panic!("the second store did not follow the notice within 3s");
 }

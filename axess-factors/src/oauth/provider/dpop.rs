@@ -141,13 +141,8 @@ pub(super) fn generate_dpop_proof_with_nonce(
     let payload_b64 = b64.encode(payload.to_string().as_bytes());
     let signing_input = format!("{header_b64}.{payload_b64}");
 
-    // The first jsonwebtoken sign or verify in a process fixes its crypto
-    // provider; under feature unification that first call must be ours,
-    // or the crate's own fallback panics on every later use.
-    crate::jwt::ensure_crypto_provider();
-    let signature =
-        jsonwebtoken::crypto::sign(signing_input.as_bytes(), &encoding_key, Algorithm::ES256)
-            .map_err(|e| OAuthError::Config(format!("DPoP signing failed: {e}")))?;
+    let signature = crate::jwt::sign(signing_input.as_bytes(), &encoding_key, Algorithm::ES256)
+        .map_err(|e| OAuthError::Config(format!("DPoP signing failed: {e}")))?;
 
     let proof_jwt = format!("{signing_input}.{signature}");
 

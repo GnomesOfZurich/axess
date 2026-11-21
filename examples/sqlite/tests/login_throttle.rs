@@ -4,8 +4,9 @@
 
 use axess::Clock;
 use axess::authn::{IdentityAuthnLog, TenantId, Throttle, ThrottleSubject, UserId};
+use axess_clock::Timestamp;
+use axess_clock::testing::Shift;
 use axess_example_sqlite::models::backend::{OurBackend, seed};
-use chrono::{DateTime, Utc};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
@@ -13,16 +14,17 @@ use std::sync::{Arc, Mutex};
 
 /// A clock the test moves by hand.
 #[derive(Clone)]
-struct MockClock(Arc<Mutex<DateTime<Utc>>>);
+struct MockClock(Arc<Mutex<Timestamp>>);
 
 impl MockClock {
-    fn advance(&self, by: chrono::Duration) {
-        *self.0.lock().unwrap() += by;
+    fn advance(&self, by: axess_clock::SignedDuration) {
+        let mut now = self.0.lock().unwrap();
+        *now = now.plus(by);
     }
 }
 
 impl Clock for MockClock {
-    fn now(&self) -> DateTime<Utc> {
+    fn now(&self) -> Timestamp {
         *self.0.lock().unwrap()
     }
 }
@@ -38,12 +40,13 @@ async fn backend() -> (OurBackend, MockClock, UserId, TenantId) {
         .expect("connect in-memory sqlite");
     sqlx::migrate!().run(&pool).await.expect("migrations");
     let clock = MockClock(Arc::new(Mutex::new(
-        DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        Timestamp::from_unix_seconds(1_700_000_000).unwrap(),
     )));
     seed(
         &clock,
         &pool,
-        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF"),
+        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF")
+            .with_clock(Arc::new(clock.clone())),
     )
     .await
     .expect("seed");
@@ -103,7 +106,7 @@ async fn a_failure_is_recorded_under_its_key_and_read_back() {
 
 #[tokio::test]
 async fn parallel_failures_are_all_counted() {
-    let (backend, _clock, user, tenant) = backend().await;
+    let (backend, _, user, tenant) = backend().await;
     let mut set = tokio::task::JoinSet::new();
     for _ in 0..12 {
         let backend = backend.clone();
@@ -128,7 +131,7 @@ async fn parallel_failures_are_all_counted() {
 
 #[tokio::test]
 async fn a_right_guess_clears_the_key() {
-    let (backend, _clock, user, tenant) = backend().await;
+    let (backend, _, user, tenant) = backend().await;
     let key = subject(&tenant, &user, 1);
     backend
         .record_throttle_failure(&key, &Throttle::default())
@@ -159,7 +162,7 @@ async fn a_stale_key_starts_over_and_stale_rows_are_deleted() {
         .await
         .unwrap();
     // Older than twice max_delay (128 s): as good as absent.
-    clock.advance(chrono::Duration::seconds(129));
+    clock.advance(axess_clock::SignedDuration::seconds(129));
     backend
         .record_throttle_failure(&key, &throttle)
         .await
@@ -176,4 +179,65 @@ async fn a_stale_key_starts_over_and_stale_rows_are_deleted() {
         .await
         .unwrap();
     assert_eq!(rows, 1);
+}
+
+/// A `max_delay` an operator set to an extreme value follows the library's
+/// reading of the bound it implies: a forget bound too long to represent,
+/// or too long to subtract from now, means rows are never swept and a key
+/// never starts over, and nothing panics. Each extreme is tried as
+/// `max_delay` and halved, so that the bound itself is the extreme.
+#[tokio::test]
+async fn a_forget_bound_too_long_for_a_date_never_sweeps_and_never_resets() {
+    use axess_testing::durations::extreme_durations;
+    let gap = axess_clock::SignedDuration::seconds(3_601);
+    for extreme in extreme_durations() {
+        for (shape, max_delay) in [
+            ("as max_delay", extreme.value),
+            ("halved", extreme.value / 2),
+        ] {
+            let (backend, clock, user, tenant) = backend().await;
+            let throttle = Throttle {
+                max_delay,
+                ..Throttle::default()
+            };
+            let key = subject(&tenant, &user, 1);
+            let other = subject(&tenant, &user, 2);
+            for _ in 0..3 {
+                backend
+                    .record_throttle_failure(&key, &throttle)
+                    .await
+                    .unwrap_or_else(|e| panic!("{} {shape}: {e}", extreme.name));
+            }
+            backend
+                .record_throttle_failure(&other, &throttle)
+                .await
+                .unwrap_or_else(|e| panic!("{} {shape}: {e}", extreme.name));
+            clock.advance(gap);
+            backend
+                .record_throttle_failure(&key, &throttle)
+                .await
+                .unwrap_or_else(|e| panic!("{} {shape}: {e}", extreme.name));
+            // A bound the gap exceeds forgets; one it cannot reach, or one
+            // no date can hold, keeps every row and every count.
+            let forgets = axess_clock::SignedDuration::try_from(throttle.forget_after())
+                .is_ok_and(|bound| bound < gap);
+            let state = backend.throttle_state(&key).await.unwrap().unwrap();
+            assert_eq!(
+                state.failures,
+                if forgets { 1 } else { 4 },
+                "{} {shape}: the key's count",
+                extreme.name
+            );
+            let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM login_throttle")
+                .fetch_one(backend.pool())
+                .await
+                .unwrap();
+            assert_eq!(
+                rows,
+                if forgets { 1 } else { 2 },
+                "{} {shape}: the rows kept",
+                extreme.name
+            );
+        }
+    }
 }

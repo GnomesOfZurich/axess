@@ -72,17 +72,17 @@ impl DpopKey {
     /// padding.
     pub(crate) fn public_coordinates(&self) -> Result<(String, String), super::error::OAuthError> {
         use base64::Engine as _;
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        use p256::elliptic_curve::sec1::ToSec1Point;
         let b64 = &base64::engine::general_purpose::URL_SAFE_NO_PAD;
         let secret = self.secret_key()?;
-        let point = secret.public_key().to_encoded_point(false);
+        let point = secret.public_key().to_sec1_point(false);
         let x = point.x().ok_or_else(|| {
             super::error::OAuthError::Config("DPoP: failed to extract EC x coordinate".to_string())
         })?;
         let y = point.y().ok_or_else(|| {
             super::error::OAuthError::Config("DPoP: failed to extract EC y coordinate".to_string())
         })?;
-        Ok((b64.encode(x.as_slice()), b64.encode(y.as_slice())))
+        Ok((b64.encode(x), b64.encode(y)))
     }
 
     /// The RFC 7638 JWK thumbprint of the public key: base64url (no

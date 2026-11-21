@@ -7,6 +7,25 @@
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
+// The `testing` feature compiles the test doubles of every crate beneath
+// this facade. A release build that links it ships those in a production
+// binary, and cargo feature unification lets any one dependent switch it on
+// for the whole build, so the build refuses by name.
+// `allow-testing-in-release` is the named opt-out for a build that means
+// it. Every crate with a `testing` feature carries this gate
+// (scripts/check-testing-gates.sh).
+#[cfg(all(
+    feature = "testing",
+    not(debug_assertions),
+    not(feature = "allow-testing-in-release")
+))]
+compile_error!(
+    "the `testing` feature of axess is enabled in a release build; it ships test doubles in a \
+     production binary. Remove the feature from the release build, or enable \
+     `allow-testing-in-release` to keep it on purpose."
+);
 
 /// Identity test fixture builders (`tenant`, `user`, `device`, ...) plus
 /// [`MockResolver`](crate::testing::MockResolver). Re-exported from `axess-identity` under the `testing`
@@ -14,11 +33,25 @@
 #[cfg(feature = "testing")]
 #[cfg_attr(docsrs, doc(cfg(feature = "testing")))]
 pub mod testing {
-    pub use axess_core::testing::{AuthSessionTestExt, test_key};
+    /// Conformance checks for a session registry of your own: the one-step
+    /// move of a session, the key a session is under now, an ending by a
+    /// former key and the cut-off of a user's other sessions.
+    pub use axess_core::testing::registry_contract;
+    /// A session registry that records every call and takes a hook before
+    /// and after each.
+    pub use axess_core::testing::registry_double;
+    /// Conformance checks for a store of your own: a session store's
+    /// conditional write, a factor store's passkey credential-id claim.
+    pub use axess_core::testing::store_contract;
+    pub use axess_core::testing::{AuthSessionTestExt, Shift, test_key};
     pub use axess_core::{
         BreachCheckOutage, MockClock, MockFactorStore, MockIdentityStore, MockRng,
     };
     pub use axess_identity::testing::*;
+
+    /// An in-process SPIRE agent for tests of the `spire` client.
+    #[cfg(all(feature = "spire", unix))]
+    pub use axess_core::testing::spire_agent;
 
     #[cfg(feature = "ldap")]
     pub use axess_core::MockLdapProvider;
@@ -31,10 +64,11 @@ pub mod testing {
 // Session layer. Kept at the root because `SessionLayer` and the core
 // session types are common facade entry points.
 pub use axess_core::{
-    AuthSession, AuthState, ConditionalUpdate, Impersonation, RevocationError, SameSite,
-    SessionBinding, SessionConfig, SessionConfigBuilder, SessionData, SessionId, SessionLayer,
-    SessionRegistry, SessionRegistryAdapter, SessionRegistryHandle, SessionRevoker, SessionStore,
-    UserAgentBinding,
+    AuthFlow, AuthSession, AuthState, ConditionalUpdate, CutOff, Impersonation, MoveOutcome,
+    RevocationError, SESSION_KEY_DOMAIN, SameSite, SessionBinding, SessionConfig,
+    SessionConfigBuilder, SessionData, SessionId, SessionKey, SessionKeyError, SessionKeyPrefix,
+    SessionLayer, SessionRegistry, SessionRegistryAdapter, SessionRegistryHandle, SessionRevoker,
+    SessionStore, UserAgentBinding,
 };
 #[cfg(feature = "memory")]
 pub use axess_core::{MemorySessionRegistry, MemorySessionStore};
@@ -50,6 +84,7 @@ pub mod session {
     pub use axess_core::session::refresh::*;
     #[cfg(any(
         feature = "sqlite",
+        feature = "sqlite-unbundled",
         feature = "postgres",
         feature = "mysql",
         feature = "valkey"
@@ -58,6 +93,18 @@ pub mod session {
     pub use axess_core::session::{
         CycleOutcome, DeviceTokenRevocation, PreviousPepper, RefreshToken, RefreshTokenConfig,
         RefreshTokenStore, RotationOutcome, WeakKeyError,
+    };
+    // How many records of its sessions' moves a registry keeps for one user:
+    // the bound a registry of your own keeps too.
+    pub use axess_core::session::MAX_MOVE_RECORDS_PER_USER;
+    // The session layer's audit sink: what every `SessionLayer` constructor
+    // takes (`AuthnService::session_end_audit` is the stock implementation,
+    // `UnrecordedSessionEnds` the named opt-out) and what a sink of your own
+    // is told about each session the layer ends. `EndingClaim` is the mark
+    // the layer leaves on a stored session while it ends it
+    // (`SessionData::ending`).
+    pub use axess_core::session::{
+        EndingClaim, LayerSessionEnded, SessionEndAudit, SessionEndReason, UnrecordedSessionEnds,
     };
 }
 
@@ -68,26 +115,70 @@ pub mod blocking {
 }
 
 /// Authentication namespace. Prefer `axess::authn::*` in new code.
+///
+/// The audit archive is here too: the [`AuditArchiver`](crate::authn::AuditArchiver)
+/// trait, the [`AuditRetentionLoop`](crate::authn::AuditRetentionLoop) that moves
+/// audit rows from the hot table to it, and, with `audit-archive-fs`, the
+/// filesystem-backed reference archiver:
+///
+/// ```
+/// # #[cfg(feature = "audit-archive-fs")]
+/// # fn main() {
+/// use axess::authn::{AuditArchiver, FilesystemArchiveError, FilesystemAuditArchiver};
+///
+/// fn archives<A: AuditArchiver<Error = FilesystemArchiveError>>(archiver: &A) -> &A {
+///     archiver
+/// }
+///
+/// let archiver = FilesystemAuditArchiver::new("/var/lib/axess/audit");
+/// assert_eq!(archives(&archiver).root(), std::path::Path::new("/var/lib/axess/audit"));
+/// # }
+/// # #[cfg(not(feature = "audit-archive-fs"))]
+/// # fn main() {}
+/// ```
 pub mod authn {
+    // What each factor of a session proved, and the step-up a refusal
+    // names: `StepUp` parses the `step_up` field of a `step_up_required`
+    // answer for `RequestAuthnService::begin_step_up_for`.
+    pub use axess_core::authn::assurance::{
+        CredentialBinding, FactorAssurance, StepUp, StepUpParseError,
+    };
     pub use axess_core::authn::factor_secret::{
         FactorSecretBinding, FactorSecretCipher, FactorSecretError, OpenedSecret,
     };
+    /// The reason on the failed `SignupCompleted` audit row written when the
+    /// session of a signup being completed could not be registered.
+    pub use axess_core::authn::service::SIGNUP_SESSION_NOT_REGISTERED_REASON;
+    /// What `RequestAuthnService::invalidate_other_sessions` reports when
+    /// it did not leave the kept session as the user's only one, and the
+    /// reasons on its failed audit rows.
+    pub use axess_core::authn::service::{
+        OTHER_SESSIONS_NOT_ENDED_REASON, OtherSessionsError, REFRESH_TOKENS_NOT_REVOKED_REASON,
+    };
+    pub use axess_core::authn::{
+        ArchiveBatchId, AuditArchiver, AuditRetentionLoop, AuditRetentionPolicy,
+        AuditRetentionSource, NoopAuditArchiver, RetentionError, RetentionTickReport,
+    };
+    /// The filesystem-backed reference [`AuditArchiver`] and its error.
+    #[cfg(feature = "audit-archive-fs")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "audit-archive-fs")))]
+    pub use axess_core::authn::{FilesystemArchiveError, FilesystemAuditArchiver};
     pub use axess_core::{
-        ActiveSessionsError, Actor, AuditContext, AuditOutcome, AuditQuery, AuthEvent,
+        ActiveSessionsError, Actor, AuditContext, AuditOutcome, AuditQuery, AuditTrail, AuthEvent,
         AuthEventBuilder, AuthEventStatus, AuthEventType, AuthFailureReason, AuthMethod,
         AuthnBackend, AuthnError, AuthnScope, AuthnService, AuthnServiceBuilder, BreachCheckError,
         BreachCheckUnavailable, BreachedPasswordCheck, BreachedPasswordList, ChosenPasswordError,
         CounterUnavailable, DeviceId, EmailOtpConfig, EntityState, EventQueryFilter, FactorConfig,
         FactorCredential, FactorKind, FactorOutcome, FactorSecret, FactorStep, FactorStore,
-        FactorTemplate, FederatedProvider, Fido2Config, HotpConfig, IdentityAdmin,
-        IdentityAuthnLog, IdentityLookup, IdentityPasswordHistory, IdentityPasswordReset,
-        IdentityStore, IpPolicy, LdapBindFactorConfig, LockoutPolicy, LoginOutcome,
-        NoSessionRegistryError, NoopAuthnLog, OtpAlgorithm, PasswordConfig, PasswordRules,
-        PrepareOutcome, ProvisioningError, RequestAuthnService, ResolvedFactor, SealedFactorSecret,
-        SessionValidator, SignupOutcome, SignupVerification, StatusCause, StatusDetail, Tenant,
-        TenantBootstrap, TenantId, Throttle, ThrottleKey, ThrottleState, ThrottleSubject,
-        TotpConfig, User, UserId, ZeroizedString, create_tenant, default_catalog,
-        require_valid_session,
+        FactorTemplate, FederatedProvider, Fido2Config, Fido2CredentialClaim, HotpConfig,
+        IdentityAdmin, IdentityAuthnLog, IdentityLookup, IdentityPasswordHistory,
+        IdentityPasswordReset, IdentityStore, IpPolicy, LdapBindFactorConfig, LockoutPolicy,
+        LockoutPolicyError, LoginOutcome, NoSessionRegistryError, NoopAuthnLog, OtpAlgorithm,
+        PasswordConfig, PasswordRules, PrepareOutcome, ProvisioningError, RequestAuthnService,
+        ResolvedFactor, SealedFactorSecret, SessionValidator, SignupOutcome, SignupVerification,
+        StatusCause, StatusDetail, Tenant, TenantBootstrap, TenantId, Throttle, ThrottleKey,
+        ThrottleState, ThrottleSubject, TotpConfig, UnreadableReason, UnreadableRows, User, UserId,
+        ZeroizedString, create_tenant, default_catalog, require_valid_session,
     };
     pub use axess_factors::{
         GeneratedRecoveryCodes, HOTP_LENGTH, HotpAlgorithm, HotpThrottle, NewPasswordError,
@@ -138,10 +229,10 @@ pub mod service_secret {
     pub use axess_core::middleware::service_secret::*;
 }
 
-/// W3C Trace Context middleware. Re-exports [`axess_core::middleware::trace_id`].
-#[cfg(feature = "trace-id")]
-pub mod trace_id {
-    pub use axess_core::middleware::trace_id::*;
+/// W3C Trace Context middleware. Re-exports [`axess_core::middleware::trace_context`].
+#[cfg(feature = "trace-context")]
+pub mod trace_context {
+    pub use axess_core::middleware::trace_context::*;
 }
 
 /// CSRF protection middleware. Re-exports [`axess_core::middleware::csrf`].
@@ -160,14 +251,16 @@ pub use axess_core::InMemoryBackend;
 /// of stitching together `SqliteSessionStore`, `SqliteDeviceStore`,
 /// `SqlStoreError`, `SqlDeviceStoreError` from disjoint flat symbols.
 pub mod backends {
-    /// SQLite-backed stores. Requires the `sqlite` feature; device-store
-    /// types additionally require the `device` feature. The
+    /// SQLite-backed stores. Requires the `sqlite` feature, or
+    /// `sqlite-unbundled` for the same stores linked to the system's SQLite
+    /// library; device-store types additionally require the `device`
+    /// feature. The
     /// `SessionStoreError` here is the codec-level error shared with
     /// PostgreSQL, gated on either feature.
-    #[cfg(feature = "sqlite")]
+    #[cfg(any(feature = "sqlite", feature = "sqlite-unbundled"))]
     pub mod sqlite {
         pub use axess_core::SqliteSessionStore as SessionStore;
-        #[cfg(any(feature = "sqlite", feature = "postgres"))]
+        #[cfg(any(feature = "sqlite", feature = "sqlite-unbundled", feature = "postgres"))]
         pub use axess_core::session::storage::session_codec::SqlStoreError as SessionStoreError;
 
         #[cfg(feature = "device")]
@@ -216,6 +309,27 @@ pub mod backends {
         pub use axess_core::ValkeyDeviceStore as DeviceStore;
         #[cfg(feature = "device")]
         pub use axess_core::ValkeyDeviceStoreError as DeviceStoreError;
+
+        /// Why a replay store's server is not known to keep its records
+        /// (`JtiReplayStore::checked`).
+        #[cfg(any(
+            feature = "jwt",
+            feature = "oauth",
+            feature = "outbound-oauth",
+            feature = "local-idp",
+            feature = "device-keys"
+        ))]
+        pub use axess_core::replay::EvictionPolicyError as JtiReplayEvictionError;
+        /// A `jti` replay store every node shares, for the JWT and DPoP
+        /// verifiers.
+        #[cfg(any(
+            feature = "jwt",
+            feature = "oauth",
+            feature = "outbound-oauth",
+            feature = "local-idp",
+            feature = "device-keys"
+        ))]
+        pub use axess_core::replay::ValkeyJtiReplayStore as JtiReplayStore;
     }
 
     /// In-memory stores. Session-store + registry require `memory`;
@@ -233,6 +347,19 @@ pub mod backends {
         pub use axess_core::MemorySessionRegistry as SessionRegistry;
         #[cfg(feature = "memory")]
         pub use axess_core::MemorySessionStore as SessionStore;
+        /// A `jti` replay store in one process, for the JWT and DPoP
+        /// verifiers and for device-key request proofs on a single node.
+        #[cfg(all(
+            feature = "memory",
+            any(
+                feature = "jwt",
+                feature = "oauth",
+                feature = "outbound-oauth",
+                feature = "local-idp",
+                feature = "device-keys"
+            )
+        ))]
+        pub use axess_core::replay::MemoryJtiReplayStore as JtiReplayStore;
 
         #[cfg(feature = "device")]
         pub use axess_core::MemoryDevicePiiStore as DevicePiiStore;
@@ -249,20 +376,38 @@ pub mod backends {
 /// tokenisation. Re-exports [`axess_core::device`].
 #[cfg(feature = "device")]
 pub mod device {
+    /// Writes device and device-key audit rows through an identity store's
+    /// `record_event`.
+    pub use axess_core::device::events::IdentityStoreEventSink;
     pub use axess_core::{
         AttestationClass, BindingsUpdate, BoundDevice, CachedDeviceStore, CascadingRefreshStore,
-        DefaultFingerprintExtractor, Device, DeviceBinding, DeviceEventSink,
+        DefaultFingerprintExtractor, Device, DeviceBinding, DeviceCookieConfig, DeviceEventSink,
         DeviceFingerprintExtractor, DeviceLifecycleService, DevicePiiCategory, DevicePiiMapping,
         DevicePiiResolver, DevicePiiStore, DeviceResolver, DeviceStore, DeviceTrustLevel,
-        FingerprintHash, LifecycleDeviceResolver, MemoryDevicePiiStore, MemoryDevicePiiStoreError,
-        MemoryDeviceStore, MemoryDeviceStoreError, NoopDeviceEventSink, NoopDeviceResolver,
-        OwnerClaim, PiiToken, ProvenDevice, REDACTED_PLACEHOLDER, RedactedResolver,
-        RevokeDeviceError, SessionUser, StepUpPolicy, StepUpPolicyBuilder, SweepConfig,
-        SweepConfigBuilder, SweepConfigError, SweepCounts, TenantPepperResolver, TrustTransition,
-        cascade_revoke_by_refresh_family, cascade_revoke_by_refresh_family_and_tokens,
+        FingerprintHash, LifecycleDeviceResolver, LifecycleResolveError, MemoryDevicePiiStore,
+        MemoryDevicePiiStoreError, MemoryDeviceStore, MemoryDeviceStoreError, NoopDeviceEventSink,
+        NoopDeviceResolver, OwnerClaim, PiiToken, ProvenDevice, REDACTED_PLACEHOLDER,
+        RedactedResolver, RevokeDeviceError, SessionUser, StepUpPolicy, StepUpPolicyBuilder,
+        SweepConfig, SweepConfigBuilder, SweepConfigError, SweepCounts, TenantPepperResolver,
+        TrustTransition, UserDevice, cascade_revoke_by_refresh_family_and_tokens,
         cascade_revoke_devices, decide_step_up_for_optional, decide_step_up_for_user,
         revoke_device,
     };
+}
+
+/// Device keys: the values a device-bound session is made of and, with the
+/// `device-keys` feature, the service that registers and proves them.
+/// Re-exports [`axess_core::device_key`].
+pub mod device_key {
+    pub use axess_core::device_key::*;
+
+    /// The proof verifier the key service is built on: `KeyProofError` (what
+    /// `DeviceKeyError::Proof` carries), the proof shapes, the browser
+    /// draft's wire names (`key_proof::browser_draft`) and, with `testing`,
+    /// the software key a test registers and signs with
+    /// (`key_proof::testing::SoftwareKey`).
+    #[cfg(feature = "device-keys")]
+    pub use axess_factors::key_proof;
 }
 
 // Device-store backends are now grouped under `backends::{sqlite,postgres,valkey,memory}::DeviceStore`
@@ -272,6 +417,10 @@ pub mod device {
 // testing. Production `Clock`/`SecureRng`/`SystemClock`/`SystemRng`
 // are unconditional; the mock counterparts are gated behind `testing`.
 pub use axess_core::{Clock, SecureRng, SystemClock, SystemRng};
+
+// The time types every `now`, stamp and expiry of the API is written in, so
+// an adopter names them through the facade.
+pub use axess_core::{SignedDuration, TimeError, Timestamp, Until, UtcDate};
 
 /// In-process IdP. Re-exports the production [`LocalIdp`] and (under
 /// `testing`) the [`LocalIdpFixture`] test double. See
@@ -306,9 +455,9 @@ pub mod local_idp {
 // Observability
 pub use axess_core::{
     AuditMetrics, AuthFlowMetrics, AuthzCacheMetrics, AxessMetrics, CompositeHealthCheck,
-    CompositeStatus, CsrfRefusal, FactorMetrics, HealthCheck, HealthStatus, MetricSinks,
-    NoopMetrics, ProviderCategory, ProviderRegistryMetrics, RequestGuardMetrics, RotationMetrics,
-    SessionMetrics,
+    CompositeStatus, CsrfRefusal, DeviceKeyMetrics, FactorMetrics, HealthCheck, HealthStatus,
+    MetricSinks, NoopMetrics, ProviderCategory, ProviderRegistryMetrics, RequestGuardMetrics,
+    RotationMetrics, SessionMetrics,
 };
 
 // Rate limiting
@@ -327,18 +476,39 @@ pub mod client_ip {
 /// `is_valid_email`, ...). Re-exports [`axess_core::validation`].
 pub use axess_core::validation;
 
+/// The security profile: `SecurityProfile::Standard` restates the library's
+/// defaults as named values and `SecurityProfile::Strict` is the tightened
+/// set for a deployment that holds money or regulated data; `ProfileValues`
+/// is read, changed and applied to each configuration type, and a service
+/// builder put under a profile is held to it when the service is built
+/// (`ProfileSetting`, `AuthnBuildError`). Re-exports
+/// [`axess_core::profile`]; the `sqlite` and `fapi` examples apply it.
+pub mod profile {
+    pub use axess_core::profile::{
+        AuthnBuildError, ProfileError, ProfileSetting, ProfileValues, SecurityProfile,
+    };
+}
+
 /// JWT verification primitives and, under `jwt-svid`, SPIFFE JWT-SVID
 /// resolution.
 ///
-/// At the root rather than under `federation` since 0.7.0, and gated on
-/// `jwt` rather than `oauth`. It was reachable only with `oauth` enabled,
-/// so `features = ["jwt-svid"]` compiled the resolver and left no path to
-/// it: a workload deployment with no OAuth in sight had to enable OAuth.
+/// At the root rather than under `federation`, and gated on `jwt` rather
+/// than `oauth`, so `features = ["jwt-svid"]` reaches the resolver and a
+/// workload deployment with no OAuth in sight does not enable OAuth.
+///
+/// [`encode`](crate::jwt::encode), [`decode`](crate::jwt::decode),
+/// [`sign`](crate::jwt::sign) and [`verify`](crate::jwt::verify) are
+/// `jsonwebtoken`'s operations after
+/// [`ensure_crypto_provider`](crate::jwt::ensure_crypto_provider): an
+/// application's own code that signs or verifies with `jsonwebtoken` goes
+/// through them, so its first operation cannot fix the provider that panics.
 #[cfg(feature = "jwt")]
 pub mod jwt {
     #[cfg(feature = "jwt-svid")]
     pub use axess_factors::jwt::svid;
-    pub use axess_factors::jwt::{claims, validation, verifier};
+    pub use axess_factors::jwt::{
+        claims, decode, encode, ensure_crypto_provider, sign, validation, verifier, verify,
+    };
 }
 
 /// External identity providers and federation adapters. Mirrors
@@ -347,9 +517,12 @@ pub mod federation {
     /// FIDO2 / WebAuthn passkey provider.
     #[cfg(feature = "fido2")]
     pub mod fido2 {
+        pub use axess_core::authn::service::DiscoverableLogin;
         pub use axess_factors::fido2::{
-            AttestationCaList, DEFAULT_FIDO2_CEREMONY, DefaultFido2Provider, Fido2Authentication,
-            Fido2Ceremony, Fido2Key, Fido2Provider, Fido2Registration, SecurityKeyVerification,
+            AttestationCaList, AuthenticatorAttachment, CredentialID, DEFAULT_FIDO2_CEREMONY,
+            DEFAULT_FIDO2_MAX_AUTHN_AGE, DefaultFido2Provider, DiscoverableCredential,
+            DiscoverablePrompt, Fido2Authentication, Fido2Ceremony, Fido2Credential, Fido2Key,
+            Fido2Options, Fido2Provider, Fido2Registration, SecurityKeyVerification,
         };
     }
 
@@ -380,18 +553,39 @@ pub mod federation {
         /// `StoredTenantOAuthProviders` applies, and its named opt-outs.
         pub use axess_factors::egress::{EgressPolicy, EgressRefusal, ReservedRange};
 
+        /// The reason on the audit row of an operator's attestation that a
+        /// tenant owns an OAuth client.
+        pub use axess_core::authn::service::CLIENT_OWNERSHIP_ATTESTED_REASON;
+        /// The reason on the row a scoped token revocation writes before
+        /// the provider is asked.
+        pub use axess_core::authn::service::OAUTH_REVOCATION_REQUESTED_REASON;
+        /// The route a callback arrived on, which `finish_oauth_login`
+        /// compares with the registration the login began with.
+        pub use axess_core::authn::service::OAuthCallbackRoute;
         /// The by-name helpers (refresh, userinfo, revocation, logout URL)
         /// resolved by a session's or a tenant's provider.
         pub use axess_core::authn::service::ScopedOAuth;
-        #[cfg(feature = "sqlite")]
+        /// The reasons on the rows of an operator's hand-over of a client's
+        /// issuer and client id: the request, and each record removed.
+        pub use axess_core::authn::service::{
+            CLIENT_PAIR_HAND_OVER_REQUESTED_REASON, CLIENT_PAIR_HANDED_OVER_REASON,
+        };
+        #[cfg(any(feature = "sqlite", feature = "sqlite-unbundled"))]
         pub use axess_core::federation::oauth_tenant::SqliteTenantOAuthProviderStore;
         /// Bring your own IdP: providers resolved by `(tenant, name)` from
         /// a store at request time.
         pub use axess_core::federation::oauth_tenant::{
-            BrokenTenantProvider, IssuerProviders, MemoryTenantOAuthProviderStore,
-            StoredTenantOAuthProviders, TenantClientCredential, TenantDpop,
+            BrokenTenantProvider, IssuerProviders, MemoryTenantOAuthProviderStore, ReassignedPair,
+            Reproved, StoredTenantOAuthProviders, TenantClientCredential, TenantDpop,
             TenantOAuthProviderRecord, TenantOAuthProviderStore, TenantOAuthProviderStoreError,
-            TenantOAuthProviders, TenantProvider,
+            TenantOAuthProviders, TenantOAuthRecords, TenantProvider,
+        };
+        /// Proof that a tenant owns the client it registers, which the
+        /// directory asks before it stores a record.
+        pub use axess_core::federation::oauth_tenant::{
+            ClientOwnershipProof, DEFAULT_OWNERSHIP_PROBE_TIMEOUT, OperatorAttestation,
+            OwnershipAttestation, OwnershipClaim, OwnershipFuture, OwnershipProofs,
+            OwnershipProven, OwnershipPurpose, OwnershipRefused, TokenEndpointProbe,
         };
         // IdP-initiated logout: mount the back-channel handler as a route,
         // and pass `AuthnService::backchannel_logout_audit` to `with_audit`
@@ -470,6 +664,7 @@ pub mod social {
     feature = "aws-sts",
     feature = "gcp-wif",
     feature = "azure-fic",
+    feature = "spire",
 ))]
 pub mod workload {
     /// The cause inside the STS errors' `ClientBuild` variant.

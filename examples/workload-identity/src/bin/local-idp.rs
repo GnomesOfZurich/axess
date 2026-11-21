@@ -68,7 +68,7 @@
 use axess::local_idp::{
     IssuanceError, LoadedKeys, LocalIdp, LocalIdpKeyStore, LocalIdpSigningKey, MintClaims,
 };
-use axess::{Clock, SystemClock};
+use axess::{Clock, SignedDuration, SystemClock, Timestamp, Until};
 use axum::{
     Json, Router,
     extract::State,
@@ -76,7 +76,6 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use chrono::Duration;
 use rsa::RsaPrivateKey;
 use rsa::pkcs8::{EncodePrivateKey, LineEnding};
 use serde::{Deserialize, Serialize};
@@ -180,10 +179,10 @@ impl FileLocalIdpKeyStore {
 
     /// Note the moment `kid` stopped being the current key. Every token it
     /// signed is valid for at most [`MAX_TTL_SECS`] after that.
-    fn record_rotation(&self, kid: &str, at: chrono::DateTime<chrono::Utc>) -> std::io::Result<()> {
+    fn record_rotation(&self, kid: &str, at: Timestamp) -> std::io::Result<()> {
         let path = self.rotated_at_path(kid);
         std::fs::create_dir_all(path.parent().expect("a file in rotated_at"))?;
-        std::fs::write(path, at.to_rfc3339())
+        std::fs::write(path, at.to_rfc3339_numeric_offset())
     }
 
     /// Whether `kid` names a key this store holds or has archived. A kid that
@@ -210,9 +209,9 @@ impl FileLocalIdpKeyStore {
         }
         let recorded = std::fs::read_to_string(self.rotated_at_path(kid))
             .ok()
-            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t.trim()).ok());
+            .and_then(|t| Timestamp::parse_rfc3339(t.trim()).ok());
         Ok(match recorded {
-            Some(at) => now < at.to_utc() + Duration::seconds(MAX_TTL_SECS),
+            Some(at) => Until::At(now) < Until::after(at, MAX_TTL),
             None => true,
         })
     }
@@ -221,13 +220,14 @@ impl FileLocalIdpKeyStore {
     /// next start does not find a key that never signed anything. The
     /// current key, and a key already renamed into place, are never removed.
     async fn discard_unused_key(&self, kid: &str) {
-        let _guard = self.rotate_lock.lock().await;
+        let guard = self.rotate_lock.lock().await;
         if valid_kid(kid)
             && self.read_pointer().is_ok_and(|current| current != kid)
             && let Err(e) = std::fs::remove_file(self.staged_key_path(kid))
         {
             tracing::warn!(error = %e, "could not remove the key of a failed rotation");
         }
+        drop(guard);
     }
 
     /// Stamp every historical key that has no rotation record with the
@@ -382,7 +382,7 @@ impl LocalIdpKeyStore for FileLocalIdpKeyStore {
         let store = self.clone();
         let kid = key_id.to_string();
         async move {
-            let _guard = store.rotate_lock.lock().await;
+            let guard = store.rotate_lock.lock().await;
             // A kid that is not a plain name cannot address a key file, and
             // the current key is never retired from under the pointer.
             if !valid_kid(&kid) || store.read_pointer()? == kid {
@@ -417,6 +417,7 @@ impl LocalIdpKeyStore for FileLocalIdpKeyStore {
                 path: from.display().to_string(),
                 source: e,
             })?;
+            drop(guard);
             Ok(true)
         }
     }
@@ -664,15 +665,18 @@ fn default_ttl_secs() -> i64 {
 /// instead of failing inside the mint.
 const MAX_TTL_SECS: i64 = 3600;
 
+/// The same lifetime as the span the IdP's cap and the retire check take.
+const MAX_TTL: std::time::Duration = std::time::Duration::from_secs(MAX_TTL_SECS.unsigned_abs());
+
 /// Validate an `/issue` request and compute the token's expiry. A lifetime
 /// outside `1..=MAX_TTL_SECS` is refused (a huge value would overflow the
 /// date arithmetic), and a token must name an audience: one without `aud` is
 /// accepted by every verifier that does not pin one.
 fn validated_expiry(
-    now: chrono::DateTime<chrono::Utc>,
+    now: Timestamp,
     ttl_secs: i64,
     audience: Option<&str>,
-) -> Result<chrono::DateTime<chrono::Utc>, (StatusCode, String)> {
+) -> Result<Timestamp, (StatusCode, String)> {
     if !(1..=MAX_TTL_SECS).contains(&ttl_secs) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -682,7 +686,7 @@ fn validated_expiry(
     if audience.is_none_or(|a| a.trim().is_empty()) {
         return Err((StatusCode::BAD_REQUEST, "audience is required".into()));
     }
-    now.checked_add_signed(Duration::seconds(ttl_secs))
+    now.checked_add(SignedDuration::seconds(ttl_secs))
         .ok_or((StatusCode::BAD_REQUEST, "ttl_secs out of range".into()))
 }
 
@@ -909,7 +913,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = FileLocalIdpKeyStore::new(key_dir, clock.clone());
     let idp = LocalIdp::from_key_store(ISSUER, store.clone())
         .await?
-        .with_max_ttl(Duration::seconds(MAX_TTL_SECS));
+        .with_clock(clock.clone())
+        .with_max_ttl(MAX_TTL);
     // The mint and rotate endpoints need a bearer token. Use the one the
     // operator supplies, or draw a fresh one and write it to a file only the
     // owner can read.

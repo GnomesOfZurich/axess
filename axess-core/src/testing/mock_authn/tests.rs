@@ -4,14 +4,21 @@
 
 use super::*;
 use crate::authn::store::{IdentityAdmin, IdentityPasswordReset};
-use crate::testing::{tenant_record, user_record};
+use crate::testing::{tenant_record_at, user_record_at};
+use axess_clock::testing::Shift;
 use std::sync::Arc;
 
 #[tokio::test]
 async fn create_tenant_refuses_a_duplicate_identifier() {
     let store = MockIdentityStore::new();
-    store.create_tenant(tenant_record("acme")).await.unwrap();
-    let mut other = tenant_record("acme");
+    store
+        .create_tenant(tenant_record_at(
+            "acme",
+            axess_clock::testing::MockClock::reference_time(),
+        ))
+        .await
+        .unwrap();
+    let mut other = tenant_record_at("acme", axess_clock::testing::MockClock::reference_time());
     other.id = axess_identity::testing::tenant("a-different-id");
     assert!(matches!(
         store.create_tenant(other).await,
@@ -22,7 +29,11 @@ async fn create_tenant_refuses_a_duplicate_identifier() {
 #[tokio::test]
 async fn create_user_refuses_a_duplicate_id_under_a_new_identifier() {
     let store = MockIdentityStore::new();
-    let user = user_record("u1", "t1");
+    let user = user_record_at(
+        "u1",
+        "t1",
+        axess_clock::testing::MockClock::reference_time(),
+    );
     store.create_user(user.clone()).await.unwrap();
     let mut clash = user;
     clash.identifier = "someone-else".into();
@@ -42,8 +53,9 @@ async fn a_reset_token_verifies_once_under_concurrent_attempts() {
             .store_reset_token(
                 &user,
                 &hash,
-                chrono::Utc::now() + chrono::Duration::hours(1),
-                chrono::Utc::now(),
+                axess_clock::testing::MockClock::reference_time()
+                    .plus(axess_clock::SignedDuration::hours(1)),
+                axess_clock::testing::MockClock::reference_time(),
                 3,
             )
             .await
@@ -54,7 +66,11 @@ async fn a_reset_token_verifies_once_under_concurrent_attempts() {
                 let hash = hash.clone();
                 tokio::spawn(async move {
                     store
-                        .verify_reset_token(&user, &hash, chrono::Utc::now())
+                        .verify_reset_token(
+                            &user,
+                            &hash,
+                            axess_clock::testing::MockClock::reference_time(),
+                        )
                         .await
                         .unwrap()
                 })
@@ -79,27 +95,40 @@ async fn a_wrong_hash_does_not_consume_the_reset_token() {
         .store_reset_token(
             &user,
             "right",
-            chrono::Utc::now() + chrono::Duration::hours(1),
-            chrono::Utc::now(),
+            axess_clock::testing::MockClock::reference_time()
+                .plus(axess_clock::SignedDuration::hours(1)),
+            axess_clock::testing::MockClock::reference_time(),
             3,
         )
         .await
         .unwrap();
     assert!(
         !store
-            .verify_reset_token(&user, "wrong", chrono::Utc::now())
+            .verify_reset_token(
+                &user,
+                "wrong",
+                axess_clock::testing::MockClock::reference_time()
+            )
             .await
             .unwrap()
     );
     assert!(
         store
-            .verify_reset_token(&user, "right", chrono::Utc::now())
+            .verify_reset_token(
+                &user,
+                "right",
+                axess_clock::testing::MockClock::reference_time()
+            )
             .await
             .unwrap()
     );
     assert!(
         !store
-            .verify_reset_token(&user, "right", chrono::Utc::now())
+            .verify_reset_token(
+                &user,
+                "right",
+                axess_clock::testing::MockClock::reference_time()
+            )
             .await
             .unwrap()
     );
@@ -110,28 +139,39 @@ async fn a_wrong_hash_does_not_consume_the_reset_token() {
 /// expiry and is refused from that instant, one second later included.
 #[tokio::test]
 async fn a_reset_token_expires_on_the_instant_passed_in() {
-    use chrono::TimeZone;
-    let origin = chrono::Utc.with_ymd_and_hms(2031, 3, 1, 12, 0, 0).unwrap();
-    let ttl = chrono::Duration::minutes(30);
+    use axess_clock::Timestamp;
+    let origin = Timestamp::from_utc(2031, 3, 1, 12, 0, 0).unwrap();
+    let ttl = axess_clock::SignedDuration::minutes(30);
     let store = MockIdentityStore::new();
     let user = axess_identity::testing::user("u1");
-    let issue = |hash: &'static str| store.store_reset_token(&user, hash, origin + ttl, origin, 3);
+    let issue =
+        |hash: &'static str| store.store_reset_token(&user, hash, origin.plus(ttl), origin, 3);
 
     issue("h1").await.unwrap();
-    let before = origin + ttl - chrono::Duration::minutes(1);
+    let before = origin.plus(
+        ttl.checked_sub(axess_clock::SignedDuration::minutes(1))
+            .unwrap(),
+    );
     assert!(store.verify_reset_token(&user, "h1", before).await.unwrap());
 
     issue("h2").await.unwrap();
     assert!(
         !store
-            .verify_reset_token(&user, "h2", origin + ttl)
+            .verify_reset_token(&user, "h2", origin.plus(ttl))
             .await
             .unwrap(),
         "the token is refused at its expiry instant"
     );
     assert!(
         !store
-            .verify_reset_token(&user, "h2", origin + ttl + chrono::Duration::seconds(1))
+            .verify_reset_token(
+                &user,
+                "h2",
+                origin.plus(
+                    ttl.checked_add(axess_clock::SignedDuration::seconds(1))
+                        .unwrap()
+                )
+            )
             .await
             .unwrap(),
         "and stays refused after it"
@@ -144,7 +184,11 @@ async fn a_reset_token_expires_on_the_instant_passed_in() {
 async fn get_user_tenant_answers_with_the_tenant_only() {
     use crate::authn::store::IdentityLookup;
     let log = CallLog::new();
-    let user = user_record("u1", "t1");
+    let user = user_record_at(
+        "u1",
+        "t1",
+        axess_clock::testing::MockClock::reference_time(),
+    );
     let store = MockIdentityStore::new()
         .with_call_log(&log)
         .with_user(user.clone());
@@ -180,7 +224,8 @@ mod lockout_outlives_the_window {
     }
 
     async fn locked_store(policy: &LockoutPolicy) -> (MockIdentityStore, MockClock, UserId) {
-        let clock = MockClock::at(chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap());
+        let clock =
+            MockClock::at(axess_clock::Timestamp::from_unix_seconds(1_700_000_000).unwrap());
         let store = MockIdentityStore::new().with_clock(clock.clone());
         let user = axess_identity::testing::user("locked");
         for expected in 1..=3 {
@@ -201,7 +246,7 @@ mod lockout_outlives_the_window {
     async fn an_indefinite_lockout_is_not_ended_by_the_window() {
         let policy = policy(None);
         let (store, clock, user) = locked_store(&policy).await;
-        clock.advance(chrono::Duration::hours(2));
+        clock.advance(axess_clock::SignedDuration::hours(2));
         assert_eq!(
             store.reserve_attempt(&user, &policy).await.unwrap(),
             None,
@@ -216,7 +261,7 @@ mod lockout_outlives_the_window {
     async fn a_lockout_longer_than_the_window_outlives_it() {
         let policy = policy(Some(Duration::from_secs(3 * 60 * 60)));
         let (store, clock, user) = locked_store(&policy).await;
-        clock.advance(chrono::Duration::hours(2));
+        clock.advance(axess_clock::SignedDuration::hours(2));
         assert_eq!(store.reserve_attempt(&user, &policy).await.unwrap(), None);
     }
 
@@ -224,7 +269,7 @@ mod lockout_outlives_the_window {
     async fn an_ended_timed_lockout_starts_the_count_over() {
         let policy = policy(Some(Duration::from_secs(15 * 60)));
         let (store, clock, user) = locked_store(&policy).await;
-        clock.advance(chrono::Duration::hours(2));
+        clock.advance(axess_clock::SignedDuration::hours(2));
         assert_eq!(
             store.reserve_attempt(&user, &policy).await.unwrap(),
             Some(1)
@@ -234,7 +279,8 @@ mod lockout_outlives_the_window {
     #[tokio::test]
     async fn a_count_below_the_limit_still_expires_with_the_window() {
         let policy = policy(None);
-        let clock = MockClock::at(chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap());
+        let clock =
+            MockClock::at(axess_clock::Timestamp::from_unix_seconds(1_700_000_000).unwrap());
         let store = MockIdentityStore::new().with_clock(clock.clone());
         let user = axess_identity::testing::user("two-strikes");
         store.reserve_attempt(&user, &policy).await.unwrap();
@@ -242,7 +288,7 @@ mod lockout_outlives_the_window {
             store.reserve_attempt(&user, &policy).await.unwrap(),
             Some(2)
         );
-        clock.advance(chrono::Duration::hours(2));
+        clock.advance(axess_clock::SignedDuration::hours(2));
         assert_eq!(
             store.reserve_attempt(&user, &policy).await.unwrap(),
             Some(1)
@@ -253,7 +299,7 @@ mod lockout_outlives_the_window {
     async fn reset_clears_an_indefinite_lockout() {
         let policy = policy(None);
         let (store, clock, user) = locked_store(&policy).await;
-        clock.advance(chrono::Duration::hours(2));
+        clock.advance(axess_clock::SignedDuration::hours(2));
         store.reset_failed_attempts(&user).await.unwrap();
         assert_eq!(
             store.reserve_attempt(&user, &policy).await.unwrap(),
@@ -267,7 +313,11 @@ mod lockout_outlives_the_window {
 #[tokio::test]
 async fn the_get_user_outage_is_unavailable_and_can_be_disarmed() {
     use crate::authn::store::IdentityLookup as _;
-    let user = user_record("u1", "t1");
+    let user = user_record_at(
+        "u1",
+        "t1",
+        axess_clock::testing::MockClock::reference_time(),
+    );
     let store = MockIdentityStore::new().with_user(user.clone());
     assert!(store.get_user(&user.id).await.unwrap().is_some(), "seeded");
     store.arm_get_user_failure();
@@ -299,13 +349,14 @@ mod throttle {
     }
 
     fn store() -> (MockIdentityStore, MockClock) {
-        let clock = MockClock::at(chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap());
+        let clock =
+            MockClock::at(axess_clock::Timestamp::from_unix_seconds(1_700_000_000).unwrap());
         (MockIdentityStore::new().with_clock(clock.clone()), clock)
     }
 
     #[tokio::test]
     async fn parallel_failures_are_all_counted() {
-        let (store, _clock) = store();
+        let (store, _) = store();
         let throttle = Throttle::default();
         let mut set = tokio::task::JoinSet::new();
         for _ in 0..12 {
@@ -326,7 +377,7 @@ mod throttle {
 
     #[tokio::test]
     async fn a_right_guess_clears_the_key_and_another_key_is_untouched() {
-        let (store, _clock) = store();
+        let (store, _) = store();
         let throttle = Throttle::default();
         store
             .record_throttle_failure(&subject(1), &throttle)
@@ -362,7 +413,7 @@ mod throttle {
             .record_throttle_failure(&subject(2), &throttle)
             .await
             .unwrap();
-        clock.advance(chrono::Duration::seconds(129));
+        clock.advance(axess_clock::SignedDuration::seconds(129));
         store
             .record_throttle_failure(&subject(1), &throttle)
             .await
@@ -398,13 +449,17 @@ async fn racing_claims_of_one_credential_id_have_one_winner() {
         store.claim_fido2_credential(&tenant, &b, b"cred"),
     );
     let (first, second) = (first.unwrap(), second.unwrap());
-    assert!(first != second, "both or neither claimed: {first} {second}");
-    let (winner, loser) = if first { (a, b) } else { (b, a) };
+    assert!(
+        first.is_claimed() != second.is_claimed(),
+        "both or neither claimed: {first:?} {second:?}"
+    );
+    let (winner, loser) = if first.is_claimed() { (a, b) } else { (b, a) };
     assert!(
         store
             .claim_fido2_credential(&tenant, &winner, b"cred")
             .await
             .unwrap()
+            .is_claimed()
     );
     store
         .release_fido2_credential(&tenant, &loser, b"cred")
@@ -414,7 +469,8 @@ async fn racing_claims_of_one_credential_id_have_one_winner() {
         !store
             .claim_fido2_credential(&tenant, &loser, b"cred")
             .await
-            .unwrap(),
+            .unwrap()
+            .is_claimed(),
         "a release by a user that does not hold the claim changed it"
     );
     store
@@ -426,13 +482,91 @@ async fn racing_claims_of_one_credential_id_have_one_winner() {
             .claim_fido2_credential(&tenant, &loser, b"cred")
             .await
             .unwrap()
+            .is_claimed()
     );
     let other_tenant = axess_identity::testing::tenant("t2");
     assert!(
         store
             .claim_fido2_credential(&other_tenant, &winner, b"cred")
             .await
-            .unwrap(),
+            .unwrap()
+            .is_claimed(),
         "the id is held per tenant"
+    );
+}
+
+/// The mock store keeps the rules of the claim, the refusal that names its
+/// holder among them.
+#[tokio::test]
+async fn the_mock_factor_store_meets_the_claim_contract() {
+    crate::testing::store_contract::assert_fido2_claim_contract(
+        &MockFactorStore::new(),
+        &axess_identity::testing::tenant("t1"),
+        &axess_identity::testing::user("a"),
+        &axess_identity::testing::user("b"),
+    )
+    .await;
+}
+
+/// A reset token is live until its expiry and not at it: one that ends at
+/// this instant no longer counts toward the bound on live tokens.
+#[tokio::test]
+async fn a_reset_token_that_ends_at_this_instant_no_longer_counts_as_live() {
+    let store = MockIdentityStore::new();
+    let user = axess_identity::testing::user("alice");
+    let now = axess_clock::testing::MockClock::reference_time();
+    let ends = now.plus(axess_clock::SignedDuration::minutes(15));
+    let later = ends.plus(axess_clock::SignedDuration::minutes(15));
+    assert!(
+        store
+            .store_reset_token(&user, "hash-a", ends, now, 1)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .store_reset_token(
+                &user,
+                "hash-b",
+                later,
+                ends.minus(axess_clock::SignedDuration::seconds(1)),
+                1
+            )
+            .await
+            .unwrap(),
+        "the bound holds while the first token is live"
+    );
+    assert!(
+        store
+            .store_reset_token(&user, "hash-b", later, ends, 1)
+            .await
+            .unwrap(),
+        "the first token ended at this instant"
+    );
+}
+
+/// A reset token checks by its own hash, and only while it is live.
+#[tokio::test]
+async fn a_reset_token_checks_only_by_its_own_hash_and_only_while_live() {
+    let store = MockIdentityStore::new();
+    let user = axess_identity::testing::user("alice");
+    let now = axess_clock::testing::MockClock::reference_time();
+    let ends = now.plus(axess_clock::SignedDuration::minutes(15));
+    store
+        .store_reset_token(&user, "hash-a", ends, now, 3)
+        .await
+        .unwrap();
+
+    assert!(store.check_reset_token(&user, "hash-a", now).await.unwrap());
+    assert!(
+        !store.check_reset_token(&user, "hash-b", now).await.unwrap(),
+        "another hash while a token is live"
+    );
+    assert!(
+        !store
+            .check_reset_token(&user, "hash-a", ends)
+            .await
+            .unwrap(),
+        "its own hash at the instant it ends"
     );
 }

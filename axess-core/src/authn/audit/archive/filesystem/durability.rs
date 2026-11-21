@@ -5,15 +5,15 @@ use super::tests::{bid, make_event, tempdir};
 use super::*;
 use std::collections::BTreeMap;
 
-fn day(d: u32) -> chrono::NaiveDate {
-    chrono::NaiveDate::from_ymd_opt(2026, 5, d).unwrap()
+fn day(d: u32) -> axess_clock::UtcDate {
+    axess_clock::UtcDate::new(2026, 5, u8::try_from(d).unwrap()).unwrap()
 }
 
 fn line_count(path: &std::path::Path) -> usize {
     std::fs::read_to_string(path).map_or(0, |t| t.lines().count())
 }
 
-fn one_batch(days: &[u32], tag: &str) -> BTreeMap<chrono::NaiveDate, Vec<String>> {
+fn one_batch(days: &[u32], tag: &str) -> BTreeMap<axess_clock::UtcDate, Vec<String>> {
     days.iter()
         .map(|d| (day(*d), vec![format!("{{\"tag\":\"{tag}\",\"day\":{d}}}")]))
         .collect()
@@ -21,7 +21,7 @@ fn one_batch(days: &[u32], tag: &str) -> BTreeMap<chrono::NaiveDate, Vec<String>
 
 fn run(
     root: &std::path::Path,
-    by_day: BTreeMap<chrono::NaiveDate, Vec<String>>,
+    by_day: BTreeMap<axess_clock::UtcDate, Vec<String>>,
     id: &str,
     cache: &std::sync::Mutex<SidecarCache>,
     faults: &mut Faults<'_>,

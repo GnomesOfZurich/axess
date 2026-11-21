@@ -1,8 +1,17 @@
 //! [`DeviceLifecycleService`]: opinionated higher-level helper that
-//! composes [`DeviceStore`] primitives into the two operations every
-//! axess consumer needs at request/authn boundaries:
+//! composes [`DeviceStore`] primitives into the operations an axess
+//! consumer needs at request/authn boundaries:
 //!
-//! 1. **Ensure-or-create**: given a fingerprint, look up the existing
+//! 0. **Resolve by proof**
+//!    ([`resolve_or_keep`](DeviceLifecycleService::resolve_or_keep),
+//!    [`resolve_proven`](DeviceLifecycleService::resolve_proven)): find the
+//!    device by the secret token on its cookie, keep the one the session
+//!    is bound to, or create one for an authenticated user. This is what
+//!    [`LifecycleDeviceResolver`](crate::device::LifecycleDeviceResolver)
+//!    runs on every request; the fingerprint selects nothing there.
+//! 1. **Ensure-or-create**
+//!    ([`ensure_device`](DeviceLifecycleService::ensure_device)), for an
+//!    application that proves the device some other way: given a fingerprint, look up the existing
 //!    `Device` row or create a fresh one with
 //!    [`DeviceTrustLevel::Unknown`]. Idempotent on the existing-device
 //!    path; bumps `last_seen_at` either way (at most once per sighting
@@ -32,18 +41,21 @@
 //!   is the stock choice, and the lifecycle layer is
 //!   fingerprint-agnostic.
 //! - **Wire itself into middleware.** The decision of *where* in the
-//!   request pipeline `ensure_device` runs is made by the
+//!   request pipeline a resolution runs is made by the
 //!   [`DeviceResolver`](crate::device::DeviceResolver) the session layer
-//!   is given (see
-//!   [`LifecycleDeviceResolver`](crate::device::LifecycleDeviceResolver)),
-//!   or by application code calling it directly. This keeps the helper
+//!   is given
+//!   ([`LifecycleDeviceResolver`](crate::device::LifecycleDeviceResolver)
+//!   calls `resolve_or_keep`), or by application code calling
+//!   `ensure_device` directly. This keeps the helper
 //!   testable in isolation and lets apps make the cost trade-offs.
-//! - **Revoke devices when a refresh family is compromised.** That is
-//!   [`cascade_revoke_by_refresh_family`](crate::device::cascade_revoke_by_refresh_family),
+//! - **Revoke devices, and their tokens, when a refresh family is
+//!   compromised.** That is
+//!   [`cascade_revoke_by_refresh_family_and_tokens`](crate::device::cascade_revoke_by_refresh_family_and_tokens),
 //!   which finds the devices through
-//!   [`DeviceStore::find_by_refresh_family`].
+//!   [`DeviceStore::find_by_refresh_family`] and revokes every refresh
+//!   token bound to them, whatever its family.
 
-use chrono::{DateTime, Utc};
+use axess_clock::Timestamp;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -51,6 +63,10 @@ use crate::authn::event::{AuthEventBuilder, AuthEventType};
 use crate::authn::ids::{DeviceId, TenantId, UserId};
 use crate::authn::service::FactorOutcome;
 use crate::device::events::{DeviceEventSink, NoopDeviceEventSink};
+// Named by the doc links below, and by the tests through `super::*`.
+#[cfg(any(doc, test))]
+use crate::device::proof::ProvenDevice;
+use crate::device::proof::UserDevice;
 #[cfg(feature = "fido2")]
 use crate::device::store::BindingsUpdate;
 use crate::device::store::{DeviceStore, OwnerClaim, TrustTransition};
@@ -59,7 +75,7 @@ use crate::device::types::{Device, DeviceTrustLevel, FingerprintHash};
 /// How long after a device's recorded `last_seen_at` `ensure_device`
 /// treats another sighting as redundant, unless
 /// [`DeviceLifecycleService::with_sighting_granularity`] says otherwise.
-const DEFAULT_SIGHTING_GRANULARITY_SECS: i64 = 300;
+const DEFAULT_SIGHTING_GRANULARITY: std::time::Duration = std::time::Duration::from_mins(5);
 
 /// How many `Unknown` devices one user may hold at once, unless
 /// [`DeviceLifecycleService::with_max_unknown_devices_per_user`] says
@@ -106,7 +122,7 @@ where
     event_sink: Arc<dyn DeviceEventSink>,
     /// A known device whose `last_seen_at` is newer than this is not
     /// written again by `ensure_device`.
-    sighting_granularity: chrono::Duration,
+    sighting_granularity: std::time::Duration,
     /// See [`DEFAULT_MAX_UNKNOWN_DEVICES_PER_USER`].
     max_unknown_per_user: usize,
 }
@@ -122,7 +138,7 @@ where
         Self {
             store,
             event_sink: Arc::new(NoopDeviceEventSink),
-            sighting_granularity: chrono::Duration::seconds(DEFAULT_SIGHTING_GRANULARITY_SECS),
+            sighting_granularity: DEFAULT_SIGHTING_GRANULARITY,
             max_unknown_per_user: DEFAULT_MAX_UNKNOWN_DEVICES_PER_USER,
         }
     }
@@ -146,9 +162,9 @@ where
     /// (default 5 minutes). A request for a device seen more recently
     /// than `granularity` before `now` performs no write, so a busy
     /// client costs one store write per window rather than one per
-    /// request. [`Duration::zero`](chrono::Duration::zero) records every
+    /// request. [`Duration::ZERO`](std::time::Duration::ZERO) records every
     /// sighting.
-    pub fn with_sighting_granularity(mut self, granularity: chrono::Duration) -> Self {
+    pub fn with_sighting_granularity(mut self, granularity: std::time::Duration) -> Self {
         self.sighting_granularity = granularity;
         self
     }
@@ -191,8 +207,9 @@ where
     /// has used: not for a lockout exemption
     /// ([`with_device_store`](crate::authn::service::AuthnServiceBuilder::with_device_store)),
     /// not for skipping a step-up. Bind the session's device with
-    /// [`resolve_proven`](Self::resolve_proven), which finds a device only by
-    /// the secret token on its cookie and is what
+    /// [`resolve_or_keep`](Self::resolve_or_keep), which finds a device only
+    /// by the secret token on its cookie, keeps the device a session already
+    /// had as recognised and no more, and is what
     /// [`LifecycleDeviceResolver`](crate::device::LifecycleDeviceResolver)
     /// uses.
     ///
@@ -226,7 +243,7 @@ where
         tenant: &TenantId,
         user: Option<&UserId>,
         fingerprint: FingerprintHash,
-        now: DateTime<Utc>,
+        now: Timestamp,
         new_id_fn: impl FnOnce() -> DeviceId + Send,
     ) -> impl Future<Output = Result<DeviceId, S::Error>> + Send {
         let tenant = *tenant;
@@ -337,12 +354,14 @@ where
         &self,
         tenant: &TenantId,
         device: &Device,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Result<DeviceTrustLevel, S::Error> {
         // A request that is older than the last recorded sighting (an
         // out-of-order arrival, or a node whose clock lags) records nothing.
+        // Past the first test the request is later than the sighting, so
+        // the size of the span between them is the span.
         if now <= device.last_seen_at
-            || now.signed_duration_since(device.last_seen_at) < self.sighting_granularity
+            || now.since(device.last_seen_at).unsigned_abs() < self.sighting_granularity
         {
             return Ok(device.trust_level);
         }
@@ -359,10 +378,10 @@ where
     /// | `Unknown` | `Seen` (recorded with `record_sighting(now)`) |
     /// | `Seen` | `Seen` (no-op; `last_seen_at` bumped) |
     /// | `Trusted` | `Trusted` (no-op; `last_seen_at` bumped) |
+    /// | `Revoked` | `Revoked` (no-op; `last_seen_at` **not** bumped) |
     ///
     /// A `Seen` or `Trusted` device that is revoked between the load and the
     /// sighting is reported as `Revoked`, with `last_seen_at` unchanged.
-    /// | `Revoked` | `Revoked` (no-op; `last_seen_at` **not** bumped) |
     ///
     /// **Never re-elevates a `Revoked` device.** Revocation is a
     /// terminal state until an admin / user explicitly resurrects the
@@ -382,22 +401,38 @@ where
     /// revoked" outcome, whether the device was already revoked when it was
     /// loaded or was revoked between the load and the promotion; the
     /// promotion is a conditional write ([`DeviceStore::set_trust_level_if`])
-    /// so the revocation is never overwritten. `Ok(None)` if the `device_id` doesn't resolve: defensive,
-    /// callers shouldn't see this if they pass an id from
-    /// [`Self::ensure_device`].
+    /// so the revocation is never overwritten. `Ok(None)` if the device no
+    /// longer exists, or is another user's.
+    ///
+    /// **Takes a [`UserDevice`], not an id.** Trust is written only onto a
+    /// device the request proved it holds, for the user the session is
+    /// authenticated as (see
+    /// [`AuthSession::user_device`](crate::session::extractor::AuthSession::user_device)),
+    /// so a row found by fingerprint ([`Self::ensure_device`]) or a device a
+    /// session only kept cannot be promoted: neither yields a
+    /// [`ProvenDevice`]. A login on a device the request did not prove
+    /// promotes nothing.
+    ///
+    /// **Writes nothing to another user's device.** The request that
+    /// completes a login proved its device before anyone was signed in, so
+    /// on a browser profile two accounts share it may be the other
+    /// account's. A row owned by another user is left as it was and the
+    /// answer is `Ok(None)`; a row with no owner is first claimed for the
+    /// user by one conditional write ([`DeviceStore::claim_owner`]).
     pub fn promote_on_authn(
         &self,
-        tenant: &TenantId,
-        device_id: &DeviceId,
-        now: DateTime<Utc>,
+        device: &UserDevice,
+        now: Timestamp,
     ) -> impl Future<Output = Result<Option<DeviceTrustLevel>, S::Error>> + Send {
-        let tenant = *tenant;
-        let device_id = *device_id;
+        let (tenant, user, device_id) = (device.tenant(), device.user(), device.device().id());
         async move {
             let device = match self.store.load(&tenant, &device_id).await? {
                 Some(d) => d,
                 None => return Ok(None),
             };
+            if !self.is_users(&tenant, &device, &user, now).await? {
+                return Ok(None);
+            }
 
             match device.trust_level {
                 DeviceTrustLevel::Unknown => {
@@ -460,31 +495,120 @@ where
     /// Usage:
     ///
     /// ```text
-    /// let outcome = authn.complete_factor_step(...).await?;
-    /// let _ = device_lifecycle
-    ///     .promote_if_authenticated(&outcome, &tenant, &device_id, now)
-    ///     .await?;
+    /// let outcome = authn.verify_factor(...).await?;
+    /// if let Some(device) = session.user_device().await {
+    ///     device_lifecycle
+    ///         .promote_if_authenticated(&outcome, &device, now)
+    ///         .await?;
+    /// }
     /// ```
     ///
     /// Returns the same `Option<DeviceTrustLevel>` as
     /// [`Self::promote_on_authn`] when the outcome was
     /// `Authenticated`; `Ok(None)` otherwise (including the absent-
-    /// device-id case, mirroring `promote_on_authn` semantics).
+    /// device case, mirroring `promote_on_authn` semantics).
     pub fn promote_if_authenticated(
         &self,
         outcome: &FactorOutcome,
-        tenant: &TenantId,
-        device_id: &DeviceId,
-        now: DateTime<Utc>,
+        device: &UserDevice,
+        now: Timestamp,
     ) -> impl Future<Output = Result<Option<DeviceTrustLevel>, S::Error>> + Send {
         let is_authenticated = matches!(outcome, FactorOutcome::Authenticated);
-        let tenant = *tenant;
-        let device_id = *device_id;
+        let device = *device;
         async move {
             if is_authenticated {
-                self.promote_on_authn(&tenant, &device_id, now).await
+                self.promote_on_authn(&device, now).await
             } else {
                 Ok(None)
+            }
+        }
+    }
+
+    /// Whether a trust write for `user` may touch `row`: the row is owned by
+    /// `user`, or has no owner and is claimed for `user` by the store's
+    /// conditional write. A row another user owns is not, and nothing is
+    /// written to it. A revoked row with no owner is passed on unclaimed:
+    /// nothing is written to a revoked row, and the caller reports it.
+    async fn is_users(
+        &self,
+        tenant: &TenantId,
+        row: &Device,
+        user: &UserId,
+        now: Timestamp,
+    ) -> Result<bool, S::Error> {
+        match row.user_id.as_ref() {
+            Some(owner) if owner == user => Ok(true),
+            Some(_) => {
+                tracing::warn!(
+                    device_id = %row.id,
+                    "a trust write named a device another user owns; nothing was written"
+                );
+                Ok(false)
+            }
+            None if row.trust_level == DeviceTrustLevel::Revoked => Ok(true),
+            None => Ok(matches!(
+                self.store.claim_owner(tenant, &row.id, user, now).await?,
+                OwnerClaim::Claimed
+            )),
+        }
+    }
+
+    /// Mark a device [`Trusted`](DeviceTrustLevel::Trusted): the write
+    /// behind "trust this device".
+    ///
+    /// Like [`promote_on_authn`](Self::promote_on_authn) it takes a
+    /// [`UserDevice`], so the device that becomes trusted is the one the
+    /// request proved it holds and never a row that merely shares its
+    /// fingerprint, and it writes nothing to a device another user owns
+    /// (`Ok(None)`). Call it after whatever the application asks of the user
+    /// first (a step-up, a confirmation).
+    ///
+    /// An `Unknown` or `Seen` device becomes `Trusted` by one conditional
+    /// write ([`DeviceStore::set_trust_level_if`]) and a
+    /// [`DeviceTrustGranted`](AuthEventType::DeviceTrustGranted) row is
+    /// written. A `Trusted` device stays as it is. A `Revoked` device is
+    /// never trusted, including one revoked between the load and the write.
+    /// Returns the level the device is at after the call, `None` when it no
+    /// longer exists.
+    pub fn grant_trust(
+        &self,
+        device: &UserDevice,
+        now: Timestamp,
+    ) -> impl Future<Output = Result<Option<DeviceTrustLevel>, S::Error>> + Send {
+        let (tenant, user, device_id) = (device.tenant(), device.user(), device.device().id());
+        async move {
+            let Some(row) = self.store.load_fresh(&tenant, &device_id).await? else {
+                return Ok(None);
+            };
+            if !self.is_users(&tenant, &row, &user, now).await? {
+                return Ok(None);
+            }
+            let from = match row.trust_level {
+                DeviceTrustLevel::Trusted => return Ok(Some(DeviceTrustLevel::Trusted)),
+                DeviceTrustLevel::Revoked => return Ok(Some(DeviceTrustLevel::Revoked)),
+                level @ (DeviceTrustLevel::Unknown | DeviceTrustLevel::Seen) => level,
+            };
+            match self
+                .store
+                .set_trust_level_if(&tenant, &device_id, from, DeviceTrustLevel::Trusted, now)
+                .await?
+            {
+                TrustTransition::Applied => {
+                    // The grant is `user`'s: `is_users` let the write through
+                    // because the row is theirs or has just been claimed for
+                    // them, and `row` is the snapshot from before that claim,
+                    // whose owner of an unowned device is still none.
+                    let event = AuthEventBuilder::success(AuthEventType::DeviceTrustGranted)
+                        .attributed_to(&user, &tenant)
+                        .with_device(device_id)
+                        .build_at(now);
+                    self.event_sink.emit(event).await;
+                    Ok(Some(DeviceTrustLevel::Trusted))
+                }
+                // The row moved under the write: report where it is now and
+                // change nothing. A revocation that won stays a revocation.
+                TrustTransition::Refused { current } => Ok(Some(current)),
+                TrustTransition::Missing => Ok(None),
             }
         }
     }
@@ -510,7 +634,7 @@ where
         device_id: &DeviceId,
         credential_id: String,
         attestation_class: crate::device::types::AttestationClass,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<bool, S::Error>> + Send {
         let tenant = *tenant;
         let device_id = *device_id;
@@ -598,7 +722,7 @@ where
         tenant: &TenantId,
         device_id: &DeviceId,
         credential_id: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<(), S::Error>> + Send {
         let tenant = *tenant;
         let device_id = *device_id;
@@ -648,7 +772,7 @@ where
 }
 
 mod proof;
-pub use proof::{DeviceRequest, ResolvedDevice};
+pub use proof::{DeviceRequest, ResolvedDevice, ResolvedOrKept};
 
 #[cfg(test)]
 mod tests;

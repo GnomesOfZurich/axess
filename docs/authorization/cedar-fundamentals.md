@@ -9,7 +9,7 @@ authorisation logic is the part of your system that needs the
 most review and is also the part most likely to drift.
 
 [Cedar](https://cedarpolicy.com/) is a policy language designed for
-this exact problem. It is declarative, deny-by-default, statically
+this problem. It is declarative, deny-by-default, statically
 checkable against a schema, and built to express RBAC, ReBAC, and
 ABAC in one set of rules. Axess loads a Cedar policy set at startup,
 validates it against a schema, and exposes per-request evaluation
@@ -24,14 +24,12 @@ Each phase has a specific failure mode, and the design is built so
 the failures land at the right place.
 
 The load phase happens once at application startup. The application
-constructs a `PolicyStore` from one or more policy files, validates
-the parsed policies against a schema, and produces an `AuthzStore`
-that holds the result. A load failure (a malformed policy, a type
+constructs a `PolicyStore` from the policy text and the schema (the
+constructor validates the parsed policies against the schema), and
+builds an `AuthzStore` that holds the result. A load failure (a malformed policy, a type
 mismatch against the schema, an action that references an
 undefined entity) is a startup failure: the process refuses to
-start. The defence is structural: there is no path to production
-with a broken policy file, because the process refuses to come
-up.
+start, so a broken policy file has no path to production.
 
 A running service can also replace its policy set without a restart:
 `AuthzStore::reload_policies` runs the same parse and strict validation
@@ -40,53 +38,55 @@ then swaps. A reload that fails any step leaves the previous set in force
 and names the step. See *Live policy reload*.
 
 The evaluate phase happens once per authorisation check. The
-application constructs an `AuthzSession` from the `AuthzStore`, a
-`Principal` (typically extracted from the session or from a
-workload-identity resolver), an `AuthzEntityProvider` that supplies
-your entity graph for this request, and a context
-(MFA status, IP address, your custom attributes). The
-session offers two verbs: `require` (allow or deny, returning an
-error on deny) and `decide` (a typed `AuthzDecision`). The
+application begins an `AuthzSession` from the `AuthzStore` with the
+user id (taken from the authenticated session), a tenant where the
+provider needs one, and a request context (MFA status, IP address,
+assurance, or your own attributes). The `AuthzEntityProvider` that
+supplies your entity graph is bound to the store, not passed per
+request. The session's verbs are `require` (`Ok(())` or
+`Err(AuthzDenied)`), `require_with_step_up`, `is_permitted` (a `bool`)
+and `batch_check` (a typed `AuthzDecision` per pair). The
 evaluation is cheap, predictable, and deterministic.
 
 The redeploy phase happens when policies change. The application
-loads a new `PolicyStore` from the new policy files, swaps it in
-behind the `AuthzStore`'s `Arc`, and from the next request onward
-new evaluations use the new policies. A hot reload of policies is
-supported; the trade-off is that decisions in flight at swap time
-see the old policies and decisions started after see the new
-policies. There is no decision-caching layer in axess for this
-reason: a cached decision from before a redeploy would survive into
+passes the new policy text and schema to
+`AuthzStore::reload_policies`, which validates them as described
+above and swaps them in, and from the next decision onward
+evaluations use the new policies. The trade-off is that decisions in
+flight at swap time see the old policies, and decisions started
+afterwards see the new ones. There is no decision-caching layer in
+axess for this reason: a cached decision from before a redeploy would survive into
 the new policy regime and produce wrong answers. The chapter
 *Entity providers and request context* expands on what does and
 does not get cached.
 
 ## Loading policies
 
-The minimal load is a directory of `.cedar` files plus a
-`schema.cedarschema` file:
+The minimal load is the Cedar policy text plus a JSON schema:
 
 ```rust,ignore
+use std::sync::Arc;
 use axess::authz::{AuthzStore, PolicyStore};
 
-let policy_store = PolicyStore::load_directory("./policies")?;
-let schema = std::fs::read_to_string("./policies/schema.cedarschema")?;
-policy_store.validate_against(&schema)?;
+let policy_text = std::fs::read_to_string("./policies/app.cedar")?;
+let schema_json = std::fs::read_to_string("./policies/app.cedarschema.json")?;
+// Parses both and validates the policies against the schema.
+let policy_store = Arc::new(PolicyStore::from_text(&policy_text, &schema_json)?);
 
-let authz_store = AuthzStore::try_new(policy_store, provider, "MyApp")?;
+let authz_store = Arc::new(AuthzStore::try_new(policy_store, Arc::new(provider), "MyApp")?);
 ```
 
-The load is recursive: every `.cedar` file under the directory is
-parsed and added to the policy set. Cedar policies have no `import`
-or namespace mechanism beyond the entity-type namespace; the
-collection of all files is the policy set, evaluated as one.
+`PolicyStore::from_text` takes one string of policy text. Policies kept
+in several files are joined into that string before the call. Cedar
+policies have no `import` or namespace mechanism beyond the entity-type
+namespace; the whole text is the policy set, evaluated as one.
 
-`validate_against` is the call that catches malformed policies
+The strict validation inside `from_text` catches malformed policies
 before they reach production. The validator checks that every
 entity type the policies reference is defined in the schema, that
 every attribute access is on an attribute the schema declares, and
 that the types align (a policy that asks `principal.age > "old"`
-gets caught because the schema declares `age` as a number and the
+is caught because the schema declares `age` as a number and the
 literal is a string).
 
 The schema is its own discipline. Writing a schema that accurately
@@ -96,8 +96,8 @@ Cedar integration. The schema names the principal types (`User`,
 `administer`), the resource types (your domain
 objects), and the parent relationships (a `User` is in `Group`s,
 which are in `Role`s, which permit `Action`s). The Cedar
-documentation covers schema authoring in detail; the chapter here
-focuses on what axess does with a schema once it has one.
+documentation covers schema authoring; this chapter covers what axess
+does with a schema once it has one.
 
 ## The per-request evaluator
 
@@ -122,7 +122,22 @@ if session.is_permitted("View", &doc_id).await {
 `for_user_id` binds the caller. It turns the user id into the Cedar
 `User` UID your schema declares, and the session carries that UID for
 every check it makes. Use `for_user_id_with_context` when policies need
-request attributes; `for_user_id` alone gives an empty Cedar context.
+request attributes. `for_user_id` supplies no context and is for a policy
+set that never reads `context`. When the policies in force read it,
+`for_user_id` and `for_user_in_tenant` return
+`AuthzError::ContextRequired` and begin nothing: on an empty
+context, a `forbid` that guards an optional attribute with `context has ..`
+stops applying, and the `permit` beside it allows. The same holds for
+`NoContext` handed to a form that takes a context. A session that is
+still held when a policy reload brings in a read of `context` has its
+next check denied. `for_user_in_tenant_with_context` and `for_session`
+are the forms with a tenant.
+
+`for_principal` and `for_principal_with_context` bind a `Principal`
+instead, a human or a workload: the principal is the `axess::Human` or
+`axess::Workload` entity of *The principal model*, in the
+principal's tenant, and the session adds that entity to the ones the
+provider supplies.
 
 The entity provider is bound to the *store*, not the session, because
 it is process-wide application code rather than per-request state. It
@@ -145,16 +160,25 @@ The session caches entities per `(action, resource)` for its lifetime,
 so a handler that checks the same pair twice pays for the provider
 once.
 
-There are three verbs, and no method returns an error for a denial.
+There are four verbs. A denial is never an `AuthzError`: the two
+`require` forms return it as their own refusal type, and the other two
+as a value.
 
 `require(action, resource)` returns `Result<(), AuthzDenied>`, so a
 handler can `?` it and let a deny become a 403. `AuthzDenied` is a
 unit type: it says access was refused, and deliberately says nothing
-about why, because the reason is exactly what an attacker probing
-policies would like to learn. Log the detail on your side of the call.
+about why, because the reason is what an attacker probing policies
+wants to learn. Log the detail on your side of the call.
+
+`require_with_step_up(action, resource)` returns
+`Result<(), AuthzRefusal>`: `AuthzRefusal::StepUpRequired` when the
+policies would permit after the step-up their `@step_up` annotations
+name, and `AuthzRefusal::Denied` for every other denial. It needs a
+context that carries `assurance`. *Authentication assurance and
+ceremonies* covers it.
 
 `is_permitted(action, resource)` returns a plain `bool`, for code that
-needs a non-binary outcome: a UI that hides a button rather than
+branches on the answer instead of stopping: a UI that hides a button rather than
 showing it and denying on click, an admin panel listing what this user
 could do.
 
@@ -163,7 +187,7 @@ returns `Vec<(String, AuthzDecision)>`, sharing the session's entity
 cache across them. Use it to answer "which of these may I do?" in one
 pass instead of a loop of `is_permitted`.
 
-All three are async because the provider is: loading entities usually
+All four are async because the provider is: loading entities usually
 means a database round trip.
 
 ```rust,ignore
@@ -185,16 +209,17 @@ async fn dashboard(
 }
 ```
 
-The wildcard resource UID in the second example is a Cedar
-convention for "is the principal allowed to perform this action at
-all?"; it relies on the policy set being written with that question
-in mind.
+The second example asks about a template rather than an existing
+document. Axess has no wildcard resource: `template_id` is a
+`ResourceId` like any other, and the answer means "may the principal
+create documents at all?" only if your provider maps it to a resource
+the policy set is written to match for that question.
 
 ## What policies cannot do
 
 Cedar is the right tool for asking "is this allowed?". It is not
-the right tool for everything that pattern-matches like
-authorisation but is actually something else.
+the right tool for concerns that resemble authorisation but are
+something else.
 
 It is not for rate limiting. Rate limits are stateful (they depend
 on the rate of past requests, not the content of the current
@@ -210,7 +235,7 @@ logic and run after the body has already been parsed.
 It is not for state transitions. A workflow that allows a
 transition from `Pending` to `Approved` but not from `Pending` to
 `Closed` is a state machine, not a policy. Implement the state
-machine in code (or in a `axess`-style typed state machine for the
+machine in code (or in an `axess`-style typed state machine for the
 workflow); use Cedar to gate access to the transition operations.
 
 It is not for caching decisions across requests. Policies and

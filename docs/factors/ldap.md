@@ -1,11 +1,11 @@
 # LDAP bind
 
-LDAP bind is the right factor for enterprise deployments where the
+LDAP bind suits enterprise deployments where the
 authoritative user store is Active Directory, OpenLDAP, or a similar
 directory server. The application does not own user passwords; the
-directory does. The verification mechanism is a simple bind against
-the directory with the user's distinguished name and password; if
-the bind succeeds, the user has authenticated.
+directory does. Axess verifies the user with a simple bind against the directory,
+using the user's distinguished name and password; a successful bind
+authenticates the user.
 
 The feature flag is `ldap` (off by default), enabled with
 `features = ["ldap"]` on the `axess` facade.
@@ -19,19 +19,22 @@ LDAP fits when three conditions hold:
 - The directory administrators have agreed to allow simple binds from
   your deployment network.
 - The directory speaks LDAP, rather than a protocol that wraps LDAP
-  semantics. SAML and OIDC route through the OAuth factor instead.
+  semantics. OIDC goes through the OAuth factor instead; SAML federation
+  is not supported.
 
 When those conditions hold, LDAP gives you authentication as a service
 from the directory, and you never store a user password. New employees
-added to the directory can log in immediately; departed
-employees removed from the directory lose access immediately. The
-directory is the source of truth.
+added to the directory can log in immediately, and an employee removed
+from the directory can no longer log in. A session they already hold is
+not checked against the directory again: it stays valid until it
+expires or is ended, for example by `invalidate_user_sessions`. The
+directory is the source of truth for every login.
 
 When those conditions do not hold (a SaaS deployment where users
 come from many organisations, a directory you cannot
 reach over a stable network, an authoritative store that is not LDAP),
-the right answer is OAuth or OIDC against an IdP that the
-organisation does support.
+use OAuth or OIDC against an IdP that the organisation
+supports.
 
 ## Configuration
 
@@ -42,8 +45,9 @@ pub struct LdapProviderConfig {
     pub url: String,                          // ldaps://ad.example.com:636
     pub bind_dn_template: String,             // "uid={user},ou=people,dc=example,dc=com"
     pub starttls: bool,                       // upgrade ldap:// to TLS via STARTTLS
-    pub connection_timeout: Duration,         // typical 5-10 seconds
+    pub connection_timeout: Duration,         // default 5 seconds
     pub group_search: Option<LdapGroupSearch>,
+    pub allow_cleartext: bool,                // see allow_cleartext() below
 }
 ```
 
@@ -60,29 +64,29 @@ the encrypted forms.
 
 `bind_dn_template` is the pattern axess uses to construct a user's
 distinguished name from their login identifier. The string `{user}`
-in the template is replaced with the identifier the user typed. The
+in the template is replaced with the user's login identifier, escaped
+for a DN (RFC 4514), so a comma or plus sign in the identifier cannot
+change which entry the bind names. The
 example above turns the username `alice` into the DN
-`uid=alice,ou=people,dc=example,dc=com`, which is then used in the
-bind request.
+`uid=alice,ou=people,dc=example,dc=com` for the bind request.
 
-`starttls` triggers a STARTTLS upgrade after the initial cleartext
-connection establishes. The mechanism is widely supported and is the
-right choice when the directory accepts both cleartext and TLS on
-the same port (usually 389). When the directory exposes a separate
+`starttls` upgrades the cleartext connection to TLS once it is
+established. Use it when the directory accepts both cleartext and TLS
+on the same port (usually 389). When the directory exposes a separate
 TLS port (usually 636), use `ldaps://` instead and leave this false.
 
-`connection_timeout` bounds how long a bind attempt may take. Five
-to ten seconds is typical. Longer timeouts admit slow failure modes
+`connection_timeout` bounds connecting and each step after it (the
+bind, then the group search). The default is five seconds, and five
+to ten is typical. Longer timeouts admit slow failure modes
 into the login path; shorter timeouts produce spurious failures
 when the directory is briefly slow. Tune to match the directory's
 observed latency.
 
-`group_search` is optional. When set, after a successful bind axess
-performs an additional search to enumerate the user's group
-memberships. The provider returns them in `LdapBindResult`, and the
-service keeps them in the session's authenticated state (not in the
-custom data, so a handler cannot overwrite them and the custom-data cap
-does not apply): read them with `AuthSession::ldap_groups()` on any
+`group_search` is optional. When it is set, axess searches for the
+user's group memberships after a successful bind. The provider returns them in `LdapBindResult`, and the
+service keeps them in the session's authenticated state rather than in
+the custom data, so a handler cannot overwrite them and the custom-data
+cap does not apply. Read them with `AuthSession::ldap_groups()` on any
 later request and map them to roles or Cedar entities. They are the groups of the login that
 produced the session; a change in the directory is seen at the next
 login. Without a group search the list is empty, and a session that
@@ -100,16 +104,22 @@ pub struct LdapGroupSearch {
 `{user}` (the original identifier) into an LDAP filter. The example
 filter `(member={dn})` matches groups that list the user's DN in
 their `member` attribute, which is the OpenLDAP convention. Active
-Directory typically uses `memberOf` on the user record itself
-instead, in which case the group search is unnecessary because the
-groups are already attributes of the user.
+Directory also lists a user's groups in `memberOf` on the user entry,
+but axess does not read attributes of the user entry: the groups come
+only from the group search. An Active Directory deployment therefore
+still configures one. Its group objects carry `member` too, but
+`member` holds full DNs and `{dn}` is the bind DN, so `(member={dn})`
+matches only when the bind DN is the user's full DN: a template that
+builds it, or a per-user `bind_dn` in `LdapBindFactorConfig`. A bind DN
+of the form `{user}@corp.example.com` or `CORP\{user}` matches no group.
 
 ## The verification flow
 
 The user submits a username and password to your handler, which calls
-`RequestAuthnService::verify_factor` with the LDAP bind credential; axess
-expands the bind DN template with the username, opens a TLS
-connection to the directory, performs a simple bind with the
+`RequestAuthnService::verify_factor` with the LDAP bind credential. Axess
+expands the bind DN template with the username, opens a connection
+to the directory (TLS for `ldaps://` or with `starttls`, cleartext only
+where the refusal above allows it), performs a simple bind with the
 constructed DN and the user's password, optionally searches for
 groups, and unbinds.
 
@@ -120,11 +130,10 @@ factors are required. A failed bind returns
 `FactorOutcome::InvalidCredential`, and the user sees the standard
 failed-login message.
 
-The connection model is per-attempt. Each bind opens a fresh TLS
-connection, performs the bind, and closes. There is no connection
-pooling. The trade-off is operational simplicity (no pool to size,
-no idle-connection management) against per-attempt latency (a TLS
-handshake on each login). For most deployments the latency is
+Each bind attempt opens a fresh connection, binds, and closes
+it; there is no connection pooling. The trade-off is operational simplicity (no pool to size,
+no idle-connection management) against per-attempt latency (a new
+connection, and on TLS a handshake, on each login). For most deployments the latency is
 acceptable; busy directories with thousands of binds per second
 benefit from a connection pool at the network layer (HAProxy,
 nginx) rather than in your process.
@@ -149,20 +158,23 @@ TOTP. The flow is otherwise unchanged.
 
 ## Changing the provider on a running service
 
-`reload_ldap(candidate)` swaps the LDAP provider after the candidate's
-`check_reachable` connected to the directory with the configured transport
-(TLS or StartTLS, and the cleartext refusal) and unbound, without sending a
-credential, within `with_provider_validation_timeout`. A directory that does not
+`reload_ldap_as(actor, candidate)`, on `authn.with_audit_context(audit)`,
+swaps the LDAP provider as the administrator it names. It swaps only after
+the candidate's `check_reachable` has connected to the directory with the
+configured transport (TLS or STARTTLS, and the cleartext refusal) and unbound,
+without sending a credential, within `with_provider_validation_timeout`. A directory that does not
 answer, or a custom provider that does not implement the check, is refused by
 name and the previous provider keeps serving. See
 [live provider reload](../authentication/live-provider-reload.md).
 
 ## Threat model
 
-LDAP bind is robust against the same attacks any second-factor
-method is robust against: credential reuse from other services,
-local password lists, offline brute-forcing of a stolen hash (the
-hash never leaves the directory).
+An LDAP bind is a password factor, verified by the directory instead
+of against a stored hash. Axess holds no password hash, so none can be
+stolen from the application and brute-forced offline (the hash never
+leaves the directory). Like any password, it does not resist a password
+reused from another service or guessed from a common-password list;
+pair it with a second factor (see above) where that matters.
 
 It is weak against attacks the directory itself is weak against. A
 directory that allows anonymous binds is vulnerable to attribute
@@ -172,9 +184,8 @@ defence is operational: configure the directory correctly, audit
 periodically, and treat the LDAP factor's security as a function of
 the directory's security posture.
 
-The application also has to be careful about what it logs. The bind
-password should never appear in application logs at any level,
-including trace. Axess does not log it; adopters' own login handlers
+The bind password must never appear in application logs at any
+level, including trace. Axess does not log it; adopters' own login handlers
 need to make the same guarantee. The standard pattern is to mark
 the password field as zeroized and to route it directly into the
 verifier without touching it again.
@@ -192,7 +203,7 @@ verifier without touching it again.
 
 *Factors and methods* covers the composition machinery this chapter
 exercises. *Identity store implementation* covers how user records
-referenced by LDAP get provisioned in your identity
+referenced by LDAP are provisioned in your identity
 store (typically just-in-time on first successful LDAP login).
 *Multi-tenancy* covers the case where different tenants federate to
 different directories.

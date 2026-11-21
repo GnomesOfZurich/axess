@@ -80,7 +80,30 @@ fn values_without_a_separator_still_render() {
         Some("t1/d1")
     );
     assert_eq!(
-        render("Doc:{id}", "a/b:c", "u", "t1").as_deref(),
-        Some("a/b:c")
+        render("Doc:{id}", "a-b.c", "u", "t1").as_deref(),
+        Some("a-b.c")
     );
+}
+
+/// A template with one placeholder on one route and a template with two on
+/// another must not render the same resource id for the same type: a
+/// single value may not carry a separator character, so `Doc:{id}` with
+/// `t1/x` never equals `Doc:{$tenant}/{id}` with (`t1`, `x`).
+#[test]
+fn a_single_placeholder_value_cannot_imitate_a_two_placeholder_id() {
+    let plain = render("Doc:{id}", "t1/x", "u", "t1");
+    let split = render("Doc:{$tenant}/{id}", "x", "u", "t1");
+    assert!(split.is_some(), "the two-placeholder id renders");
+    assert!(plain.is_none() || plain != split, "both give {plain:?}");
+    let plain = render("Doc:{id}", "t1:x", "u", "t1");
+    let split = render("Doc:{$tenant}:{id}", "x", "u", "t1");
+    assert!(plain.is_none() || plain != split, "both give {plain:?}");
+}
+
+/// A template that opens a placeholder and never closes it is refused, not
+/// rendered with the brace as literal text.
+#[test]
+fn an_unclosed_placeholder_is_refused() {
+    assert!(render("Doc:{id", "d1", "u", "t1").is_none());
+    assert!(render("Doc:{$tenant}/{id", "d1", "u", "t1").is_none());
 }

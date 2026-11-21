@@ -35,19 +35,20 @@ mkdir -p "$BIN_DIR"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-# fetch <url> <sha256> <file>: download, verify, then extract into BIN_DIR.
-fetch() {
-  local url="$1" sha="$2" file="$WORK/$3"
-  curl -fsSL -o "$file" "$url"
-  (cd "$WORK" && printf '%s  %s\n' "$sha" "$3" | sha256sum -c -) \
-    || { echo "refused: $3 does not match its pinned SHA-256; nothing was extracted." >&2; exit 1; }
-  tar -xz -C "$BIN_DIR" -f "$file"
-}
+# Each archive: download it, check it against its pinned SHA-256 (with -e
+# set, a mismatch stops the script here, before anything is extracted),
+# then extract it into BIN_DIR. Written out once per archive, so that
+# scripts/check-workflow-pins.sh reads the check beside the download.
+curl -fsSL -o "$WORK/mdbook.tar.gz" \
+  "https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+echo "$MDBOOK_SHA256  $WORK/mdbook.tar.gz" | sha256sum --check --strict -
+tar -xz -C "$BIN_DIR" -f "$WORK/mdbook.tar.gz"
 
-fetch "https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
-  "$MDBOOK_SHA256" mdbook.tar.gz
-fetch "https://github.com/badboy/mdbook-mermaid/releases/download/v${MDBOOK_MERMAID_VERSION}/mdbook-mermaid-v${MDBOOK_MERMAID_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
-  "$MDBOOK_MERMAID_SHA256" mdbook-mermaid.tar.gz
+curl -fsSL -o "$WORK/mdbook-mermaid.tar.gz" \
+  "https://github.com/badboy/mdbook-mermaid/releases/download/v${MDBOOK_MERMAID_VERSION}/mdbook-mermaid-v${MDBOOK_MERMAID_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+echo "$MDBOOK_MERMAID_SHA256  $WORK/mdbook-mermaid.tar.gz" | sha256sum --check --strict -
+tar -xz -C "$BIN_DIR" -f "$WORK/mdbook-mermaid.tar.gz"
+
 chmod +x "$BIN_DIR/mdbook" "$BIN_DIR/mdbook-mermaid"
 
 echo "Installed mdbook ${MDBOOK_VERSION} and mdbook-mermaid ${MDBOOK_MERMAID_VERSION} into ${BIN_DIR}."

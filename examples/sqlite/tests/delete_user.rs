@@ -3,12 +3,13 @@
 //! naming them, while the other seeded user is untouched and the audit log
 //! keeps its rows with the user column cleared.
 
-use axess::SystemClock;
 use axess::authn::AuthnScope;
 use axess::authn::{
     FactorKind, FactorStore, IdentityAdmin, IdentityLookup, IdentityPasswordHistory,
     IdentityPasswordReset, TenantId, UserId,
 };
+use axess_clock::testing::MockClock;
+use axess_clock::testing::Shift;
 use axess_example_sqlite::models::backend::{OurBackend, seed};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::str::FromStr;
@@ -17,7 +18,7 @@ const ALICE: &str = "00000000-0000-0000-0000-000000000010";
 const BOB: &str = "00000000-0000-0000-0000-000000000020";
 const TENANT: &str = "00000000-0000-0000-0000-000000000001";
 
-async fn pool() -> sqlx::SqlitePool {
+async fn pool(clock: &MockClock) -> sqlx::SqlitePool {
     let opts = SqliteConnectOptions::from_str("sqlite::memory:")
         .expect("in-memory url")
         .create_if_missing(true);
@@ -28,9 +29,10 @@ async fn pool() -> sqlx::SqlitePool {
         .expect("connect in-memory sqlite");
     sqlx::migrate!().run(&pool).await.expect("migrations");
     seed(
-        &SystemClock,
+        clock,
         &pool,
-        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF"),
+        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF")
+            .with_clock(std::sync::Arc::new(clock.clone())),
     )
     .await
     .expect("seed");
@@ -50,8 +52,9 @@ async fn rows_where(pool: &sqlx::SqlitePool, table: &str, column: &str, user: &s
 
 #[tokio::test]
 async fn delete_user_erases_every_row_naming_the_user() {
-    let pool = pool().await;
-    let backend = OurBackend::new(pool.clone());
+    let clock = MockClock::at_reference();
+    let pool = pool(&clock).await;
+    let backend = OurBackend::new(pool.clone()).with_clock(std::sync::Arc::new(clock.clone()));
     let alice = UserId::try_new(ALICE).expect("user id");
     let tenant = TenantId::try_new(TENANT).expect("tenant id");
     let scope = AuthnScope::User {
@@ -67,8 +70,8 @@ async fn delete_user_erases_every_row_naming_the_user() {
         .store_reset_token(
             &alice,
             "h",
-            chrono::Utc::now() + chrono::Duration::hours(1),
-            chrono::Utc::now(),
+            MockClock::reference_time().plus(axess_clock::SignedDuration::hours(1)),
+            MockClock::reference_time(),
             3,
         )
         .await
@@ -139,7 +142,7 @@ async fn delete_user_erases_every_row_naming_the_user() {
     );
     assert!(
         !backend
-            .verify_reset_token(&alice, "h", chrono::Utc::now())
+            .verify_reset_token(&alice, "h", MockClock::reference_time())
             .await
             .expect("verify")
     );

@@ -1,25 +1,26 @@
-//! `tests`: extracted from `totp.rs` per the
-//! 200-LoC inline-test rule in AGENTS.md.
+//! `tests`: the unit tests of `totp.rs`, kept beside it per the
+//! 200-line inline-test rule in AGENTS.md.
 
 use super::*;
+use std::time::Duration;
 
-/// Regression: a too-short TOTP secret must be refused.
+/// A too-short TOTP secret must be refused.
 #[test]
 fn totp_rejects_short_secret() {
-    use chrono::DateTime;
+    use axess_clock::Timestamp;
     let short_raw: [u8; 8] = [0xab; 8];
     let short_b32 = base32::encode(base32::Alphabet::Rfc4648 { padding: false }, &short_raw);
     // Pinned timestamp; short-secret rejection is time-independent
-    // by design, but using `Utc::now()` here would still bypass the
+    // by design, but reading the system clock here would still bypass the
     // workspace's Clock discipline and teach the wrong pattern.
-    let now = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let now = Timestamp::from_unix_seconds(1_700_000_000).unwrap();
     let result = verify_totp(
         &short_b32,
         "123456",
         now,
         TotpVerifyParams {
             length: Some(6),
-            period: Some(30),
+            period: Some(Duration::from_secs(30)),
             past_window: Some(1),
             future_window: Some(1),
             algorithm: TotpAlgorithm::SHA1,
@@ -44,7 +45,7 @@ fn rfc_4226_secret_b32() -> String {
 /// `* `), and the window-walk boolean flips.
 #[test]
 fn rfc_6238_appendix_b_totp_sha1_vectors_match() {
-    use chrono::DateTime;
+    use axess_clock::Timestamp;
     const VECTORS: &[(u64, &str)] = &[
         (59, "94287082"),
         (1111111109, "07081804"),
@@ -55,14 +56,14 @@ fn rfc_6238_appendix_b_totp_sha1_vectors_match() {
     let b32 = rfc_4226_secret_b32();
 
     for (t, expected) in VECTORS {
-        let now = DateTime::from_timestamp(*t as i64, 0).unwrap();
+        let now = Timestamp::from_unix_seconds(*t as i64).unwrap();
         let result = verify_totp(
             &b32,
             expected,
             now,
             TotpVerifyParams {
                 length: Some(8),
-                period: Some(30),
+                period: Some(Duration::from_secs(30)),
                 past_window: Some(0),
                 future_window: Some(0),
                 algorithm: TotpAlgorithm::SHA1,
@@ -81,16 +82,16 @@ fn rfc_6238_appendix_b_totp_sha1_vectors_match() {
 /// drift comparator.
 #[test]
 fn rfc_6238_vector_does_not_match_outside_window() {
-    use chrono::DateTime;
+    use axess_clock::Timestamp;
     let b32 = rfc_4226_secret_b32();
-    let way_later = DateTime::from_timestamp((59 + 5 * 30) as i64, 0).unwrap();
+    let way_later = Timestamp::from_unix_seconds((59 + 5 * 30) as i64).unwrap();
     let result = verify_totp(
         &b32,
         "94287082",
         way_later,
         TotpVerifyParams {
             length: Some(8),
-            period: Some(30),
+            period: Some(Duration::from_secs(30)),
             past_window: Some(0),
             future_window: Some(0),
             algorithm: TotpAlgorithm::SHA1,
@@ -107,7 +108,7 @@ fn rfc_6238_vector_does_not_match_outside_window() {
 /// 32-byte ASCII secret distinct from the SHA-1 secret.
 #[test]
 fn rfc_6238_appendix_b_totp_sha256_vectors_match() {
-    use chrono::DateTime;
+    use axess_clock::Timestamp;
     const RFC_6238_SHA256_SECRET: &[u8] = b"12345678901234567890123456789012";
     const VECTORS: &[(u64, &str)] = &[
         (59, "46119246"),
@@ -122,14 +123,14 @@ fn rfc_6238_appendix_b_totp_sha256_vectors_match() {
     );
 
     for (t, expected) in VECTORS {
-        let now = DateTime::from_timestamp(*t as i64, 0).unwrap();
+        let now = Timestamp::from_unix_seconds(*t as i64).unwrap();
         let result = verify_totp(
             &b32,
             expected,
             now,
             TotpVerifyParams {
                 length: Some(8),
-                period: Some(30),
+                period: Some(Duration::from_secs(30)),
                 past_window: Some(0),
                 future_window: Some(0),
                 algorithm: TotpAlgorithm::SHA256,
@@ -145,7 +146,7 @@ fn rfc_6238_appendix_b_totp_sha256_vectors_match() {
 /// RFC 6238 Appendix B SHA-512 vectors. 64-byte ASCII secret.
 #[test]
 fn rfc_6238_appendix_b_totp_sha512_vectors_match() {
-    use chrono::DateTime;
+    use axess_clock::Timestamp;
     const RFC_6238_SHA512_SECRET: &[u8] =
         b"1234567890123456789012345678901234567890123456789012345678901234";
     const VECTORS: &[(u64, &str)] = &[
@@ -161,14 +162,14 @@ fn rfc_6238_appendix_b_totp_sha512_vectors_match() {
     );
 
     for (t, expected) in VECTORS {
-        let now = DateTime::from_timestamp(*t as i64, 0).unwrap();
+        let now = Timestamp::from_unix_seconds(*t as i64).unwrap();
         let result = verify_totp(
             &b32,
             expected,
             now,
             TotpVerifyParams {
                 length: Some(8),
-                period: Some(30),
+                period: Some(Duration::from_secs(30)),
                 past_window: Some(0),
                 future_window: Some(0),
                 algorithm: TotpAlgorithm::SHA512,
@@ -185,19 +186,19 @@ fn rfc_6238_appendix_b_totp_sha512_vectors_match() {
 /// length and reject below.
 #[test]
 fn verify_totp_accepts_minimum_length_secret() {
-    use chrono::DateTime;
+    use axess_clock::Timestamp;
     let raw: [u8; 16] = [0xab; 16];
     let b32 = base32::encode(base32::Alphabet::Rfc4648 { padding: false }, &raw);
     let t: u64 = 1_700_000_000;
     let code = format!("{:06}", totp_value(&raw, t, 30, 6, TotpAlgorithm::SHA1));
-    let now = DateTime::from_timestamp(t as i64, 0).unwrap();
+    let now = Timestamp::from_unix_seconds(t as i64).unwrap();
     let result = verify_totp(
         &b32,
         &code,
         now,
         TotpVerifyParams {
             length: Some(6),
-            period: Some(30),
+            period: Some(Duration::from_secs(30)),
             past_window: Some(0),
             future_window: Some(0),
             algorithm: TotpAlgorithm::SHA1,
@@ -214,9 +215,9 @@ fn verify_totp_accepts_minimum_length_secret() {
 /// The bound is 8 because RFC 6238 §1.2 allows 6 to 8 digits.
 #[test]
 fn verify_totp_rejects_length_above_max() {
-    use chrono::DateTime;
+    use axess_clock::Timestamp;
     let b32 = rfc_4226_secret_b32();
-    let now = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let now = Timestamp::from_unix_seconds(1_700_000_000).unwrap();
     let over = MAX_TOTP_DIGITS + 1;
     let code: String = std::iter::repeat_n('1', over).collect();
     let result = verify_totp(
@@ -225,7 +226,7 @@ fn verify_totp_rejects_length_above_max() {
         now,
         TotpVerifyParams {
             length: Some(over),
-            period: Some(30),
+            period: Some(Duration::from_secs(30)),
             past_window: Some(1),
             future_window: Some(1),
             algorithm: TotpAlgorithm::SHA1,
@@ -288,7 +289,14 @@ fn generate_totp_secret_is_32_char_base32() {
 /// digits, and period.
 #[test]
 fn build_totp_uri_known_output() {
-    let uri = build_totp_uri("alice@example.com", "Acme Corp", "JBSWY3DPEHPK3PXP", 6, 30).unwrap();
+    let uri = build_totp_uri(
+        "alice@example.com",
+        "Acme Corp",
+        "JBSWY3DPEHPK3PXP",
+        6,
+        Duration::from_secs(30),
+    )
+    .unwrap();
     assert!(uri.starts_with("otpauth://totp/"), "wrong scheme: {uri}");
     assert!(
         uri.contains("Acme%20Corp:alice%40example.com"),
@@ -310,13 +318,13 @@ fn build_totp_uri_known_output() {
 /// divide by zero; both are refused before any code is compared.
 #[test]
 fn totp_rejects_short_length_and_zero_period() {
-    use chrono::DateTime;
+    use axess_clock::Timestamp;
     let raw: [u8; 20] = [0xab; 20];
     let b32 = base32::encode(base32::Alphabet::Rfc4648 { padding: false }, &raw);
-    let now = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let now = Timestamp::from_unix_seconds(1_700_000_000).unwrap();
     let short = TotpVerifyParams {
         length: Some(1),
-        period: Some(30),
+        period: Some(Duration::from_secs(30)),
         ..TotpVerifyParams::default()
     };
     assert!(
@@ -325,7 +333,7 @@ fn totp_rejects_short_length_and_zero_period() {
     );
     let zero_period = TotpVerifyParams {
         length: Some(6),
-        period: Some(0),
+        period: Some(Duration::ZERO),
         ..TotpVerifyParams::default()
     };
     assert!(
@@ -334,20 +342,66 @@ fn totp_rejects_short_length_and_zero_period() {
     );
 }
 
+/// RFC 6238's time step is a whole number of seconds: a period with a
+/// fraction is refused, even for the code its whole seconds would accept,
+/// rather than verified as a step the authenticator does not use.
+#[test]
+fn totp_refuses_a_period_that_is_not_whole_seconds() {
+    use axess_clock::Timestamp;
+    let raw: [u8; 20] = [0xab; 20];
+    let b32 = base32::encode(base32::Alphabet::Rfc4648 { padding: false }, &raw);
+    let time: u64 = 1_700_000_000;
+    let now = Timestamp::from_unix_seconds(i64::try_from(time).unwrap()).unwrap();
+    let code = format!("{:06}", totp_value(&raw, time, 30, 6, TotpAlgorithm::SHA1));
+    let with = |period| TotpVerifyParams {
+        length: Some(6),
+        period: Some(period),
+        past_window: Some(0),
+        future_window: Some(0),
+        ..TotpVerifyParams::default()
+    };
+    assert_eq!(
+        verify_totp(&b32, &code, now, with(Duration::from_secs(30))),
+        Some(time / 30)
+    );
+    for period in [
+        Duration::from_millis(30_500),
+        Duration::from_secs(30) + Duration::from_nanos(1),
+        Duration::from_nanos(1),
+    ] {
+        assert_eq!(
+            verify_totp(&b32, &code, now, with(period)),
+            None,
+            "{period:?}"
+        );
+    }
+}
+
 /// A digit count or period `verify_totp` refuses is refused here too, rather
 /// than clamped into an authenticator the server would then verify with
 /// other parameters than the ones the user was shown.
 #[test]
 fn build_totp_uri_refuses_parameters_verify_refuses() {
-    for (digits, period) in [(1, 30), (5, 30), (9, 30), (12, 30), (6, 0), (6, 4)] {
+    let secs = Duration::from_secs;
+    for (digits, period) in [
+        (1, secs(30)),
+        (5, secs(30)),
+        (9, secs(30)),
+        (12, secs(30)),
+        (6, Duration::ZERO),
+        (6, secs(4)),
+        (6, Duration::from_millis(4_999)),
+        (6, Duration::from_millis(30_500)),
+        (6, secs(30) + Duration::from_nanos(1)),
+    ] {
         assert_eq!(
             build_totp_uri("a", "Acme", "JBSWY3DPEHPK3PXP", digits, period),
             None,
-            "digits {digits}, period {period}"
+            "digits {digits}, period {period:?}"
         );
     }
     for digits in 6..=8 {
-        assert!(build_totp_uri("a", "Acme", "JBSWY3DPEHPK3PXP", digits, 5).is_some());
+        assert!(build_totp_uri("a", "Acme", "JBSWY3DPEHPK3PXP", digits, secs(5)).is_some());
     }
 }
 
@@ -358,7 +412,7 @@ fn build_totp_uri_with_algorithm_names_the_algorithm() {
         "Acme",
         "JBSWY3DPEHPK3PXP",
         6,
-        30,
+        Duration::from_secs(30),
         TotpAlgorithm::SHA256,
     )
     .unwrap();
@@ -366,7 +420,8 @@ fn build_totp_uri_with_algorithm_names_the_algorithm() {
         uri.contains("&algorithm=SHA256"),
         "algorithm missing: {uri}"
     );
-    let default = build_totp_uri("a", "Acme", "JBSWY3DPEHPK3PXP", 6, 30).unwrap();
+    let default =
+        build_totp_uri("a", "Acme", "JBSWY3DPEHPK3PXP", 6, Duration::from_secs(30)).unwrap();
     assert!(
         default.contains("&algorithm=SHA1"),
         "SHA1 missing: {default}"
@@ -379,15 +434,15 @@ const RFC_4226_SECRET_HEX: &str = "3132333435363738393031323334353637383930";
 
 #[test]
 fn a_hex_secret_is_not_read() {
-    use chrono::DateTime;
-    let now = DateTime::from_timestamp(59, 0).unwrap();
+    use axess_clock::Timestamp;
+    let now = Timestamp::from_unix_seconds(59).unwrap();
     let result = verify_totp(
         RFC_4226_SECRET_HEX,
         "94287082",
         now,
         TotpVerifyParams {
             length: Some(8),
-            period: Some(30),
+            period: Some(Duration::from_secs(30)),
             past_window: Some(0),
             future_window: Some(0),
             algorithm: TotpAlgorithm::SHA1,
@@ -398,11 +453,11 @@ fn a_hex_secret_is_not_read() {
 
 #[test]
 fn a_secret_of_hex_letters_and_base32_digits_verifies_as_base32() {
-    use chrono::DateTime;
+    use axess_clock::Timestamp;
     // Every character is in both the hex and the base32 alphabets.
     let secret = "ABCDEF2345ABCDEF2345ABCDEF2345AB";
     let raw = base32::decode(base32::Alphabet::Rfc4648 { padding: false }, secret).unwrap();
-    let now = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let now = Timestamp::from_unix_seconds(1_700_000_000).unwrap();
     let code = format!(
         "{:06}",
         totp_value(&raw, 1_700_000_000, 30, 6, TotpAlgorithm::SHA1)
@@ -413,7 +468,7 @@ fn a_secret_of_hex_letters_and_base32_digits_verifies_as_base32() {
         now,
         TotpVerifyParams {
             length: Some(6),
-            period: Some(30),
+            period: Some(Duration::from_secs(30)),
             past_window: Some(0),
             future_window: Some(0),
             algorithm: TotpAlgorithm::SHA1,
@@ -455,14 +510,14 @@ fn rfc_6238_appendix_b_codes_match_for_every_algorithm_and_time() {
 
 #[test]
 fn rfc_6238_appendix_b_codes_verify_through_verify_totp() {
-    use chrono::DateTime;
+    use axess_clock::Timestamp;
     for (time, expected) in RFC_6238_VECTORS {
         for ((algorithm, secret), expected) in RFC_6238_SECRETS.into_iter().zip(expected) {
             let b32 = base32::encode(base32::Alphabet::Rfc4648 { padding: false }, secret);
-            let now = DateTime::from_timestamp(time as i64, 0).unwrap();
+            let now = Timestamp::from_unix_seconds(time as i64).unwrap();
             let params = TotpVerifyParams {
                 length: Some(8),
-                period: Some(30),
+                period: Some(Duration::from_secs(30)),
                 past_window: Some(0),
                 future_window: Some(0),
                 algorithm,
@@ -479,13 +534,27 @@ fn rfc_6238_appendix_b_codes_verify_through_verify_totp() {
 #[test]
 fn the_provisioning_uri_is_unchanged_byte_for_byte() {
     assert_eq!(
-        build_totp_uri("alice@example.com", "Acme Corp", "JBSWY3DPEHPK3PXP", 6, 30).unwrap(),
+        build_totp_uri(
+            "alice@example.com",
+            "Acme Corp",
+            "JBSWY3DPEHPK3PXP",
+            6,
+            Duration::from_secs(30)
+        )
+        .unwrap(),
         "otpauth://totp/Acme%20Corp:alice%40example.com?secret=JBSWY3DPEHPK3PXP\
          &issuer=Acme%20Corp&algorithm=SHA1&digits=6&period=30"
     );
     assert_eq!(
-        build_totp_uri_with_algorithm("a", "I", "JBSWY3DPEHPK3PXP", 8, 60, TotpAlgorithm::SHA512)
-            .unwrap(),
+        build_totp_uri_with_algorithm(
+            "a",
+            "I",
+            "JBSWY3DPEHPK3PXP",
+            8,
+            Duration::from_secs(60),
+            TotpAlgorithm::SHA512,
+        )
+        .unwrap(),
         "otpauth://totp/I:a?secret=JBSWY3DPEHPK3PXP&issuer=I&algorithm=SHA512&digits=8&period=60"
     );
 }

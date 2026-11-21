@@ -4,7 +4,7 @@
 //! [`SessionCrypto`](crate::session::crypto::SessionCrypto), and the
 //! MessagePack + AES-GCM combined encode/decode pipeline lives in
 //! [`SessionCodec`](crate::session::storage::session_codec::SessionCodec):
-//! the same codec contract the SQL backends use, so all three encrypted
+//! the same codec contract the SQL backends use, so all four encrypted
 //! backends share one implementation.
 //!
 //! This module exposes thin factory helpers so the
@@ -16,9 +16,10 @@ use crate::session::crypto::SessionCrypto;
 use crate::session::storage::session_codec::SessionCodec;
 
 /// Build a [`SessionCodec`] configured for AES-256-GCM encryption at
-/// rest with the given 32-byte key.
-pub(super) fn encrypted_codec(key: [u8; 32]) -> SessionCodec {
-    SessionCodec::encrypted(SessionCrypto::new(key))
+/// rest with the given 32-byte key. Each key here is read through a
+/// reference, so the store's constructor holds the one copy it zeroes.
+pub(super) fn encrypted_codec(key: &[u8; 32]) -> SessionCodec {
+    SessionCodec::encrypted(SessionCrypto::from_key(key))
 }
 
 /// Build a [`SessionCodec`] configured for AES-256-GCM encryption at
@@ -26,10 +27,12 @@ pub(super) fn encrypted_codec(key: [u8; 32]) -> SessionCodec {
 /// `current_key` first and fall back to `previous_key` if decryption
 /// fails.
 pub(super) fn encrypted_codec_with_rotation(
-    current_key: [u8; 32],
-    previous_key: [u8; 32],
+    current_key: &[u8; 32],
+    previous_key: &[u8; 32],
 ) -> SessionCodec {
-    SessionCodec::encrypted(SessionCrypto::new(current_key).with_previous_key(previous_key))
+    SessionCodec::encrypted(
+        SessionCrypto::from_key(current_key).with_previous_key_from(previous_key),
+    )
 }
 
 /// Build a [`SessionCodec`] that stores session data unencrypted

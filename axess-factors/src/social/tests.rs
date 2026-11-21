@@ -1,5 +1,5 @@
-//! `tests`: extracted from `social.rs` per the
-//! 200-LoC inline-test rule in AGENTS.md.
+//! `tests`: the unit tests of `social.rs`, kept beside it per the
+//! 200-line inline-test rule in AGENTS.md.
 
 use super::*;
 use axess_rng::testing::MockRng;
@@ -24,11 +24,56 @@ fn github_style_mapper(raw: &serde_json::Value) -> Result<SocialClaims, SocialEr
     })
 }
 
+/// A provider under the policy for a mock on the loopback interface: the
+/// default, `screened`, refuses loopback.
+fn loopback_new<F>(
+    config: SocialProviderConfig,
+    mapper: F,
+) -> Result<SocialProvider<F>, SocialError>
+where
+    F: Fn(&serde_json::Value) -> Result<SocialClaims, SocialError> + Send + Sync,
+{
+    SocialProvider::new_screened(
+        config,
+        mapper,
+        crate::egress::EgressPolicy::screened_allowing_loopback_http(),
+    )
+}
+
+/// `new` screens by default: a loopback or private endpoint is refused by
+/// name, a public one is taken.
+#[test]
+fn new_screens_its_endpoints_by_default() {
+    for (token, range) in [
+        ("https://127.0.0.1:8443/token", "loopback"),
+        ("https://10.0.0.5/token", "private"),
+    ] {
+        let err = SocialProvider::new(
+            cleartext_config(token.into(), "https://api.example/user".into()),
+            github_style_mapper,
+        )
+        .err()
+        .expect("the default policy screens the token endpoint");
+        assert!(
+            err.to_string().contains("token_endpoint") && err.to_string().contains(range),
+            "{err}"
+        );
+    }
+    SocialProvider::new(
+        cleartext_config(
+            "https://idp.example/token".into(),
+            "https://api.example/user".into(),
+        ),
+        github_style_mapper,
+    )
+    .expect("a public endpoint");
+}
+
 fn make_provider(
     mock: &MockServer,
 ) -> SocialProvider<impl Fn(&serde_json::Value) -> Result<SocialClaims, SocialError> + Send + Sync>
 {
-    SocialProvider::new(
+    loopback_new(
         SocialProviderConfig {
             name: "github".into(),
             authorization_endpoint: format!("{}/login/oauth/authorize", mock.uri()),
@@ -50,7 +95,7 @@ fn make_provider(
 
 #[test]
 fn build_auth_url_includes_pkce_and_state_by_default() {
-    let provider = SocialProvider::new(
+    let provider = loopback_new(
         SocialProviderConfig {
             name: "github".into(),
             authorization_endpoint: "https://github.com/login/oauth/authorize".into(),
@@ -86,7 +131,7 @@ fn build_auth_url_includes_pkce_and_state_by_default() {
 
 #[test]
 fn without_pkce_omits_code_challenge() {
-    let provider = SocialProvider::new(
+    let provider = loopback_new(
         SocialProviderConfig {
             name: "discord".into(),
             authorization_endpoint: "https://discord.com/api/oauth2/authorize".into(),
@@ -287,136 +332,6 @@ fn config_debug_does_not_leak_the_client_secret() {
     );
 }
 
-// ── User-Agent ownership ─────────────────────────────────────────────
-
-async fn userinfo_mock(server: &MockServer, user_agent: &str) {
-    Mock::given(method("GET"))
-        .and(path("/user"))
-        .and(header("user-agent", user_agent))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "id": 7 })))
-        .expect(1)
-        .mount(server)
-        .await;
-}
-
-/// The default client carries the `axess-social/<version>` agent.
-#[tokio::test]
-async fn default_client_sends_the_axess_user_agent() {
-    let server = MockServer::start().await;
-    userinfo_mock(&server, concat!("axess-social/", env!("CARGO_PKG_VERSION"))).await;
-    let claims = make_provider(&server).fetch_userinfo("tok").await.unwrap();
-    assert_eq!(claims.subject, "7");
-}
-
-/// A `User-Agent` the adopter's builder sets is the one that goes out.
-#[tokio::test]
-async fn supplied_builder_keeps_its_own_user_agent() {
-    let server = MockServer::start().await;
-    userinfo_mock(&server, "adopter-app/3.1").await;
-    let claims = make_provider(&server)
-        .with_http_client_builder(|builder| builder.user_agent("adopter-app/3.1"))
-        .unwrap()
-        .fetch_userinfo("tok")
-        .await
-        .unwrap();
-    assert_eq!(claims.subject, "7");
-}
-
-// ── response size caps ───────────────────────────────────────────────────────
-
-/// A JSON object padded with a string member to exactly `total` bytes.
-fn padded_json(prefix: &str, total: usize) -> Vec<u8> {
-    let suffix = r#""}"#;
-    let pad = total - prefix.len() - suffix.len();
-    let mut body = prefix.as_bytes().to_vec();
-    body.extend(std::iter::repeat_n(b'a', pad));
-    body.extend_from_slice(suffix.as_bytes());
-    assert_eq!(body.len(), total);
-    body
-}
-
-async fn serve(server: &MockServer, route: &str, body: Vec<u8>) {
-    Mock::given(method(if route == "/user" { "GET" } else { "POST" }))
-        .and(path(route))
-        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/json"))
-        .mount(server)
-        .await;
-}
-
-#[tokio::test]
-async fn a_token_body_over_the_cap_is_refused() {
-    let server = MockServer::start().await;
-    let body = padded_json(
-        r#"{"access_token":"t","pad":""#,
-        crate::http_body::MAX_TOKEN_BODY_BYTES + 1,
-    );
-    serve(&server, "/login/oauth/access_token", body).await;
-
-    let err = make_provider(&server)
-        .exchange_code(STATE, STATE, "c", VERIFIER)
-        .await
-        .expect_err("oversized token body");
-
-    assert!(
-        matches!(&err, SocialError::InvalidResponse(m) if m.contains("exceeds")),
-        "got {err:?}"
-    );
-}
-
-#[tokio::test]
-async fn a_token_body_at_the_cap_is_read() {
-    let server = MockServer::start().await;
-    let body = padded_json(
-        r#"{"access_token":"t","token_type":"Bearer","pad":""#,
-        crate::http_body::MAX_TOKEN_BODY_BYTES,
-    );
-    serve(&server, "/login/oauth/access_token", body).await;
-
-    let token = make_provider(&server)
-        .exchange_code(STATE, STATE, "c", VERIFIER)
-        .await
-        .expect("a body of exactly the cap is read");
-
-    assert_eq!(&*token, "t");
-}
-
-#[tokio::test]
-async fn a_userinfo_body_over_the_cap_is_refused() {
-    let server = MockServer::start().await;
-    let body = padded_json(
-        r#"{"id":1,"pad":""#,
-        crate::http_body::MAX_USERINFO_BODY_BYTES + 1,
-    );
-    serve(&server, "/user", body).await;
-
-    let err = make_provider(&server)
-        .fetch_userinfo("tok")
-        .await
-        .expect_err("oversized userinfo body");
-
-    assert!(
-        matches!(&err, SocialError::InvalidResponse(m) if m.contains("exceeds")),
-        "got {err:?}"
-    );
-}
-
-#[tokio::test]
-async fn a_userinfo_body_at_the_cap_is_read() {
-    let server = MockServer::start().await;
-    let body = padded_json(
-        r#"{"id":1,"pad":""#,
-        crate::http_body::MAX_USERINFO_BODY_BYTES,
-    );
-    serve(&server, "/user", body).await;
-
-    let claims = make_provider(&server)
-        .fetch_userinfo("tok")
-        .await
-        .expect("a body of exactly the cap is read");
-
-    assert_eq!(claims.subject, "1");
-}
-
 #[test]
 fn auth_url_debug_redacts_the_pkce_verifier() {
     let auth = AuthUrl {
@@ -459,7 +374,7 @@ async fn a_cleartext_endpoint_to_a_remote_host_is_refused_at_construction() {
         ),
     ];
     for (config, setting) in cases {
-        let err = SocialProvider::new(config, github_style_mapper)
+        let err = loopback_new(config, github_style_mapper)
             .err()
             .expect("a cleartext endpoint is refused at construction");
         assert!(matches!(err, SocialError::Config(_)), "{err:?}");
@@ -479,9 +394,8 @@ async fn a_cleartext_endpoint_to_a_remote_host_is_refused_at_construction() {
         format!("{}/user", mock.uri()),
     );
     loopback.authorization_endpoint = format!("{}/authorize", mock.uri());
-    SocialProvider::new(loopback, github_style_mapper)
-        .expect("loopback http is for local development");
-    SocialProvider::new(
+    loopback_new(loopback, github_style_mapper).expect("loopback http is for local development");
+    loopback_new(
         cleartext_config(
             "https://idp.example/token".into(),
             "https://api.example/user".into(),
@@ -509,7 +423,7 @@ fn cleartext_config(token: String, userinfo: String) -> SocialProviderConfig {
 /// second `?`.
 #[test]
 fn an_endpoint_with_a_query_string_gets_the_parameters_appended() {
-    let provider = SocialProvider::new(
+    let provider = loopback_new(
         SocialProviderConfig {
             name: "tenanted".into(),
             authorization_endpoint: "https://idp.example/authorize?tenant=acme".into(),
@@ -541,7 +455,7 @@ fn an_endpoint_with_a_query_string_gets_the_parameters_appended() {
 /// and on the result, not one the caller can pick or reuse.
 #[test]
 fn build_auth_url_mints_a_fresh_state_per_flow() {
-    let provider = SocialProvider::new(
+    let provider = loopback_new(
         SocialProviderConfig {
             name: "github".into(),
             authorization_endpoint: "https://github.com/login/oauth/authorize".into(),
@@ -616,11 +530,11 @@ async fn a_short_pkce_verifier_is_refused_before_any_request() {
     }
 }
 
-/// Whatever the adopter's builder sets, the client does not follow
+/// Whatever settings the adopter adds, the client does not follow
 /// redirects: a redirect from the userinfo endpoint is an error and its
 /// target is never requested.
 #[tokio::test]
-async fn the_client_builder_cannot_restore_redirects() {
+async fn the_adopters_settings_cannot_restore_redirects() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/user"))
@@ -637,10 +551,10 @@ async fn the_client_builder_cannot_restore_redirects() {
         .mount(&server)
         .await;
     let provider = make_provider(&server)
-        .with_http_client_builder(|builder| {
-            builder
-                .redirect(reqwest::redirect::Policy::limited(10))
+        .with_client_settings(|settings| {
+            settings
                 .timeout(std::time::Duration::from_secs(3600))
+                .user_agent("adopter-app/3.1")
         })
         .unwrap();
     let result = provider.fetch_userinfo("tok").await;
@@ -663,7 +577,7 @@ async fn a_cleartext_redirect_uri_to_a_remote_host_is_refused_at_construction() 
         config
     };
 
-    let refused = SocialProvider::new(config("http://app.example.com/cb"), github_style_mapper);
+    let refused = loopback_new(config("http://app.example.com/cb"), github_style_mapper);
 
     match refused {
         Err(SocialError::Config(message)) => {
@@ -674,7 +588,7 @@ async fn a_cleartext_redirect_uri_to_a_remote_host_is_refused_at_construction() 
     }
     for accepted in ["http://127.0.0.1:8080/cb", "https://app.example.com/cb"] {
         assert!(
-            SocialProvider::new(config(accepted), github_style_mapper).is_ok(),
+            loopback_new(config(accepted), github_style_mapper).is_ok(),
             "{accepted}"
         );
     }
@@ -782,3 +696,5 @@ async fn a_missing_token_type_is_read_as_bearer_only_when_asked() {
         );
     }
 }
+
+mod transport;

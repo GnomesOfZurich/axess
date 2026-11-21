@@ -1,6 +1,7 @@
 //! The in-memory factor store and the pre-wired login fixture.
 
 use super::{CallLog, MockIdentityStore, MockStoreError, note};
+use crate::authn::store::Fido2CredentialClaim;
 use crate::authn::{
     factor::{FactorConfig, FactorKind},
     ids::{TenantId, UserId},
@@ -14,7 +15,6 @@ use std::sync::{Arc, Mutex};
 /// An auth method and whether it is enabled.
 type ScopedMethod = (AuthMethod, bool);
 /// `(tenant, credential id) -> user`: the passkey credential claims a store holds.
-#[cfg(feature = "fido2")]
 type Fido2Claims = Arc<Mutex<HashMap<(String, Vec<u8>), String>>>;
 
 /// A write another request makes to a stored factor row.
@@ -32,7 +32,6 @@ pub struct MockFactorStore {
     /// `(tenant, credential id) -> user` claims taken by
     /// `claim_fido2_credential`, decided under one lock so two racing
     /// registrations cannot both win.
-    #[cfg(feature = "fido2")]
     fido2_claims: Fido2Claims,
     /// `user_id -> Vec<AuthMethod>` (legacy test fixture keyed by user)
     methods: Arc<Mutex<HashMap<String, Vec<AuthMethod>>>>,
@@ -118,6 +117,12 @@ impl MockFactorStore {
         lock(&self.configs).retain(|k, _| !k.starts_with(&prefix));
         lock(&self.scoped_methods).remove(&scope_key);
         lock(&self.methods).remove(user_id.to_string().as_str());
+        // The user's passkey credential-id claims go with the user, so an
+        // id the erased account held can be registered by another account.
+        {
+            let (tenant, user) = (tenant_id.to_string(), user_id.to_string());
+            lock(&self.fido2_claims).retain(|(t, _), u| *t != tenant || *u != user);
+        }
     }
 
     /// Arm the CAS-contention failure mode: the next `n` calls to
@@ -165,12 +170,47 @@ impl MockFactorStore {
     fn take_armed_resolve_failure(&self) -> bool {
         use std::sync::atomic::Ordering::SeqCst;
         let dec = |a: &std::sync::atomic::AtomicUsize| {
-            a.fetch_update(SeqCst, SeqCst, |v| v.checked_sub(1)).is_ok()
+            a.try_update(SeqCst, SeqCst, |v| v.checked_sub(1)).is_ok()
         };
         if dec(&self.resolve_skip_remaining) {
             return false;
         }
         dec(&self.resolve_failures_remaining)
+    }
+}
+
+impl MockFactorStore {
+    /// The user of the tenant whose stored passkeys hold the id. Without
+    /// the `fido2` feature no passkey is typed, and none is registered
+    /// through the service, so no user holds one.
+    fn stored_fido2_holder(&self, tenant_id: &TenantId, credential_id: &[u8]) -> Option<UserId> {
+        #[cfg(feature = "fido2")]
+        {
+            let prefix = format!("user:{tenant_id}:");
+            let suffix = format!("::{}", FactorKind::Fido2.as_str());
+            let configs = lock(&self.configs);
+            for (key, config) in configs.iter() {
+                let Some(user) = key
+                    .strip_prefix(&prefix)
+                    .and_then(|rest| rest.strip_suffix(&suffix))
+                else {
+                    continue;
+                };
+                let FactorConfig::Fido2(cfg) = config else {
+                    continue;
+                };
+                if cfg
+                    .credentials
+                    .iter()
+                    .any(|c| c.cred_id().as_slice() == credential_id)
+                {
+                    return UserId::try_new(user).ok();
+                }
+            }
+        }
+        #[cfg(not(feature = "fido2"))]
+        let _ = (tenant_id, credential_id);
+        None
     }
 }
 
@@ -259,9 +299,17 @@ impl FactorStore for MockFactorStore {
         }
 
         let key = Self::config_key(scope, &prior.kind());
-        // FactorConfig has no PartialEq derive; compare via canonical JSON.
-        // serde_json::to_value never fails for FactorConfig (no map-key shape
-        // violations), so a None result here means "treat as mismatch."
+        // The stored configuration and `prior` are compared as values, and
+        // the write follows under the same lock, so the swap is one step.
+        // `FactorConfig` has no `PartialEq`, so each side is turned into its
+        // JSON value first; both are typed values of this build, so no row
+        // can differ from `prior` by an older serialised shape, which is
+        // what a store that keeps text has to guard against. A generation
+        // counter would decide nothing here: `prior` carries no generation
+        // to compare it with, and a store only needs one to guard a write
+        // that is a second step after the comparison.
+        // `serde_json::to_value` never fails for `FactorConfig` (no map-key
+        // shape violations), so a `None` here is treated as a mismatch.
         let prior_json = serde_json::to_value(prior).ok();
         if prior_json.is_none() {
             return Ok(false);
@@ -292,58 +340,33 @@ impl FactorStore for MockFactorStore {
         }
     }
 
-    #[cfg(feature = "fido2")]
-    async fn fido2_credential_holder(
-        &self,
-        tenant_id: &TenantId,
-        credential_id: &[u8],
-    ) -> Result<Option<UserId>, Self::Error> {
-        let prefix = format!("user:{tenant_id}:");
-        let suffix = format!("::{}", FactorKind::Fido2.as_str());
-        let configs = lock(&self.configs);
-        for (key, config) in configs.iter() {
-            let Some(user) = key
-                .strip_prefix(&prefix)
-                .and_then(|rest| rest.strip_suffix(&suffix))
-            else {
-                continue;
-            };
-            let FactorConfig::Fido2(cfg) = config else {
-                continue;
-            };
-            if cfg
-                .credentials
-                .iter()
-                .any(|c| c.cred_id().as_slice() == credential_id)
-            {
-                return Ok(UserId::try_new(user).ok());
-            }
-        }
-        Ok(None)
-    }
-
-    #[cfg(feature = "fido2")]
+    /// One step under the claims lock: the id is taken when it is free, and
+    /// the holder already there is the answer when it is not, so a refusal
+    /// names its holder with no second read. A passkey stored without a
+    /// claim (seeded directly) holds its id too, for the user it is stored
+    /// for.
     async fn claim_fido2_credential(
         &self,
         tenant_id: &TenantId,
         user_id: &UserId,
         credential_id: &[u8],
-    ) -> Result<bool, Self::Error> {
-        // A passkey stored before claims existed (or seeded directly) holds
-        // its id too.
-        let holder = self
-            .fido2_credential_holder(tenant_id, credential_id)
-            .await?;
-        if holder.is_some_and(|holder| &holder != user_id) {
-            return Ok(false);
+    ) -> Result<Fido2CredentialClaim, Self::Error> {
+        if let Some(holder) = self.stored_fido2_holder(tenant_id, credential_id)
+            && &holder != user_id
+        {
+            return Ok(Fido2CredentialClaim::HeldBy(holder));
         }
         let mut claims = lock(&self.fido2_claims);
         let key = (tenant_id.to_string(), credential_id.to_vec());
         let user = user_id.to_string();
-        Ok(claims.entry(key).or_insert(user.clone()) == &user)
+        let holder = claims.entry(key).or_insert_with(|| user.clone());
+        if *holder == user {
+            return Ok(Fido2CredentialClaim::Claimed);
+        }
+        Ok(UserId::try_new(holder.as_str())
+            .map_or(Fido2CredentialClaim::Refused, Fido2CredentialClaim::HeldBy))
     }
 
-    #[cfg(feature = "fido2")]
     async fn release_fido2_credential(
         &self,
         tenant_id: &TenantId,
@@ -459,7 +482,26 @@ impl FactorStore for MockFactorStore {
 /// let svc = make_password_service("u1", "alice@example.com", "hunter2");
 /// // ... drive svc.begin_login("alice@example.com", "t1", &session) ...
 /// ```
+///
+/// The service, its identity store and the records run on the system
+/// clock; [`make_password_service_on`] builds the same on a test's clock.
 pub fn make_password_service(
+    user_label: &str,
+    identifier: &str,
+    password: &str,
+) -> crate::authn::service::RequestAuthnService<MockIdentityStore, MockFactorStore> {
+    make_password_service_on(
+        Arc::new(axess_clock::SystemClock),
+        user_label,
+        identifier,
+        password,
+    )
+}
+
+/// [`make_password_service`] on `clock`: the user and tenant records are
+/// stamped at its time, and the identity store and the service read it.
+pub fn make_password_service_on(
+    clock: Arc<dyn axess_clock::Clock>,
     user_label: &str,
     identifier: &str,
     password: &str,
@@ -467,12 +509,13 @@ pub fn make_password_service(
     use crate::authn::event::AuditContext;
     use crate::authn::factor::{PasswordConfig, PasswordRules, ZeroizedString};
     use crate::authn::service::AuthnService;
-    use crate::testing::{tenant_record, user_record};
+    use crate::testing::{tenant_record_at, user_record_at};
+    use axess_clock::Clock;
 
-    let mut user = user_record(user_label, "t1");
+    let mut user = user_record_at(user_label, "t1", clock.now());
     user.identifier = identifier.into();
     user.display_name = identifier.into();
-    let tenant = tenant_record("t1");
+    let tenant = tenant_record_at("t1", clock.now());
     let scope = AuthnScope::User {
         tenant_id: tenant.id,
         user_id: user.id,
@@ -485,7 +528,10 @@ pub fn make_password_service(
     });
 
     let user_id = user.id;
-    let identity = MockIdentityStore::new().with_tenant(tenant).with_user(user);
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(tenant)
+        .with_user(user);
     let factors = MockFactorStore::new()
         .with_factor(scope.clone(), pw_config)
         .with_method(
@@ -493,5 +539,8 @@ pub fn make_password_service(
             AuthMethod::sequential("password", vec![FactorKind::Password], scope),
         );
 
-    AuthnService::new(identity, factors).with_audit_context(AuditContext::default())
+    AuthnService::builder(identity, factors)
+        .with_clock(clock)
+        .build()
+        .with_audit_context(AuditContext::default())
 }

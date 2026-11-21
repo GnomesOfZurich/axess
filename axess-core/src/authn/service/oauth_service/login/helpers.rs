@@ -4,7 +4,7 @@
 //!
 //! - [`normalize_issuer`]: canonicalises an OIDC issuer URL.
 //! - [`is_valid_pkce_verifier`]: validates a PKCE `code_verifier` per RFC 7636.
-//! - [`compute_claim_lock`]: SHA-256 binding of (provider, subject, session_id).
+//! - [`compute_claim_lock`]: SHA-256 binding of (provider, subject, session key).
 //! - [`encode_dpop_key`], [`decode_dpop_key`]: the spelling in the ceremony
 //!   state of the DPoP key a login makes at begin and presents at finish.
 
@@ -48,13 +48,15 @@ pub(super) fn is_valid_pkce_verifier(verifier: &str) -> bool {
 }
 
 /// Compute the claim-binding lock for an OAuth ceremony. The lock
-/// is `SHA-256` over `provider`, `subject` and `session_id`, each behind its
-/// length as eight big-endian bytes, encoded
+/// is `SHA-256` over `provider`, `subject` and the session's key, each
+/// behind its length as eight big-endian bytes, encoded
 /// as URL-safe base64. It binds the IdP-attested identity to the session,
 /// so a caller that bypasses `finish_oauth_login` and invokes
 /// `complete_oauth_login` directly cannot satisfy the verification: the
-/// session won't carry a matching lock, and the lock's input is the
-/// session id which the caller cannot forge.
+/// session won't carry a matching lock. The lock is stored in the session
+/// and compared server-side, so what keeps it from being forged is that
+/// only the server writes the session, not the secrecy of its input; the
+/// key names the session as uniquely as its id does.
 pub(super) async fn compute_claim_lock(
     provider: &str,
     subject: &str,
@@ -62,11 +64,11 @@ pub(super) async fn compute_claim_lock(
 ) -> String {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use sha2::{Digest, Sha256};
-    let sid = session.session_id().await;
+    let key = session.session_key().await;
     let mut hasher = Sha256::new();
     // Each field behind its length, so where one ends and the next begins
     // is part of what is hashed.
-    for field in [provider.as_bytes(), subject.as_bytes(), sid.as_bytes()] {
+    for field in [provider.as_bytes(), subject.as_bytes(), key.as_bytes()] {
         hasher.update((field.len() as u64).to_be_bytes());
         hasher.update(field);
     }
@@ -286,5 +288,36 @@ mod claim_lock_tests {
         let first = compute_claim_lock("idp", "sub", &one).await;
         assert_eq!(first, compute_claim_lock("idp", "sub", &one).await);
         assert_ne!(first, compute_claim_lock("idp", "sub", &other).await);
+    }
+
+    /// The lock is bound to the session's key: it is the digest over the
+    /// key's 32 bytes, it stays while nothing changes, and it moves when
+    /// the session's key rotates.
+    #[tokio::test]
+    async fn the_lock_binds_the_sessions_key_and_moves_when_it_rotates() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        use sha2::{Digest, Sha256};
+        let session = test_session();
+        let first = compute_claim_lock("idp", "sub", &session).await;
+        assert_eq!(
+            first,
+            compute_claim_lock("idp", "sub", &session).await,
+            "nothing changed"
+        );
+        let key = session.session_key().await;
+        let mut hasher = Sha256::new();
+        for field in [&b"idp"[..], b"sub", key.as_bytes()] {
+            hasher.update((field.len() as u64).to_be_bytes());
+            hasher.update(field);
+        }
+        assert_eq!(first, URL_SAFE_NO_PAD.encode(hasher.finalize()));
+
+        session.clear().await;
+        assert_ne!(session.session_key().await, key);
+        assert_ne!(
+            first,
+            compute_claim_lock("idp", "sub", &session).await,
+            "a session whose key rotated holds another lock"
+        );
     }
 }

@@ -12,6 +12,8 @@
 //! by axess's `PiiToken` / `DevicePiiStore` primitives; orthogonal
 //! to the envelope's encryption choice.
 
+use std::time::SystemTime;
+
 use axess_strings::ShortString;
 
 use crate::id::{EventId, TenantId};
@@ -93,56 +95,6 @@ pub struct EncryptedBlob {
     pub ciphertext: Vec<u8>,
 }
 
-/// Associated data to seal an [`EncryptedBlob`] under, binding the
-/// ciphertext to the envelope it travels in.
-///
-/// An AEAD without associated data authenticates the payload and nothing
-/// around it: a broker or store that can rewrite envelope metadata can move
-/// a valid ciphertext into another event, tenant or subject and the
-/// recipient decrypts it without complaint. Pass this value as the AAD when
-/// sealing (`aes-gcm`'s and `chacha20poly1305`'s `Payload { msg, aad }`) and
-/// again when opening, built from the envelope's own fields, and a blob moved
-/// to any other id, kind, tenant or subject fails authentication.
-///
-/// The encoding is injective: every field is length-prefixed, an absent
-/// tenant or subject is distinct from any present one, and a label and
-/// version lead, so a future change to the field set cannot collide with
-/// this one.
-///
-/// This is the first AAD tag and authenticates only the four fields above.
-/// The event's `status`, `actor`, `time_micros`, `envelope_version` and
-/// `trace_context`, and the blob's `algorithm` and `key_id`, are not bound:
-/// someone who can write the store but holds no key can change them and the
-/// payload still decrypts. It is deprecated for sealing: seal new events
-/// under [`envelope_aad_for`] (or [`envelope_aad_v2`]), and open any event
-/// with [`open_aads_for`], which tries the second tag first and this one
-/// second. This crate does no sealing itself; the AAD an adopter's seal path
-/// passes is the AAD it asks one of these functions for.
-///
-/// # Panics
-///
-/// If a field is longer than `u32::MAX` bytes: a length that saturated
-/// would let two different oversized fields share one encoding.
-#[deprecated(
-    since = "0.18.0",
-    note = "binds only id, kind, tenant and subject; seal under `envelope_aad_for` and open with `open_aads_for`"
-)]
-#[must_use]
-pub fn envelope_aad(
-    id: &EventId,
-    kind: &KindTag,
-    tenant: Option<&TenantId>,
-    subject: Option<&EventSubject>,
-) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(96);
-    put(&mut buf, b"axess-events/envelope-aad/v1");
-    put(&mut buf, id.as_bytes());
-    put(&mut buf, kind.as_str().as_bytes());
-    put_tenant(&mut buf, tenant);
-    put_subject(&mut buf, subject);
-    buf
-}
-
 /// Every envelope field a reader acts on, for [`envelope_aad_v2`].
 ///
 /// A producer that is about to seal a payload has these in hand (the key and
@@ -175,24 +127,37 @@ pub struct EnvelopeFields<'a> {
     pub algorithm: AeadAlgorithm,
 }
 
-/// Associated data under the second AAD tag: [`envelope_aad`]'s fields and
-/// every other envelope field a reader acts on (status, actor, time,
-/// envelope version, trace context, and the blob's algorithm and key id).
+/// Associated data to seal an [`EncryptedBlob`] under, binding the
+/// ciphertext to the envelope it travels in: the second AAD tag.
 ///
-/// With [`envelope_aad`] alone, someone who can write the event store but
-/// holds no key can rewrite `status`, `actor` or `time_micros` and the
-/// payload still decrypts: the audit record reads differently from what was
-/// written. Sealed under this value, a changed field fails authentication.
+/// An AEAD without associated data authenticates the payload and nothing
+/// around it: a broker or store that can rewrite envelope metadata can move
+/// a valid ciphertext into another event, tenant or subject and the
+/// recipient decrypts it without complaint. Pass this value as the AAD when
+/// sealing (`aes-gcm`'s and `chacha20poly1305`'s `Payload { msg, aad }`) and
+/// again when opening, built from the envelope's own fields, and a blob
+/// whose event was changed in any field a reader acts on fails
+/// authentication: the id, kind, tenant and subject, and the status, actor,
+/// time, envelope version, trace context, and the blob's algorithm and key
+/// id. This crate does no sealing itself; the AAD an adopter's seal path
+/// passes is the AAD it asks this function, or [`envelope_aad_for`], for.
 ///
-/// The encoding is injective in the same way as [`envelope_aad`]'s and leads
-/// with its own label (`axess-events/envelope-aad/v2`), so a v1 and a v2
-/// value never collide. Events sealed under the first tag stay readable: a
-/// reader tries [`envelope_aad_for`] first and [`envelope_aad`] second, and
-/// accepts a v1 success knowing that only the v1 fields were authenticated.
+/// The encoding is injective: every field is length-prefixed, an absent
+/// tenant, subject, actor or trace context is distinct from any present one,
+/// and a label and version lead (`axess-events/envelope-aad/v2`), so a
+/// future change to the field set cannot collide with this one.
+///
+/// The first tag, which events sealed before 0.18.0 carry, bound only the
+/// id, kind, tenant and subject: someone who can write the event store but
+/// holds no key can rewrite the `status`, `actor` or `time_micros` of such
+/// an event and the payload still decrypts. Nothing seals under it any
+/// more, and a reader refuses it unless it names the opt-in: see
+/// [`FirstTag`] and [`open_aads_for`].
 ///
 /// # Panics
 ///
-/// If a field is longer than `u32::MAX` bytes, as for [`envelope_aad`].
+/// If a field is longer than `u32::MAX` bytes: a length that saturated
+/// would let two different oversized fields share one encoding.
 #[must_use]
 pub fn envelope_aad_v2(fields: &EnvelopeFields<'_>) -> Vec<u8> {
     let mut buf = Vec::with_capacity(160);
@@ -230,8 +195,10 @@ pub fn envelope_aad_v2(fields: &EnvelopeFields<'_>) -> Vec<u8> {
 /// own fields and its blob. `None` when the body is
 /// [`EventBody::Clear`]: there is no ciphertext to open.
 ///
-/// To read an event of either generation, open the blob under this value
-/// and, if that fails, under [`envelope_aad`] built from the same event.
+/// Seal under this value, and open under it: it is the only associated
+/// data a reader tries by default. A reader that still holds events sealed
+/// under the first tag names that with [`FirstTag`] and opens with the
+/// values [`open_aads_for`] lists.
 #[must_use]
 pub fn envelope_aad_for<P: EventPayload>(event: &Event<P>) -> Option<Vec<u8>> {
     let EventBody::Encrypted(blob) = &event.body else {
@@ -252,24 +219,131 @@ pub fn envelope_aad_for<P: EventPayload>(event: &Event<P>) -> Option<Vec<u8>> {
     }))
 }
 
-/// The associated data to try, in order, when opening an encrypted event:
-/// the second tag, then the first for events sealed before the second
-/// existed. `None` when the body is [`EventBody::Clear`].
+/// Whether a reader tries the first AAD tag, which authenticated only id,
+/// kind, tenant and subject, when the second fails.
 ///
-/// A success under the first entry means every field a reader acts on was
-/// authenticated. A success under the second authenticated only id, kind,
-/// tenant and subject, as it did when the event was sealed.
+/// The default is [`Reject`](Self::Reject): only an event sealed under the
+/// second tag opens. An event sealed under the first tag can have its
+/// status, actor or time rewritten at rest and still open under it, so a
+/// reader that accepts the first tag accepts such a rewrite, and says so by
+/// name: [`Accept`](Self::Accept), or [`AcceptUntil`](Self::AcceptUntil)
+/// with the instant the acceptance ends. The cutoff is on the reader's
+/// clock, not the event's own time: the first tag does not authenticate the
+/// event's time, so a cutoff on it would be rewritten with the field it is
+/// meant to protect. Both the cutoff and the reader's clock are a
+/// [`SystemTime`], not a number: a count of seconds read against a cutoff
+/// in microseconds would have accepted the first tag for good.
+///
+/// # Events sealed under the first tag
+///
+/// Releases before 0.18.0 sealed under the first tag. This crate computes
+/// associated data and holds neither a key nor a store, so it cannot move
+/// such events to the second tag; the process that holds the key does, once,
+/// before its readers run under the default:
+///
+/// 1. Read each stored event whose body is [`EventBody::Encrypted`] and open
+///    it with the values `open_aads_for(&event, FirstTag::Accept, now)`
+///    lists, in order.
+/// 2. An event that opens under the first value is sealed under the second
+///    tag already; leave it.
+/// 3. An event that opens only under the second value was sealed under the
+///    first tag: seal its plaintext again under [`envelope_aad_for`] with a
+///    fresh nonce and write the event back.
+/// 4. An event that opens under neither is damaged or was sealed under
+///    another key; it is not a first-tag event and the pass does not fix it.
+///
+/// The re-seal binds the fields as the store holds them at that moment. It
+/// cannot show that a status, an actor or a time is the one originally
+/// written, since the first tag never authenticated them; it stops them
+/// changing unnoticed from then on. Events past retention need no pass.
+/// While writers of an earlier release still seal under the first tag (a
+/// rolling upgrade), readers name [`AcceptUntil`](Self::AcceptUntil) with
+/// the end of that window and the pass runs after the last such writer is
+/// gone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FirstTag {
+    /// Never try the first tag: only an event sealed under the second
+    /// opens. The default.
+    #[default]
+    Reject,
+    /// Try the first tag while the reader's clock is before this instant,
+    /// and refuse it from then on: the opt-in for a rolling upgrade or a
+    /// re-seal pass with a known end.
+    AcceptUntil(SystemTime),
+    /// Try the first tag after the second, with no end date: the opt-in for
+    /// the pass that re-seals such events, and for a reader that must open
+    /// them before that pass has run.
+    Accept,
+}
+
+impl FirstTag {
+    /// Whether a reader whose clock reads `now` tries the first tag.
+    #[must_use]
+    pub fn accepts_at(self, now: SystemTime) -> bool {
+        match self {
+            Self::Reject => false,
+            Self::AcceptUntil(cutoff) => now < cutoff,
+            Self::Accept => true,
+        }
+    }
+}
+
+/// The associated data to try, in order, when opening an encrypted event
+/// under a [`FirstTag`] policy read at `now`, the reader's clock: the second
+/// tag, then the first while the policy accepts it. `None` when the body is
+/// [`EventBody::Clear`].
+///
+/// This is the entry for a reader that names an accepting policy. A reader
+/// under the default needs no clock and no list: it opens under the one
+/// value [`envelope_aad_for`] returns, which is also all this function
+/// lists under [`FirstTag::Reject`], whatever the clock reads. A success under
+/// the first entry means every field a reader acts on was authenticated. A
+/// success under the second, which only an accepting policy lists,
+/// authenticated only id, kind, tenant and subject, as it did when the
+/// event was sealed: a status, actor or time rewritten at rest still opens.
+/// A reader that fails to open an event under every value listed holds a
+/// rewritten event, a damaged one, or one sealed under the first tag that
+/// the policy refuses; all three are refused, by design.
 #[must_use]
-pub fn open_aads_for<P: EventPayload>(event: &Event<P>) -> Option<[Vec<u8>; 2]> {
-    let v2 = envelope_aad_for(event)?;
-    #[allow(deprecated)]
-    let v1 = envelope_aad(
+pub fn open_aads_for<P: EventPayload>(
+    event: &Event<P>,
+    first_tag: FirstTag,
+    now: SystemTime,
+) -> Option<Vec<Vec<u8>>> {
+    let mut aads = vec![envelope_aad_for(event)?];
+    if first_tag.accepts_at(now) {
+        aads.push(first_tag_aad(event));
+    }
+    Some(aads)
+}
+
+/// The first-tag AAD of a stored event, read from its own fields: the id,
+/// kind, tenant and subject, and nothing else. Kept to open events sealed
+/// before the second tag existed, for a reader that names [`FirstTag`];
+/// nothing seals under it.
+fn first_tag_aad<P: EventPayload>(event: &Event<P>) -> Vec<u8> {
+    first_tag_aad_of(
         &event.id,
         &event.kind,
         event.tenant_id.as_ref(),
         event.subject.as_ref(),
-    );
-    Some([v2, v1])
+    )
+}
+
+/// The first-tag encoding of the four fields it binds.
+fn first_tag_aad_of(
+    id: &EventId,
+    kind: &KindTag,
+    tenant: Option<&TenantId>,
+    subject: Option<&EventSubject>,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(96);
+    put(&mut buf, b"axess-events/envelope-aad/v1");
+    put(&mut buf, id.as_bytes());
+    put(&mut buf, kind.as_str().as_bytes());
+    put_tenant(&mut buf, tenant);
+    put_subject(&mut buf, subject);
+    buf
 }
 
 fn put(buf: &mut Vec<u8>, bytes: &[u8]) {
@@ -303,14 +377,21 @@ fn put_subject(buf: &mut Vec<u8>, subject: Option<&EventSubject>) {
             buf.push(3);
             put(buf, d.as_bytes());
         }
-        Some(EventSubjectRef::Session(s)) => {
+        // The 16 bytes an event of an earlier release recorded, under the tag
+        // it was sealed with: such an event opens only when exactly these
+        // bytes are rebuilt, which no mapping of the id to its key could do.
+        Some(EventSubjectRef::Session(recorded)) => {
             buf.push(4);
-            put(buf, s.as_bytes());
+            put(buf, recorded.as_bytes());
         }
         Some(EventSubjectRef::Other { kind, id }) => {
             buf.push(5);
             put(buf, kind.as_bytes());
             put(buf, id.as_bytes());
+        }
+        Some(EventSubjectRef::SessionKey(key)) => {
+            buf.push(6);
+            put(buf, key.as_bytes());
         }
     }
 }
@@ -321,7 +402,6 @@ fn field_len(len: usize) -> Option<u32> {
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::id::UserId;
@@ -334,12 +414,12 @@ mod tests {
     }
 
     #[test]
-    fn aad_differs_when_any_envelope_field_differs() {
+    fn the_first_tag_aad_differs_when_any_field_it_binds_differs() {
         let id = EventId::NIL;
         let kind = KindTag::from_static("a.b.v1");
         let tenant = TenantId::from_bytes([1; 16]);
         let user = EventSubject::User(UserId::from_bytes([2; 16]));
-        let base = envelope_aad(&id, &kind, Some(&tenant), Some(&user));
+        let base = first_tag_aad_of(&id, &kind, Some(&tenant), Some(&user));
 
         let other_id = EventId::from_bytes([9; 16]);
         let other_kind = KindTag::from_static("a.b.v2");
@@ -348,19 +428,19 @@ mod tests {
         let tenant_subject = EventSubject::Tenant(TenantId::from_bytes([2; 16]));
 
         for changed in [
-            envelope_aad(&other_id, &kind, Some(&tenant), Some(&user)),
-            envelope_aad(&id, &other_kind, Some(&tenant), Some(&user)),
-            envelope_aad(&id, &kind, Some(&other_tenant), Some(&user)),
-            envelope_aad(&id, &kind, None, Some(&user)),
-            envelope_aad(&id, &kind, Some(&tenant), Some(&other_user)),
-            envelope_aad(&id, &kind, Some(&tenant), None),
+            first_tag_aad_of(&other_id, &kind, Some(&tenant), Some(&user)),
+            first_tag_aad_of(&id, &other_kind, Some(&tenant), Some(&user)),
+            first_tag_aad_of(&id, &kind, Some(&other_tenant), Some(&user)),
+            first_tag_aad_of(&id, &kind, None, Some(&user)),
+            first_tag_aad_of(&id, &kind, Some(&tenant), Some(&other_user)),
+            first_tag_aad_of(&id, &kind, Some(&tenant), None),
             // Same 16 bytes, different subject class.
-            envelope_aad(&id, &kind, Some(&tenant), Some(&tenant_subject)),
+            first_tag_aad_of(&id, &kind, Some(&tenant), Some(&tenant_subject)),
         ] {
             assert_ne!(changed, base);
         }
         assert_eq!(
-            envelope_aad(&id, &kind, Some(&tenant), Some(&user)),
+            first_tag_aad_of(&id, &kind, Some(&tenant), Some(&user)),
             base,
             "deterministic"
         );

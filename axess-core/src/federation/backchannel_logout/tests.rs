@@ -8,10 +8,9 @@
 //! micro-carve).
 
 use super::*;
-use crate::session::id::SessionId;
+use crate::session::id::{SessionId, SessionKey};
 use crate::session::store::{MemorySessionRegistry, SessionRegistry, SessionRegistryAdapter};
 use crate::testing::mock_random::MockRng;
-use axess_clock::SystemClock;
 use axess_factors::oauth::MockOAuthProvider;
 use axess_factors::oidc::logout_token::BACKCHANNEL_LOGOUT_EVENT;
 use axess_factors::oidc::logout_token::decode_jwt_payload;
@@ -26,27 +25,22 @@ fn setup() -> (
     MockOAuthProvider,
     MemorySessionRegistry,
 ) {
-    let provider = MockOAuthProvider::new("test-idp").with_user(
-        "user-123",
-        "alice@example.com",
-        vec![],
-        vec![],
-    );
+    let provider = MockOAuthProvider::new("test-idp")
+        .with_clock(Arc::new(axess_clock::testing::MockClock::at_reference()))
+        .with_user("user-123", "alice@example.com", vec![], vec![]);
     let registry = MemorySessionRegistry::new();
 
-    let providers: Vec<Arc<dyn OAuthProvider>> =
-        vec![Arc::new(MockOAuthProvider::new("test-idp").with_user(
-            "user-123",
-            "alice@example.com",
-            vec![],
-            vec![],
-        ))];
+    let providers: Vec<Arc<dyn OAuthProvider>> = vec![Arc::new(
+        MockOAuthProvider::new("test-idp")
+            .with_clock(Arc::new(axess_clock::testing::MockClock::at_reference()))
+            .with_user("user-123", "alice@example.com", vec![], vec![]),
+    )];
 
     let handler = BackChannelLogoutHandler::new(
         &providers,
         Arc::new(SessionRegistryAdapter(registry.clone())),
         SidMap::new(),
-        Arc::new(SystemClock),
+        Arc::new(axess_clock::testing::MockClock::at_reference()),
     )
     .expect("handler should be created");
 
@@ -59,7 +53,7 @@ async fn valid_logout_token_invalidates_user_sessions() {
 
     // Register a session for the user.
     let rng = MockRng::new(42);
-    let sid = SessionId::new(&rng);
+    let sid = SessionKey::of(&SessionId::new(&rng));
     let user = axess_identity::testing::user("user-123");
     let user_sub = user.to_string();
     registry.register(&user, &sid).await.unwrap();
@@ -97,6 +91,7 @@ async fn invalid_token_returns_bad_request() {
 
     // Valid JWT structure but wrong issuer.
     let wrong_issuer = MockOAuthProvider::new("wrong-idp")
+        .with_clock(Arc::new(axess_clock::testing::MockClock::at_reference()))
         .with_issuer("https://evil.example.com")
         .mock_logout_token(Some("user-123"), None);
     let result = handler.validate_logout_token(&wrong_issuer).await;
@@ -112,7 +107,7 @@ async fn missing_events_claim_rejected() {
     let payload = serde_json::json!({
         "iss": "https://test-idp.example.com",
         "aud": "mock-client-id",
-        "iat": chrono::Utc::now().timestamp(),
+        "iat": axess_clock::testing::MockClock::reference_time().unix_seconds(),
         "sub": "user-123",
         "jti": "test-jti"
     });
@@ -129,7 +124,8 @@ async fn missing_events_claim_rejected() {
 
 #[tokio::test]
 async fn mock_generates_parseable_logout_token() {
-    let provider = MockOAuthProvider::new("test-idp");
+    let provider = MockOAuthProvider::new("test-idp")
+        .with_clock(Arc::new(axess_clock::testing::MockClock::at_reference()));
 
     // With sub only.
     let token = provider.mock_logout_token(Some("user-456"), None);
@@ -170,7 +166,7 @@ async fn missing_sub_and_sid_rejected() {
     let payload = serde_json::json!({
         "iss": "https://test-idp.example.com",
         "aud": "mock-client-id",
-        "iat": chrono::Utc::now().timestamp(),
+        "iat": axess_clock::testing::MockClock::reference_time().unix_seconds(),
         "jti": "test-jti",
         "events": {
             "http://schemas.openid.net/event/backchannel-logout": {}
@@ -196,7 +192,7 @@ async fn nonce_in_token_rejected() {
     let payload = serde_json::json!({
         "iss": "https://test-idp.example.com",
         "aud": "mock-client-id",
-        "iat": chrono::Utc::now().timestamp(),
+        "iat": axess_clock::testing::MockClock::reference_time().unix_seconds(),
         "sub": "user-123",
         "jti": "test-jti",
         "nonce": "should-not-be-here",
@@ -226,7 +222,7 @@ async fn wrong_audience_rejected() {
     let payload = serde_json::json!({
         "iss": "https://test-idp.example.com",
         "aud": "wrong-client-id",
-        "iat": chrono::Utc::now().timestamp(),
+        "iat": axess_clock::testing::MockClock::reference_time().unix_seconds(),
         "sub": "user-123",
         "jti": "test-jti",
         "events": {
@@ -250,7 +246,7 @@ async fn stale_iat_rejected() {
     let (handler, _, _) = setup();
 
     // 10 minutes in the past.
-    let stale_iat = chrono::Utc::now().timestamp() - 600;
+    let stale_iat = axess_clock::testing::MockClock::reference_time().unix_seconds() - 600;
 
     let header = serde_json::json!({"alg": "none", "typ": "JWT"});
     let payload = serde_json::json!({
@@ -279,7 +275,7 @@ async fn stale_iat_rejected() {
 async fn future_iat_rejected() {
     let (handler, _, _) = setup();
 
-    let future_iat = chrono::Utc::now().timestamp() + 600;
+    let future_iat = axess_clock::testing::MockClock::reference_time().unix_seconds() + 600;
 
     let header = serde_json::json!({"alg": "none", "typ": "JWT"});
     let payload = serde_json::json!({
@@ -310,7 +306,7 @@ async fn sid_only_logout_invalidates_session() {
     let sid_map: SidMap = SidMap::new();
 
     let rng = MockRng::new(42);
-    let session_id = SessionId::new(&rng);
+    let session_id = SessionKey::of(&SessionId::new(&rng));
     let user_id = axess_identity::testing::user("user-123");
 
     // Register in registry and sid map.
@@ -325,26 +321,25 @@ async fn sid_only_logout_invalidates_session() {
         None,
         user_id,
         session_id,
-        chrono::Utc::now(),
+        axess_clock::testing::MockClock::reference_time(),
     );
 
-    let providers: Vec<Arc<dyn OAuthProvider>> =
-        vec![Arc::new(MockOAuthProvider::new("test-idp").with_user(
-            "user-123",
-            "alice@example.com",
-            vec![],
-            vec![],
-        ))];
+    let providers: Vec<Arc<dyn OAuthProvider>> = vec![Arc::new(
+        MockOAuthProvider::new("test-idp")
+            .with_clock(Arc::new(axess_clock::testing::MockClock::at_reference()))
+            .with_user("user-123", "alice@example.com", vec![], vec![]),
+    )];
     let handler = BackChannelLogoutHandler::new(
         &providers,
         Arc::new(SessionRegistryAdapter(registry.clone())),
         sid_map.clone(),
-        Arc::new(SystemClock),
+        Arc::new(axess_clock::testing::MockClock::at_reference()),
     )
     .expect("handler should be created");
 
     // Create a token with sid only, no sub.
-    let provider = MockOAuthProvider::new("test-idp");
+    let provider = MockOAuthProvider::new("test-idp")
+        .with_clock(Arc::new(axess_clock::testing::MockClock::at_reference()));
     let token = provider.mock_logout_token(None, Some("oidc-sid-abc"));
 
     let claims = handler.validate_logout_token(&token).await.unwrap();
@@ -373,7 +368,7 @@ async fn oversized_logout_token_rejected() {
 async fn future_iat_beyond_60s_rejected() {
     let (handler, _, _) = setup();
     // 90 seconds in the future; within old tolerance but beyond new ±60s.
-    let future_iat = chrono::Utc::now().timestamp() + 90;
+    let future_iat = axess_clock::testing::MockClock::reference_time().unix_seconds() + 90;
     let header = serde_json::json!({"alg": "none", "typ": "JWT"});
     let payload = serde_json::json!({
         "iss": "https://test-idp.example.com",
@@ -396,7 +391,7 @@ async fn future_iat_beyond_60s_rejected() {
 #[tokio::test]
 async fn future_iat_within_60s_accepted() {
     let (handler, _, _) = setup();
-    let future_iat = chrono::Utc::now().timestamp() + 30;
+    let future_iat = axess_clock::testing::MockClock::reference_time().unix_seconds() + 30;
     let header = serde_json::json!({"alg": "none", "typ": "JWT"});
     let payload = serde_json::json!({
         "iss": "https://test-idp.example.com",
@@ -415,7 +410,7 @@ async fn future_iat_within_60s_accepted() {
     assert!(result.is_ok());
 }
 
-// ── mutation-coverage tests ─────────────────────────────────────────
+// ── The jti cache: its size, and a replayed token ───────────────────
 
 /// `JTI_CACHE_MAX` is exactly 16 KiB. Pins `16 * 1024` against
 /// `+` (1040) and `/` (0) mutations: both would silently change the
@@ -435,36 +430,34 @@ fn jti_cache_max_is_sixteen_kib() {
 /// short-circuit with 200 OK) by asserting both the response code AND
 /// the side effect on the registry.
 ///
-/// Also pins replay detection (`record_jti` body, the `delete !` in
-/// `&& !record_jti(...)`, the `>= → <` in retain/capacity checks, and
-/// the `- → +` cutoff sign): a second call with the same `(issuer,
-/// jti)` pair within the IAT window must be rejected as replay. Each
-/// of those mutations breaks replay detection in a way the second call
-/// would observe (either it succeeds when it must reject, or it
-/// rejects when it must succeed).
+/// Also pins replay detection (`admit_jti`, and the replay log's record
+/// of the pair, its retention cutoff and its bound): a second call with
+/// the same `(issuer, jti)` pair within the IAT window must be rejected as
+/// replay. A change that stops the pair being recorded, forgets it inside
+/// its window or refuses the first delivery is one the two calls observe
+/// (the second succeeds when it must be rejected, or the first is rejected
+/// when it must succeed).
 #[tokio::test]
 async fn handler_invalidates_session_and_rejects_jti_replay() {
     let registry = MemorySessionRegistry::new();
-    let providers: Vec<Arc<dyn OAuthProvider>> =
-        vec![Arc::new(MockOAuthProvider::new("test-idp").with_user(
-            "user-123",
-            "alice@example.com",
-            vec![],
-            vec![],
-        ))];
+    let providers: Vec<Arc<dyn OAuthProvider>> = vec![Arc::new(
+        MockOAuthProvider::new("test-idp")
+            .with_clock(Arc::new(axess_clock::testing::MockClock::at_reference()))
+            .with_user("user-123", "alice@example.com", vec![], vec![]),
+    )];
     let sid_map: SidMap = SidMap::new();
     let handler = BackChannelLogoutHandler::new(
         &providers,
         Arc::new(SessionRegistryAdapter(registry.clone())),
         sid_map.clone(),
-        Arc::new(SystemClock),
+        Arc::new(axess_clock::testing::MockClock::at_reference()),
     )
     .expect("handler should be created");
 
     // Register a session that the logout must invalidate, signed in through
     // the issuer that sends the token.
     let rng = MockRng::new(42);
-    let session_id = SessionId::new(&rng);
+    let session_id = SessionKey::of(&SessionId::new(&rng));
     let user_id = axess_identity::testing::user("user-123");
     registry.register(&user_id, &session_id).await.unwrap();
     sid_map.insert(
@@ -473,12 +466,13 @@ async fn handler_invalidates_session_and_rejects_jti_replay() {
         None,
         user_id,
         session_id,
-        chrono::Utc::now(),
+        axess_clock::testing::MockClock::reference_time(),
     );
     assert!(registry.is_valid(&user_id, &session_id).await.unwrap());
 
     // Build a sub-only logout token (jti embedded in the mock).
-    let provider = MockOAuthProvider::new("test-idp");
+    let provider = MockOAuthProvider::new("test-idp")
+        .with_clock(Arc::new(axess_clock::testing::MockClock::at_reference()));
     let user_sub = user_id.to_string();
     let token = provider.mock_logout_token(Some(user_sub.as_str()), None);
 
@@ -507,8 +501,9 @@ async fn handler_invalidates_session_and_rejects_jti_replay() {
     );
 
     // Second call with the same token (same issuer+jti): must be
-    // rejected as replay. Under any of the record_jti / cutoff / retain
-    // mutations this assertion flips and the mutant survives.
+    // rejected as replay. This is the assertion that fails when
+    // `admit_jti` does not record the pair, or when the replay log's
+    // cutoff drops an entry still inside its window.
     let result = BackChannelLogoutHandler::handle_backchannel_logout(
         State(handler.clone()),
         Form(LogoutParams {
@@ -536,7 +531,7 @@ fn raw_token(extra: serde_json::Value) -> String {
     let mut payload = serde_json::json!({
         "iss": ISS,
         "aud": "mock-client-id",
-        "iat": chrono::Utc::now().timestamp(),
+        "iat": axess_clock::testing::MockClock::reference_time().unix_seconds(),
         "events": { BACKCHANNEL_LOGOUT_EVENT: {} },
     });
     payload
@@ -562,12 +557,15 @@ async fn post(handler: &BackChannelLogoutHandler, token: String) -> Result<Statu
 }
 
 fn handler_with(registry: &MemorySessionRegistry, sid_map: SidMap) -> BackChannelLogoutHandler {
-    let providers: Vec<Arc<dyn OAuthProvider>> = vec![Arc::new(MockOAuthProvider::new("test-idp"))];
+    let providers: Vec<Arc<dyn OAuthProvider>> = vec![Arc::new(
+        MockOAuthProvider::new("test-idp")
+            .with_clock(Arc::new(axess_clock::testing::MockClock::at_reference())),
+    )];
     BackChannelLogoutHandler::new(
         &providers,
         Arc::new(SessionRegistryAdapter(registry.clone())),
         sid_map,
-        Arc::new(SystemClock),
+        Arc::new(axess_clock::testing::MockClock::at_reference()),
     )
     .expect("handler")
 }
@@ -580,7 +578,7 @@ async fn sub_does_not_log_out_a_user_who_never_signed_in_through_the_issuer() {
     let sid_map: SidMap = SidMap::new();
     let handler = handler_with(&registry, sid_map.clone());
     let rng = MockRng::new(7);
-    let session_id = SessionId::new(&rng);
+    let session_id = SessionKey::of(&SessionId::new(&rng));
     let victim = axess_identity::testing::user("user-123");
     registry.register(&victim, &session_id).await.unwrap();
     // The victim signed in through a different issuer.
@@ -590,7 +588,7 @@ async fn sub_does_not_log_out_a_user_who_never_signed_in_through_the_issuer() {
         None,
         victim,
         session_id,
-        chrono::Utc::now(),
+        axess_clock::testing::MockClock::reference_time(),
     );
 
     let token = raw_token(serde_json::json!({ "sub": victim.to_string(), "jti": "j1" }));
@@ -606,7 +604,7 @@ async fn non_uuid_sub_does_not_block_sid_logout() {
     let sid_map: SidMap = SidMap::new();
     let handler = handler_with(&registry, sid_map.clone());
     let rng = MockRng::new(8);
-    let session_id = SessionId::new(&rng);
+    let session_id = SessionKey::of(&SessionId::new(&rng));
     let user = axess_identity::testing::user("user-123");
     registry.register(&user, &session_id).await.unwrap();
     sid_map.insert(
@@ -615,7 +613,7 @@ async fn non_uuid_sub_does_not_block_sid_logout() {
         None,
         user,
         session_id,
-        chrono::Utc::now(),
+        axess_clock::testing::MockClock::reference_time(),
     );
 
     let token = raw_token(serde_json::json!({
@@ -642,14 +640,14 @@ async fn sub_ends_only_the_sessions_the_issuer_established() {
     let sid_map: SidMap = SidMap::new();
     let handler = handler_with(&registry, sid_map.clone());
     let rng = MockRng::new(9);
-    let via_issuer = SessionId::new(&rng);
-    let via_other_issuer = SessionId::new(&rng);
-    let via_password = SessionId::new(&rng);
+    let via_issuer = SessionKey::of(&SessionId::new(&rng));
+    let via_other_issuer = SessionKey::of(&SessionId::new(&rng));
+    let via_password = SessionKey::of(&SessionId::new(&rng));
     let user = axess_identity::testing::user("user-123");
     for id in [&via_issuer, &via_other_issuer, &via_password] {
         registry.register(&user, id).await.unwrap();
     }
-    let now = chrono::Utc::now();
+    let now = axess_clock::testing::MockClock::reference_time();
     sid_map.insert(
         (ISS.to_string(), "a".into()),
         &user.to_string(),
@@ -676,17 +674,19 @@ async fn sub_ends_only_the_sessions_the_issuer_established() {
 }
 
 /// A token whose `iat` is the furthest accepted into the future stays
-/// acceptable for `MAX_IAT_AGE_SECS` after that `iat`, which is longer than
-/// `MAX_IAT_AGE_SECS` after it first arrived. Its `jti` must be remembered
+/// acceptable for `MAX_IAT_AGE` after that `iat`, which is longer than
+/// `MAX_IAT_AGE` after it first arrived. Its `jti` must be remembered
 /// for the whole span, or the token replays once the first sighting ages out.
 #[tokio::test]
 async fn jti_is_remembered_for_the_whole_span_a_token_stays_acceptable() {
     use axess_clock::testing::MockClock;
-    use axess_factors::oidc::logout_token::{JTI_RETENTION_SECS, MAX_IAT_FUTURE_SECS};
+    use axess_factors::oidc::logout_token::{JTI_RETENTION, MAX_IAT_FUTURE};
 
     let registry = MemorySessionRegistry::new();
-    let clock = MockClock::now();
-    let providers: Vec<Arc<dyn OAuthProvider>> = vec![Arc::new(MockOAuthProvider::new("test-idp"))];
+    let clock = MockClock::at_reference();
+    let providers: Vec<Arc<dyn OAuthProvider>> = vec![Arc::new(
+        MockOAuthProvider::new("test-idp").with_clock(Arc::new(clock.clone())),
+    )];
     let handler = BackChannelLogoutHandler::new(
         &providers,
         Arc::new(SessionRegistryAdapter(registry.clone())),
@@ -694,9 +694,12 @@ async fn jti_is_remembered_for_the_whole_span_a_token_stays_acceptable() {
         Arc::new(clock.clone()),
     )
     .expect("handler");
-    assert_eq!(JTI_RETENTION_SECS, 300 + MAX_IAT_FUTURE_SECS);
+    assert_eq!(
+        JTI_RETENTION,
+        std::time::Duration::from_secs(300) + MAX_IAT_FUTURE
+    );
 
-    let iat = clock.now().timestamp() + MAX_IAT_FUTURE_SECS;
+    let iat = clock.now().unix_seconds() + i64::try_from(MAX_IAT_FUTURE.as_secs()).unwrap();
     let token = raw_token(serde_json::json!({ "sid": "s", "jti": "edge", "iat": iat }));
     assert_eq!(post(&handler, token.clone()).await, Ok(StatusCode::OK));
 

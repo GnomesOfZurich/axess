@@ -280,6 +280,49 @@ async fn the_remaining_header_is_sent_only_for_a_callers_own_bucket() {
     );
 }
 
+fn keyed_service(key: KeyExtractor) -> RateLimitService<OkService> {
+    let config = RateLimitConfig::builder()
+        .max_requests(10)
+        .window(Duration::from_secs(60))
+        .key(key)
+        .build();
+    RateLimitLayer::new(config).layer(OkService)
+}
+
+/// A tenant's bucket is drawn on by all of its users, and the bucket of
+/// requests with no known client address by everyone: neither reports what
+/// is left of it. A user's own bucket does.
+#[tokio::test]
+async fn the_tenant_bucket_and_the_unknown_address_bucket_send_no_remaining_header() {
+    let request = || Request::builder().uri("/").body(Body::empty()).unwrap();
+
+    let mut of_tenant = request();
+    of_tenant
+        .extensions_mut()
+        .insert(RateLimitTenantId(axess_identity::testing::tenant("acme")));
+    assert_eq!(
+        remaining_header(keyed_service(KeyExtractor::TenantId), of_tenant).await,
+        None,
+        "a tenant's count would tell one user of the others"
+    );
+
+    let mut of_user = request();
+    of_user
+        .extensions_mut()
+        .insert(RateLimitUserId(axess_identity::testing::user("alice")));
+    assert_eq!(
+        remaining_header(keyed_service(KeyExtractor::UserId), of_user).await,
+        Some("9".to_owned())
+    );
+
+    // No `ClientIp` in the request: every such request draws on one bucket.
+    assert_eq!(
+        remaining_header(keyed_service(KeyExtractor::ClientIp), request()).await,
+        None,
+        "the bucket of unknown addresses is everyone's"
+    );
+}
+
 /// An address whose group is at its bucket cap draws on the group's shared
 /// overflow bucket, so its answer carries no remaining count: that count
 /// would say how much the other folded callers have used.

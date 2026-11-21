@@ -1,8 +1,9 @@
-//! `authn_types_tests`: extracted from `types.rs` per the
-//! 200-LoC inline-test rule in AGENTS.md.
+//! `authn_types_tests`: the unit tests of `types.rs`, kept beside it per the
+//! 200-line inline-test rule in AGENTS.md.
 
 use super::*;
 use crate::authn::ids::UserId;
+use axess_clock::testing::Shift;
 
 /// `EntityState::is_active` returns true ONLY for the
 /// `Active` variant. A `-> true` body mutation would silently
@@ -12,13 +13,26 @@ use crate::authn::ids::UserId;
 fn entity_state_is_active_only_for_active() {
     assert!(EntityState::Active.is_active());
     assert!(
-        !EntityState::Suspended(StatusDetail::administrative("test", chrono::Utc::now()))
-            .is_active()
+        !EntityState::Suspended(StatusDetail::administrative(
+            "test",
+            axess_clock::testing::MockClock::reference_time()
+        ))
+        .is_active()
     );
     assert!(
-        !EntityState::Terminated(StatusDetail::closure("test", chrono::Utc::now())).is_active()
+        !EntityState::Terminated(StatusDetail::closure(
+            "test",
+            axess_clock::testing::MockClock::reference_time()
+        ))
+        .is_active()
     );
-    assert!(!EntityState::Archived(StatusDetail::closure("test", chrono::Utc::now())).is_active());
+    assert!(
+        !EntityState::Archived(StatusDetail::closure(
+            "test",
+            axess_clock::testing::MockClock::reference_time()
+        ))
+        .is_active()
+    );
     assert!(!EntityState::Candidate.is_active());
 }
 
@@ -85,7 +99,7 @@ fn as_columns_always_populates_tenant() {
 }
 
 fn make_user_with_identifier(identifier: &str, display_name: &str) -> User {
-    let now = chrono::Utc::now();
+    let now = axess_clock::testing::MockClock::reference_time();
     User {
         id: axess_identity::testing::user("u-validate"),
         tenant_id: axess_identity::testing::tenant("t-validate"),
@@ -101,7 +115,7 @@ fn make_user_with_identifier(identifier: &str, display_name: &str) -> User {
 }
 
 fn make_tenant_with_identifier(identifier: &str) -> Tenant {
-    let now = chrono::Utc::now();
+    let now = axess_clock::testing::MockClock::reference_time();
     Tenant {
         id: axess_identity::testing::tenant("t-validate"),
         identifier: identifier.into(),
@@ -273,29 +287,38 @@ fn a_malformed_allow_entry_matches_nothing() {
 
 #[test]
 fn suspension_ends_when_until_passes() {
-    use chrono::TimeZone;
-    let now = Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap();
+    use axess_clock::Timestamp;
+    let now = Timestamp::from_utc(2026, 6, 1, 12, 0, 0).unwrap();
     let detail = |until| {
         EntityState::Suspended(
-            StatusDetail::lockout("lockout", now - chrono::Duration::hours(1)).with_until(until),
+            StatusDetail::lockout("lockout", now.minus(axess_clock::SignedDuration::hours(1)))
+                .with_until(until),
         )
     };
     assert!(
-        detail(Some(now - chrono::Duration::seconds(1)))
+        detail(Some(axess_clock::Until::At(
+            now.minus(axess_clock::SignedDuration::seconds(1))
+        )))
+        .effective_at(now)
+        .allows_login()
+    );
+    assert!(
+        detail(Some(axess_clock::Until::At(now)))
             .effective_at(now)
             .allows_login()
     );
-    assert!(detail(Some(now)).effective_at(now).allows_login());
     assert!(
-        !detail(Some(now + chrono::Duration::seconds(1)))
-            .effective_at(now)
-            .allows_login()
+        !detail(Some(axess_clock::Until::At(
+            now.plus(axess_clock::SignedDuration::seconds(1))
+        )))
+        .effective_at(now)
+        .allows_login()
     );
     assert!(!detail(None).effective_at(now).allows_login());
     assert!(
-        !EntityState::Terminated(
-            StatusDetail::closure("x", now).with_until(Some(now - chrono::Duration::days(1)))
-        )
+        !EntityState::Terminated(StatusDetail::closure("x", now).with_until(Some(
+            axess_clock::Until::At(now.minus(axess_clock::SignedDuration::days(1)))
+        )))
         .effective_at(now)
         .allows_login()
     );
@@ -315,7 +338,7 @@ fn detail(cause: StatusCause) -> StatusDetail {
     StatusDetail {
         cause,
         reason: "test".into(),
-        since: chrono::Utc::now(),
+        since: axess_clock::testing::MockClock::reference_time(),
         until: None,
     }
 }
@@ -372,16 +395,22 @@ fn is_administratively_disabled_names_an_operators_act_only() {
 /// operator set the end.
 #[test]
 fn the_helpers_read_the_effective_state() {
-    let now = chrono::Utc::now();
-    let ended = StatusDetail::lockout("too many attempts", now - chrono::Duration::hours(2))
-        .with_until(Some(now - chrono::Duration::hours(1)));
+    let now = axess_clock::testing::MockClock::reference_time();
+    let ended = StatusDetail::lockout(
+        "too many attempts",
+        now.minus(axess_clock::SignedDuration::hours(2)),
+    )
+    .with_until(Some(axess_clock::Until::At(
+        now.minus(axess_clock::SignedDuration::hours(1)),
+    )));
     assert!(
         EntityState::Suspended(ended)
             .effective_at(now)
             .can_self_recover()
     );
-    let open = StatusDetail::administrative("review", now)
-        .with_until(Some(now + chrono::Duration::hours(1)));
+    let open = StatusDetail::administrative("review", now).with_until(Some(
+        axess_clock::Until::At(now.plus(axess_clock::SignedDuration::hours(1))),
+    ));
     let state = EntityState::Suspended(open).effective_at(now);
     assert!(state.is_administratively_disabled());
     assert!(!state.can_self_recover());

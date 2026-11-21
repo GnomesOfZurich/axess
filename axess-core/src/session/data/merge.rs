@@ -13,7 +13,10 @@ use serde_json::{Map, Value};
 /// key the concurrent request took stays taken unless this request set it
 /// anew, a key this request set or removed is set or removed, and a key the
 /// concurrent request added is kept. The revision and the refresh stamp are
-/// the store's: the caller sets them for its write.
+/// the store's: the caller sets them for its write. This request's proof of
+/// its device and of its key binding stays only beside the device and the
+/// binding it proved: a merged row that takes another from the stored row
+/// is not proven by this request.
 pub(crate) fn merge_concurrent(
     base: &SessionData,
     local: &SessionData,
@@ -22,11 +25,15 @@ pub(crate) fn merge_concurrent(
     merge(base, local, fresh, true)
 }
 
-/// [`merge_concurrent`] for a rotation that changed the authentication state
-/// (a login, a logout, a step-up): the request cleared or rebuilt the custom
-/// bag on purpose, so a key a concurrent request added to the retired row is
-/// not carried into it (an anonymous visitor could have planted it before
-/// the login). A key the concurrent request took still stays taken.
+/// [`merge_concurrent`] for a rotation. One rule for what a concurrent
+/// request wrote on the retired row: when the rotation changed the
+/// authentication state (a login, a logout, a step-up), what it added there
+/// is not carried into the new row, because the retired id may be known to
+/// an attacker (an anonymous visitor could have planted it before the
+/// login). That is a key it added to the custom bag, which the request
+/// cleared or rebuilt on purpose, and a device it stamped that the row did
+/// not name when this request loaded it. What it took stays taken: a key it
+/// removed, a device it cleared.
 pub(crate) fn merge_rotating(
     base: &SessionData,
     local: &SessionData,
@@ -41,20 +48,63 @@ fn merge(
     fresh: &SessionData,
     keep_additions: bool,
 ) -> SessionData {
-    SessionData {
+    // The stored row's device, under the rule of `merge_rotating`: without
+    // additions, one it gained after this request loaded it is not taken,
+    // and the one this request loaded stands; one it cleared stays cleared.
+    let fresh_device = if keep_additions {
+        fresh.device_id
+    } else {
+        fresh.device_id.and(base.device_id)
+    };
+    let mut merged = SessionData {
         version: pick(&base.version, &local.version, &fresh.version),
         auth_state: pick(&base.auth_state, &local.auth_state, &fresh.auth_state),
         fingerprint: pick(&base.fingerprint, &local.fingerprint, &fresh.fingerprint),
-        device_id: pick(&base.device_id, &local.device_id, &fresh.device_id),
-        device_proven: pick(
-            &base.device_proven,
-            &local.device_proven,
-            &fresh.device_proven,
-        ),
+        device_id: pick(&base.device_id, &local.device_id, &fresh_device),
+        // This request's own answers, which no stored row carries; below,
+        // they are withdrawn from a device or a binding they did not prove.
+        device_proven: local.device_proven,
+        device_key: local.device_key,
+        key_proven: local.key_proven,
+        key_binding: pick(&base.key_binding, &local.key_binding, &fresh.key_binding),
         custom: merge_custom(&base.custom, &local.custom, &fresh.custom, keep_additions),
         revision: fresh.revision,
         touched_at: fresh.touched_at,
+        // A claim to end the session is the store's: a request that merges
+        // its changes onto a claimed row leaves the claim in place.
+        ending: fresh.ending,
+    };
+    // `pick` chose which side's binding is the candidate: this request's
+    // when it changed one, else the stored one. The candidate stays only
+    // while it is in force for the merged state. A sign-out that raced a
+    // bind leaves a guest, and another person's sign-in leaves that person:
+    // neither keeps a binding made for someone else. A step-up that raced a
+    // registration is still the owner's session, and keeps it.
+    merged.drop_binding_not_in_force();
+    // The device `pick` chose holds only for the person it was resolved
+    // for. A row as stored has passed this judgement, so the device of
+    // either side was resolved for that side's person: this request's for
+    // the person it began as, which `base` holds, and the stored row's for
+    // the stored row's own person. Another person's sign-in that raced a
+    // stamp of the first person's device does not take that device.
+    let resolved_for = if local.device_id != base.device_id {
+        base.auth_state.person_at_browser()
+    } else {
+        fresh.auth_state.person_at_browser()
+    };
+    merged.drop_device_not_in_force(resolved_for.as_ref());
+    // A proof is of what this request held: the device it resolved, the
+    // binding it loaded. Beside a device or a binding the merge took from
+    // the stored row (a concurrent request's, or none), it would prove what
+    // no request proved.
+    if merged.device_id != local.device_id {
+        merged.device_proven = false;
+        merged.device_key = None;
     }
+    if merged.key_binding != local.key_binding {
+        merged.key_proven = false;
+    }
+    merged
 }
 
 /// The local value when this request changed it, the stored one otherwise.
@@ -116,78 +166,4 @@ fn merge_bags(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    fn with(custom: Value) -> SessionData {
-        SessionData {
-            custom,
-            ..SessionData::default()
-        }
-    }
-
-    #[test]
-    fn a_key_the_concurrent_request_took_stays_taken() {
-        let base = with(json!({"ceremony": "s", "cart": 0}));
-        let mut local = base.clone();
-        local.custom["cart"] = json!(1);
-        let fresh = with(json!({"cart": 0}));
-        let merged = merge_concurrent(&base, &local, &fresh);
-        assert_eq!(merged.custom, json!({"cart": 1}));
-    }
-
-    #[test]
-    fn a_key_this_request_set_or_removed_wins_and_concurrent_additions_are_kept() {
-        let base = with(json!({"a": 1, "b": 1, "c": 1}));
-        let local = with(json!({"a": 2, "c": 1, "mine": true}));
-        let fresh = with(json!({"a": 1, "b": 9, "c": 9, "theirs": true}));
-        let merged = merge_concurrent(&base, &local, &fresh);
-        assert_eq!(
-            merged.custom,
-            json!({"a": 2, "c": 9, "mine": true, "theirs": true})
-        );
-    }
-
-    #[test]
-    fn a_key_set_anew_by_this_request_survives_a_concurrent_take() {
-        let base = with(json!({"ceremony": "old"}));
-        let local = with(json!({"ceremony": "new"}));
-        let fresh = with(json!({}));
-        assert_eq!(
-            merge_concurrent(&base, &local, &fresh).custom,
-            json!({"ceremony": "new"})
-        );
-    }
-
-    #[test]
-    fn a_guest_bag_counts_as_empty() {
-        let base = with(Value::Null);
-        let local = with(json!({"mine": 1}));
-        let fresh = with(json!({"theirs": 2}));
-        assert_eq!(
-            merge_concurrent(&base, &local, &fresh).custom,
-            json!({"mine": 1, "theirs": 2})
-        );
-        let untouched = merge_concurrent(&base, &base, &base);
-        assert_eq!(untouched.custom, Value::Null);
-    }
-
-    #[test]
-    fn top_level_fields_follow_the_same_rule_and_the_stored_revision_is_kept() {
-        let base = SessionData::default();
-        let mut local = base.clone();
-        local.fingerprint = Some("mine".into());
-        let mut fresh = base.clone();
-        fresh.auth_state.set_authenticated(
-            crate::authn::ids::testing::user("u"),
-            crate::authn::ids::testing::tenant("t"),
-            chrono::Utc::now(),
-        );
-        fresh.revision = 7;
-        let merged = merge_concurrent(&base, &local, &fresh);
-        assert_eq!(merged.fingerprint.as_deref(), Some("mine"));
-        assert!(merged.auth_state.is_authenticated());
-        assert_eq!(merged.revision, 7);
-    }
-}
+mod tests;

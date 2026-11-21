@@ -1,65 +1,66 @@
-//! Shared codec for backend session stores (SQLite, PostgreSQL, Valkey).
+//! Shared codec for backend session stores (SQLite, PostgreSQL, MySQL, Valkey).
 //!
 //! Extracts the encode/decode/expiry logic that is identical across backends.
 //! Each backend still owns its own `SessionStore` impl because the storage
 //! shape differs (SQL dialect quirks; key-value semantics), but the session-
 //! data serialization and crypto layer is shared here.
 
-// base64 + Duration only feed the SQL-side helpers (encode/decode/expires_at);
-// gate behind the SQL backend features so a valkey-only build doesn't
-// surface them as unused-import warnings.
-#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-
+// Duration only feeds the SQL-side expiry helper; gated behind the SQL
+// backend features so a valkey-only build doesn't surface it as an unused
+// import.
 use crate::session::{
-    crypto::{Binding, BoundFormat, SessionCrypto},
-    data::SessionData,
-    id::SessionId,
+    crypto::{BoundFormat, SessionCrypto},
+    data::{SESSION_DATA_VERSION, SessionData, stored_version},
+    id::SessionKey,
 };
 
-#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
+#[cfg(any(
+    feature = "sqlite",
+    feature = "sqlite-unbundled",
+    feature = "postgres",
+    feature = "mysql"
+))]
 use std::time::Duration;
 
 /// Shared session-data codec (MessagePack + optional AES-256-GCM encryption).
 ///
-/// # Encrypted blob format and binding to the session id
+/// # Encrypted blob format and binding to the session's key
 ///
-/// An encrypted blob is `AXS 0x01 || nonce(12) || ciphertext+tag`. The
-/// four marker bytes are `0x41 0x58 0x53 0x01`. The AES-256-GCM additional
-/// authenticated data is exactly
-/// `"axess.session.v1" || 0x00 || session_id_uuid_bytes(16)`. The id is not
-/// stored in the blob; it is supplied again on every read, so an encrypted
-/// stored value copied from one row into a row with a different id fails
-/// authentication instead of decrypting under the new id.
+/// An encrypted blob is `AXS 0x82 || salt(16) || ciphertext+tag`, sealed
+/// under a key derived for the record from the configured key, the salt
+/// and the AAD, with a fixed nonce. The four marker bytes are
+/// `0x41 0x58 0x53 0x82`. The AES-256-GCM additional authenticated data is
+/// exactly `"axess.session.v2" || 0x00 || session_key_bytes(32)`. The key
+/// is not stored in the blob; it is supplied again on every read, so an
+/// encrypted stored value copied from one row into a row with a different
+/// key fails authentication instead of decrypting under the new key.
 ///
-/// A blob that carries the marker is opened under the bound AAD. A blob
-/// without the marker predates this format (random nonce first, empty AAD)
-/// and is opened under the empty AAD only when the
-/// [`LegacyBlobs`](crate::session::crypto::LegacyBlobs) policy reads such
-/// blobs. A pre-binding nonce that happens to begin with the four marker
-/// bytes (probability 2^-32 per legacy row) is tried as a pre-binding blob
-/// after the bound open fails, under a policy that reads them; under the
-/// default policy such a row is refused and the user signs in again.
+/// # One form is read
 ///
-/// # Upgrade path
+/// A blob is opened through
+/// [`SessionCrypto::open_current`](crate::session::crypto::SessionCrypto::open_current):
+/// it must carry the marker and authenticate under the AAD of its own row.
+/// Every other blob is refused whatever
+/// [`LegacyBlobs`](crate::session::crypto::LegacyBlobs) policy the crypto
+/// carries: the first session format (`AXS 0x81`, bound to the session id),
+/// the direct layout under the configured key itself, and a blob with no
+/// marker and no binding, which would open under any row. Sessions stored
+/// by an earlier release are not carried over, so nothing is lost by
+/// refusing them, and a deployment that reads legacy device blobs through
+/// the same `SessionCrypto` does not thereby read a moved session.
 ///
-/// The default policy refuses a blob without a binding, which opens under
-/// any session id. A deployment that still holds pre-binding rows sets
-/// [`LegacyBlobs::AcceptUntil`](crate::session::crypto::LegacyBlobs::AcceptUntil)
-/// for one session lifetime: reads then accept both formats and the store
-/// that read a pre-binding row re-seals it in the bound format right away (a
-/// conditional write that keeps the row's expiry and never overwrites a
-/// newer save); every write (`save`, `update`, `cycle`) seals the bound
-/// format too. Session data carries no session id, so the cutoff is the only
-/// protection against a moved legacy row. Plaintext codecs have nothing to
-/// bind.
+/// A blob in the current form that only the previous key opened is re-sealed
+/// under the current key by the store that reads it (a conditional write
+/// that keeps the row's expiry and never overwrites a newer save). Plaintext
+/// codecs have nothing to bind.
 ///
 /// Used by [`SqliteSessionStore`](super::sqlite::SqliteSessionStore),
 /// [`PostgresSessionStore`](super::postgres::PostgresSessionStore), and
-/// [`ValkeySessionStore`](super::valkey::ValkeySessionStore). SQL backends
-/// store the raw bytes (`encode_bytes`) in a binary column and read legacy
-/// base64 text rows through `decode_row`; Valkey uses the raw-bytes path
-/// (`encode_bytes` / `decode_bytes`).
+/// [`ValkeySessionStore`](super::valkey::ValkeySessionStore). Every backend
+/// stores the raw bytes ([`encode_bytes`](Self::encode_bytes)) and reads
+/// them back ([`decode_bytes_checked`](Self::decode_bytes_checked)): the SQL
+/// backends in their binary column, whose value
+/// [`binary_column`](Self::binary_column) requires, Valkey as the value.
 #[derive(Clone)]
 pub(crate) struct SessionCodec {
     crypto: Option<SessionCrypto>,
@@ -76,71 +77,22 @@ impl SessionCodec {
         Self { crypto: None }
     }
 
-    /// Apply a [`LegacyBlobs`] choice to the codec's crypto. A plaintext
-    /// codec has nothing to refuse and is returned unchanged.
-    #[cfg(feature = "valkey")]
-    pub fn with_legacy_blobs(mut self, policy: crate::session::crypto::LegacyBlobs) -> Self {
-        self.crypto = self.crypto.map(|c| c.with_legacy_blobs(policy));
-        self
-    }
-
-    /// The legacy text form of a stored value: base64 of
-    /// [`encode_bytes`](Self::encode_bytes). Production writes use the
-    /// binary column; this exists so tests can plant rows as an earlier
-    /// release wrote them.
-    #[cfg(all(test, feature = "sqlite"))]
-    pub fn encode_text(&self, id: &SessionId, data: &SessionData) -> Result<String, SqlStoreError> {
-        Ok(BASE64.encode(self.encode_bytes(id, data)?))
-    }
-
-    /// Decode a SQL row: the binary column when it holds a value, the legacy
-    /// base64 text column otherwise. A row an earlier release wrote has only
-    /// the text; every save writes the binary column and empties the text.
-    ///
-    /// [`Decoded::reseal`] says the row is to be re-sealed: its blob is bound
-    /// but not in the current form, or it still lives in the legacy text
-    /// column (see [`decode_bytes_checked`](Self::decode_bytes_checked) for
-    /// the blob without any binding, which a read leaves as it is). The SQL
-    /// stores re-seal such a row on load.
-    #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
-    pub fn decode_row(
-        &self,
-        id: &SessionId,
-        binary: Option<&[u8]>,
-        text: &str,
-    ) -> Result<Decoded, SqlStoreError> {
-        match binary {
-            Some(bytes) => self.decode_bytes_checked(id, bytes),
-            None => {
-                // A bound blob moves to the binary column; one without any
-                // binding stays where it is until the next save.
-                let (data, state) = self.decode_text(id, text)?;
-                Ok(Decoded {
-                    data,
-                    reseal: state.bound(),
-                })
-            }
-        }
-    }
-
-    #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
-    fn decode_text(
-        &self,
-        id: &SessionId,
-        stored: &str,
-    ) -> Result<(SessionData, BlobState), SqlStoreError> {
-        // Plaintext-legacy fast path: a JSON object always starts with
-        // `{`, which is never a valid base64 character. If we see one,
-        // we know we are reading a pre-MessagePack plaintext row; decode
-        // it as JSON and return.
-        if self.crypto.is_none() && stored.starts_with('{') {
-            return Ok((serde_json::from_str(stored)?, BlobState::plaintext()));
-        }
-
-        let payload = BASE64
-            .decode(stored)
-            .map_err(|_| SqlStoreError::Crypto(crate::session::crypto::CryptoError))?;
-        self.decode_payload(id, &payload)
+    /// The value of a SQL row's binary column, which holds the stored
+    /// session. A row whose binary column is NULL holds no session this
+    /// release wrote (a row of an earlier release kept its session in the
+    /// text column, which is not read) and is refused as undecodable.
+    #[cfg(any(
+        feature = "sqlite",
+        feature = "sqlite-unbundled",
+        feature = "postgres",
+        feature = "mysql"
+    ))]
+    pub fn binary_column(binary: Option<Vec<u8>>) -> Result<Vec<u8>, SqlStoreError> {
+        binary.ok_or_else(|| {
+            SqlStoreError::Decode(serde::de::Error::custom(
+                "the stored session has no value in its binary column",
+            ))
+        })
     }
 
     /// Serialize (and optionally encrypt) session data for binary
@@ -150,12 +102,12 @@ impl SessionCodec {
     /// column, Valkey as the value.
     pub fn encode_bytes(
         &self,
-        id: &SessionId,
+        key: &SessionKey,
         data: &SessionData,
     ) -> Result<Vec<u8>, SqlStoreError> {
         let bytes = rmp_serde::to_vec_named(data)?;
         Ok(match &self.crypto {
-            Some(crypto) => crypto.seal_bound(BoundFormat::SESSION, id.as_bytes(), &bytes)?,
+            Some(crypto) => crypto.seal_bound(BoundFormat::SESSION, key.as_bytes(), &bytes)?,
             None => bytes,
         })
     }
@@ -163,14 +115,19 @@ impl SessionCodec {
     /// [`encode_bytes`](Self::encode_bytes) refusing a payload over `max`
     /// bytes with [`SqlStoreError::PayloadTooLarge`]. The SQL stores write
     /// through this.
-    #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
+    #[cfg(any(
+        feature = "sqlite",
+        feature = "sqlite-unbundled",
+        feature = "postgres",
+        feature = "mysql"
+    ))]
     pub fn encode_bytes_within(
         &self,
-        id: &SessionId,
+        key: &SessionKey,
         data: &SessionData,
         max: usize,
     ) -> Result<Vec<u8>, SqlStoreError> {
-        let encoded = self.encode_bytes(id, data)?;
+        let encoded = self.encode_bytes(key, data)?;
         if encoded.len() > max {
             tracing::warn!(
                 size = encoded.len(),
@@ -188,69 +145,74 @@ impl SessionCodec {
     /// Deserialize (and optionally decrypt) session data from binary
     /// storage; no base64 wrap.
     ///
-    /// Counterpart to [`encode_bytes`](Self::encode_bytes).
-    /// Tries MessagePack first; falls back to JSON to tolerate legacy
-    /// blobs that adopters may still have in storage from before the
-    /// MessagePack switch. Production reads use
+    /// Counterpart to [`encode_bytes`](Self::encode_bytes): the session is
+    /// read as MessagePack and as nothing else, so a blob in any other
+    /// encoding is refused with [`SqlStoreError::Decode`]. Production reads
+    /// use
     /// [`decode_bytes_checked`](Self::decode_bytes_checked), which also
     /// reports whether the blob needs re-sealing.
     #[cfg(test)]
     pub fn decode_bytes(
         &self,
-        id: &SessionId,
+        key: &SessionKey,
         payload: &[u8],
     ) -> Result<SessionData, SqlStoreError> {
-        Ok(self.decode_bytes_checked(id, payload)?.data)
+        Ok(self.decode_bytes_checked(key, payload)?.data)
     }
 
     /// [`decode_bytes`](Self::decode_bytes) plus whether the store that read
     /// the blob should re-seal it ([`encode_bytes`](Self::encode_bytes) writes
-    /// the current format): the blob is bound to its row but not in the
-    /// current form (the direct layout, or a blob that only the previous key
-    /// opened). A blob without any binding, read under the [`LegacyBlobs`]
-    /// window, is not re-sealed by a read: it proves nothing about the row it
-    /// sits under, so a re-seal would bind a blob copied from another row to
-    /// this one for good. The next save of the session writes the bound form,
-    /// and a session that is never saved again expires with its TTL.
-    ///
-    /// [`LegacyBlobs`]: crate::session::crypto::LegacyBlobs
+    /// it under the current key): true for one case only, a blob in the
+    /// current form that only the previous key opened, holding a row at or
+    /// above the current schema version. A blob in any other form is not
+    /// read at all.
     pub fn decode_bytes_checked(
         &self,
-        id: &SessionId,
+        key: &SessionKey,
         payload: &[u8],
     ) -> Result<Decoded, SqlStoreError> {
-        let (data, state) = self.decode_payload(id, payload)?;
-        Ok(Decoded {
-            data,
-            reseal: state.stale && state.bound(),
-        })
+        let (data, reseal) = self.decode_payload(key, payload)?;
+        Ok(Decoded { data, reseal })
     }
 
-    /// Decrypt (when the codec encrypts) and deserialize a blob, reporting
-    /// its state at rest.
+    /// Decrypt (when the codec encrypts) and deserialize a blob, and say
+    /// whether only the previous key opened it.
+    ///
+    /// A sealed blob is opened in the current form only
+    /// ([`SessionCrypto::open_current`](crate::session::crypto::SessionCrypto::open_current)),
+    /// for every legacy policy: see the type's documentation.
+    ///
+    /// The session is MessagePack, the one encoding `encode_bytes` has
+    /// written since 0.2.0; no second decoder is tried, so a payload that is
+    /// not a MessagePack session (a JSON row of the 0.1.x line, plain or
+    /// sealed, or one a hand-written tool made) fails with
+    /// [`SqlStoreError::Decode`] and its user signs in again.
+    ///
+    /// The schema version is read first. A row below
+    /// [`SESSION_DATA_VERSION`] is not decoded: it is handed up as its
+    /// version alone ([`SessionData::below_version`]), for the session layer
+    /// to count and refuse, and never re-sealed, so no store writes it back.
     fn decode_payload(
         &self,
-        id: &SessionId,
+        key: &SessionKey,
         payload: &[u8],
-    ) -> Result<(SessionData, BlobState), SqlStoreError> {
+    ) -> Result<(SessionData, bool), SqlStoreError> {
         let opened;
-        let mut state = BlobState::plaintext();
+        let mut under_previous_key = false;
         let plaintext: &[u8] = match &self.crypto {
             Some(crypto) => {
-                opened = crypto.open_bound(BoundFormat::SESSION, id.as_bytes(), &[], payload)?;
-                state = BlobState {
-                    stale: opened.stale,
-                    binding: opened.binding,
-                };
+                opened = crypto.open_current(BoundFormat::SESSION, key.as_bytes(), payload)?;
+                under_previous_key = opened.stale;
                 &opened.plaintext
             }
             None => payload,
         };
-        let data = match rmp_serde::from_slice(plaintext) {
-            Ok(data) => data,
-            Err(_) => serde_json::from_slice(plaintext)?,
-        };
-        Ok((data, state))
+        let version = stored_version(plaintext)?;
+        if version < SESSION_DATA_VERSION {
+            return Ok((SessionData::below_version(version), false));
+        }
+        let data = rmp_serde::from_slice(plaintext)?;
+        Ok((data, under_previous_key))
     }
 }
 
@@ -264,30 +226,6 @@ pub(crate) struct Decoded {
     pub reseal: bool,
 }
 
-/// What a decode found out about a blob besides its data.
-struct BlobState {
-    /// Not at rest in the current form.
-    stale: bool,
-    /// How the blob was bound to its row.
-    binding: Binding,
-}
-
-impl BlobState {
-    /// A blob of a plaintext codec: in the current form, with nothing to
-    /// bind.
-    fn plaintext() -> Self {
-        Self {
-            stale: false,
-            binding: Binding::Current,
-        }
-    }
-
-    /// Whether the blob carries a row binding, so a read may re-seal it.
-    fn bound(&self) -> bool {
-        self.binding != Binding::Unbound
-    }
-}
-
 /// Compute the `expires_at` Unix timestamp from the current time and a TTL.
 /// SQL-only; Valkey delegates TTL enforcement to the server (`EXPIRE`).
 ///
@@ -299,14 +237,19 @@ impl BlobState {
 /// `update_if_revision` removes the row whose revision matched, and `cycle`
 /// removes both rows; each reports the session gone or not kept (see the
 /// trait's "Zero TTL" section).
-#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
+#[cfg(any(
+    feature = "sqlite",
+    feature = "sqlite-unbundled",
+    feature = "postgres",
+    feature = "mysql"
+))]
 pub(crate) fn expires_at(clock: &dyn axess_clock::Clock, ttl: Duration) -> i64 {
     let secs = if ttl.is_zero() {
         0
     } else {
         ttl.as_secs().clamp(1, i64::MAX as u64) as i64
     };
-    clock.now().timestamp().saturating_add(secs)
+    clock.now().unix_seconds().saturating_add(secs)
 }
 
 /// Shared error type for backend session stores.
@@ -325,25 +268,26 @@ pub enum SqlStoreError {
     /// by the SQL backends; gated out under valkey-only builds so the
     /// enum does not reference `sqlx::Error` when `sqlx` is not in
     /// the dep graph.
-    #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
+    #[cfg(any(
+        feature = "sqlite",
+        feature = "sqlite-unbundled",
+        feature = "postgres",
+        feature = "mysql"
+    ))]
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
 
-    /// JSON deserialisation of a stored row failed. Either a legacy
-    /// row whose JSON is corrupt, or a backend wire-format drift bug.
-    #[error("session JSON deserialisation failed: {0}")]
-    Serialization(#[from] serde_json::Error),
-
-    /// MessagePack encoding of `SessionData` failed. Distinct
-    /// from `Serialization` (which is JSON-only) so the variant
-    /// reflects the actual codec in use on the write path.
+    /// MessagePack encoding of `SessionData` failed.
     #[error("session MessagePack encoding failed: {0}")]
     Encode(#[from] rmp_serde::encode::Error),
 
-    /// MessagePack decoding of a stored row failed AFTER
-    /// the JSON-fallback path also rejected the bytes. Indicates true
-    /// row corruption rather than a routine format-detection miss.
-    #[error("session MessagePack decoding failed: {0}")]
+    /// A stored row is not a session in the stored form: a SQL row with no
+    /// value in its binary column, or bytes (opened first, when the codec
+    /// encrypts) that are not a MessagePack session in the shape this
+    /// release writes. MessagePack is the only encoding
+    /// read; a row in any other one, such as JSON from the 0.1.x line, is
+    /// refused with this error and loads no session.
+    #[error("stored session decoding failed: {0}")]
     Decode(#[from] rmp_serde::decode::Error),
 
     /// AES-256-GCM encryption or decryption of session payload failed.

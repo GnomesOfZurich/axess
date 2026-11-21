@@ -12,9 +12,9 @@ to leak, no replay window after the handshake.
 A certificate identifies a machine. What you do with that depends on
 whether a machine is the whole answer.
 
-Where the caller is a service, it is: *Inbound: mTLS-SVID* covers
-`MtlsResolver`, which reads a SPIFFE URI out of the validated leaf and
-produces a `Principal::Workload`, and the certificate is the subject.
+Where the caller is a service, it is. *Inbound: mTLS-SVID* covers that
+case: `MtlsResolver` reads a SPIFFE URI from the validated leaf and
+produces a `Principal::Workload`, so the certificate is the subject.
 
 Where the caller is a person at a kiosk or an internal admin host, the
 certificate says which machine and nothing about who is using it. This
@@ -27,19 +27,19 @@ The feature flag is `mtls` (off by default), enabled with
 
 ## Where the certificate comes from
 
-The most important detail about an mTLS integration is that axess
-does not handle the TLS handshake. Axum sits behind a TLS
+Axess does not handle the TLS handshake. Axum sits behind a TLS
 terminator (rustls in process, or nginx, HAProxy, AWS NLB, or
 Cloudflare in front), and the certificate validation happens at the
-terminator. Axess receives the validated certificate as part of the
-request, extracts an identity from it, and proceeds.
+terminator. The validated certificate reaches your process with the
+request, and your own middleware reads it; on the path this chapter
+describes, axess extracts no identity from it.
 
-The extraction is a Tower middleware the adopter wires in. The
-middleware reads the certificate from wherever the terminator put it:
+The extraction is a Tower middleware the adopter wires in. It reads
+the certificate from wherever the terminator put it:
 
-- For rustls in process, the certificate is in
-  `axum_server::tls_rustls::RustlsConnectInfo` or an equivalent
-  connector callback.
+- For rustls in process, the application reads the chain the
+  handshake recorded (`ServerConnection::peer_certificates()` under
+  tokio-rustls, or an equivalent connector callback).
 - For nginx, the certificate is passed through as the
   `X-SSL-Client-Cert` header (the exact header is the deployment's
   choice).
@@ -48,19 +48,18 @@ middleware reads the certificate from wherever the terminator put it:
   for AWS ALB with mTLS, the certificate is in
   `X-Amzn-Mtls-Clientcert`.
 
-The middleware reads the certificate, validates that it came from a
-trusted source (the certificate must be present, the header must
-have arrived only from the trusted terminator, the deployment must
-not allow clients to inject the header directly), wraps the
-certificate chain in a `PeerCertChain`, and inserts it into the
-Axum request extensions:
+The middleware checks that the certificate came from a trusted source:
+the certificate is present, the header arrived only from the trusted
+terminator, and clients cannot inject the header directly. It then wraps
+the certificate chain in a `PeerCertChain` and inserts it into the Axum
+request extensions:
 
 ```rust,ignore
 use axess::federation::mtls::PeerCertChain;
 
-async fn mtls_middleware<B>(
-    mut req: Request<B>,
-    next: Next<B>,
+async fn mtls_middleware(
+    mut req: Request,
+    next: Next,
 ) -> Response {
     // `new` takes the chain leaf first, as the client presented it.
     // Cloning a `PeerCertChain` is cheap; it holds an `Arc<[..]>`.
@@ -71,27 +70,24 @@ async fn mtls_middleware<B>(
 }
 ```
 
-The trusted-terminator check is the critical line. If the
+The trusted-terminator check is the critical step. If the
 deployment accepts the certificate header from anywhere, an
 attacker who can reach your service directly (bypassing the
 terminator) can spoof any identity by setting the header
-themselves. The defence is to either configure your listener to
-listen only on a socket the terminator owns, or to gate the
-extraction on a token the terminator injects alongside the
+themselves. The defence is to listen only on a socket the terminator owns, or to
+gate the extraction on a token the terminator injects alongside the
 certificate.
 
 ## The trust anchor
 
-The certificate validation that the TLS terminator performs uses a
-trust anchor: a set of CA certificates the terminator considers
-authoritative. A client certificate is accepted only if it chains
+The TLS terminator validates the certificate against a trust anchor:
+a set of CA certificates it considers authoritative. A client certificate is accepted only if it chains
 back to one of those CAs.
 
 For service-to-service mTLS within an organisation, the trust
-anchor is typically the organisation's own internal CA. The CA
-issues certificates to known clients, the terminator trusts the
-CA, and the validation works on the closed set of certificates the
-organisation has signed.
+anchor is typically the organisation's own internal CA: it issues
+certificates to known clients, the terminator trusts it, and only
+certificates the organisation has signed are accepted.
 
 For broader deployments (a partner integration where the partner
 runs their own CA), the trust anchor is the partner's CA or a
@@ -140,7 +136,7 @@ Two consequences follow from the split. The certificate is not part of
 the authentication, so no audit row mentions it: record the gate's
 decision yourself if you need evidence that a particular machine was
 used. And the session is not bound to the certificate, so one issued
-behind the gate lasts until it expires whatever becomes of the
+behind the gate lasts until it expires, whatever becomes of the
 certificate. Pair short session lifetimes with short-lived certificates
 where that matters.
 
@@ -177,10 +173,9 @@ The TLS terminator checks revocation through OCSP (the Online
 Certificate Status Protocol, which asks the issuer about one
 certificate), a CRL (a certificate revocation list, which the issuer
 publishes in bulk), or a short-lived-certificate strategy that lets
-revocation happen by expiry; an unchecked revocation lets
-the old certificate continue to work. The defence is to wire
-revocation checking at the terminator and to monitor the
-revocation lifecycle.
+revocation happen by expiry. Without a check, a revoked certificate
+keeps working. The defence is to enable revocation checking at the
+terminator and monitor the revocation lifecycle.
 
 ## Troubleshooting
 
@@ -191,15 +186,16 @@ client certificate at handshake time; others accept the handshake
 without a certificate and silently let the request through. Check
 the terminator's configuration.
 
-If certificates are present but the CN extraction returns nothing,
-the certificate may use a SAN URI instead of a CN. Inspect the
+If certificates are present but your gate's policy matches none of
+them, the certificate may carry its name in a SAN (a DNS name or a
+URI) rather than in the CN, or the reverse. Inspect the
 certificate (`openssl x509 -in cert.pem -text`) to see what fields
-are present. Updating the extraction to read the SAN URI is the
-fix; the structured-mapping pattern above is the right shape.
+are present, and match the gate's policy on the field the
+certificate carries.
 
-If the trust-anchor configuration accepts a certificate the
-application does not expect, the terminator's trust store may
-include a CA the deployment did not intend to trust. Check the
+If the terminator accepts a certificate the application does not
+expect, its trust store may include a CA the deployment did not
+intend to trust. Check the
 terminator's CA-bundle configuration and remove anything that
 should not be there. Use a dedicated trust store for client
 certificates rather than reusing the server's general CA bundle.

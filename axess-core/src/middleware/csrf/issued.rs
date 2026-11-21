@@ -17,23 +17,23 @@ pub(super) struct EntryToken {
 /// that read `CsrfToken` from the request extension (to embed
 /// in an HTML form, say) need SOME value; give them either
 /// the presented cookie or a fresh mint bound to the current
-/// session id. A token can only be minted when a session id
+/// session key. A token can only be minted when a session key
 /// is present to bind it to; without one we leave the client
 /// tokenless rather than issue an unbound token.
 ///
-/// A presented cookie that does not verify against the session id
-/// at entry (left over from before the id changed) is not handed
+/// A presented cookie that does not verify against the session's key
+/// at entry (left over from before the key changed) is not handed
 /// to the handler: embedding it would render a form whose first
 /// submit is refused. It is treated as absent here, so the handler
-/// sees a fresh token bound to the current id, and the same token
+/// sees a fresh token bound to the current key, and the same token
 /// goes out as the replacement cookie. Validation of a
 /// state-changing request is unchanged and has already run.
 pub(super) fn entry_token(
     config: &CsrfConfig,
     cookie_token: Option<&str>,
-    session_id: Option<SessionId>,
+    session_key: Option<SessionKey>,
 ) -> EntryToken {
-    if session_id.is_none() {
+    if session_key.is_none() {
         use std::sync::Once;
         static WARN: Once = Once::new();
         WARN.call_once(|| {
@@ -43,19 +43,19 @@ pub(super) fn entry_token(
             );
         });
     }
-    // Only a cookie that verifies against the session id is handed on. With
-    // no session id there is nothing to verify it against, and the value is
+    // Only a cookie that verifies against the session's key is handed on. With
+    // no session key there is nothing to verify it against, and the value is
     // the client's own.
     let usable_cookie = cookie_token.filter(|c| {
         !c.is_empty()
-            && session_id
+            && session_key
                 .as_ref()
-                .is_some_and(|sid| validate_token(c, sid.as_bytes(), &config.signing_key))
+                .is_some_and(|key| validate_token(c, key.as_bytes(), &config.signing_key))
     });
-    let provisional_mint = match (usable_cookie, session_id.as_ref()) {
+    let provisional_mint = match (usable_cookie, session_key.as_ref()) {
         (Some(_), _) => None,
-        (None, Some(sid_at_entry)) => Some(mint_token(
-            sid_at_entry.as_bytes(),
+        (None, Some(key_at_entry)) => Some(mint_token(
+            key_at_entry.as_bytes(),
             &config.signing_key,
             &*config.rng,
         )),
@@ -73,15 +73,15 @@ pub(super) fn entry_token(
 
 /// The token to ship as `Set-Cookie` after the handler ran, if any.
 ///
-/// The post-handler session id decides: if the cookie the client will present
+/// The post-handler session key decides: if the cookie the client will present
 /// next no longer verifies against it (typical after `session.regenerate()`), a
-/// token for the new id is issued; otherwise only a token minted at entry is sent.
+/// token for the new key is issued; otherwise only a token minted at entry is sent.
 pub(super) fn replacement_token(
     config: &CsrfConfig,
     issuer: &CsrfIssuer,
     provisional_mint: Option<String>,
     cookie_token: Option<&str>,
-    session_id_after: Option<SessionId>,
+    session_key_after: Option<SessionKey>,
 ) -> Option<String> {
     // The token the client would present next request: either the
     // freshly-provisioned mint (if we issued one) or the cookie
@@ -91,22 +91,22 @@ pub(super) fn replacement_token(
         .as_deref()
         .or(cookie_token)
         .filter(|t| !t.is_empty());
-    match (effective_cookie, session_id_after.as_ref()) {
-        (Some(existing), Some(sid_after))
-            if validate_token(existing, sid_after.as_bytes(), &config.signing_key) =>
+    match (effective_cookie, session_key_after.as_ref()) {
+        (Some(existing), Some(key_after))
+            if validate_token(existing, key_after.as_bytes(), &config.signing_key) =>
         {
-            // Cookie still binds to the post-handler session id
+            // Cookie still binds to the post-handler session key
             // (usually because the handler didn't rotate). Mint
             // only if we chose to at entry.
             provisional_mint
         }
-        (_, Some(sid_after)) => {
+        (_, Some(key_after)) => {
             // Either no effective cookie, or the effective cookie
-            // no longer binds to the current session id (typical
+            // no longer binds to the current session key (typical
             // after `session.regenerate()`). Use the issuer's token
-            // for the new id: it is the one a handler that rotated
+            // for the new key: it is the one a handler that rotated
             // may already have embedded in its response body.
-            Some(issuer.token_for(*sid_after))
+            Some(issuer.token_for(*key_after))
         }
         (_, None) => None,
     }

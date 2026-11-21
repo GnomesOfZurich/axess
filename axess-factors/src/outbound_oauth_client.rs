@@ -54,11 +54,15 @@
 //!
 //! The token URL must be HTTPS (plain HTTP only for `localhost`,
 //! `127.0.0.1` and `[::1]`), since the request carries the client secret or
-//! assertion. The default HTTP client follows no redirects (a redirect would
-//! re-send the credentials to wherever it points) and has connect and request
-//! timeouts. A client passed to
-//! [`with_http_client`](OutboundOAuthClient::with_http_client) is the
-//! caller's to configure the same way.
+//! assertion. The default HTTP client is built by an
+//! [`EgressPolicy`](crate::egress::EgressPolicy) (see
+//! [`new_screened`](OutboundOAuthClient::new_screened)): it follows no
+//! redirects (a redirect would re-send the credentials to wherever it
+//! points), has connect and request timeouts, and under a screened policy
+//! follows no proxy from the environment and reaches no reserved address.
+//! The caller adds to it only what cannot undo the policy
+//! ([`with_client_settings`](OutboundOAuthClient::with_client_settings)): no
+//! client of the caller's own is taken.
 //!
 //! # DST
 //!
@@ -71,16 +75,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axess_clock::{Clock, SystemClock};
+use axess_clock::{SignedDuration, Timestamp};
 use axess_rng::{SecureRng, SystemRng};
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as B64_STANDARD;
-use chrono::{DateTime, Utc};
 use reqwest::header::AUTHORIZATION;
 use serde::Deserialize;
 use tokio::sync::{Mutex, RwLock};
 use url::Url;
 
 use crate::secret::ZeroizedString;
+
+/// The most bytes of a token response's `token_type` a refusal quotes.
+const TOKEN_TYPE_LOG_BYTES: usize = 64;
 
 /// Errors surfaced by [`OutboundOAuthClient`].
 ///
@@ -101,7 +106,9 @@ pub enum OAuthClientError {
         /// HTTP status code returned by the token endpoint.
         status: u16,
         /// The first [`ERROR_BODY_BYTES`](crate::http_body::ERROR_BODY_BYTES)
-        /// of the response body as text, with
+        /// of the response body as text, with every class of character
+        /// [`escapes`](crate::log_text::escapes) names escaped
+        /// ([`log_safe_snippet`](crate::http_body::log_safe_snippet)) and
         /// [`TRUNCATED_SUFFIX`](crate::http_body::TRUNCATED_SUFFIX) when more
         /// followed; empty if the body could not be read.
         body: String,
@@ -130,6 +137,13 @@ pub enum OAuthClientError {
     /// backend fails to initialise.
     #[error("HTTP client could not be built: {0}")]
     ClientBuild(String),
+    /// The egress policy the client is built under refuses the token URL:
+    /// a reserved address (`localhost` included) under a screened policy,
+    /// or not HTTPS. The refusal names the setting and the reason, never the
+    /// URL. A configuration fault; name the policy that fits the endpoint
+    /// with [`OutboundOAuthClient::new_screened`].
+    #[error("{0}")]
+    EgressRefused(crate::egress::EgressRefusal),
 }
 
 /// How axess authenticates itself to the token endpoint.
@@ -209,11 +223,11 @@ struct CachedToken {
     access_token: ZeroizedString,
     /// `now + expires_in` from the token response: the token is unusable
     /// from here on.
-    expires_at: DateTime<Utc>,
+    expires_at: Timestamp,
     /// When a refresh is due: `refresh_threshold` before `expires_at`, or
     /// half the token's lifetime before it if that is shorter. Fixed when the
     /// token is fetched, because the lifetime is known only then.
-    refresh_at: DateTime<Utc>,
+    refresh_at: Timestamp,
 }
 
 /// The cache and the record of the fetches that filled it, under one lock.
@@ -268,7 +282,33 @@ pub struct OutboundOAuthClient {
     /// assertion JWTs.
     rng: Arc<dyn SecureRng>,
     http_client: reqwest::Client,
+    /// The policy the client was built under, kept so that
+    /// `with_client_settings` builds the next one under it too.
+    egress: crate::egress::EgressPolicy,
 }
+
+/// The HTTP client of the token fetch: the default timeouts, then the
+/// caller's settings, then the policy's own, which follow no redirect (a
+/// 307 or 308 would re-POST the credentials wherever it points) and come
+/// last so nothing before them can undo them.
+fn build_http_client(
+    policy: crate::egress::EgressPolicy,
+    configure: impl FnOnce(crate::egress::ClientSettings) -> crate::egress::ClientSettings,
+) -> Result<reqwest::Client, OAuthClientError> {
+    policy
+        .build_client(|settings| {
+            configure(
+                settings
+                    .connect_timeout(Duration::from_secs(10))
+                    .timeout(DEFAULT_REQUEST_TIMEOUT),
+            )
+        })
+        .map(crate::egress::ScreenedClient::into_inner)
+        .map_err(|e| OAuthClientError::ClientBuild(e.to_string()))
+}
+
+/// Bound on one token fetch unless `with_request_timeout` says otherwise.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Base64 payload of an HTTP Basic `client_secret_basic` credential.
 ///
@@ -281,17 +321,7 @@ pub struct OutboundOAuthClient {
 /// the way to it; [`basic_authorization`] builds the header from it.
 #[must_use]
 pub fn basic_credentials(client_id: &str, client_secret: &str) -> ZeroizedString {
-    let enc = |s: &str| ZeroizedString::new(crate::http_basic::form_urlencode(s));
-    let id = enc(client_id);
-    let secret = enc(client_secret);
-    // Sized up front: a buffer that grows leaves its earlier allocations
-    // behind unzeroed.
-    let mut joined = String::with_capacity(id.len() + 1 + secret.len());
-    joined.push_str(&id);
-    joined.push(':');
-    joined.push_str(&secret);
-    let joined = ZeroizedString::new(joined);
-    ZeroizedString::new(B64_STANDARD.encode(&*joined))
+    crate::http_basic::credentials(client_id, client_secret)
 }
 
 /// The `Authorization` header for `client_secret_basic`: `Basic` and
@@ -308,15 +338,7 @@ pub fn basic_authorization(
     client_id: &str,
     client_secret: &str,
 ) -> Result<reqwest::header::HeaderValue, reqwest::header::InvalidHeaderValue> {
-    const SCHEME: &str = "Basic ";
-    let credentials = basic_credentials(client_id, client_secret);
-    let mut value = String::with_capacity(SCHEME.len() + credentials.len());
-    value.push_str(SCHEME);
-    value.push_str(&credentials);
-    let value = ZeroizedString::new(value);
-    let mut header = reqwest::header::HeaderValue::from_str(&value)?;
-    header.set_sensitive(true);
-    Ok(header)
+    crate::http_basic::authorization(client_id, client_secret)
 }
 
 /// Refuse a token URL that is not HTTPS, other than plain HTTP to a loopback
@@ -343,12 +365,9 @@ fn require_secure_token_url(url: &Url) -> Result<(), OAuthClientError> {
 /// An IdP-supplied `expires_in` is untrusted: a huge value must be
 /// refused rather than panic or wrap into the past.
 #[must_use]
-pub fn expiry_after(
-    now: chrono::DateTime<chrono::Utc>,
-    secs: u64,
-) -> Option<chrono::DateTime<chrono::Utc>> {
+pub fn expiry_after(now: Timestamp, secs: u64) -> Option<Timestamp> {
     let secs = i64::try_from(secs).ok()?;
-    now.checked_add_signed(chrono::Duration::try_seconds(secs)?)
+    now.checked_add(SignedDuration::seconds(secs))
 }
 
 impl OutboundOAuthClient {
@@ -360,9 +379,16 @@ impl OutboundOAuthClient {
     /// `with_*` builder methods.
     ///
     /// The default client sends no `User-Agent`. Some token endpoints refuse a
-    /// request without one; pass a configured client to
-    /// [`with_http_client`](Self::with_http_client) for those, and configure
-    /// it with no redirects and timeouts as well.
+    /// request without one; name it with
+    /// [`with_client_settings`](Self::with_client_settings), which keeps the
+    /// policy's redirect, proxy and address rules in place.
+    ///
+    /// The client and the token URL are under
+    /// [`EgressPolicy::screened`](crate::egress::EgressPolicy::screened), the
+    /// default: no token URL on a loopback, private, link-local or metadata
+    /// address, and no proxy from the environment. A token endpoint on the
+    /// deployment's own network, or a mock on loopback, goes through
+    /// [`new_screened`](Self::new_screened) with the policy named.
     ///
     /// # Errors
     ///
@@ -371,18 +397,37 @@ impl OutboundOAuthClient {
     ///   assertion.
     /// * [`OAuthClientError::ClientBuild`] when the default HTTP client cannot
     ///   be built (the TLS backend failed to initialise).
+    /// * [`OAuthClientError::EgressRefused`] when the egress policy refuses the
+    ///   token URL, naming the setting and the reason.
     pub fn new(token_url: Url, auth_method: ClientAuthMethod) -> Result<Self, OAuthClientError> {
+        Self::new_screened(
+            token_url,
+            auth_method,
+            crate::egress::EgressPolicy::screened(),
+        )
+    }
+
+    /// [`new`](Self::new) under the egress policy `policy`: the token URL is
+    /// checked against it here and the HTTP client is built by it, so under
+    /// a screened policy the token request follows no proxy from the
+    /// environment and reaches no loopback, private, link-local or metadata
+    /// address, a host name that resolves to one included.
+    ///
+    /// # Errors
+    ///
+    /// As [`new`](Self::new), and [`OAuthClientError::EgressRefused`] naming
+    /// why the policy refuses the token URL, without the URL.
+    pub fn new_screened(
+        token_url: Url,
+        auth_method: ClientAuthMethod,
+        policy: crate::egress::EgressPolicy,
+    ) -> Result<Self, OAuthClientError> {
         require_secure_token_url(&token_url)?;
-        let request_timeout = Duration::from_secs(30);
-        let http_client = reqwest::Client::builder()
-            // A redirect would re-send the credentials wherever it points
-            // (a 307 or 308 re-POSTs the form), and a downgrade to HTTP would
-            // send them in the clear. A 3xx is an error response here.
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(request_timeout)
-            .build()
-            .map_err(|e| OAuthClientError::ClientBuild(e.to_string()))?;
+        policy
+            .check_url(token_url.as_str(), "token URL")
+            .map_err(OAuthClientError::EgressRefused)?;
+        let request_timeout = DEFAULT_REQUEST_TIMEOUT;
+        let http_client = build_http_client(policy, |settings| settings)?;
         Ok(Self {
             token_url,
             auth_method,
@@ -398,6 +443,7 @@ impl OutboundOAuthClient {
             clock: Arc::new(SystemClock),
             rng: Arc::new(SystemRng),
             http_client,
+            egress: policy,
         })
     }
 
@@ -434,19 +480,28 @@ impl OutboundOAuthClient {
         self
     }
 
-    /// Inject a pre-configured `reqwest::Client`; for adopters who
-    /// want custom TLS roots, connection pooling, proxies, or
-    /// per-request timeouts.
+    /// Add settings to the HTTP client of the token fetch: a `User-Agent`
+    /// (some token endpoints refuse a request without one), a trusted root
+    /// certificate, a client certificate, timeouts.
     ///
-    /// The client replaces the default one, and with it the default's
-    /// protections: configure it with
-    /// `redirect(reqwest::redirect::Policy::none())` and a request timeout,
-    /// or a redirect carries the client credentials to wherever it points. The
-    /// bound set by [`with_request_timeout`](Self::with_request_timeout) still
+    /// The client is built again under the policy this one was constructed
+    /// with, `configure`'s settings before the policy's own, so the redirect
+    /// rule, the proxy rule and the address screen stay: a
+    /// [`ClientSettings`](crate::egress::ClientSettings) offers nothing that
+    /// could undo them, and no client of the caller's own is taken. The
+    /// bound of [`with_request_timeout`](Self::with_request_timeout) still
     /// applies to a whole fetch.
-    pub fn with_http_client(mut self, client: reqwest::Client) -> Self {
-        self.http_client = client;
-        self
+    ///
+    /// # Errors
+    ///
+    /// [`OAuthClientError::ClientBuild`] when the client cannot be built with
+    /// the settings.
+    pub fn with_client_settings(
+        mut self,
+        configure: impl FnOnce(crate::egress::ClientSettings) -> crate::egress::ClientSettings,
+    ) -> Result<Self, OAuthClientError> {
+        self.http_client = build_http_client(self.egress, configure)?;
+        Ok(self)
     }
 
     /// Bound one token fetch (default: 30 s). A fetch that takes longer fails
@@ -678,7 +733,7 @@ impl OutboundOAuthClient {
             let body = crate::http_body::read_error_snippet(&mut response).await;
             return Err(OAuthClientError::TokenEndpoint {
                 status: status.as_u16(),
-                body,
+                body: crate::http_body::log_safe_snippet(&body),
             });
         }
 
@@ -686,8 +741,9 @@ impl OutboundOAuthClient {
             crate::http_body::read_limited(&mut response, crate::http_body::MAX_TOKEN_BODY_BYTES)
                 .await
                 .map_err(|e| OAuthClientError::MalformedResponse(e.to_string()))?;
-        let parsed: TokenResponse = serde_json::from_slice(&body)
-            .map_err(|e| OAuthClientError::MalformedResponse(e.to_string()))?;
+        let parsed: TokenResponse = serde_json::from_slice(&body).map_err(|e| {
+            OAuthClientError::MalformedResponse(crate::remote_text::parse_error(&e))
+        })?;
 
         if parsed.access_token.is_empty() {
             return Err(OAuthClientError::MalformedResponse(
@@ -700,8 +756,8 @@ impl OutboundOAuthClient {
         // would be refused, or accepted unbound by a lax resource server.
         if !parsed.token_type.eq_ignore_ascii_case("bearer") {
             return Err(OAuthClientError::MalformedResponse(format!(
-                "token_type {:?} is not Bearer",
-                parsed.token_type
+                "token_type `{}` is not Bearer",
+                crate::log_text::log_safe(&parsed.token_type, TOKEN_TYPE_LOG_BYTES)
             )));
         }
 
@@ -727,12 +783,15 @@ impl OutboundOAuthClient {
         let early = self
             .refresh_threshold
             .min(Duration::from_secs(lifetime_secs / 2));
-        let early = chrono::Duration::from_std(early).unwrap_or_default();
+        let early = SignedDuration::try_from(early).unwrap_or_default();
 
         Ok(CachedToken {
             access_token,
             expires_at,
-            refresh_at: expires_at - early,
+            // `early` is at most half the lifetime, so the refresh is due
+            // between the fetch and the expiry, inside the range. Were it
+            // not, the refresh would be due at the expiry.
+            refresh_at: expires_at.checked_sub(early).unwrap_or(expires_at),
         })
     }
 }

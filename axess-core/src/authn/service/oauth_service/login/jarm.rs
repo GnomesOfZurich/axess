@@ -2,7 +2,8 @@
 //! authorization response as a signed JWT (JWT Secured Authorization Response
 //! Mode, `response_mode=jwt`).
 
-use super::finish::{IssCheck, ResponseForm};
+use super::finish::{AuthorizationResponse, ResponseForm};
+use super::route::OAuthCallbackRoute;
 use crate::authn::event::AuthFailureReason;
 use crate::authn::service::RequestAuthnService;
 use crate::authn::store::{FactorStore, IdentityStore};
@@ -19,14 +20,20 @@ where
     F: FactorStore<Error = I::Error>,
 {
     /// Complete an OAuth/OIDC login whose authorization response is a JWT
-    /// (the `response` query or form parameter of the callback).
+    /// (the `response` query or form parameter of the callback), at the
+    /// callback route `route`.
+    ///
+    /// `route` is the route the callback arrived on, as for
+    /// [`finish_oauth_login`](Self::finish_oauth_login), and is compared
+    /// with the registration the login began with in the same way, once
+    /// the response has verified and carries this ceremony's `state`.
     ///
     /// The JWT is verified against the provider's key set (its signature, an
     /// `iss` equal to the provider's issuer, an `aud` naming this client, an
     /// unexpired `exp`; never `none`, never a symmetric algorithm). A stale
     /// key set is refreshed once and the check repeated. The `code`, `state`
     /// and `iss` it carries then go through exactly the checks
-    /// [`finish_oauth_login_with_iss`](Self::finish_oauth_login_with_iss)
+    /// [`finish_oauth_login`](Self::finish_oauth_login)
     /// makes, with `iss` required, so a signed response cannot be replayed
     /// into another flow.
     ///
@@ -48,17 +55,26 @@ where
     /// when the JWT does not verify, and
     /// [`OAuthError::CsrfMismatch`](axess_factors::oauth::OAuthError::CsrfMismatch)
     /// when its `state` is not the ceremony's. Everything
-    /// [`finish_oauth_login_with_iss`](Self::finish_oauth_login_with_iss)
+    /// [`finish_oauth_login`](Self::finish_oauth_login)
     /// reports follows.
-    #[tracing::instrument(skip(self, response, session))]
+    #[tracing::instrument(
+        skip(self, route, response, session),
+        fields(
+            callback_provider = %super::super::logged_provider_name(route.provider()),
+            callback_tenant = ?route.tenant(),
+        )
+    )]
     pub async fn finish_oauth_login_jarm(
         &self,
+        route: OAuthCallbackRoute<'_>,
         response: &str,
         session: &AuthSession,
     ) -> Result<axess_factors::oauth::OAuthClaims, axess_factors::oauth::OAuthError> {
         use axess_factors::oauth::{OAuthError, keys as oauth_keys};
 
-        if response.len() > MAX_JARM_RESPONSE_BYTES {
+        if response.len() > MAX_JARM_RESPONSE_BYTES
+            || route.provider().len() > crate::validation::MAX_OAUTH_PARAM_BYTES
+        {
             return Err(OAuthError::InvalidParameter);
         }
         let provider_name = session
@@ -89,7 +105,7 @@ where
                 // a response that is not the IdP's must not end a flow the
                 // IdP is still about to answer.
                 tracing::warn!(
-                    provider = %provider_name,
+                    provider = %super::super::logged_provider_name(&provider_name),
                     error = %e,
                     "authorization response JWT did not verify"
                 );
@@ -116,7 +132,7 @@ where
             .is_some_and(|state| bool::from(state.as_bytes().ct_eq(stored_csrf.as_bytes())));
         if !state_is_ours {
             tracing::warn!(
-                provider = %provider_name,
+                provider = %super::super::logged_provider_name(&provider_name),
                 "authorization response state is not this ceremony's; refusing"
             );
             self.record_oauth_failure(AuthFailureReason::CsrfMismatch, &provider_name, session)
@@ -126,7 +142,7 @@ where
 
         if verified.error.is_some() {
             tracing::warn!(
-                provider = %provider_name,
+                provider = %super::super::logged_provider_name(&provider_name),
                 "the identity provider refused the authorization request"
             );
             self.record_oauth_failure_and_clear(
@@ -150,10 +166,13 @@ where
             return Err(OAuthError::InvalidParameter);
         };
         self.finish_oauth_login_checked(
-            code,
-            state,
-            IssCheck::Compared(Some(&verified.iss)),
-            ResponseForm::Jarm,
+            route,
+            AuthorizationResponse {
+                code,
+                state,
+                iss: Some(&verified.iss),
+                form: ResponseForm::Jarm,
+            },
             Some(provider),
             session,
         )

@@ -1,11 +1,21 @@
 //! [`StoredTenantOAuthProviders`]: providers built from a store's records.
 
-use super::{BrokenTenantProvider, IssuerFuture, IssuerProviders, ProviderFuture, TenantProvider};
+mod records;
+mod register;
+
+pub use records::TenantOAuthRecords;
+pub use register::Reproved;
+
+use super::ownership::OwnershipProofs;
+use super::{
+    BrokenTenantProvider, IssuerFuture, IssuerProviders, KindFuture, ProviderFuture, TenantProvider,
+};
 use super::{
     TenantClientCredential, TenantDpop, TenantOAuthProviderRecord, TenantOAuthProviderStore,
     TenantOAuthProviderStoreError, TenantOAuthProviders,
 };
-use crate::authn::factor_secret::FactorSecretCipher;
+use crate::authn::factor::FederatedProvider;
+use crate::authn::factor_secret::{FactorSecretCipher, FactorSecretError};
 use crate::authn::ids::TenantId;
 use axess_clock::Clock;
 use axess_factors::client_assertion::ClientAssertionSigner;
@@ -15,6 +25,10 @@ use axess_rng::SecureRng;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::OnceCell;
+
+mod reseal;
+use reseal::RecordCredentialError;
+pub use reseal::ResealReport;
 
 /// The provider of one record revision: built once, by the first resolution
 /// that needs it, while the others that arrive meanwhile wait for that build.
@@ -56,15 +70,35 @@ struct Built {
 /// on the loopback interface use
 /// [`EgressPolicy::screened_allowing_loopback_http`].
 ///
+/// Whoever registers an issuer and client id first holds them, so a record
+/// is stored only once the tenant's ownership of the client is proven: the
+/// constructor takes the [`OwnershipProofs`] the deployment accepts, with no
+/// default and no proof that accepts everything, and every write
+/// ([`upsert`](Self::upsert), [`upsert_attested`](Self::upsert_attested)
+/// and an operator's hand-over through
+/// [`RequestAuthnService::reassign_tenant_oauth_pair_as`](crate::authn::service::RequestAuthnService::reassign_tenant_oauth_pair_as))
+/// asks them first and refuses the record by name when none holds.
+/// [`reprove`](Self::reprove) asks them of a stored record without writing
+/// it, for records stored before the directory asked.
+///
 /// [`invalidate`](Self::invalidate) drops a held provider early, for a
 /// reason the record does not show (the IdP rotated its keys and you want
 /// discovery redone).
+///
+/// Nothing resolves before the start-up pass
+/// ([`reseal_earlier_bindings`](Self::reseal_earlier_bindings)) has run to
+/// the end once: [`started`](Self::started) runs it when the service
+/// starts, and a directory that was not started runs it before its first
+/// resolution. Until a pass succeeds every resolution is refused with the
+/// pass's error, which names the record it could not move.
 pub struct StoredTenantOAuthProviders<S> {
     store: S,
     cipher: Option<Arc<FactorSecretCipher>>,
     clock: Arc<dyn Clock>,
     rng: Arc<dyn SecureRng>,
     egress: EgressPolicy,
+    /// The proofs of ownership a write needs.
+    ownership: OwnershipProofs,
     /// The `(issuer, client id)` pairs the global registration holds, which
     /// no tenant may register.
     global: Vec<(String, String)>,
@@ -72,9 +106,15 @@ pub struct StoredTenantOAuthProviders<S> {
     /// so two registrations in this process cannot both pass.
     registering: tokio::sync::Mutex<()>,
     built: Mutex<HashMap<(TenantId, String), Built>>,
-    /// Bumped by `upsert`, `remove` and the invalidations; see
+    /// Bumped by every write the store accepts and by the invalidations;
+    /// see
     /// [`TenantOAuthProviders::generation`].
     generation: std::sync::atomic::AtomicU64,
+    /// Set once the start-up pass has run to the end: by
+    /// [`started`](Self::started), or before the first resolution of a
+    /// directory that was not started. A pass that fails sets nothing, so
+    /// the next resolution runs it again.
+    passed: OnceCell<()>,
 }
 
 impl<S: TenantOAuthProviderStore> StoredTenantOAuthProviders<S> {
@@ -82,8 +122,20 @@ impl<S: TenantOAuthProviderStore> StoredTenantOAuthProviders<S> {
     /// each credential with `cipher` and a provider is built by opening it,
     /// so a client secret or private key is never in the table in clear
     /// text, and a sealed credential cannot be read without the cipher.
-    pub fn new(store: S, cipher: Arc<FactorSecretCipher>) -> Self {
-        Self::with_optional_cipher(store, Some(cipher))
+    ///
+    /// `ownership` names the proofs that a tenant owns the client it
+    /// registers which the deployment accepts: every write of a record asks
+    /// them first, and a record none of them proves is not stored. There is
+    /// no constructor without it:
+    ///
+    /// ```compile_fail,E0061
+    /// use axess_core::federation::oauth_tenant::{
+    ///     MemoryTenantOAuthProviderStore, StoredTenantOAuthProviders,
+    /// };
+    /// let _ = StoredTenantOAuthProviders::new_unencrypted(MemoryTenantOAuthProviderStore::new());
+    /// ```
+    pub fn new(store: S, cipher: Arc<FactorSecretCipher>, ownership: OwnershipProofs) -> Self {
+        Self::with_optional_cipher(store, Some(cipher), ownership)
     }
 
     /// Providers over `store` with no cipher: credentials are read and
@@ -93,21 +145,28 @@ impl<S: TenantOAuthProviderStore> StoredTenantOAuthProviders<S> {
     /// the session and device stores. A production directory keeps client
     /// secrets and private keys in a table, which is where a backup, a
     /// replica or a SQL injection reads them; use [`new`](Self::new).
-    pub fn new_unencrypted(store: S) -> Self {
-        Self::with_optional_cipher(store, None)
+    /// `ownership` is as for `new`.
+    pub fn new_unencrypted(store: S, ownership: OwnershipProofs) -> Self {
+        Self::with_optional_cipher(store, None, ownership)
     }
 
-    fn with_optional_cipher(store: S, cipher: Option<Arc<FactorSecretCipher>>) -> Self {
+    fn with_optional_cipher(
+        store: S,
+        cipher: Option<Arc<FactorSecretCipher>>,
+        ownership: OwnershipProofs,
+    ) -> Self {
         Self {
             store,
             cipher,
             clock: Arc::new(axess_clock::SystemClock),
             rng: Arc::new(axess_rng::SystemRng),
             egress: EgressPolicy::screened(),
+            ownership,
             global: Vec::new(),
             registering: tokio::sync::Mutex::new(()),
             built: Mutex::new(HashMap::new()),
             generation: std::sync::atomic::AtomicU64::new(0),
+            passed: OnceCell::new(),
         }
     }
 
@@ -151,98 +210,41 @@ impl<S: TenantOAuthProviderStore> StoredTenantOAuthProviders<S> {
         self
     }
 
-    /// The underlying store, for listing and reading records.
-    pub fn store(&self) -> &S {
+    /// The records, read-only: [`get`](TenantOAuthRecords::get),
+    /// [`list`](TenantOAuthRecords::list),
+    /// [`list_by_issuer`](TenantOAuthRecords::list_by_issuer) and
+    /// [`list_all`](TenantOAuthRecords::list_all).
+    ///
+    /// Every write goes through the directory
+    /// ([`upsert`](Self::upsert), [`remove`](Self::remove), and an
+    /// operator's hand-over), which proves ownership, checks the issuer
+    /// against the egress policy, refuses a held or global pair, seals the
+    /// credential and drops held providers. A raw write past all of that
+    /// stays on the store handle you built the directory from (keep an
+    /// `Arc` of it, which is a store too); never pass that handle to a path
+    /// a tenant reaches.
+    ///
+    /// ```compile_fail,E0599
+    /// use axess_core::federation::oauth_tenant::{
+    ///     MemoryTenantOAuthProviderStore, StoredTenantOAuthProviders,
+    ///     TenantOAuthProviderRecord, TenantOAuthProviderStore,
+    /// };
+    /// async fn write_past(
+    ///     directory: &StoredTenantOAuthProviders<MemoryTenantOAuthProviderStore>,
+    ///     record: TenantOAuthProviderRecord,
+    /// ) {
+    ///     let _ = directory.store().put(record).await;
+    /// }
+    /// ```
+    pub fn store(&self) -> TenantOAuthRecords<'_, S> {
+        TenantOAuthRecords::new(&self.store)
+    }
+
+    /// The store itself, for a test that writes past the directory or reads
+    /// a test store's own counters.
+    #[cfg(test)]
+    pub(crate) fn raw_store(&self) -> &S {
         &self.store
-    }
-
-    /// Write a record (sealing its credential when a cipher is set). Returns
-    /// the stored record with its new revision, which the next resolution
-    /// builds.
-    ///
-    /// # Errors
-    ///
-    /// [`OAuthError::Config`] when the record is incomplete, its issuer URL is
-    /// one the egress policy refuses, or its issuer and client id are already
-    /// registered by another tenant or by the global registration
-    /// ([`with_global_registration`](Self::with_global_registration)): the
-    /// refusal names which, never the other tenant or the issuer.
-    /// [`OAuthError::Store`] when the credential cannot be sealed or the
-    /// store fails.
-    ///
-    /// Registrations in one process are serialised, so two of them cannot both
-    /// take a free pair. Two processes sharing a store can: a store that must
-    /// close that window needs a unique index over issuer and client id.
-    pub async fn upsert(
-        &self,
-        mut record: TenantOAuthProviderRecord,
-    ) -> Result<TenantOAuthProviderRecord, OAuthError> {
-        if record.name.is_empty() || record.issuer.is_empty() || record.client_id.is_empty() {
-            return Err(OAuthError::Config(
-                "a tenant provider needs a name, an issuer and a client id".to_string(),
-            ));
-        }
-        self.egress
-            .check_url(&record.issuer, "issuer URL")
-            .map_err(|e| OAuthError::Config(e.to_string()))?;
-        let _registering = self.registering.lock().await;
-        self.refuse_a_held_pair(&record).await?;
-        if let Some(cipher) = &self.cipher {
-            record
-                .seal(cipher)
-                .map_err(|e| OAuthError::Store(Box::new(e)))?;
-        }
-        let stored = self.store.put(record).await.map_err(store_error);
-        self.bump();
-        stored
-    }
-
-    /// Refuse a record whose issuer and client id another tenant, or the
-    /// global registration, already holds. A record that does not build counts
-    /// as holding its pair: the logout route counts it too.
-    async fn refuse_a_held_pair(
-        &self,
-        record: &TenantOAuthProviderRecord,
-    ) -> Result<(), OAuthError> {
-        if self
-            .global
-            .iter()
-            .any(|(issuer, client_id)| *issuer == record.issuer && *client_id == record.client_id)
-        {
-            return Err(OAuthError::Config(
-                "tenant provider refused: its issuer and client id are already registered by \
-                 the global provider"
-                    .to_string(),
-            ));
-        }
-        let held = self
-            .store
-            .list_by_issuer(&record.issuer)
-            .await
-            .map_err(store_error)?;
-        if held
-            .iter()
-            .any(|other| other.tenant_id != record.tenant_id && other.client_id == record.client_id)
-        {
-            return Err(OAuthError::Config(
-                "tenant provider refused: its issuer and client id are already registered by \
-                 another tenant"
-                    .to_string(),
-            ));
-        }
-        Ok(())
-    }
-
-    /// Remove a record and the provider held for it; `true` when there was a
-    /// record.
-    ///
-    /// # Errors
-    ///
-    /// [`OAuthError::Store`] when the store fails.
-    pub async fn remove(&self, tenant: &TenantId, name: &str) -> Result<bool, OAuthError> {
-        let removed = self.store.delete(tenant, name).await.map_err(store_error)?;
-        self.invalidate(tenant, name);
-        Ok(removed)
     }
 
     /// Drop the provider held for `(tenant, name)`; the next resolution
@@ -272,6 +274,7 @@ impl<S: TenantOAuthProviderStore> StoredTenantOAuthProviders<S> {
         tenant: &TenantId,
         name: &str,
     ) -> Result<Option<Arc<dyn OAuthProvider>>, OAuthError> {
+        self.pass_once().await?;
         let Some(record) = self.store.get(tenant, name).await.map_err(store_error)? else {
             self.invalidate(tenant, name);
             return Ok(None);
@@ -359,11 +362,33 @@ impl<S: TenantOAuthProviderStore> StoredTenantOAuthProviders<S> {
     }
 
     /// Store `record` with its credential sealed under the cipher's current
-    /// key and binding, if the record is still at the revision it was read
-    /// at. A failure or a lost race leaves the record as it is: it opens
-    /// again, and moves on a later use.
-    async fn move_to_current_binding(&self, record: &TenantOAuthProviderRecord, plain: &str) {
+    /// key and binding, if the stored record still says what `record` says
+    /// at the revision it was read at. A failure or a lost race leaves the
+    /// record as it is: it opens again, and moves on a later use.
+    ///
+    /// The revision alone does not show the record is unchanged: one removed
+    /// and registered again (by an operator's hand-over, then its old
+    /// tenant) starts at revision 1 again, and a write matched on the
+    /// revision only would put the removed record, its pair included, back.
+    /// So the stored record is read and its content compared, as
+    /// [`cell_for`](Self::cell_for) does for a build, before the write that
+    /// is still matched on the revision.
+    pub(super) async fn move_to_current_binding(
+        &self,
+        record: &TenantOAuthProviderRecord,
+        plain: &str,
+    ) {
         let Some(cipher) = &self.cipher else { return };
+        let unchanged = match self.store.get(&record.tenant_id, &record.name).await {
+            Ok(Some(stored)) => {
+                let read = fingerprint(record);
+                stored.revision == record.revision && read.is_some() && fingerprint(&stored) == read
+            }
+            Ok(None) | Err(_) => false,
+        };
+        if !unchanged {
+            return;
+        }
         let mut resealed = record.clone();
         if resealed.reseal(cipher, plain).is_err() {
             return;
@@ -372,10 +397,32 @@ impl<S: TenantOAuthProviderStore> StoredTenantOAuthProviders<S> {
             tracing::warn!(
                 target: "axess::federation::oauth_tenant",
                 tenant = %record.tenant_id,
-                name = %record.name,
+                name = %crate::authn::service::log_text::logged_request_text(&record.name),
                 %error,
                 "could not move a tenant provider credential to the current binding"
             );
+        }
+    }
+
+    /// Why `record`'s credential did not open, for the log line that names
+    /// it: the cipher's error, or, for a credential still under the earlier
+    /// binding that the cipher's policy refuses, that binding and the policy.
+    fn refusal_reason(
+        &self,
+        record: &TenantOAuthProviderRecord,
+        error: &FactorSecretError,
+    ) -> String {
+        let earlier = matches!(error, FactorSecretError::Open)
+            && self.cipher.as_deref().is_some_and(|cipher| {
+                !cipher.earlier_tenant_binding_readable()
+                    && matches!(record.credential_due_a_reseal(cipher), Ok(Some(_)))
+            });
+        if earlier {
+            "the credential is still sealed under the earlier binding, which the cipher's \
+             with_earlier_tenant_binding policy refuses, and the start-up pass did not move it"
+                .to_string()
+        } else {
+            error.to_string()
         }
     }
 
@@ -383,9 +430,20 @@ impl<S: TenantOAuthProviderStore> StoredTenantOAuthProviders<S> {
         &self,
         record: &TenantOAuthProviderRecord,
     ) -> Result<OAuthProviderConfig, OAuthError> {
+        // A credential that does not open is refused, and the refusal is
+        // logged naming its record and why, so an operator can find a row the
+        // start-up pass could not reach or could not move. The error stays
+        // the cipher's own.
         let (opened, rotated) = record
             .open_credential(self.cipher.as_deref())
-            .map_err(|e| OAuthError::Store(Box::new(e)))?;
+            .map_err(|e| {
+                tracing::warn!(
+                    target: "axess::federation::oauth_tenant",
+                    refused = %RecordCredentialError::new(record, self.refusal_reason(record, &e)),
+                    "a tenant provider credential does not open"
+                );
+                OAuthError::Store(Box::new(e))
+            })?;
         if rotated {
             self.move_to_current_binding(record, &opened).await;
         }
@@ -447,6 +505,13 @@ fn fingerprint(record: &TenantOAuthProviderRecord) -> Option<[u8; 32]> {
 }
 
 fn store_error(e: TenantOAuthProviderStoreError) -> OAuthError {
+    if e.is_pair_held() {
+        return OAuthError::Config(
+            "tenant provider refused: its issuer and client id are already registered by \
+             another record"
+                .to_string(),
+        );
+    }
     OAuthError::Store(Box::new(e))
 }
 
@@ -459,6 +524,23 @@ impl<S: TenantOAuthProviderStore> TenantOAuthProviders for StoredTenantOAuthProv
         Box::pin(self.resolve(tenant, name))
     }
 
+    fn provider_kind<'a>(&'a self, tenant: &'a TenantId, name: &'a str) -> KindFuture<'a> {
+        Box::pin(async move {
+            match self.store.get(tenant, name).await {
+                Ok(Some(record)) => record.federated_kind(),
+                Ok(None) => FederatedProvider::Custom(name.to_string()),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "tenant OAuth provider record not read for its kind; the login records \
+                         Custom(name)"
+                    );
+                    FederatedProvider::Custom(name.to_string())
+                }
+            }
+        })
+    }
+
     fn built_providers(&self) -> Vec<Arc<dyn OAuthProvider>> {
         self.lock()
             .values()
@@ -468,6 +550,7 @@ impl<S: TenantOAuthProviderStore> TenantOAuthProviders for StoredTenantOAuthProv
 
     fn providers_for_issuer<'a>(&'a self, issuer: &'a str) -> IssuerFuture<'a> {
         Box::pin(async move {
+            self.pass_once().await?;
             let records = self
                 .store
                 .list_by_issuer(issuer)

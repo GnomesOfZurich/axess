@@ -3,7 +3,7 @@
 //! isolation, registry-gated session validity, refresh-token reuse rejection,
 //! and `set_custom` size enforcement.
 
-mod common;
+use axess_core::testing::fixtures as common;
 
 use axess_core::authn::Actor;
 use axess_core::authn::AuditContext;
@@ -13,24 +13,28 @@ use axess_core::authn::{
     types::StatusDetail,
 };
 use axess_core::session::store::MemorySessionRegistry;
-use axess_core::testing::mock_authn::make_password_service;
+use axess_core::testing::mock_authn::make_password_service_on;
 use axess_core::testing::{
     mock_authn::{MockFactorStore, MockIdentityStore},
     test_session,
 };
-use chrono::Utc;
 use common::{password_config, password_method, test_tenant, test_user, uid, user_scope};
 
 /// Verify that the session id rotates synchronously as part of the auth-state
 /// transition (session-fixation prevention). Handler-side code that calls
-/// `reg.register(user, session.session_id())` must key the registry against
-/// the same id the cookie will carry on the next request.
+/// `reg.register(user, &session.session_key().await)` must key the registry
+/// against the key of the id the cookie will carry on the next request.
 #[tokio::test]
 async fn session_id_changes_after_authentication() {
-    let service = make_password_service("u1", "alice", "pass");
+    let service = make_password_service_on(
+        std::sync::Arc::new(common::test_clock()),
+        "u1",
+        "alice",
+        "pass",
+    );
     let session = test_session();
 
-    let id_before = session.session_id().await;
+    let id_before = session.session_key().await;
 
     service.begin_login("alice", "t1", &session).await.unwrap();
     service
@@ -42,12 +46,12 @@ async fn session_id_changes_after_authentication() {
         .unwrap();
 
     assert!(session.is_authenticated().await);
-    let id_after = session.session_id().await;
+    let id_after = session.session_key().await;
     assert_ne!(
         id_before, id_after,
         "session id MUST rotate synchronously on auth completion \
-         so handler-side `reg.register(user, session_id())` keys the \
-         registry against the same id the cookie carries"
+         so handler-side `reg.register(user, &session_key())` keys the \
+         registry against the key of the id the cookie carries"
     );
 }
 
@@ -55,7 +59,12 @@ async fn session_id_changes_after_authentication() {
 /// fully authenticated. Prevents privilege escalation via partial auth.
 #[tokio::test]
 async fn partial_auth_is_not_authenticated() {
-    let service = make_password_service("u1", "alice", "pass");
+    let service = make_password_service_on(
+        std::sync::Arc::new(common::test_clock()),
+        "u1",
+        "alice",
+        "pass",
+    );
     let session = test_session();
 
     let outcome = service.begin_login("alice", "t1", &session).await.unwrap();
@@ -74,7 +83,12 @@ async fn partial_auth_is_not_authenticated() {
 /// access to registry-protected routes.
 #[tokio::test]
 async fn check_session_rejects_unauthenticated() {
-    let service = make_password_service("u1", "alice", "pass");
+    let service = make_password_service_on(
+        std::sync::Arc::new(common::test_clock()),
+        "u1",
+        "alice",
+        "pass",
+    );
     let session = test_session();
 
     // Not logged in at all.
@@ -88,14 +102,17 @@ async fn check_session_rejects_unauthenticated() {
 /// Suspended users are force-logged-out when using a session registry.
 #[tokio::test]
 async fn suspend_invalidates_registry_sessions() {
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new()
         .with_factor(user_scope(), password_config("pass"))
         .with_method(&uid("u1"), password_method());
-    let registry = MemorySessionRegistry::new();
+    let registry = MemorySessionRegistry::new().with_clock(std::sync::Arc::new(clock.clone()));
     let service = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
         .with_registry(registry.clone())
         .build()
         .with_audit_context(AuditContext::default());
@@ -119,7 +136,7 @@ async fn suspend_invalidates_registry_sessions() {
         .suspend_user_across_tenants(
             Actor::System,
             &uid("u1"),
-            StatusDetail::administrative("admin action", Utc::now()),
+            StatusDetail::administrative("admin action", common::start()),
         )
         .await
         .unwrap();
@@ -130,22 +147,22 @@ async fn suspend_invalidates_registry_sessions() {
 /// Refresh token rotation: using the old plaintext after rotation fails.
 #[tokio::test]
 async fn refresh_token_reuse_after_rotation_rejected() {
-    use axess_clock::{Clock, testing::MockClock};
+    let clock = common::test_clock();
+    use axess_clock::Clock;
     use axess_core::session::refresh::*;
     use axess_core::testing::{MemoryRefreshTokenStore, MockRng};
 
-    let store = MemoryRefreshTokenStore::new();
+    let store = MemoryRefreshTokenStore::new().with_clock(std::sync::Arc::new(clock.clone()));
     let config = RefreshTokenConfig {
         rotation: true,
         ..Default::default()
     };
     let rng = MockRng::new(99);
-    let clock = MockClock::now();
     let now = clock.now();
 
     let user = axess_core::authn::ids::testing::user("u1");
     let tenant = axess_core::authn::ids::testing::tenant("t1");
-    let (plaintext, _record) = issue_refresh_token(
+    let (plaintext, _) = issue_refresh_token(
         IssueRequest {
             user_id: &user,
             tenant_id: &tenant,
@@ -163,6 +180,7 @@ async fn refresh_token_reuse_after_rotation_rejected() {
 
     // First refresh: should succeed and rotate.
     let (_, new_token) = Refresh::any_tenant(&plaintext, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, now)
         .await
         .unwrap();
@@ -170,6 +188,7 @@ async fn refresh_token_reuse_after_rotation_rejected() {
 
     // Reuse the OLD plaintext: should be rejected (revoked by rotation).
     let err = Refresh::any_tenant(&plaintext, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, now)
         .await
         .unwrap_err();

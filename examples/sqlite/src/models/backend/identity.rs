@@ -1,11 +1,11 @@
 //! Identity-tier trait impls: `IdentityLookup`, `IdentityAuthnLog`,
 //! `IdentityAdmin`.
 
+use axess::Timestamp;
 use axess::authn::{
     AuditOutcome, AuthEvent, EntityState, IpPolicy, LockoutPolicy, PasswordRules, StatusDetail,
     Tenant, TenantId, Throttle, ThrottleState, ThrottleSubject, User, UserId,
 };
-use chrono::{DateTime, Utc};
 use sqlx::Row;
 use tracing::debug;
 use uuid::Uuid;
@@ -140,18 +140,15 @@ impl axess::authn::IdentityLookup for OurBackend {
 
     // One policy for every tenant; a multi-tenant deployment reads its
     // tenant table here.
-    fn lockout_policy_for_tenant(&self, _tenant_id: &TenantId) -> LockoutPolicy {
+    fn lockout_policy_for_tenant(&self, _: &TenantId) -> LockoutPolicy {
         self.lockout_policy()
     }
 
-    async fn password_rules_for_tenant(
-        &self,
-        _tenant_id: &TenantId,
-    ) -> Result<PasswordRules, Self::Error> {
+    async fn password_rules_for_tenant(&self, _: &TenantId) -> Result<PasswordRules, Self::Error> {
         Ok(PasswordRules::default())
     }
 
-    async fn ip_policy_for_tenant(&self, _tenant_id: &TenantId) -> Result<IpPolicy, Self::Error> {
+    async fn ip_policy_for_tenant(&self, _: &TenantId) -> Result<IpPolicy, Self::Error> {
         Ok(IpPolicy::default())
     }
 }
@@ -180,7 +177,7 @@ macro_rules! fresh_count {
 /// The bind values behind `fresh_count!`, computed once per statement from
 /// the clock and the policy in force.
 struct FreshBounds {
-    now: DateTime<Utc>,
+    now: Timestamp,
     /// `?3`: a failure before this is outside the attempt window.
     window_start: String,
     /// `?4`: the policy's effective limit.
@@ -191,15 +188,22 @@ struct FreshBounds {
 }
 
 impl FreshBounds {
-    fn at(now: DateTime<Utc>, policy: &axess::authn::LockoutPolicy) -> Self {
+    fn at(now: Timestamp, policy: &axess::authn::LockoutPolicy) -> Self {
+        // A span too long for a date gets the reading its length asks for:
+        // no failure is older than such a window, and no lockout of such a
+        // duration has ended. The window then starts at the earliest
+        // instant and the lockout is indefinite, instead of a panic or a
+        // bound of one hour the policy never asked for.
         let back = |d: std::time::Duration| {
-            failure_time(now - chrono::Duration::from_std(d).unwrap_or(chrono::Duration::hours(1)))
+            axess::SignedDuration::try_from(d)
+                .ok()
+                .and_then(|d| now.checked_sub(d))
         };
         Self {
             now,
-            window_start: back(policy.attempt_window),
+            window_start: failure_time(back(policy.attempt_window).unwrap_or(Timestamp::MIN)),
             max_attempts: i64::from(policy.effective_max_attempts()),
-            lock_ended_by: policy.duration.map(back),
+            lock_ended_by: policy.duration.and_then(back).map(failure_time),
         }
     }
 }
@@ -214,12 +218,14 @@ impl axess::authn::IdentityAuthnLog for OurBackend {
         // columns allow NULL for this reason.
         let user_id: Option<String> = event.user_id.as_ref().map(|u| u.to_string());
         let tenant_id: Option<String> = event.tenant_id.as_ref().map(|t| t.to_string());
-        let session_id = event.session_id.map(|sid| sid.to_string());
+        // The session's key, 64 hexadecimal characters: the name the session
+        // table and the registry give the session, not the cookie's value.
+        let session_id = event.session_id.map(|key| key.to_string());
         let event_type = event.event_type.to_string();
         let event_status = event.event_status.to_string();
-        let event_time = DateTime::<Utc>::from_timestamp_micros(event.event_time)
+        let event_time = Timestamp::from_unix_micros(event.event_time)
             .expect("event_time micros in range")
-            .to_rfc3339();
+            .to_rfc3339_numeric_offset();
         let factor_kind = event.factor_kind.as_ref().map(|k| k.as_str().to_string());
         let ip_address = event.ip_address.map(|ip| ip.to_string());
         let ip_source = event.ip_source.as_str();
@@ -347,7 +353,7 @@ impl axess::authn::IdentityAuthnLog for OurBackend {
     async fn failed_attempts(
         &self,
         user_id: &UserId,
-    ) -> Result<(u32, Option<DateTime<Utc>>), Self::Error> {
+    ) -> Result<(u32, Option<Timestamp>), Self::Error> {
         let row = sqlx::query("SELECT failed_attempts, last_failed_at FROM users WHERE id = ?1")
             .bind(user_id.to_string())
             .fetch_optional(self.pool())
@@ -359,18 +365,21 @@ impl axess::authn::IdentityAuthnLog for OurBackend {
         let last: Option<String> = row.get("last_failed_at");
         let last = last
             .as_deref()
-            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-            .map(|t| t.with_timezone(&Utc));
+            .and_then(|s| Timestamp::parse_rfc3339(s).ok());
         // Failures older than the window have expired, as in the increment,
         // while the count is under the limit. At the limit the raw count and
         // time are returned so the library derives the lockout's end from
         // the policy's duration rather than from the window.
+        // A window too long for a date is one no failure is older than.
         let policy = self.lockout_policy();
-        let window = chrono::Duration::from_std(policy.attempt_window)
-            .unwrap_or_else(|_| chrono::Duration::hours(1));
+        let now = self.clock().now();
+        let expired = |t: Timestamp| {
+            axess::SignedDuration::try_from(policy.attempt_window)
+                .is_ok_and(|window| now.since(t) > window)
+        };
         let count = u32::try_from(count).unwrap_or(u32::MAX);
         let under_limit = count < policy.effective_max_attempts();
-        if under_limit && last.is_some_and(|t| self.clock().now() - t > window) {
+        if under_limit && last.is_some_and(expired) {
             return Ok((0, None));
         }
         Ok((count, last))
@@ -394,9 +403,8 @@ impl axess::authn::IdentityAuthnLog for OurBackend {
         };
         let failures: i64 = row.get("failures");
         let last: String = row.get("last_failure_at");
-        let last_failure_at = DateTime::parse_from_rfc3339(&last)
-            .map_err(|e| BackendError::Backend(format!("login_throttle.last_failure_at: {e}")))?
-            .with_timezone(&Utc);
+        let last_failure_at = Timestamp::parse_rfc3339(&last)
+            .map_err(|e| BackendError::Backend(format!("login_throttle.last_failure_at: {e}")))?;
         Ok(Some(ThrottleState {
             failures: u32::try_from(failures).unwrap_or(u32::MAX),
             last_failure_at,
@@ -409,17 +417,22 @@ impl axess::authn::IdentityAuthnLog for OurBackend {
         throttle: &Throttle,
     ) -> Result<(), Self::Error> {
         let now = self.clock().now();
-        let forget_before = failure_time(
-            now - chrono::Duration::from_std(throttle.forget_after())
-                .unwrap_or(chrono::Duration::hours(1)),
-        );
         // Rows older than twice the longest delay throttle nothing; sweeping
         // them on every record keeps the table at the size of the keys that
-        // still matter, with no job to run.
-        sqlx::query("DELETE FROM login_throttle WHERE last_failure_at < ?1")
-            .bind(&forget_before)
-            .execute(self.pool())
-            .await?;
+        // still matter, with no job to run. A bound too long for a date is
+        // one no row is older than, as the library reads it: nothing is
+        // swept and no key starts over, where a bound of one hour would
+        // have let a guesser wait it out.
+        let forget_before = axess::SignedDuration::try_from(throttle.forget_after())
+            .ok()
+            .and_then(|keep| now.checked_sub(keep));
+        if let Some(bound) = forget_before {
+            sqlx::query("DELETE FROM login_throttle WHERE last_failure_at < ?1")
+                .bind(failure_time(bound))
+                .execute(self.pool())
+                .await?;
+        }
+        let forget_before = failure_time(forget_before.unwrap_or(Timestamp::MIN));
         // One statement: the read and the increment cannot be separated by a
         // concurrent failure, so parallel guesses all count. A row the sweep
         // just missed (older than the bound by less than a tick) starts over
@@ -463,11 +476,7 @@ impl axess::authn::IdentityAuthnLog for OurBackend {
     }
 
     // The example schema keeps no last-login column.
-    async fn record_last_login(
-        &self,
-        _user_id: &UserId,
-        _at: DateTime<Utc>,
-    ) -> Result<(), Self::Error> {
+    async fn record_last_login(&self, _: &UserId, _: Timestamp) -> Result<(), Self::Error> {
         Ok(())
     }
 }
@@ -487,9 +496,9 @@ impl axess::authn::IdentityAdmin for OurBackend {
         .bind(user.display_name.as_ref())
         .bind(status_to_db(&user.status))
         .bind(user.created_by.to_string())
-        .bind(user.created_at.to_rfc3339())
+        .bind(user.created_at.to_rfc3339_numeric_offset())
         .bind(user.updated_by.to_string())
-        .bind(user.updated_at.to_rfc3339())
+        .bind(user.updated_at.to_rfc3339_numeric_offset())
         .execute(self.pool())
         .await?;
         Ok(())
@@ -507,9 +516,9 @@ impl axess::authn::IdentityAdmin for OurBackend {
         .bind(tenant.display_name.as_ref())
         .bind(status_to_db(&tenant.status))
         .bind(tenant.created_by.to_string())
-        .bind(tenant.created_at.to_rfc3339())
+        .bind(tenant.created_at.to_rfc3339_numeric_offset())
         .bind(tenant.updated_by.to_string())
-        .bind(tenant.updated_at.to_rfc3339())
+        .bind(tenant.updated_at.to_rfc3339_numeric_offset())
         .execute(self.pool())
         .await?;
         Ok(())
@@ -540,7 +549,11 @@ impl axess::authn::IdentityAdmin for OurBackend {
         // The cause is written beside the status so it reads back as it was
         // given: a lockout a caller materialises stays a lockout, an
         // operator's hold stays an operator's.
-        let until = detail.until.map(|u| u.to_rfc3339());
+        // An end is stored as a reading: one that never comes as the latest
+        // reading, which reads back as never.
+        let until = detail
+            .until
+            .map(|u| u.to_timestamp().to_rfc3339_numeric_offset());
         let cause = serde_json::to_string(&detail.cause)
             .map_err(|e| BackendError::Backend(format!("status cause does not encode: {e}")))?;
         sqlx::query(
@@ -555,9 +568,10 @@ impl axess::authn::IdentityAdmin for OurBackend {
         Ok(())
     }
 
-    /// Erase the user in one transaction: factor configs, auth methods,
-    /// password history, the pending reset token and refresh tokens are
-    /// deleted, audit rows keep their place with the user column cleared
+    /// Erase the user in one transaction: factor configs, passkey
+    /// credential-id claims, auth methods, password history, the pending
+    /// reset token and refresh tokens are deleted, audit rows keep their
+    /// place with the user column cleared
     /// (the log outlives the account but no longer names it), and the user
     /// row goes last. A missing user is `RowNotFound`.
     ///
@@ -581,6 +595,7 @@ impl axess::authn::IdentityAdmin for OurBackend {
         }
         for statement in [
             "DELETE FROM factor_configs WHERE user_id = ?1",
+            "DELETE FROM fido2_credential_claims WHERE user_id = ?1",
             "DELETE FROM auth_methods WHERE user_id = ?1",
             "DELETE FROM password_history WHERE user_id = ?1",
             "DELETE FROM password_reset_tokens WHERE user_id = ?1",
@@ -604,7 +619,7 @@ impl axess::authn::IdentityAdmin for OurBackend {
     /// timestamp, not the stored text, whose sub-second digits vary.
     async fn delete_candidates_created_before(
         &self,
-        before: DateTime<Utc>,
+        before: Timestamp,
         limit: usize,
     ) -> Result<Vec<User>, Self::Error> {
         let rows = sqlx::query(
@@ -648,8 +663,8 @@ impl axess::authn::IdentityPasswordReset for OurBackend {
         &self,
         user_id: &UserId,
         token_hash: &str,
-        expires_at: DateTime<Utc>,
-        now: DateTime<Utc>,
+        expires_at: Timestamp,
+        now: Timestamp,
         max_live: usize,
     ) -> Result<bool, Self::Error> {
         // One transaction: drop the user's expired tokens, count the live
@@ -667,8 +682,7 @@ impl axess::authn::IdentityPasswordReset for OurBackend {
         for row in &rows {
             let hash: String = row.get("token_hash");
             let text: String = row.get("expires_at");
-            let is_live =
-                DateTime::parse_from_rfc3339(&text).is_ok_and(|at| at.with_timezone(&Utc) > now);
+            let is_live = Timestamp::parse_rfc3339(&text).is_ok_and(|at| at > now);
             if is_live {
                 live += 1;
                 present |= hash == token_hash;
@@ -696,7 +710,7 @@ impl axess::authn::IdentityPasswordReset for OurBackend {
         )
         .bind(user_id.to_string())
         .bind(token_hash)
-        .bind(expires_at.to_rfc3339())
+        .bind(expires_at.to_rfc3339_numeric_offset())
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -707,7 +721,7 @@ impl axess::authn::IdentityPasswordReset for OurBackend {
         &self,
         user_id: &UserId,
         token_hash: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Result<bool, Self::Error> {
         // One transaction: compare against each live token in constant time,
         // and on a match delete every token of the user.
@@ -727,7 +741,7 @@ impl axess::authn::IdentityPasswordReset for OurBackend {
         &self,
         user_id: &UserId,
         token_hash: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Result<bool, Self::Error> {
         let mut tx = self.pool().begin().await?;
         let matched = Self::any_live_match(&mut tx, user_id, token_hash, now).await?;
@@ -743,7 +757,7 @@ impl OurBackend {
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         user_id: &UserId,
         token_hash: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Result<bool, BackendError> {
         use subtle::ConstantTimeEq;
         let rows = sqlx::query(
@@ -756,8 +770,7 @@ impl OurBackend {
         for row in &rows {
             let stored: String = row.get("token_hash");
             let text: String = row.get("expires_at");
-            let live =
-                DateTime::parse_from_rfc3339(&text).is_ok_and(|at| at.with_timezone(&Utc) > now);
+            let live = Timestamp::parse_rfc3339(&text).is_ok_and(|at| at > now);
             if live {
                 found |= stored.as_bytes().ct_eq(token_hash.as_bytes());
             }
@@ -766,7 +779,8 @@ impl OurBackend {
     }
 }
 
-/// Password-reuse prevention, carved out of `IdentityAdmin` in 0.6.0.
+/// Password-reuse prevention, a capability trait of its own beside
+/// `IdentityAdmin`.
 ///
 /// A backend with no reuse policy simply does not implement this trait;
 /// the password-change flow is then unavailable to it at compile time,
@@ -784,7 +798,7 @@ impl axess::authn::IdentityPasswordHistory for OurBackend {
         )
         .bind(user_id.to_string())
         .bind(hash)
-        .bind(self.clock().now().to_rfc3339())
+        .bind(self.clock().now().to_rfc3339_numeric_offset())
         .execute(self.pool())
         .await?;
         Ok(())
@@ -811,8 +825,14 @@ impl axess::authn::IdentityPasswordHistory for OurBackend {
 
 /// A failure time in the one fixed-width form the window comparison in
 /// SQL sorts correctly as text.
-fn failure_time(t: DateTime<Utc>) -> String {
-    t.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+fn failure_time(t: Timestamp) -> String {
+    // Six digits of fraction at every reading, where the library's own text
+    // writes the fewest that hold the value.
+    let (date, hour, minute, second, nanos) = t.to_utc();
+    format!(
+        "{date}T{hour:02}:{minute:02}:{second:02}.{:06}Z",
+        nanos / 1_000
+    )
 }
 
 /// The `address` column of a throttle key: the address, or the empty string

@@ -27,8 +27,11 @@
 //!
 //! # What's wired today
 //!
-//! - [`DeviceLifecycleService::ensure_device`](super::lifecycle::DeviceLifecycleService::ensure_device)
-//!   emits `AuthEventType::DeviceFirstSeen` on the create path.
+//! - [`DeviceLifecycleService::resolve_or_keep`](super::lifecycle::DeviceLifecycleService::resolve_or_keep)
+//!   and [`ensure_device`](super::lifecycle::DeviceLifecycleService::ensure_device)
+//!   emit `AuthEventType::DeviceFirstSeen` when they create a device.
+//! - Adding a WebAuthn binding to a device through the lifecycle emits
+//!   `AuthEventType::DeviceBindingAdded`.
 //!
 //! Cascade-time and sweep-time emission (`DeviceRevoked` /
 //! `DevicePurged`) is left to the application: the cascade returns

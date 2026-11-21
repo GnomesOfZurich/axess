@@ -7,18 +7,20 @@
 
 #![cfg(all(feature = "testing", feature = "oauth"))]
 
-mod common;
+use axess_core::testing::fixtures as common;
 
 use axess_clock::testing::MockClock;
+use axess_core::authn::AuditContext;
+use axess_core::authn::factor::FederatedProvider;
 use axess_core::authn::ids::testing::tenant;
 use axess_core::authn::service::AuthnService;
 use axess_core::federation::oauth_tenant::LiveTenantOAuthProviders;
 use axess_core::testing::mock_authn::{MockFactorStore, MockIdentityStore};
 use axess_factors::oauth::{OAuthError, OAuthProviderBuilder, OAuthProviderConfig};
 use axess_testing::oauth_wiremock::{oauth_discovery_document, oauth_generate_rsa_keypair};
-use common::test_tenant;
+use common::{provider_admin, test_tenant};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -51,10 +53,17 @@ async fn candidate(
     uri: &str,
     clock: &MockClock,
 ) -> Result<OAuthProviderConfig, OAuthError> {
-    OAuthProviderConfig::discover(name, uri, "client", "secret", REDIRECT)
-        .await
-        .map(|b| b.with_clock(Arc::new(clock.clone())))
-        .and_then(OAuthProviderBuilder::build)
+    OAuthProviderConfig::discover_screened(
+        name,
+        uri,
+        "client",
+        "secret",
+        REDIRECT,
+        axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
+    )
+    .await
+    .map(|b| b.with_clock(Arc::new(clock.clone())))
+    .and_then(OAuthProviderBuilder::build)
 }
 
 async fn key_set_fetches(server: &MockServer) -> usize {
@@ -68,26 +77,33 @@ async fn key_set_fetches(server: &MockServer) -> usize {
 }
 
 fn service(
+    clock: &MockClock,
     live: &Arc<LiveTenantOAuthProviders>,
 ) -> AuthnService<MockIdentityStore, MockFactorStore> {
     AuthnService::builder(
-        MockIdentityStore::new().with_tenant(test_tenant()),
+        MockIdentityStore::new()
+            .with_clock(clock.clone())
+            .with_tenant(test_tenant()),
         MockFactorStore::new(),
     )
+    .with_clock(clock.clone())
     .with_live_tenant_oauth_providers(live.clone())
     .build()
 }
 
 #[tokio::test]
 async fn a_pass_refreshes_the_providers_tenants_hold() {
-    let clock = MockClock::now();
+    let clock = common::test_clock();
     let live = Arc::new(LiveTenantOAuthProviders::new());
-    let service = service(&live);
+    let service = service(&clock, &live);
     let server = idp(Duration::ZERO).await;
     service
-        .reload_tenant_oauth_provider(
+        .with_audit_context(AuditContext::default())
+        .reload_tenant_oauth_provider_as(
+            &provider_admin(),
             &tenant("acme"),
             "sso",
+            FederatedProvider::Custom("sso".into()),
             candidate("sso", &server.uri(), &clock),
         )
         .await
@@ -95,7 +111,7 @@ async fn a_pass_refreshes_the_providers_tenants_hold() {
     let built = key_set_fetches(&server).await;
 
     // Past the provider's 60 s debounce on its own clock.
-    clock.advance(chrono::Duration::seconds(61));
+    clock.advance(axess_clock::SignedDuration::seconds(61));
     let failures = service.refresh_all_jwks().await;
 
     assert!(failures.is_empty(), "{failures:?}");
@@ -108,16 +124,19 @@ async fn a_pass_refreshes_the_providers_tenants_hold() {
 #[tokio::test]
 async fn one_slow_key_set_does_not_hold_the_others_back() {
     const SLOW: Duration = Duration::from_millis(700);
-    let clock = MockClock::now();
+    let clock = common::test_clock();
     let live = Arc::new(LiveTenantOAuthProviders::new());
-    let service = service(&live);
+    let service = service(&clock, &live);
     let mut servers = Vec::new();
     for n in 0..4 {
         let server = idp(SLOW).await;
         service
-            .reload_tenant_oauth_provider(
+            .with_audit_context(AuditContext::default())
+            .reload_tenant_oauth_provider_as(
+                &provider_admin(),
                 &tenant(&format!("t{n}")),
                 "sso",
+                FederatedProvider::Custom("sso".into()),
                 candidate("sso", &server.uri(), &clock),
             )
             .await
@@ -125,10 +144,12 @@ async fn one_slow_key_set_does_not_hold_the_others_back() {
         servers.push(server);
     }
 
-    clock.advance(chrono::Duration::seconds(61));
-    let started = Instant::now();
+    clock.advance(axess_clock::SignedDuration::seconds(61));
+    // The identity providers answer after a real delay, so the time the
+    // refresh takes is the machine's, not the world's.
+    let watch = axess_testing::stopwatch::Stopwatch::start();
     let failures = service.refresh_all_jwks().await;
-    let took = started.elapsed();
+    let took = watch.elapsed();
 
     assert!(failures.is_empty(), "{failures:?}");
     assert!(

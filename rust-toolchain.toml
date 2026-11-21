@@ -1,11 +1,10 @@
 # Pinned, not `stable`.
 #
 # `channel = "stable"` means any `rustup update` can change the compiler under
-# a checkout that did not change. That is not theoretical here: a stable bump
-# introduced `clippy::chunks_exact_to_as_chunks`, which fired on hex-decoding
-# code untouched since the 0.2.0 release, and because the clippy gate runs with
-# `-D warnings` it turned the whole of `scripts/test-all.sh` red on main with
-# no commit responsible for it.
+# a checkout that did not change: a stable release that adds a lint (as one
+# added `clippy::chunks_exact_to_as_chunks`) fires on code nobody touched, and
+# because the clippy gate runs with `-D warnings` it turns the whole of
+# `scripts/test-all.sh` red on main with no commit responsible for it.
 #
 # Pinning makes a toolchain change a deliberate edit to this file, arriving
 # with the lint fixes it requires, instead of arriving unannounced on whichever
@@ -18,10 +17,20 @@
 # `RUSTUP_TOOLCHAIN`, which takes precedence over this file, so it continues to
 # compile against the MSRV rather than against this pin.
 #
-# To move: bump `channel`, run `./scripts/test-all.sh`, and fix whatever new
-# lints the bump brings in the same commit.
+# CI builds with this release too: the jobs that run on a push, a pull
+# request or a release install it through .github/actions/pinned-toolchain,
+# which reads it from this file. The release workflow writes it out in its
+# toolchain steps: one of its jobs may ask for an OIDC token, so the pin
+# check holds every toolchain there to a release written as X.Y.Z.
+# scripts/check-workflow-pins.sh refuses a workflow toolchain that is
+# another release than this one, and `stable` in a workflow that runs on a
+# change.
+#
+# To move: bump `channel` and the release workflow's toolchain steps, run
+# `./scripts/test-all.sh`, and fix whatever new lints the bump brings in the
+# same commit.
 [toolchain]
-channel = "1.98.0"
+channel = "1.100.0"
 # Named explicitly so a fresh checkout or a CI runner using a minimal profile
 # still has the tools the gates need, rather than failing on a missing binary.
 components = ["clippy", "rustfmt"]

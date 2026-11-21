@@ -1,5 +1,6 @@
 use super::*;
 use crate::session::data::SessionData;
+use crate::session::id::{SessionId, SessionKey};
 use crate::testing::mock_clock::MockClock;
 use axess_rng::SystemRng;
 
@@ -8,10 +9,10 @@ use axess_rng::SystemRng;
 /// `MockClock::advance_secs` can.
 #[tokio::test]
 async fn prune_expired_uses_injected_clock() {
-    let clock = Arc::new(MockClock::now());
+    let clock = Arc::new(MockClock::at_reference());
     let store = MemorySessionStore::new().with_clock(clock.clone());
     let rng = SystemRng;
-    let id = SessionId::new(&rng);
+    let id = SessionKey::of(&SessionId::new(&rng));
 
     store
         .save(&id, &SessionData::default(), Duration::from_secs(60))
@@ -33,10 +34,10 @@ async fn prune_expired_uses_injected_clock() {
 /// as expired even when prune_expired hasn't run.
 #[tokio::test]
 async fn load_uses_injected_clock_for_expiry() {
-    let clock = Arc::new(MockClock::now());
+    let clock = Arc::new(MockClock::at_reference());
     let store = MemorySessionStore::new().with_clock(clock.clone());
     let rng = SystemRng;
-    let id = SessionId::new(&rng);
+    let id = SessionKey::of(&SessionId::new(&rng));
 
     store
         .save(&id, &SessionData::default(), Duration::from_secs(10))
@@ -52,10 +53,10 @@ async fn load_uses_injected_clock_for_expiry() {
 /// leave the expired row behind.
 #[tokio::test]
 async fn purge_expired_method_evicts_expired_row() {
-    let clock = Arc::new(MockClock::now());
+    let clock = Arc::new(MockClock::at_reference());
     let store = MemorySessionStore::new().with_clock(clock.clone());
     let rng = SystemRng;
-    let id = SessionId::new(&rng);
+    let id = SessionKey::of(&SessionId::new(&rng));
 
     store
         .save(&id, &SessionData::default(), Duration::from_secs(30))
@@ -81,8 +82,8 @@ async fn purge_expired_method_evicts_expired_row() {
 /// TTL boundary. A row whose elapsed time is **exactly**
 /// equal to its TTL must be considered expired (`elapsed < ttl`
 /// is false at the boundary). This kills the
-/// `< -> <=` mutants at lines 262 (purge_expired), 291 (load),
-/// and 352 (prune_expired); under the mutation, the row would
+/// `< -> <=` mutants in `purge_expired`, `load` and
+/// `prune_expired`; under the mutation, the row would
 /// be retained at the boundary.
 #[tokio::test]
 async fn ttl_boundary_at_exact_elapsed_equals_ttl_evicts() {
@@ -90,9 +91,9 @@ async fn ttl_boundary_at_exact_elapsed_equals_ttl_evicts() {
 
     // ── purge_expired boundary ─────────────────────────────────────
     {
-        let clock = Arc::new(MockClock::now());
+        let clock = Arc::new(MockClock::at_reference());
         let store = MemorySessionStore::new().with_clock(clock.clone());
-        let id = SessionId::new(&rng);
+        let id = SessionKey::of(&SessionId::new(&rng));
         store
             .save(&id, &SessionData::default(), Duration::from_secs(30))
             .await
@@ -107,9 +108,9 @@ async fn ttl_boundary_at_exact_elapsed_equals_ttl_evicts() {
 
     // ── load() boundary ───────────────────────────────────────────
     {
-        let clock = Arc::new(MockClock::now());
+        let clock = Arc::new(MockClock::at_reference());
         let store = MemorySessionStore::new().with_clock(clock.clone());
-        let id = SessionId::new(&rng);
+        let id = SessionKey::of(&SessionId::new(&rng));
         store
             .save(&id, &SessionData::default(), Duration::from_secs(30))
             .await
@@ -123,9 +124,9 @@ async fn ttl_boundary_at_exact_elapsed_equals_ttl_evicts() {
 
     // ── prune_expired boundary ────────────────────────────────────
     {
-        let clock = Arc::new(MockClock::now());
+        let clock = Arc::new(MockClock::at_reference());
         let store = MemorySessionStore::new().with_clock(clock.clone());
-        let id = SessionId::new(&rng);
+        let id = SessionKey::of(&SessionId::new(&rng));
         store
             .save(&id, &SessionData::default(), Duration::from_secs(30))
             .await
@@ -146,10 +147,10 @@ async fn ttl_boundary_at_exact_elapsed_equals_ttl_evicts() {
 /// underlying map size to discriminate.
 #[tokio::test]
 async fn purge_expired_physically_evicts_from_internal_map() {
-    let clock = Arc::new(MockClock::now());
+    let clock = Arc::new(MockClock::at_reference());
     let store = MemorySessionStore::new().with_clock(clock.clone());
     let rng = SystemRng;
-    let id = SessionId::new(&rng);
+    let id = SessionKey::of(&SessionId::new(&rng));
 
     store
         .save(&id, &SessionData::default(), Duration::from_secs(10))
@@ -166,10 +167,10 @@ async fn purge_expired_physically_evicts_from_internal_map() {
 /// removed; the mutation keeps it.
 #[tokio::test]
 async fn purge_expired_boundary_removes_at_elapsed_eq_ttl() {
-    let clock = Arc::new(MockClock::now());
+    let clock = Arc::new(MockClock::at_reference());
     let store = MemorySessionStore::new().with_clock(clock.clone());
     let rng = SystemRng;
-    let id = SessionId::new(&rng);
+    let id = SessionKey::of(&SessionId::new(&rng));
 
     store
         .save(&id, &SessionData::default(), Duration::from_secs(30))
@@ -190,12 +191,12 @@ async fn purge_expired_boundary_removes_at_elapsed_eq_ttl() {
 /// simultaneously.
 #[tokio::test]
 async fn maybe_auto_purge_only_runs_at_1024_with_nonempty_store() {
-    let clock = Arc::new(MockClock::now());
+    let clock = Arc::new(MockClock::at_reference());
     let store = MemorySessionStore::new().with_clock(clock.clone());
     let rng = SystemRng;
 
     // Seed one expired row.
-    let expired = SessionId::new(&rng);
+    let expired = SessionKey::of(&SessionId::new(&rng));
     store
         .save(&expired, &SessionData::default(), Duration::from_secs(10))
         .await
@@ -207,7 +208,7 @@ async fn maybe_auto_purge_only_runs_at_1024_with_nonempty_store() {
     // of 1024 yet, so auto-purge must NOT fire. The expired row
     // must remain in the map.
     for _ in 0..5 {
-        let id = SessionId::new(&rng);
+        let id = SessionKey::of(&SessionId::new(&rng));
         store
             .save(&id, &SessionData::default(), Duration::from_secs(60))
             .await
@@ -225,14 +226,14 @@ async fn maybe_auto_purge_only_runs_at_1024_with_nonempty_store() {
     // We currently have 6 saves; bump to 1024 with cheap writes.
     let target = 1024usize - 6;
     for _ in 0..target {
-        let id = SessionId::new(&rng);
+        let id = SessionKey::of(&SessionId::new(&rng));
         store
             .save(&id, &SessionData::default(), Duration::from_secs(60))
             .await
             .unwrap();
     }
     // 1025th write triggers the guard.
-    let id = SessionId::new(&rng);
+    let id = SessionKey::of(&SessionId::new(&rng));
     store
         .save(&id, &SessionData::default(), Duration::from_secs(60))
         .await
@@ -250,10 +251,10 @@ async fn maybe_auto_purge_only_runs_at_1024_with_nonempty_store() {
 /// kills the mutant.
 #[tokio::test]
 async fn delete_removes_session_so_subsequent_load_returns_none() {
-    let clock = Arc::new(MockClock::now());
+    let clock = Arc::new(MockClock::at_reference());
     let store = MemorySessionStore::new().with_clock(clock.clone());
     let rng = SystemRng;
-    let id = SessionId::new(&rng);
+    let id = SessionKey::of(&SessionId::new(&rng));
 
     store
         .save(&id, &SessionData::default(), Duration::from_secs(60))
@@ -274,7 +275,7 @@ async fn delete_removes_session_so_subsequent_load_returns_none() {
 /// reports the session as not kept, gone, or not rotated.
 #[tokio::test]
 async fn zero_ttl_writes_store_nothing_and_remove_the_entry() {
-    let store = MemorySessionStore::new().with_clock(Arc::new(MockClock::now()));
+    let store = MemorySessionStore::new().with_clock(Arc::new(MockClock::at_reference()));
     let rng = SystemRng;
     let data = SessionData {
         revision: 3,
@@ -282,7 +283,7 @@ async fn zero_ttl_writes_store_nothing_and_remove_the_entry() {
     };
     let ttl = Duration::from_secs(60);
 
-    let id = SessionId::new(&rng);
+    let id = SessionKey::of(&SessionId::new(&rng));
     store.save(&id, &data, ttl).await.unwrap();
     store.save(&id, &data, Duration::ZERO).await.unwrap();
     assert_eq!(store.inner.len(), 0, "save: no entry is left behind");
@@ -314,7 +315,10 @@ async fn zero_ttl_writes_store_nothing_and_remove_the_entry() {
     );
 
     for require_old in [false, true] {
-        let (old, new) = (SessionId::new(&rng), SessionId::new(&rng));
+        let (old, new) = (
+            SessionKey::of(&SessionId::new(&rng)),
+            SessionKey::of(&SessionId::new(&rng)),
+        );
         store.save(&old, &data, ttl).await.unwrap();
         assert_eq!(
             store
@@ -332,7 +336,7 @@ async fn zero_ttl_writes_store_nothing_and_remove_the_entry() {
 #[tokio::test]
 async fn a_session_carrying_assurance_round_trips() {
     let store = MemorySessionStore::new();
-    let id = SessionId::new(&SystemRng);
+    let id = SessionKey::of(&SessionId::new(&SystemRng));
     let data = crate::session::data::assured_fixture::assured_session();
     store
         .save(&id, &data, Duration::from_secs(60))

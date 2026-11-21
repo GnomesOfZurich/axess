@@ -35,10 +35,10 @@ const SHORT: &str = "case-42";
 /// Inline for both contenders: 22 bytes is exactly `ShortString`'s cap
 /// and inside `CompactString`'s 24.
 const LONG: &str = "inst-aapl-20260923-001";
-/// The dominant real workload: `platform/domain/messaging/core` builds a
-/// subject id from a principal's SPIFFE URI. At 42 bytes it exceeds both
-/// inline buffers, so this is the case the design turns on.
-const SPIFFE: &str = "spiffe://gnomes.local/compute-worker/gnomes";
+/// The dominant real workload: an event pipeline builds a subject id from
+/// a principal's SPIFFE URI. At 42 bytes it exceeds both inline buffers,
+/// so this is the case the design turns on.
+const SPIFFE: &str = "spiffe://example.org/reporting-worker/acme";
 
 const CASES: [(&str, &str); 3] = [
     ("short_7b", SHORT),
@@ -132,13 +132,13 @@ fn construct_static(c: &mut Criterion) {
     group.finish();
 }
 
-/// Cloning a `from_static` value: the actual hot path at the call site
-/// that drove this design.
+/// Cloning a `from_static` value: the hot path of the call site this
+/// design is for.
 ///
-/// `platform/services/capture/producer` builds its actor subject once,
-/// outside the pump loop, from a `&'static str`, and then clones it into
-/// every event. So what runs per message is a clone of `Repr::Static`,
-/// which copies a pointer and **performs no atomic operation at all**.
+/// A producer builds its actor subject once, outside its pump loop, from
+/// a `&'static str`, and then clones it into every event. So what runs
+/// per message is a clone of `Repr::Static`, which copies a pointer and
+/// **performs no atomic operation at all**.
 /// `Arc<str>` has no such form: every clone is an atomic increment on a
 /// refcount, whatever the string.
 ///
@@ -185,8 +185,8 @@ fn equality_static(c: &mut Criterion) {
 /// With `unsafe` this would be `from_utf8_unchecked` and free. Without it,
 /// `as_str` on an *inline* value revalidates UTF-8 on every call: the
 /// `Static` and `Shared` forms already hold a `&str` and pay nothing.
-/// Equality, ordering and hashing were moved off this path onto
-/// `as_bytes`, so what remains is `Deref`, `Display` and anything handing
+/// Equality, ordering and hashing work on `as_bytes`, off this path, so
+/// what remains is `Deref`, `Display` and anything handing
 /// the value to a `&str` API.
 ///
 /// This is the honest price of the safe representation, and the number to

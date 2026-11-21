@@ -5,12 +5,14 @@
 //! create is under the caller's control: an over-long key is cut and suffixed
 //! with a digest of the whole, a header value only selects one of
 //! [`HEADER_SLOTS`] sub-buckets of its user, and an IPv6 client is keyed by
-//! its /64 prefix. Every key starts with a kind (`ip:`, `user:`, `login:` ...)
-//! so a value one caller chooses (a login name) can never equal a sentinel or
-//! another kind's key, and a key that was cut can never equal one that was
-//! not.
+//! its /64 prefix, as the IPv4 client it carries, or, under the locally used
+//! NAT64 prefix, by the whole address (see [`ip_bucket`]). Every key starts
+//! with a kind (`ip:`, `user:`, `login:` ...) so a value one caller chooses (a
+//! login name) can never equal a sentinel or another kind's key, and a key
+//! that was cut can never equal one that was not.
 
 use super::{KeyExtractor, RateLimitLoginIdentifier, RateLimitTenantId, RateLimitUserId};
+use crate::client_ip::network::ClientNetwork;
 use axum::{body::Body, http::Request};
 use sha2::{Digest, Sha256};
 use std::net::IpAddr;
@@ -100,37 +102,46 @@ fn header_slot(value: &str) -> u64 {
     u64::from_be_bytes(first) % HEADER_SLOTS
 }
 
-/// The bucket name for a client address: the address itself for IPv4, the
-/// /64 prefix for IPv6.
+/// The bucket name for a client address: the network the login throttle
+/// keys the same address on (see [`ClientNetwork`]).
 ///
-/// A single IPv6 subscriber is routinely handed a whole /64, so keying on the
-/// full address would give one client 2^64 buckets. An IPv4-mapped IPv6
-/// address is keyed as the IPv4 address it carries.
+/// An IPv4 client, and an IPv6 address that carries one (IPv4-mapped,
+/// IPv4-translated, IPv4-compatible, NAT64, 6to4, Teredo), is keyed as that
+/// IPv4 address, so the clients of one translator or relay are as many
+/// buckets as they are clients. An address under the locally used NAT64
+/// prefix is keyed whole (`/128`). Any other IPv6 address is keyed by its
+/// /64 prefix: a single IPv6 subscriber is routinely handed a whole /64, so
+/// keying on the full address would give one client 2^64 buckets.
 pub(super) fn ip_bucket(addr: IpAddr) -> String {
-    match addr.to_canonical() {
-        IpAddr::V4(v4) => v4.to_string(),
-        IpAddr::V6(v6) => {
-            let masked = u128::from(v6) & (u128::MAX << 64);
-            format!("{}/64", std::net::Ipv6Addr::from(masked))
-        }
+    match ClientNetwork::of(addr) {
+        ClientNetwork::V4(v4) => v4.to_string(),
+        ClientNetwork::Whole(v6) => format!("{v6}/128"),
+        ClientNetwork::Prefix64(net) => format!("{net}/64"),
     }
 }
 
-/// The group an address counts against: its IPv4 /24, or its IPv6 /48.
+/// The group an address counts against: the /24 of the IPv4 client it is
+/// keyed as, the /120 of an address keyed whole (the place of an IPv4 /24
+/// under the common /96 translator prefix), or the /48 of any other IPv6
+/// address.
 ///
 /// A /48 holds 65,536 /64s, each its own bucket, so one allocation could
 /// otherwise mint enough keys to fill the table. Past [`GROUP_BUCKET_CAP`]
 /// live buckets in a group, new keys of that group share the group's
-/// overflow bucket. The group is also what a login-identifier overflow is
-/// keyed on for an IPv6 client.
+/// overflow bucket. An IPv4 client behind a translator is grouped with its
+/// IPv4 neighbours, not with every other client of the translator.
 pub(super) fn ip_group(addr: IpAddr) -> String {
-    match addr.to_canonical() {
-        IpAddr::V4(v4) => {
+    match ClientNetwork::of(addr) {
+        ClientNetwork::V4(v4) => {
             let [a, b, c, _] = v4.octets();
             format!("{a}.{b}.{c}.0/24")
         }
-        IpAddr::V6(v6) => {
-            let masked = u128::from(v6) & (u128::MAX << 80);
+        ClientNetwork::Whole(v6) => {
+            let masked = u128::from(v6) & (u128::MAX << 8);
+            format!("{}/120", std::net::Ipv6Addr::from(masked))
+        }
+        ClientNetwork::Prefix64(net) => {
+            let masked = u128::from(net) & (u128::MAX << 80);
             format!("{}/48", std::net::Ipv6Addr::from(masked))
         }
     }
@@ -290,14 +301,15 @@ fn login_overflow_key(bucket_key: &str) -> String {
 /// then one per `every`. A wiring mistake repeats on every request, so a line
 /// each time would flood the log, and one line ever is missed by anyone who
 /// reads the log after the first request. The clock is per thread, which
-/// keeps the check free of a lock and bounds the rate by the worker count.
+/// keeps the check free of a lock and bounds the rate by the worker count,
+/// and it is tokio's, which a paused runtime moves in a test.
 fn log_due(kind: &'static str, every: std::time::Duration) -> bool {
-    use std::{cell::RefCell, collections::HashMap, time::Instant};
+    use std::{cell::RefCell, collections::HashMap};
     thread_local! {
-        static LAST: RefCell<HashMap<&'static str, Instant>> = RefCell::default();
+        static LAST: RefCell<HashMap<&'static str, tokio::time::Instant>> = RefCell::default();
     }
     LAST.with(|last| {
-        let now = Instant::now();
+        let now = tokio::time::Instant::now();
         let mut last = last.borrow_mut();
         match last.get(kind) {
             Some(at) if now.duration_since(*at) < every => false,
@@ -452,3 +464,6 @@ pub(super) fn fingerprint(secret: &[u8], key: &str) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }
+
+#[cfg(test)]
+mod keys_tests;

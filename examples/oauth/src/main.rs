@@ -78,7 +78,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = app::build(Config {
         providers: vec![provider],
         provisioning,
-        require_verified_email: false,
+        // A provider only asserts an address it has verified (`email_verified`
+        // in the ID token); an unverified one can be any address the person
+        // typed, including another user's, so it must not create or match an
+        // account. A provider that never sets the claim cannot provision
+        // users under this setting, which is the intended refusal.
+        require_verified_email: true,
         secure_cookies: secure_cookies(),
     })
     .await?;
@@ -108,8 +113,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// The client authentication method. `OAUTH_PRIVATE_KEY_FILE` names a PEM
 /// private key and selects `private_key_jwt` (the algorithm is
-/// `OAUTH_PRIVATE_KEY_ALG`, default `RS256`, and `OAUTH_PRIVATE_KEY_KID` sets
-/// the assertion's `kid`); otherwise `OAUTH_CLIENT_SECRET` is the secret.
+/// `OAUTH_PRIVATE_KEY_ALG`, default `ES256`, and `OAUTH_PRIVATE_KEY_KID` sets
+/// the assertion's `kid`); otherwise `OAUTH_CLIENT_SECRET` is the secret. An
+/// RSA key (`RS256`, `PS256`) is refused when the signer is built, because
+/// this example signs on `jwt-rust-crypto`, where an RSA signature runs in
+/// rsa 0.9 (RUSTSEC-2023-0071); the `client-assertion-rsa` feature of
+/// `axess` is how a build chooses it.
 fn client_auth() -> ClientAuth {
     let Ok(path) = std::env::var("OAUTH_PRIVATE_KEY_FILE") else {
         return ClientAuth::Secret(
@@ -121,7 +130,7 @@ fn client_auth() -> ClientAuth {
         std::process::exit(2);
     });
     let algorithm = std::env::var("OAUTH_PRIVATE_KEY_ALG")
-        .unwrap_or_else(|_| "RS256".to_string())
+        .unwrap_or_else(|_| "ES256".to_string())
         .parse()
         .unwrap_or_else(|e| {
             tracing::error!("OAUTH_PRIVATE_KEY_ALG: {e}");

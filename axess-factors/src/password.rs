@@ -126,6 +126,31 @@ impl Argon2Cost {
         self.p_cost
     }
 
+    /// Whether a hash under this cost takes at least the memory and the
+    /// passes one under `other` takes. Lanes are not compared: they spread
+    /// the same memory over threads, and more or fewer of them is neither a
+    /// stronger nor a weaker hash.
+    #[must_use]
+    pub fn is_at_least(self, other: Self) -> bool {
+        self.m_cost_kib >= other.m_cost_kib && self.t_cost >= other.t_cost
+    }
+
+    /// This cost with its memory and its passes raised to at least
+    /// `other`'s, and its own lanes kept: the least cost that
+    /// [`is_at_least`](Self::is_at_least) both. Neither component of either
+    /// cost comes out lower.
+    ///
+    /// The result is a valid cost: memory only grows, so it still holds
+    /// eight KiB for each of the lanes this cost already had.
+    #[must_use]
+    pub fn raised_to(self, other: Self) -> Self {
+        Self {
+            m_cost_kib: self.m_cost_kib.max(other.m_cost_kib),
+            t_cost: self.t_cost.max(other.t_cost),
+            p_cost: self.p_cost,
+        }
+    }
+
     fn argon2(self) -> Argon2<'static> {
         let params = Params::new(self.m_cost_kib, self.t_cost, self.p_cost, None)
             .expect("an Argon2Cost is validated when it is built");
@@ -170,6 +195,8 @@ impl std::error::Error for PasswordVerifyError {}
 /// govern new hashes. The comparison of the derived tag is constant time.
 /// Slow by design: call from blocking context.
 pub fn verify_password(password: impl AsRef<[u8]>, hash: &str) -> Result<(), PasswordVerifyError> {
+    #[cfg(any(test, feature = "testing"))]
+    recording::note_hash(hash);
     match argon2().verify_password(password.as_ref(), hash) {
         Ok(()) => Ok(()),
         Err(argon2::password_hash::Error::PasswordInvalid) => Err(PasswordVerifyError::Mismatch),
@@ -232,10 +259,52 @@ pub fn hash_password_with_salt_and_cost(
     salt: &[u8; PASSWORD_SALT_LEN],
     cost: Argon2Cost,
 ) -> String {
+    #[cfg(any(test, feature = "testing"))]
+    recording::note(cost.m_cost_kib, cost.t_cost, cost.p_cost);
     cost.argon2()
         .hash_password_with_salt(password.as_ref(), salt)
         .expect("Argon2id hashing with fixed valid parameters cannot fail")
         .to_string()
+}
+
+/// A record of the Argon2 parameters every password operation on the
+/// current thread ran under, for tests that compare what two paths spend
+/// (`testing` feature). A hash or a verification notes `(m_cost_kib,
+/// t_cost, p_cost)`; a verification reads them from the stored hash, so a
+/// hash made under old parameters is recorded under those. The record is
+/// per thread: run the paths under test on an inline executor.
+#[cfg(any(test, feature = "testing"))]
+pub mod recording {
+    use std::cell::RefCell;
+
+    /// The parameters one operation ran under: `(m_cost_kib, t_cost, p_cost)`.
+    pub type Parameters = (u32, u32, u32);
+
+    thread_local! {
+        static RUNS: RefCell<Vec<Parameters>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn note(m_cost_kib: u32, t_cost: u32, p_cost: u32) {
+        RUNS.with(|runs| runs.borrow_mut().push((m_cost_kib, t_cost, p_cost)));
+    }
+
+    /// Note a verification against `hash` under the parameters it carries;
+    /// a hash that does not parse is noted as `(0, 0, 0)`.
+    pub(super) fn note_hash(hash: &str) {
+        let parsed = argon2::PasswordHash::new(hash)
+            .ok()
+            .and_then(|parsed| argon2::Params::try_from(&parsed).ok());
+        match parsed {
+            Some(params) => note(params.m_cost(), params.t_cost(), params.p_cost()),
+            None => note(0, 0, 0),
+        }
+    }
+
+    /// Take the operations recorded on this thread so far, oldest first,
+    /// leaving the record empty.
+    pub fn take_runs() -> Vec<Parameters> {
+        RUNS.with(|runs| std::mem::take(&mut *runs.borrow_mut()))
+    }
 }
 
 /// Hash `password` with a salt drawn from `rng`.
@@ -467,7 +536,7 @@ mod tests {
 
     #[test]
     fn the_phc_string_carries_the_pinned_parameters() {
-        let hash = generate_password_hash_with_rng(&FixedRng(1), "Gnomes2+");
+        let hash = generate_password_hash_with_rng(&FixedRng(1), "Sample2+");
         assert!(
             hash.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"),
             "unexpected parameter block: {hash}"
@@ -497,7 +566,7 @@ mod tests {
 
     #[test]
     fn a_hash_under_the_pinned_parameters_needs_no_rehash() {
-        let hash = generate_password_hash_with_rng(&FixedRng(1), "Gnomes2+");
+        let hash = generate_password_hash_with_rng(&FixedRng(1), "Sample2+");
         assert!(!password_needs_rehash(&hash));
     }
 
@@ -575,9 +644,34 @@ mod tests {
 
     #[test]
     fn a_good_new_password_hashes_and_verifies() {
-        let hash = hash_new_password("Gnomes2+andmore", &PasswordRules::default()).unwrap();
-        assert!(verify_password("Gnomes2+andmore", &hash).is_ok());
+        let hash = hash_new_password("Sample2+andmore", &PasswordRules::default()).unwrap();
+        assert!(verify_password("Sample2+andmore", &hash).is_ok());
         assert!(!password_needs_rehash(&hash));
+    }
+
+    /// Raising a cost to another never lowers memory or passes on either
+    /// side, keeps the lanes, and gives a cost the hashing library accepts.
+    #[test]
+    fn a_raised_cost_is_at_least_both_and_keeps_its_lanes() {
+        let cost = |m: u32, t, p| Argon2Cost::new(m * ARGON2_M_COST_KIB, t, p).unwrap();
+        for (own, other) in [
+            (cost(1, 2, 1), cost(4, 2, 1)),
+            (cost(4, 3, 4), cost(4, 2, 1)),
+            (cost(2, 4, 2), cost(4, 2, 1)),
+            (cost(8, 2, 1), cost(4, 3, 4)),
+        ] {
+            let raised = own.raised_to(other);
+            assert!(raised.is_at_least(own) && raised.is_at_least(other));
+            assert_eq!(raised.p_cost(), own.p_cost(), "the lanes are its own");
+            assert_eq!(
+                Argon2Cost::new(raised.m_cost_kib(), raised.t_cost(), raised.p_cost()),
+                Ok(raised)
+            );
+            assert_eq!(raised.raised_to(other), raised, "raising twice is once");
+        }
+        assert!(!cost(8, 2, 1).is_at_least(cost(4, 3, 1)), "fewer passes");
+        assert!(!cost(1, 4, 1).is_at_least(cost(4, 2, 1)), "less memory");
+        assert!(cost(4, 2, 4).is_at_least(cost(4, 2, 1)), "lanes are free");
     }
 
     #[test]
@@ -595,5 +689,8 @@ mod tests {
 
 #[cfg(test)]
 mod legacy_hashes;
+
+#[cfg(test)]
+mod recording_tests;
 
 pub mod breached;

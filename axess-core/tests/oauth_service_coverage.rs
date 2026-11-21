@@ -1,16 +1,16 @@
-//! Mutation-coverage backfill for `oauth_service`: size guards, expiry
-//! boundary, revoke, and the JWKS single-flight + min-interval debounce.
+//! Boundaries of `oauth_service`: size guards, the expiry boundary,
+//! revoke, and the JWKS single-flight + min-interval debounce.
 
 #![cfg(all(feature = "testing", feature = "oauth"))]
 
-mod common;
+use axess_core::testing::fixtures as common;
 
 use axess_core::authn::AuditContext;
-use axess_core::testing::oauth_provider::oauth_setup_provider;
+use axess_core::authn::service::OAuthCallbackRoute;
+use axess_core::testing::oauth_provider::oauth_setup_provider_on;
 use axess_core::{
     authn::service::AuthnService,
     testing::{
-        MockClock,
         mock_authn::{MockFactorStore, MockIdentityStore},
         test_session,
     },
@@ -36,10 +36,16 @@ use wiremock::{
 async fn finish_oauth_login_rejects_oversized_code() {
     use axess_core::validation::MAX_OAUTH_PARAM_BYTES;
     use axess_factors::oauth::MockOAuthProvider;
+    let clock = common::test_clock();
 
-    let mock = MockOAuthProvider::new("size-idp").with_user("u", "u@e.com", vec![], vec![]);
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
+    let mock = MockOAuthProvider::new("size-idp")
+        .with_clock(std::sync::Arc::new(clock.clone()))
+        .with_user("u", "u@e.com", vec![], vec![]);
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
     let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_oauth_provider(mock)
         .build()
         .with_audit_context(AuditContext::default());
@@ -47,7 +53,13 @@ async fn finish_oauth_login_rejects_oversized_code() {
 
     let oversized_code = "a".repeat(MAX_OAUTH_PARAM_BYTES + 1);
     let result = authn
-        .finish_oauth_login(&oversized_code, "any-state", &session)
+        .finish_oauth_login(
+            OAuthCallbackRoute::global("size-idp"),
+            &oversized_code,
+            "any-state",
+            None,
+            &session,
+        )
         .await;
     assert!(matches!(
         result.unwrap_err(),
@@ -64,10 +76,16 @@ async fn finish_oauth_login_rejects_oversized_code() {
 async fn finish_oauth_login_accepts_at_boundary() {
     use axess_core::validation::MAX_OAUTH_PARAM_BYTES;
     use axess_factors::oauth::MockOAuthProvider;
+    let clock = common::test_clock();
 
-    let mock = MockOAuthProvider::new("size-idp2").with_user("u", "u@e.com", vec![], vec![]);
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
+    let mock = MockOAuthProvider::new("size-idp2")
+        .with_clock(std::sync::Arc::new(clock.clone()))
+        .with_user("u", "u@e.com", vec![], vec![]);
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
     let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_oauth_provider(mock)
         .build()
         .with_audit_context(AuditContext::default());
@@ -75,7 +93,13 @@ async fn finish_oauth_login_accepts_at_boundary() {
 
     let exactly_max = "a".repeat(MAX_OAUTH_PARAM_BYTES);
     let result = authn
-        .finish_oauth_login(&exactly_max, &exactly_max, &session)
+        .finish_oauth_login(
+            OAuthCallbackRoute::global("size-idp2"),
+            &exactly_max,
+            &exactly_max,
+            None,
+            &session,
+        )
         .await;
     match result {
         Err(axess_factors::oauth::OAuthError::NoFlow) => {}
@@ -92,10 +116,16 @@ async fn finish_oauth_login_accepts_at_boundary() {
 async fn finish_oauth_login_rejects_oversized_state() {
     use axess_core::validation::MAX_OAUTH_PARAM_BYTES;
     use axess_factors::oauth::MockOAuthProvider;
+    let clock = common::test_clock();
 
-    let mock = MockOAuthProvider::new("size-idp3").with_user("u", "u@e.com", vec![], vec![]);
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
+    let mock = MockOAuthProvider::new("size-idp3")
+        .with_clock(std::sync::Arc::new(clock.clone()))
+        .with_user("u", "u@e.com", vec![], vec![]);
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
     let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_oauth_provider(mock)
         .build()
         .with_audit_context(AuditContext::default());
@@ -103,12 +133,72 @@ async fn finish_oauth_login_rejects_oversized_state() {
 
     let oversized_state = "s".repeat(MAX_OAUTH_PARAM_BYTES + 1);
     let result = authn
-        .finish_oauth_login("short-code", &oversized_state, &session)
+        .finish_oauth_login(
+            OAuthCallbackRoute::global("size-idp3"),
+            "short-code",
+            &oversized_state,
+            None,
+            &session,
+        )
         .await;
     assert!(matches!(
         result.unwrap_err(),
         axess_factors::oauth::OAuthError::InvalidParameter
     ));
+}
+
+/// The callback's provider name is held to the same cap as `code` and
+/// `state`: one byte over is refused as an invalid parameter even when the
+/// other parameters are small, and a name of exactly the cap passes the
+/// guard and fails later, with no ceremony in progress.
+#[tokio::test]
+async fn finish_oauth_login_caps_the_callback_provider_name() {
+    use axess_core::validation::MAX_OAUTH_PARAM_BYTES;
+    use axess_factors::oauth::{MockOAuthProvider, OAuthError};
+    let clock = common::test_clock();
+
+    let mock = MockOAuthProvider::new("size-idp4")
+        .with_clock(std::sync::Arc::new(clock.clone()))
+        .with_user("u", "u@e.com", vec![], vec![]);
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
+    let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
+        .with_oauth_provider(mock)
+        .build()
+        .with_audit_context(AuditContext::default());
+    let session = test_session();
+
+    let oversized = "p".repeat(MAX_OAUTH_PARAM_BYTES + 1);
+    let result = authn
+        .finish_oauth_login(
+            OAuthCallbackRoute::global(&oversized),
+            "short-code",
+            "short-state",
+            None,
+            &session,
+        )
+        .await;
+    assert!(
+        matches!(result, Err(OAuthError::InvalidParameter)),
+        "an oversized callback provider name: {result:?}"
+    );
+
+    let exactly_max = "p".repeat(MAX_OAUTH_PARAM_BYTES);
+    let result = authn
+        .finish_oauth_login(
+            OAuthCallbackRoute::global(&exactly_max),
+            "short-code",
+            "short-state",
+            None,
+            &session,
+        )
+        .await;
+    assert!(
+        matches!(result, Err(OAuthError::NoFlow)),
+        "a callback provider name of exactly the cap passes the guard: {result:?}"
+    );
 }
 
 /// `is_oauth_expired` boundary: at exactly the configured
@@ -117,13 +207,15 @@ async fn finish_oauth_login_rejects_oversized_state() {
 /// boundary.
 #[tokio::test]
 async fn oauth_ceremony_not_expired_at_exact_boundary() {
+    let clock = common::test_clock();
     let server = MockServer::start().await;
     let (_, jwk, _) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &jwk).await;
-    let provider = oauth_setup_provider(&server.uri()).await;
+    let provider = oauth_setup_provider_on(&server.uri(), std::sync::Arc::new(clock.clone())).await;
 
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let clock = MockClock::now();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
     let authn = AuthnService::builder(identity, MockFactorStore::new())
         .with_clock(clock.clone())
         .with_oauth_provider(provider)
@@ -147,7 +239,13 @@ async fn oauth_ceremony_not_expired_at_exact_boundary() {
     clock.advance_secs(600);
 
     let result = authn
-        .finish_oauth_login("any-code", &stored_state, &session)
+        .finish_oauth_login(
+            OAuthCallbackRoute::global("test"),
+            "any-code",
+            &stored_state,
+            None,
+            &session,
+        )
         .await;
     // Any non-Expired outcome (CSRF mismatch, token exchange failure, ...)
     // is acceptable; we only care that it didn't trip the expiry guard.
@@ -164,11 +262,17 @@ async fn oauth_ceremony_not_expired_at_exact_boundary() {
 /// records "revoked" for tokens still live at the IdP.
 #[tokio::test]
 async fn revoke_oauth_token_unknown_provider_errors() {
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let authn = AuthnService::new(identity, MockFactorStore::new())
+    let clock = common::test_clock();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
+    let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build()
         .with_audit_context(AuditContext::default());
 
     let result = authn
+        .oauth_global()
         .revoke_oauth_token("nonexistent", "some-token", Some("access_token"), None)
         .await;
     assert!(matches!(
@@ -186,6 +290,7 @@ async fn jwks_concurrent_refreshes_coalesce_to_single_fetch() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    let clock = common::test_clock();
     let server = MockServer::start().await;
     let issuer = server.uri();
 
@@ -200,7 +305,7 @@ async fn jwks_concurrent_refreshes_coalesce_to_single_fetch() {
     // `discover()`; we measure refresh fan-out as `count_after - 1`.
     let jwks_hits = Arc::new(AtomicUsize::new(0));
     let jwks_hits_handler = Arc::clone(&jwks_hits);
-    let (_priv_der, jwk, _kid) = oauth_generate_rsa_keypair();
+    let (_, jwk, _) = oauth_generate_rsa_keypair();
     let body = json!({ "keys": [jwk] });
     Mock::given(method("GET"))
         .and(path("/jwks"))
@@ -211,7 +316,7 @@ async fn jwks_concurrent_refreshes_coalesce_to_single_fetch() {
         .mount(&server)
         .await;
 
-    let provider = Arc::new(oauth_setup_provider(&server.uri()).await);
+    let provider = Arc::new(oauth_setup_provider_on(&server.uri(), Arc::new(clock.clone())).await);
 
     // Setup may fetch JWKS once or twice (OIDC discovery prefetch + the
     // explicit cache prime). Snapshot whatever it landed on as our
@@ -248,10 +353,18 @@ async fn jwks_concurrent_refreshes_coalesce_to_single_fetch() {
 #[tokio::test]
 async fn spawn_jwks_refresh_survives_a_zero_interval() {
     use axess_factors::oauth::MockOAuthProvider;
+    let clock = common::test_clock();
 
-    let mock = || MockOAuthProvider::new("zero-idp").with_user("u", "u@e.com", vec![], vec![]);
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
+    let mock = || {
+        MockOAuthProvider::new("zero-idp")
+            .with_clock(std::sync::Arc::new(clock.clone()))
+            .with_user("u", "u@e.com", vec![], vec![])
+    };
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
     let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_oauth_provider(mock())
         .build();
     let service_task = authn.spawn_jwks_refresh(std::time::Duration::ZERO);

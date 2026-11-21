@@ -7,7 +7,7 @@
 //! registry has ended it.
 
 use crate::authn::ids::UserId;
-use crate::session::id::SessionId;
+use crate::session::id::SessionKey;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -18,8 +18,10 @@ pub struct IdpSessionEnded {
     pub iss: String,
     /// The local user the session belonged to.
     pub user_id: UserId,
-    /// The session that was ended.
-    pub session_id: SessionId,
+    /// The session that was ended, by the key the sid store held for it: the
+    /// key its login registered. A rotation since may have moved the session
+    /// to another key; the registry followed the move to end it.
+    pub session_id: SessionKey,
 }
 
 /// Where the handler reports the sessions it ends.

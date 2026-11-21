@@ -7,8 +7,11 @@
 //! Run with `VALKEY_URL=redis://127.0.0.1:6390 cargo test -p axess-core
 //! --features testing,oauth,valkey,jwt-aws-lc --test provider_reload_valkey -- --ignored`.
 
-mod common;
+use axess_core::testing::fixtures as common;
 
+use axess_clock::testing::MockClock;
+use axess_core::authn::AuditContext;
+use axess_core::authn::factor::FederatedProvider;
 use axess_core::authn::service::{
     AuthnService, BuiltProvider, ProviderEntry, ProviderKey, ProviderSource, ProviderSourceError,
     ReadCause,
@@ -16,7 +19,7 @@ use axess_core::authn::service::{
 use axess_core::reload::{ReloadCoordinator, ReloadFuture, ValkeyReloadCoordinator};
 use axess_core::testing::mock_authn::{MockFactorStore, MockIdentityStore};
 use axess_factors::oauth::MockOAuthProvider;
-use common::test_tenant;
+use common::{provider_admin, test_tenant};
 use fred::clients::SubscriberClient;
 use fred::prelude::*;
 use std::num::NonZeroUsize;
@@ -50,17 +53,22 @@ async fn coordinator(prefix: &str, name: &str) -> Arc<ValkeyReloadCoordinator> {
     )
 }
 
-fn service(coordinator: Arc<ValkeyReloadCoordinator>) -> Service {
+fn service(clock: &MockClock, coordinator: Arc<ValkeyReloadCoordinator>) -> Service {
     AuthnService::builder(
-        MockIdentityStore::new().with_tenant(test_tenant()),
+        MockIdentityStore::new()
+            .with_clock(clock.clone())
+            .with_tenant(test_tenant()),
         MockFactorStore::new(),
     )
+    .with_clock(clock.clone())
     .with_provider_coordinator(coordinator)
     .build()
 }
 
 /// A source that lists one OAuth provider and counts how often it is read.
+/// It builds the provider on the clock of the test's world.
 struct Source {
+    clock: MockClock,
     reads: AtomicUsize,
 }
 
@@ -84,12 +92,15 @@ impl ProviderSource for Source {
 
     fn build<'a>(
         &'a self,
-        _key: &'a ProviderKey,
+        _: &'a ProviderKey,
     ) -> ReloadFuture<'a, Result<BuiltProvider, ProviderSourceError>> {
-        Box::pin(async {
-            Ok(BuiltProvider::OAuth(Arc::new(MockOAuthProvider::new(
-                "sso",
-            ))))
+        Box::pin(async move {
+            Ok(BuiltProvider::OAuth {
+                provider: Arc::new(
+                    MockOAuthProvider::new("sso").with_clock(Arc::new(self.clock.clone())),
+                ),
+                kind: FederatedProvider::Custom("sso".into()),
+            })
         })
     }
 }
@@ -108,11 +119,13 @@ async fn within_three_seconds(what: &str, mut check: impl FnMut() -> bool) {
 #[tokio::test]
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn a_provider_reload_on_one_service_reaches_a_second_service_through_valkey() {
+    let clock = common::test_clock();
     // A prefix per run keeps concurrent test runs on one server apart.
     let prefix = format!("axess_provider_test_{}", uuid::Uuid::new_v4().simple());
-    let a = service(coordinator(&prefix, "provider-reloaded").await);
-    let b = service(coordinator(&prefix, "provider-reloaded").await);
+    let a = service(&clock, coordinator(&prefix, "provider-reloaded").await);
+    let b = service(&clock, coordinator(&prefix, "provider-reloaded").await);
     let source = Arc::new(Source {
+        clock: clock.clone(),
         reads: AtomicUsize::new(0),
     });
     // A long poll: only the notice can make B read again within the test.
@@ -131,9 +144,15 @@ async fn a_provider_reload_on_one_service_reaches_a_second_service_through_valke
     let reads_before = source.reads.load(Ordering::SeqCst);
 
     let change = a
-        .reload_oauth_provider("other", async {
-            Ok::<_, String>(MockOAuthProvider::new("other"))
-        })
+        .with_audit_context(AuditContext::default())
+        .reload_oauth_provider_as(
+            &provider_admin(),
+            "other",
+            FederatedProvider::Custom("other".into()),
+            async {
+                Ok::<_, String>(MockOAuthProvider::new("other").with_clock(Arc::new(clock.clone())))
+            },
+        )
         .await
         .expect("reload");
     assert!(change.announced, "the notice was published");
@@ -161,11 +180,13 @@ async fn a_provider_reload_on_one_service_reaches_a_second_service_through_valke
 #[tokio::test]
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn the_policy_channel_and_the_provider_channel_do_not_cross() {
+    let clock = common::test_clock();
     let prefix = format!("axess_provider_test_{}", uuid::Uuid::new_v4().simple());
     let providers = coordinator(&prefix, "provider-reloaded").await;
     let policies = coordinator(&prefix, "authz-policy-reloaded").await;
-    let b = service(providers.clone());
+    let b = service(&clock, providers.clone());
     let source = Arc::new(Source {
+        clock: clock.clone(),
         reads: AtomicUsize::new(0),
     });
     let follower = b

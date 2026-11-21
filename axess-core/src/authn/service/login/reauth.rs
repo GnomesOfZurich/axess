@@ -13,11 +13,9 @@ use crate::authn::{
     store::{FactorStore, IdentityStore},
     types::AuthnScope,
 };
+use crate::session::data::{AuthFlow, AuthState, STEP_UP_LABEL};
 use crate::session::extractor::AuthSession;
-use chrono::{DateTime, Utc};
-
-/// The method name a step-up runs under; it names no stored method.
-const STEP_UP_METHOD: &str = "step-up";
+use axess_clock::Timestamp;
 
 impl AuthSession {
     /// Whether the session is authenticated and its authentication (or last
@@ -29,17 +27,13 @@ impl AuthSession {
     /// The age is that of the session's `authn_time`, the moment the most
     /// recent factor completed. After a step-up it is the step-up's, so it
     /// says nothing about how long ago an earlier factor (the password of
-    /// the original login) was verified.
-    pub async fn authenticated_within(
-        &self,
-        max_age: std::time::Duration,
-        now: DateTime<Utc>,
-    ) -> bool {
+    /// the original login) was verified, nor about the session's own age,
+    /// which counts from its login (`signed_in_at`).
+    pub async fn authenticated_within(&self, max_age: std::time::Duration, now: Timestamp) -> bool {
         let Some(snapshot) = self.snapshot().await else {
             return false;
         };
-        (now - snapshot.authn_time)
-            .to_std()
+        std::time::Duration::try_from(now.since(snapshot.authn_time))
             .is_ok_and(|age| age <= max_age)
     }
 
@@ -52,12 +46,36 @@ impl AuthSession {
         &self,
         kind: &FactorKind,
         max_age: std::time::Duration,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> bool {
         self.auth_state()
             .await
             .factor_completed_at(kind)
-            .is_some_and(|at| (now - at).to_std().is_ok_and(|age| age <= max_age))
+            .is_some_and(|at| {
+                std::time::Duration::try_from(now.since(at)).is_ok_and(|age| age <= max_age)
+            })
+    }
+
+    /// Whether a step-up is open: `begin_step_up` moved an authenticated
+    /// session to `Authenticating` and its factor is not yet verified.
+    /// `false` for a login in progress, which is also `Authenticating`.
+    ///
+    /// A route that finishes a step-up reads this first, so that it never
+    /// verifies a factor for a login someone else's route began: the two
+    /// flows take the same `verify_factor`, and a login's first step may
+    /// accept a factor (a password) the step-up route would then be a second
+    /// door for.
+    ///
+    /// The answer is the state's own [`AuthFlow`], set when the step was
+    /// opened; no method name decides it.
+    pub async fn step_up_pending(&self) -> bool {
+        matches!(
+            self.auth_state().await,
+            AuthState::Authenticating {
+                flow: AuthFlow::StepUp { .. },
+                ..
+            }
+        )
     }
 
     /// Whether the session is authenticated and `kind` is among the factors
@@ -70,7 +88,7 @@ impl AuthSession {
     pub async fn has_completed_factor(&self, kind: &FactorKind) -> bool {
         matches!(
             self.auth_state().await,
-            crate::session::data::AuthState::Authenticated { factors_completed, .. }
+            AuthState::Authenticated { factors_completed, .. }
                 if factors_completed.iter().any(|(k, _)| k == kind)
         )
     }
@@ -98,7 +116,9 @@ where
     /// failure (counted, audited, lockout applies), and the right one
     /// returns [`FactorOutcome::Authenticated`](crate::authn::service::FactorOutcome::Authenticated)
     /// with `factors_completed` holding the earlier factors and the new one,
-    /// a later authentication time, and a rotated session id. The answer
+    /// a later authentication time (`authn_time`), the login's time
+    /// unchanged (`signed_in_at`, so the session's absolute age cap is not
+    /// renewed), and a rotated session id. The answer
     /// is the first enrolled factor of `factors`, the one to prompt for.
     ///
     /// Until the step is finished the session is not authenticated, so an
@@ -193,7 +213,7 @@ where
         // logged out or cleared meanwhile is refused there, and a refusal
         // leaves no stamp behind.
         let stamp = self
-            .stamp_for_steps(&user_id, &tenant_id, STEP_UP_METHOD, &steps)
+            .stamp_for_steps(&user_id, &tenant_id, STEP_UP_LABEL, &steps)
             .await?;
         {
             let mut guard = session.0.0.write().await;

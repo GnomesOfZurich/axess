@@ -3,7 +3,7 @@
 //! Argon2id takes tens of milliseconds and 19 MiB per run. Done inline in an
 //! async handler it holds a runtime worker for that whole time, and a burst of
 //! logins starves every other task on the runtime. [`KdfExecutor::run`](crate::blocking::KdfExecutor::run) moves
-//! the work onto the blocking pool instead, behind a [`Semaphore`](tokio::sync::Semaphore) sized to the
+//! the work onto the blocking pool instead, behind a [`Semaphore`] sized to the
 //! CPU count so a burst queues in the async layer (where waiting is free)
 //! rather than filling the blocking pool with memory-hungry jobs.
 //!
@@ -154,15 +154,17 @@ impl KdfExecutor {
         self.started.fetch_add(1, Ordering::Relaxed);
         match self.mode {
             Mode::Inline => {
-                let _permit = permit;
-                Ok(job())
+                let done = job();
+                drop(permit);
+                Ok(done)
             }
             // The permit moves into the blocking closure, so it is released
             // when the job ends and not when the caller's future is dropped:
             // a dropped `JoinHandle` detaches the job without stopping it.
             Mode::Pool => tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                job()
+                let done = job();
+                drop(permit);
+                done
             })
             .await
             .map_err(|e| KdfError::Join(e.to_string())),
@@ -181,15 +183,18 @@ impl KdfExecutor {
             self.waiting.fetch_sub(1, Ordering::AcqRel);
             return Err(KdfError::Busy);
         }
-        let _waiting = Waiting(&self.waiting);
+        // The caller counts as waiting until the permit is taken or refused.
+        let waiting = Waiting(&self.waiting);
         let acquire = self.permits.clone().acquire_owned();
-        match self.acquire_timeout {
+        let acquired = match self.acquire_timeout {
             Some(limit) => tokio::time::timeout(limit, acquire)
                 .await
                 .map_err(|_| KdfError::Busy)?
                 .map_err(|_| KdfError::Closed),
             None => acquire.await.map_err(|_| KdfError::Closed),
-        }
+        };
+        drop(waiting);
+        acquired
     }
 }
 

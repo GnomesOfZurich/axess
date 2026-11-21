@@ -1,0 +1,7 @@
+error[E0046]: not all trait items implemented, missing: `load_fresh`
+  --> tests/ui/device_store_without_load_fresh.rs:16:1
+   |
+16 | impl DeviceStore for Wrapped {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `load_fresh` in implementation
+   |
+   = help: implement the missing item: `fn load_fresh(&self, _: &axess_core::TenantId, _: &DeviceId) -> impl Future<Output = Result<Option<axess_core::Device>, <Self as axess_core::DeviceStore>::Error>> + Send { todo!() }`

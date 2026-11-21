@@ -1,7 +1,7 @@
 //! The claim set a mint signs: the [`MintClaims`] builder and its rendering
 //! to the JWT body.
 
-use chrono::{DateTime, Utc};
+use axess_clock::Timestamp;
 use serde::{Deserialize, Serialize};
 
 // ── MintClaims ───────────────────────────────────────────────────────────────
@@ -20,16 +20,16 @@ pub struct MintClaims {
     /// as a string, multi-element as an array (per RFC 7519 §4.1.3).
     pub audience: Vec<String>,
     /// `exp`: required to keep tokens auto-expiring in test runs.
-    pub expires_at: DateTime<Utc>,
+    pub expires_at: Timestamp,
     /// `nbf`: optional.
-    pub not_before: Option<DateTime<Utc>>,
+    pub not_before: Option<Timestamp>,
     /// `iat`: optional. Recommended; some verifiers reject tokens
     /// without `iat`. Written as given, never set or clamped by the IdP:
     /// the IdP's `max_ttl` cap measures the lifetime from its own clock,
     /// so a backdated `iat` does not stretch it, and a verifier that bounds
     /// the age of a token (as the back-channel logout handler bounds the
     /// token's `iat`) reads whatever was set here.
-    pub issued_at: Option<DateTime<Utc>>,
+    pub issued_at: Option<Timestamp>,
     /// `jti`: optional. Required when feeding a
     /// [`axess_factors::jwt::verifier::JwtVerifier`] configured with a
     /// `JtiReplayStore` (replay protection).
@@ -44,7 +44,7 @@ pub struct MintClaims {
 
 impl MintClaims {
     /// Build with the two required claims.
-    pub fn new(subject: impl Into<String>, expires_at: DateTime<Utc>) -> Self {
+    pub fn new(subject: impl Into<String>, expires_at: Timestamp) -> Self {
         Self {
             subject: subject.into(),
             audience: Vec::new(),
@@ -73,14 +73,14 @@ impl MintClaims {
     }
 
     /// Set `nbf`.
-    pub fn with_not_before(mut self, nbf: DateTime<Utc>) -> Self {
+    pub fn with_not_before(mut self, nbf: Timestamp) -> Self {
         self.not_before = Some(nbf);
         self
     }
 
     /// Set `iat`. See [`issued_at`](Self::issued_at): the value is written
     /// as given.
-    pub fn with_issued_at(mut self, iat: DateTime<Utc>) -> Self {
+    pub fn with_issued_at(mut self, iat: Timestamp) -> Self {
         self.issued_at = Some(iat);
         self
     }
@@ -137,10 +137,10 @@ pub(crate) fn build_claims_json(issuer: &str, claims: &MintClaims) -> serde_json
     let view = StandardClaimsView {
         iss: issuer.to_string(),
         sub: claims.subject.clone(),
-        exp: claims.expires_at.timestamp(),
+        exp: claims.expires_at.unix_seconds(),
         aud: aud_value,
-        nbf: claims.not_before.map(|t| t.timestamp()),
-        iat: claims.issued_at.map(|t| t.timestamp()),
+        nbf: claims.not_before.map(|t| t.unix_seconds()),
+        iat: claims.issued_at.map(|t| t.unix_seconds()),
         jti: claims.jwt_id.clone(),
     };
 

@@ -13,7 +13,7 @@ use wiremock::MockServer;
 const DISCOVERY: &str = "/.well-known/openid-configuration";
 
 /// An IdP with discovery and a JWKS, and its issuer.
-async fn idp() -> (MockServer, String) {
+pub(super) async fn idp() -> (MockServer, String) {
     let server = MockServer::start().await;
     let (_, jwk, _) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &jwk).await;
@@ -31,7 +31,7 @@ async fn discoveries(server: &MockServer) -> usize {
         .count()
 }
 
-fn record(
+pub(super) fn record(
     tenant_label: &str,
     issuer: &str,
     client_id: &str,
@@ -46,17 +46,18 @@ fn record(
         scopes: vec![],
         credential,
         dpop: TenantDpop::Advertised,
+        kind: None,
         revision: 0,
     }
 }
 
-fn secret() -> TenantClientCredential {
+pub(super) fn secret() -> TenantClientCredential {
     TenantClientCredential::Secret(FactorSecret::Plain("s3cret".into()))
 }
 
 /// A `private_key_jwt` credential whose key is not a key: the provider is
 /// never built.
-fn unloadable_key() -> TenantClientCredential {
+pub(super) fn unloadable_key() -> TenantClientCredential {
     TenantClientCredential::PrivateKeyJwt {
         key_pem: FactorSecret::Plain("not a key".into()),
         signer: SignerSpec::new(jsonwebtoken::Algorithm::RS256),
@@ -65,9 +66,12 @@ fn unloadable_key() -> TenantClientCredential {
 
 type Directory = StoredTenantOAuthProviders<MemoryTenantOAuthProviderStore>;
 
-fn directory() -> Directory {
-    StoredTenantOAuthProviders::new_unencrypted(MemoryTenantOAuthProviderStore::new())
-        .with_egress_policy(axess_factors::egress::EgressPolicy::screened_allowing_loopback_http())
+pub(super) fn directory() -> Directory {
+    StoredTenantOAuthProviders::new_unencrypted(
+        MemoryTenantOAuthProviderStore::new(),
+        crate::testing::oauth_tenant::ownership_assumed(),
+    )
+    .with_egress_policy(axess_factors::egress::EgressPolicy::screened_allowing_loopback_http())
 }
 
 /// `n` resolutions of acme's `sso` at once; every one must build.
@@ -97,7 +101,7 @@ async fn resolve_concurrently(directory: &Arc<Directory>, n: usize) -> Vec<Arc<d
 /// logout token from a shared IdP still finds them.
 #[tokio::test]
 async fn a_broken_record_does_not_hide_the_other_providers_of_its_issuer() {
-    let (_server, issuer) = idp().await;
+    let (server, issuer) = idp().await;
     let directory = directory();
     directory
         .upsert(record("acme", &issuer, "client-a", secret()))
@@ -133,6 +137,7 @@ async fn a_broken_record_does_not_hide_the_other_providers_of_its_issuer() {
         "{:?}",
         found.broken[0].error
     );
+    drop(server);
 }
 
 /// Resolutions of one revision that arrive together share one build: one
@@ -169,7 +174,7 @@ async fn concurrent_resolutions_of_one_revision_discover_once() {
 /// not the new record's.
 #[tokio::test]
 async fn a_record_replaced_at_the_same_revision_is_built_afresh() {
-    let (_server, issuer) = idp().await;
+    let (server, issuer) = idp().await;
     let directory = directory();
     let acme = tenant("acme");
     directory
@@ -181,9 +186,9 @@ async fn a_record_replaced_at_the_same_revision_is_built_afresh() {
 
     // Another process: the row goes and a new one takes its place, which
     // this directory's `remove` never saw.
-    directory.store().delete(&acme, "sso").await.unwrap();
+    directory.raw_store().delete(&acme, "sso").await.unwrap();
     let stored = directory
-        .store()
+        .raw_store()
         .put(record("acme", &issuer, "client-new", secret()))
         .await
         .unwrap();
@@ -191,6 +196,7 @@ async fn a_record_replaced_at_the_same_revision_is_built_afresh() {
 
     let new = directory.provider(&acme, "sso").await.unwrap().unwrap();
     assert_eq!(new.client_id(), Some("client-new"));
+    drop(server);
 }
 
 /// The same, where the new record's revision is lower than the held one:
@@ -209,9 +215,9 @@ async fn a_record_replaced_at_a_lower_revision_is_discovered_once() {
     directory.provider(&acme, "sso").await.unwrap().unwrap();
     assert_eq!(discoveries(&server).await, 1);
 
-    directory.store().delete(&acme, "sso").await.unwrap();
+    directory.raw_store().delete(&acme, "sso").await.unwrap();
     directory
-        .store()
+        .raw_store()
         .put(record("acme", &issuer, "client-new", secret()))
         .await
         .unwrap();
@@ -270,13 +276,14 @@ async fn a_record_in_the_first_binding_is_stored_in_the_current_one_on_first_use
     use crate::authn::factor_secret::FactorSecretCipher;
     use crate::session::legacy_blobs::LegacyBlobs;
     const KEY: [u8; 32] = *b"0123456789abcdef0123456789abcdeF";
-    let (_server, issuer) = idp().await;
+    let (server, issuer) = idp().await;
     let cipher = Arc::new(FactorSecretCipher::new(KEY).with_first_binding(LegacyBlobs::Accept));
-    let directory =
-        StoredTenantOAuthProviders::new(MemoryTenantOAuthProviderStore::new(), cipher.clone())
-            .with_egress_policy(
-                axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
-            );
+    let directory = StoredTenantOAuthProviders::new(
+        MemoryTenantOAuthProviderStore::new(),
+        cipher.clone(),
+        crate::testing::oauth_tenant::ownership_assumed(),
+    )
+    .with_egress_policy(axess_factors::egress::EgressPolicy::screened_allowing_loopback_http());
     let acme = tenant("acme");
     let mut probe = record("acme", &issuer, "client-1", secret());
     probe.seal(&cipher).unwrap();
@@ -286,7 +293,7 @@ async fn a_record_in_the_first_binding_is_stored_in_the_current_one_on_first_use
     };
     let old = sealed_by_the_first_release(&KEY, key_id, &acme, "sso");
     directory
-        .store()
+        .raw_store()
         .put(record(
             "acme",
             &issuer,
@@ -298,12 +305,99 @@ async fn a_record_in_the_first_binding_is_stored_in_the_current_one_on_first_use
 
     directory.provider(&acme, "sso").await.unwrap().unwrap();
 
-    let stored = directory.store().get(&acme, "sso").await.unwrap().unwrap();
+    let stored = directory
+        .raw_store()
+        .get(&acme, "sso")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(stored.revision, 2, "the record was written back once");
     let strict = FactorSecretCipher::new(KEY).with_first_binding(LegacyBlobs::Reject);
     let (text, rotated) = stored.open_credential(Some(&strict)).unwrap();
     assert_eq!(&*text, "s3cret");
     assert!(!rotated);
+    drop(server);
+}
+
+/// Under the `Accept` opt-in, a record whose credential 0.15 to 0.19 sealed
+/// (bound to the issuer and the client id only) is opened under the earlier
+/// binding and written back under the full one by the time it is first
+/// used: the stored record moves to the next revision, and a cipher that no
+/// longer reads the earlier binding opens it afterwards.
+#[tokio::test]
+async fn a_record_in_the_earlier_binding_is_written_back_in_the_current_one_on_first_use() {
+    use crate::authn::factor::{FactorKind, FederatedProvider};
+    use crate::authn::factor_secret::{FactorSecretBinding, FactorSecretCipher};
+    use crate::authn::types::AuthnScope;
+    use crate::session::legacy_blobs::LegacyBlobs;
+    const KEY: [u8; 32] = *b"0123456789abcdef0123456789abcdeF";
+    let (server, issuer) = idp().await;
+    let cipher =
+        Arc::new(FactorSecretCipher::new(KEY).with_earlier_tenant_binding(LegacyBlobs::Accept));
+    let directory = StoredTenantOAuthProviders::new(
+        MemoryTenantOAuthProviderStore::new(),
+        cipher.clone(),
+        crate::testing::oauth_tenant::ownership_assumed(),
+    )
+    .with_egress_policy(axess_factors::egress::EgressPolicy::screened_allowing_loopback_http());
+    let acme = tenant("acme");
+    let scope = AuthnScope::Tenant(acme);
+    let kind = FactorKind::Federated(FederatedProvider::Custom("sso".into()));
+    let earlier = cipher
+        .seal(
+            "s3cret",
+            FactorSecretBinding::new(&scope, &kind).with_context(&[&issuer, "client-1"]),
+        )
+        .unwrap();
+    let held = directory
+        .raw_store()
+        .put(record(
+            "acme",
+            &issuer,
+            "client-1",
+            TenantClientCredential::Secret(FactorSecret::Sealed(earlier)),
+        ))
+        .await
+        .unwrap();
+    let (_, due) = held.open_credential(Some(&cipher)).unwrap();
+    assert!(due, "the earlier binding opens and is due a re-seal");
+
+    directory.provider(&acme, "sso").await.unwrap().unwrap();
+
+    let stored = directory
+        .raw_store()
+        .get(&acme, "sso")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.revision,
+        held.revision + 1,
+        "the record was written back once"
+    );
+    let strict = FactorSecretCipher::new(KEY).with_earlier_tenant_binding(LegacyBlobs::Reject);
+    let (text, due) = stored.open_credential(Some(&strict)).unwrap();
+    assert_eq!(&*text, "s3cret");
+    assert!(
+        !due,
+        "the written-back credential is under the current binding"
+    );
+    assert!(
+        held.open_credential(Some(&strict)).is_err(),
+        "the earlier binding is what a strict cipher refuses"
+    );
+
+    // The next use finds nothing to move.
+    directory.invalidate(&acme, "sso");
+    directory.provider(&acme, "sso").await.unwrap().unwrap();
+    let again = directory
+        .raw_store()
+        .get(&acme, "sso")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(again.revision, stored.revision, "written back once only");
+    drop(server);
 }
 
 /// A store that lists a stale record and fails the read that follows, as a
@@ -333,6 +427,19 @@ impl TenantOAuthProviderStore for StaleListing {
     ) -> Result<TenantOAuthProviderRecord, TenantOAuthProviderStoreError> {
         self.inner.put(record).await
     }
+    async fn put_if_revision(
+        &self,
+        record: TenantOAuthProviderRecord,
+        expected: u64,
+    ) -> Result<Option<TenantOAuthProviderRecord>, TenantOAuthProviderStoreError> {
+        self.inner.put_if_revision(record, expected).await
+    }
+    async fn reassign_pair(
+        &self,
+        record: TenantOAuthProviderRecord,
+    ) -> Result<ReassignedPair, TenantOAuthProviderStoreError> {
+        self.inner.reassign_pair(record).await
+    }
     async fn delete(
         &self,
         tenant: &TenantId,
@@ -352,6 +459,11 @@ impl TenantOAuthProviderStore for StaleListing {
     ) -> Result<Vec<TenantOAuthProviderRecord>, TenantOAuthProviderStoreError> {
         self.inner.list(tenant).await
     }
+    async fn list_all(
+        &self,
+    ) -> Result<Vec<TenantOAuthProviderRecord>, TenantOAuthProviderStoreError> {
+        self.inner.list_all().await
+    }
 }
 
 /// A resolution that read an older revision than the one held reads the
@@ -359,19 +471,22 @@ impl TenantOAuthProviderStore for StaleListing {
 /// older record is not served.
 #[tokio::test]
 async fn a_failed_re_read_is_reported_not_answered_with_the_older_record() {
-    let (_server, issuer) = idp().await;
-    let directory = StoredTenantOAuthProviders::new_unencrypted(StaleListing {
-        inner: MemoryTenantOAuthProviderStore::new(),
-        stale: std::sync::Mutex::new(None),
-        fail_get: std::sync::atomic::AtomicBool::new(false),
-    })
+    let (server, issuer) = idp().await;
+    let directory = StoredTenantOAuthProviders::new_unencrypted(
+        StaleListing {
+            inner: MemoryTenantOAuthProviderStore::new(),
+            stale: std::sync::Mutex::new(None),
+            fail_get: std::sync::atomic::AtomicBool::new(false),
+        },
+        crate::testing::oauth_tenant::ownership_assumed(),
+    )
     .with_egress_policy(axess_factors::egress::EgressPolicy::screened_allowing_loopback_http());
     let acme = tenant("acme");
     let first = directory
         .upsert(record("acme", &issuer, "client-old", secret()))
         .await
         .unwrap();
-    *directory.store().stale.lock().unwrap() = Some(first);
+    *directory.raw_store().stale.lock().unwrap() = Some(first);
     directory
         .upsert(record("acme", &issuer, "client-new", secret()))
         .await
@@ -380,7 +495,7 @@ async fn a_failed_re_read_is_reported_not_answered_with_the_older_record() {
     assert_eq!(held.client_id(), Some("client-new"));
 
     directory
-        .store()
+        .raw_store()
         .fail_get
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let found = directory.providers_for_issuer(&issuer).await.unwrap();
@@ -388,6 +503,7 @@ async fn a_failed_re_read_is_reported_not_answered_with_the_older_record() {
     assert!(found.providers.is_empty(), "the older record was served");
     assert_eq!(found.broken.len(), 1);
     assert!(matches!(found.broken[0].error, OAuthError::Store(_)));
+    drop(server);
 }
 
 /// The directory is built with its cipher, so a credential is sealed on
@@ -398,8 +514,12 @@ async fn a_directory_built_with_its_cipher_seals_a_credential_on_upsert() {
     let cipher = Arc::new(FactorSecretCipher::new(
         *b"0123456789abcdef0123456789abcdeF",
     ));
-    let directory = StoredTenantOAuthProviders::new(MemoryTenantOAuthProviderStore::new(), cipher)
-        .with_egress_policy(axess_factors::egress::EgressPolicy::screened_allowing_loopback_http());
+    let directory = StoredTenantOAuthProviders::new(
+        MemoryTenantOAuthProviderStore::new(),
+        cipher,
+        crate::testing::oauth_tenant::ownership_assumed(),
+    )
+    .with_egress_policy(axess_factors::egress::EgressPolicy::screened_allowing_loopback_http());
     let stored = directory
         .upsert(record("acme", "https://idp.example", "client-1", secret()))
         .await
@@ -434,143 +554,151 @@ async fn the_generation_moves_when_a_record_is_written_removed_or_invalidated() 
 
 // ── One (issuer, client id) pair belongs to one tenant ────────────────────
 
-const SHARED_ISSUER: &str = "https://idp.shared.example";
+pub(super) const SHARED_ISSUER: &str = "https://idp.shared.example";
 
-fn refused_text(result: Result<TenantOAuthProviderRecord, OAuthError>) -> String {
+pub(super) fn refused_text(result: Result<TenantOAuthProviderRecord, OAuthError>) -> String {
     match result {
         Err(OAuthError::Config(text)) => text,
         other => panic!("expected a refusal, got {:?}", other.map(|r| r.name)),
     }
 }
 
-/// A second tenant cannot register the issuer and client id a first one holds:
-/// the pair would make every logout token addressed to that client ambiguous
-/// and refused.
+/// A store that counts the writes asked of it, over a memory store, and
+/// cannot hand a pair from one record to another in one step.
+struct CountingPuts {
+    inner: MemoryTenantOAuthProviderStore,
+    puts: std::sync::atomic::AtomicUsize,
+}
+
+impl TenantOAuthProviderStore for CountingPuts {
+    async fn get(
+        &self,
+        tenant: &TenantId,
+        name: &str,
+    ) -> Result<Option<TenantOAuthProviderRecord>, TenantOAuthProviderStoreError> {
+        self.inner.get(tenant, name).await
+    }
+    async fn put(
+        &self,
+        record: TenantOAuthProviderRecord,
+    ) -> Result<TenantOAuthProviderRecord, TenantOAuthProviderStoreError> {
+        self.puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.put(record).await
+    }
+    async fn put_if_revision(
+        &self,
+        record: TenantOAuthProviderRecord,
+        expected: u64,
+    ) -> Result<Option<TenantOAuthProviderRecord>, TenantOAuthProviderStoreError> {
+        self.inner.put_if_revision(record, expected).await
+    }
+    async fn reassign_pair(
+        &self,
+        _: TenantOAuthProviderRecord,
+    ) -> Result<ReassignedPair, TenantOAuthProviderStoreError> {
+        Err(TenantOAuthProviderStoreError::reassign_pair_unsupported())
+    }
+    async fn delete(
+        &self,
+        tenant: &TenantId,
+        name: &str,
+    ) -> Result<bool, TenantOAuthProviderStoreError> {
+        self.inner.delete(tenant, name).await
+    }
+    async fn list_by_issuer(
+        &self,
+        issuer: &str,
+    ) -> Result<Vec<TenantOAuthProviderRecord>, TenantOAuthProviderStoreError> {
+        self.inner.list_by_issuer(issuer).await
+    }
+    async fn list(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<Vec<TenantOAuthProviderRecord>, TenantOAuthProviderStoreError> {
+        self.inner.list(tenant).await
+    }
+    async fn list_all(
+        &self,
+    ) -> Result<Vec<TenantOAuthProviderRecord>, TenantOAuthProviderStoreError> {
+        self.inner.list_all().await
+    }
+}
+
+/// The rule is one record per pair, not one tenant: a tenant's own second
+/// record of the same issuer and client id under another name is refused by
+/// the directory's own check, before the store is asked, as the store's
+/// unique constraint would refuse it. Two records of one pair, whoever owns
+/// them, make that client's logout tokens ambiguous.
 #[tokio::test]
-async fn a_tenant_cannot_register_a_pair_another_tenant_holds() {
-    let directory = directory();
+async fn a_tenants_own_second_record_over_one_pair_is_refused_before_the_store_is_asked() {
+    let directory = StoredTenantOAuthProviders::new_unencrypted(
+        CountingPuts {
+            inner: MemoryTenantOAuthProviderStore::new(),
+            puts: std::sync::atomic::AtomicUsize::new(0),
+        },
+        crate::testing::oauth_tenant::ownership_assumed(),
+    )
+    .with_egress_policy(axess_factors::egress::EgressPolicy::screened_allowing_loopback_http());
     directory
         .upsert(record("acme", SHARED_ISSUER, "client-x", secret()))
         .await
         .unwrap();
+    let mut second_name = record("acme", SHARED_ISSUER, "client-x", secret());
+    second_name.name = "sso-copy".into();
 
-    let text = refused_text(
-        directory
-            .upsert(record("beta", SHARED_ISSUER, "client-x", secret()))
-            .await,
-    );
+    let text = refused_text(directory.upsert(second_name).await);
 
     assert!(
-        text.contains("already registered by another tenant"),
+        text.contains("already registered by another record"),
         "{text}"
     );
-    assert!(!text.contains("acme"), "the holder is not named: {text}");
-    assert!(
-        !text.contains(SHARED_ISSUER),
-        "the issuer is not echoed: {text}"
+    assert_eq!(
+        directory
+            .raw_store()
+            .puts
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the store was asked for the first record only"
     );
     assert!(
         directory
-            .store()
-            .get(&tenant("beta"), "sso")
+            .raw_store()
+            .get(&tenant("acme"), "sso-copy")
             .await
             .unwrap()
-            .is_none(),
-        "nothing was written"
+            .is_none()
     );
 }
 
-/// What stays allowed: a tenant updating its own record, one issuer with
-/// different client ids, one client id at different issuers.
+/// A store that cannot hand a pair over in one step refuses by name, and
+/// the pair stays where it was: nothing is removed and nothing written.
 #[tokio::test]
-async fn the_pairs_that_do_not_collide_are_registered() {
-    let directory = directory();
-    directory
-        .upsert(record("acme", SHARED_ISSUER, "client-x", secret()))
-        .await
-        .unwrap();
-
-    directory
-        .upsert(record("acme", SHARED_ISSUER, "client-x", secret()))
-        .await
-        .expect("a tenant updates its own record");
-    directory
-        .upsert(record("beta", SHARED_ISSUER, "client-y", secret()))
-        .await
-        .expect("another client id at the same issuer");
-    directory
-        .upsert(record(
-            "gamma",
-            "https://idp.other.example",
-            "client-x",
-            secret(),
-        ))
-        .await
-        .expect("the same client id at another issuer");
-}
-
-/// A broken record counts as holding its pair, so a tenant cannot take the
-/// pair of a record that does not build.
-#[tokio::test]
-async fn a_record_that_does_not_build_still_holds_its_pair() {
-    let directory = directory();
-    directory
-        .upsert(record("acme", SHARED_ISSUER, "client-x", unloadable_key()))
-        .await
-        .unwrap();
-
-    let text = refused_text(
-        directory
-            .upsert(record("beta", SHARED_ISSUER, "client-x", secret()))
-            .await,
+async fn a_store_that_cannot_reassign_a_pair_refuses_and_changes_nothing() {
+    let directory = StoredTenantOAuthProviders::new_unencrypted(
+        CountingPuts {
+            inner: MemoryTenantOAuthProviderStore::new(),
+            puts: std::sync::atomic::AtomicUsize::new(0),
+        },
+        crate::testing::oauth_tenant::ownership_assumed(),
     );
+    let mut squatter = record("squatter", SHARED_ISSUER, "client-x", secret());
+    squatter.name = "borrowed".into();
+    directory.upsert(squatter).await.unwrap();
+
+    let refused = directory
+        .hand_over(record("owner", SHARED_ISSUER, "client-x", secret()), None)
+        .await
+        .expect_err("the store cannot hand the pair over in one step");
 
     assert!(
-        text.contains("already registered by another tenant"),
-        "{text}"
+        matches!(&refused, OAuthError::Store(e) if e.to_string().contains("reassign_pair")),
+        "{refused:?}"
     );
-}
-
-/// The global registration's pair is not a tenant's to take, whichever tenant
-/// asks.
-#[tokio::test]
-async fn a_tenant_cannot_register_the_pair_of_the_global_provider() {
-    let directory = directory().with_global_registration(SHARED_ISSUER, "client-x");
-
-    let text = refused_text(
+    assert_eq!(
         directory
-            .upsert(record("acme", SHARED_ISSUER, "client-x", secret()))
-            .await,
+            .holder_of(SHARED_ISSUER, "client-x")
+            .await
+            .unwrap(),
+        Some((tenant("squatter"), "borrowed".to_string()))
     );
-
-    assert!(
-        text.contains("already registered by the global provider"),
-        "{text}"
-    );
-    directory
-        .upsert(record("acme", SHARED_ISSUER, "client-y", secret()))
-        .await
-        .expect("another client id at the same issuer");
-}
-
-/// Registrations in one process are serialised: of two tenants racing for one
-/// pair, one wins and one is refused.
-#[tokio::test]
-async fn two_tenants_racing_for_one_pair_do_not_both_win() {
-    let directory = Arc::new(directory());
-    let mut set = tokio::task::JoinSet::new();
-    for label in ["acme", "beta", "gamma", "delta"] {
-        let directory = directory.clone();
-        set.spawn(async move {
-            directory
-                .upsert(record(label, SHARED_ISSUER, "client-x", secret()))
-                .await
-                .is_ok()
-        });
-    }
-    let mut won = 0;
-    while let Some(done) = set.join_next().await {
-        won += usize::from(done.unwrap());
-    }
-    assert_eq!(won, 1);
 }

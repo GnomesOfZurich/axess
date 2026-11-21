@@ -1,10 +1,11 @@
-//! Reading `v1` envelopes, and re-sealing a row on load without overwriting a
-//! rotation that landed in between.
+//! Reading `v1` envelopes, re-sealing a row on load without overwriting a
+//! rotation that landed in between, and rows whose two fields are sealed
+//! under different keys or envelope versions.
 
 use super::*;
 use crate::delegated::stored::credential::MemoryDelegatedCredentialStore;
 use crate::session::crypto::LegacyBlobs;
-use chrono::{TimeZone, Utc};
+use axess_clock::Timestamp;
 use std::sync::Mutex;
 
 fn tenant() -> TenantId {
@@ -18,9 +19,13 @@ fn user() -> UserId {
 fn credential() -> StoredDelegation {
     StoredDelegation {
         provider: "gmail".to_string(),
+        registration: Some(crate::delegated::stored::GrantRegistration {
+            provider: "gmail".to_string(),
+            fingerprint: "gmail-registration".to_string(),
+        }),
         access_token: ZeroizedString::from("at-plaintext"),
         refresh_token: Some(ZeroizedString::from("rt-plaintext")),
-        expires_at: Some(Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap()),
+        expires_at: Some(Timestamp::from_utc(2030, 1, 1, 0, 0, 0).unwrap()),
         scopes: vec!["gmail.send".to_string()],
         token_type: "Bearer".to_string(),
     }
@@ -40,7 +45,7 @@ fn v1_row() -> StoredDelegation {
         key: Arc::new(EncryptionKey::from_bytes(test_key(1))),
     };
     let rng = axess_rng::SystemRng;
-    let v1 = |env: String| env.replacen("v3.", "v1.", 1);
+    let v1 = |env: String| env.replacen("v4.", "v1.", 1);
     let aad_a = build_aad("gmail", &tenant(), &user(), FIELD_ACCESS);
     let aad_r = build_aad("gmail", &tenant(), &user(), FIELD_REFRESH);
     StoredDelegation {
@@ -280,7 +285,7 @@ fn v2_row_with_far_expiry() -> StoredDelegation {
         key: Arc::new(EncryptionKey::from_bytes(test_key(2))),
     };
     let rng = axess_rng::SystemRng;
-    let v2 = |env: String| env.replacen("v3.", "v2.", 1);
+    let v2 = |env: String| env.replacen("v4.", "v2.", 1);
     let cred = credential();
     let aad =
         |field: &[u8]| build_aad_v2("gmail", &tenant(), &user(), field, &cred.scopes, "Bearer");
@@ -299,14 +304,14 @@ fn v2_row_with_far_expiry() -> StoredDelegation {
             &aad(FIELD_REFRESH),
         )
         .unwrap()))),
-        expires_at: Some(Utc.with_ymd_and_hms(2999, 1, 1, 0, 0, 0).unwrap()),
+        expires_at: Some(Timestamp::from_utc(2999, 1, 1, 0, 0, 0).unwrap()),
         ..cred
     }
 }
 
 /// A `v2` row's expiry is not authenticated, so a store writer could have
-/// moved it. The row loads as expired (the refresh that follows saves a `v3`
-/// row from the provider's answer) and is not re-sealed, which would have
+/// moved it. The row loads as expired (and as granted through no
+/// registration, so the user grants again) and is not re-sealed, which would have
 /// vouched for the unauthenticated value.
 #[tokio::test]
 async fn a_v2_row_loads_as_expired_and_is_not_resealed() {
@@ -324,7 +329,10 @@ async fn a_v2_row_loads_as_expired_and_is_not_resealed() {
         .unwrap();
     assert_eq!(&*loaded.access_token, "at-plaintext");
     assert!(
-        !loaded.is_fresh(Utc::now(), chrono::Duration::zero()),
+        !loaded.is_fresh(
+            axess_clock::testing::MockClock::reference_time(),
+            std::time::Duration::ZERO
+        ),
         "an unauthenticated expiry must not read as fresh: {:?}",
         loaded.expires_at
     );
@@ -334,7 +342,205 @@ async fn a_v2_row_loads_as_expired_and_is_not_resealed() {
     );
 
     let mut refreshed = loaded;
-    refreshed.expires_at = Some(Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap());
+    refreshed.expires_at = Some(Timestamp::from_utc(2030, 1, 1, 0, 0, 0).unwrap());
     store.save(&tenant(), &user(), refreshed).await.unwrap();
-    assert!((*raw(store.inner()).await.access_token).starts_with("v3.k2."));
+    assert!((*raw(store.inner()).await.access_token).starts_with("v4.k2."));
+}
+
+// ── Rows whose two fields are sealed apart ───────────────────────────────────
+
+/// An expiry far in the future, as a store writer would move it to.
+fn far_expiry() -> Option<Timestamp> {
+    Some(Timestamp::from_utc(2999, 1, 1, 0, 0, 0).unwrap())
+}
+
+/// One field as the current envelope version seals it, bound to
+/// `expires_at` and the fixture's registration, under the key `id`
+/// (`test_key(seed)`).
+fn current_field(
+    id: &str,
+    seed: u8,
+    field: &[u8],
+    plain: &str,
+    expires_at: Option<Timestamp>,
+) -> ZeroizedString {
+    let key = CurrentKey {
+        key_id: Arc::from(id),
+        key: Arc::new(EncryptionKey::from_bytes(test_key(seed))),
+    };
+    let row = StoredDelegation {
+        expires_at,
+        ..credential()
+    };
+    let aad = build_aad_v4("gmail", &tenant(), &user(), field, &row);
+    ZeroizedString::from(encrypt_envelope(&key, &axess_rng::SystemRng, plain, &aad).unwrap())
+}
+
+async fn store_holding(
+    row: StoredDelegation,
+) -> EncryptedDelegatedCredentialStore<MemoryDelegatedCredentialStore, MemoryKeyProvider> {
+    let inner = MemoryDelegatedCredentialStore::new();
+    inner.save(&tenant(), &user(), row).await.unwrap();
+    EncryptedDelegatedCredentialStore::new(inner, keys())
+}
+
+fn reads_as_fresh(row: &StoredDelegation) -> bool {
+    row.is_fresh(
+        axess_clock::testing::MockClock::reference_time(),
+        std::time::Duration::ZERO,
+    )
+}
+
+/// A row with no refresh token, sealed under a retired key, is re-sealed
+/// under the current key on load: the access token alone makes it stale.
+#[tokio::test]
+async fn an_access_token_alone_under_a_retired_key_is_resealed_on_load() {
+    let expires_at = credential().expires_at;
+    let store = store_holding(StoredDelegation {
+        access_token: current_field("k1", 1, FIELD_ACCESS, "at-plaintext", expires_at),
+        refresh_token: None,
+        ..credential()
+    })
+    .await;
+
+    let loaded = store
+        .load(&tenant(), &user(), "gmail")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&*loaded.access_token, "at-plaintext");
+    assert!(reads_as_fresh(&loaded), "{:?}", loaded.expires_at);
+    assert!((*raw(store.inner()).await.access_token).starts_with("v4.k2."));
+}
+
+/// One field under a retired key is enough: a refresh token sealed under it,
+/// beside an access token under the current key, is re-sealed on load.
+#[tokio::test]
+async fn a_refresh_token_under_a_retired_key_is_resealed_on_load() {
+    let expires_at = credential().expires_at;
+    let store = store_holding(StoredDelegation {
+        access_token: current_field("k2", 2, FIELD_ACCESS, "at-plaintext", expires_at),
+        refresh_token: Some(current_field(
+            "k1",
+            1,
+            FIELD_REFRESH,
+            "rt-plaintext",
+            expires_at,
+        )),
+        ..credential()
+    })
+    .await;
+
+    let loaded = store
+        .load(&tenant(), &user(), "gmail")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.refresh_token.as_deref(), Some("rt-plaintext"));
+    let stored = raw(store.inner()).await;
+    assert!(
+        stored
+            .refresh_token
+            .as_deref()
+            .is_some_and(|sealed| sealed.starts_with("v4.k2.")),
+        "the refresh token is still under the retired key"
+    );
+}
+
+/// A `v2` access token with no refresh token beside it: the expiry is not
+/// authenticated, so the row reads as expired and is left as it was.
+#[tokio::test]
+async fn a_v2_access_token_alone_reads_as_expired_and_is_not_resealed() {
+    let store = store_holding(StoredDelegation {
+        refresh_token: None,
+        ..v2_row_with_far_expiry()
+    })
+    .await;
+
+    let loaded = store
+        .load(&tenant(), &user(), "gmail")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&*loaded.access_token, "at-plaintext");
+    assert!(!reads_as_fresh(&loaded), "{:?}", loaded.expires_at);
+    assert!((*raw(store.inner()).await.access_token).starts_with("v2.k2."));
+}
+
+/// Every field has to cover the expiry: a `v2` refresh token beside an
+/// access token that does cover it still reads as expired, and the row is
+/// left as it was.
+#[tokio::test]
+async fn a_v2_refresh_token_beside_a_current_access_token_reads_as_expired() {
+    let store = store_holding(StoredDelegation {
+        access_token: current_field("k2", 2, FIELD_ACCESS, "at-plaintext", far_expiry()),
+        ..v2_row_with_far_expiry()
+    })
+    .await;
+
+    let loaded = store
+        .load(&tenant(), &user(), "gmail")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.refresh_token.as_deref(), Some("rt-plaintext"));
+    assert!(!reads_as_fresh(&loaded), "{:?}", loaded.expires_at);
+    let stored = raw(store.inner()).await;
+    assert!(
+        stored
+            .refresh_token
+            .as_deref()
+            .is_some_and(|sealed| sealed.starts_with("v2.k2.")),
+        "the row was re-sealed, which vouches for an expiry nobody authenticated"
+    );
+}
+
+/// The swap through the encrypting store compares what the rows open to: it
+/// saves over the row the caller read, and leaves a row that has changed
+/// since, or that is gone.
+#[tokio::test]
+async fn a_swap_saves_over_the_row_the_caller_read_and_leaves_a_changed_one() {
+    let store =
+        EncryptedDelegatedCredentialStore::new(MemoryDelegatedCredentialStore::new(), keys());
+    let with_access = |token: &str| StoredDelegation {
+        access_token: ZeroizedString::from(token),
+        ..credential()
+    };
+
+    let gone = store
+        .save_if_unchanged(&tenant(), &user(), &credential(), with_access("at-first"))
+        .await
+        .unwrap();
+    assert_eq!(gone, CredentialSwap::Changed, "no row to swap against");
+    assert!(
+        store
+            .load(&tenant(), &user(), "gmail")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    store.save(&tenant(), &user(), credential()).await.unwrap();
+    let read = store
+        .load(&tenant(), &user(), "gmail")
+        .await
+        .unwrap()
+        .unwrap();
+    let saved = store
+        .save_if_unchanged(&tenant(), &user(), &read, with_access("at-rotated"))
+        .await
+        .unwrap();
+    assert_eq!(saved, CredentialSwap::Saved);
+
+    let late = store
+        .save_if_unchanged(&tenant(), &user(), &read, with_access("at-late"))
+        .await
+        .unwrap();
+    assert_eq!(late, CredentialSwap::Changed);
+    let held = store
+        .load(&tenant(), &user(), "gmail")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&*held.access_token, "at-rotated");
 }

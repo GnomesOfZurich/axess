@@ -14,31 +14,110 @@ all-features = true
 
 [advisories]
 db-path = "~/.cargo/advisory-db"
+# An ignore that no crate in Cargo.lock matches any more is an error, so the
+# entry goes the day the advisory stops applying.
+unused-ignored-advisory = "deny"
 ignore = [
-    # rsa: Marvin Attack timing sidechannel (RUSTSEC-2023-0071)
-    # Severity: 5.9 (medium). No fixed version available.
+    # rsa 0.9: Marvin Attack timing sidechannel (RUSTSEC-2023-0071)
+    # Severity: 5.9 (medium). The crate's private-key operations are not
+    # constant-time, and what they leak can be measured over a network and
+    # may recover the key. Patched in rsa 0.10.0; rsa 0.9 is held in the lock
+    # by openidconnect 4.1.0 (rsa ^0.9.2), and jsonwebtoken 11.1.0 requires
+    # rsa ^0.9.6 for its `rust_crypto` backend.
     #
-    # Reachability, stated precisely because an earlier version of this note
-    # called it transitive-only and that was wrong:
-    #   - Transitively, via sqlx-mysql and openidconnect (rsa 0.9), and via
-    #     crypto-glue (webauthn-rs), which carries the 0.10.0-rc line.
-    #   - Directly, as an optional runtime dependency of axess-core enabled by
-    #     `local-idp`, for RSA-2048 keygen and PKCS#1 parsing in
-    #     `LocalIdpSigningKey`.
-    #   - Directly, under `jwt-rust-crypto`, because jsonwebtoken's
-    #     `rust_crypto` backend performs RS256 signing and verification
-    #     through this crate.
+    # No workspace code calls an rsa private-key operation directly; RSA
+    # signing happens only through jsonwebtoken under `jwt-rust-crypto`, in
+    # the local IdP under `local-idp-rsa` and in a private_key_jwt client
+    # assertion under `client-assertion-rsa`.
     #
-    # Risk: the advisory is a timing sidechannel on RSA private-key
-    # operations. RSA is not used for session encryption or key exchange, and
-    # keygen is unaffected. The exposed operation is RS256 *signing*, which
-    # only happens when `local-idp` is enabled (off by default) and the
-    # deployment mints its own tokens. A deployment that signs with
-    # `local-idp` over an attacker-reachable interface should prefer ES256, or
-    # the `jwt-aws-lc` backend, which does not route through this crate.
-    # Verification-only deployments are not exposed.
+    # What holds the 0.9 line in Cargo.lock:
+    #   - jsonwebtoken, under `jwt-rust-crypto`: its `rust_crypto` backend
+    #     signs and verifies RS* and PS* tokens through this crate.
+    #   - openidconnect, under `oauth`: it verifies an identity provider's
+    #     RSA signatures with it, a public-key operation, which the advisory
+    #     does not concern.
+    #   - axess-core, under `local-idp-rsa` only (`local-idp` alone compiles
+    #     no rsa; scripts/supply-chain.sh reads the tree for it): RSA-2048
+    #     key generation and PKCS#1 / PKCS#8 parsing for
+    #     `LocalIdpSigningKey`, in the one module scripts/check-rsa-sites.sh
+    #     allows. None of that is a private-key operation; the key reaches
+    #     jsonwebtoken as DER bytes.
+    #   - axess-testing, a published crate that is taken as a
+    #     dev-dependency: it generates the RSA key of its OIDC provider
+    #     fixture.
+    #   - the dev-dependencies of axess-core and axess-factors, and the
+    #     oauth and workload-identity examples: fixture keys for tests, and
+    #     the workload-identity example's development IdP.
+    # The 0.10 pre-release: webauthn-rs (`fido2`) reaches rsa 0.10.0-rc.19
+    # through crypto-glue 0.2.2, to verify an authenticator's RSA signature
+    # (a public-key operation). The advisory counts a pre-release of the
+    # fixed line as affected, and cargo cannot move it to 0.10.0: crypto-glue
+    # asks for the rsa feature `sha2`, which 0.10.0 no longer has.
     #
-    # Resolution: wait for rsa crate maintainers to release a fix.
+    # Where a private RSA key is used. A signature with an RSA key is a
+    # private-key operation, which is what the advisory is about. Library
+    # code makes one in two places, both through `jsonwebtoken::encode`:
+    #   1. The local IdP (`LocalIdp`, and `LocalIdpFixture` in tests), when
+    #      its signing key is an RSA key (RS256, RS384, RS512): on every
+    #      token it mints. Feature `local-idp-rsa`; without it the local IdP
+    #      has ES256 keys only.
+    #   2. `private_key_jwt` client assertions (`ClientAssertionSigner` in
+    #      axess-factors), when the client's key is an RSA key (RS256, RS384,
+    #      RS512, PS256, PS384, PS512): once when the signer is built, and
+    #      then on every token request of the outbound OAuth client
+    #      (`outbound-oauth`) and of a user login at a provider configured
+    #      for `private_key_jwt` (`oauth`). On `jwt-rust-crypto` without
+    #      `jwt-aws-lc` such a signer is refused when it is built, before
+    #      its key is read, unless the feature `client-assertion-rsa` names
+    #      that choice; on `jwt-aws-lc` it needs nothing where the provider
+    #      in place is the aws-lc one axess installed (below).
+    # Which code computes those signatures is decided by the JWT backend,
+    # not by the feature that signs. With `jwt-rust-crypto` and without
+    # `jwt-aws-lc` it is rsa 0.9: the code the advisory describes. With
+    # `jwt-aws-lc` on, alone or beside the other, it is aws-lc-rs (axess
+    # installs that provider unless the application installed one first),
+    # and rsa 0.9 computes no signature.
+    # A third place holds a private RSA key and never reaches this crate:
+    # the client certificate of outbound mTLS (`outbound-mtls`), whose key
+    # signs the TLS handshake in the rustls provider the application
+    # installs. axess decrypts nothing with RSA and exchanges no key with
+    # it.
+    # In the tree, outside the published libraries: axess-testing's OIDC
+    # fixture and the oauth example's tests sign their ID tokens with an RSA
+    # key, and the workload-identity example's `--bin local-idp` mints RS256
+    # on `jwt-rust-crypto`, so in rsa 0.9. That is test and development
+    # code.
+    #
+    # Risk. A deployment is exposed when all three hold: it is built with
+    # `jwt-rust-crypto` and without `jwt-aws-lc`; it chose to sign with an
+    # RSA key in place 1 or 2 (`local-idp-rsa`, `client-assertion-rsa`);
+    # and someone it does not trust can time many of those
+    # signatures over the network. For the local IdP that is whoever can
+    # ask it for tokens; for a client assertion, whoever can make the
+    # client request a token and see when the request leaves. What is at
+    # stake is the IdP's signing key, or the client's credential at its
+    # identity provider. A deployment that only verifies tokens is not
+    # exposed, whatever its backend.
+    #
+    # To keep the advisory's code from signing: build with `jwt-aws-lc`; or
+    # stay on `jwt-rust-crypto` and leave `local-idp-rsa` and
+    # `client-assertion-rsa` off. Then the local IdP signs ES256 and a
+    # `private_key_jwt` client signs ES256, ES384 or EdDSA: axess refuses
+    # an RSA signing key on `jwt-rust-crypto` unless one of the two
+    # features chose it. On `jwt-aws-lc` an RSA client key signs without
+    # `client-assertion-rsa` only where the jsonwebtoken provider in place
+    # is the aws-lc one axess installed: an application or crate that
+    # installed a provider first (RustCrypto's, which signs in rsa 0.9, or
+    # any other, since which one cannot be read back) gets the same
+    # refusal.
+    #
+    # Resolution: when jsonwebtoken and openidconnect accept rsa 0.10 and
+    # crypto-glue takes 0.10.0, move every rsa requirement of the workspace
+    # to 0.10.0 with them (axess-core's optional and dev requirement,
+    # axess-factors' dev requirement, axess-testing, and the oauth and
+    # workload-identity examples), and drop this entry in the same commit.
+    # The weekly `advisory-fix-watch` workflow opens an issue for each of
+    # the three releases as it appears; the entry goes when all three have.
     "RUSTSEC-2023-0071",
 
     # libsqlite3-sys 0.37.0: bundled SQLite before 3.54.0 can return
@@ -52,21 +131,25 @@ ignore = [
     # session and identity stores open the database the application
     # configures for itself; a deployment that lets another party place
     # that file is exposed. A build that links the system SQLite (3.54.0 or
-    # later) instead of the bundled source is not affected.
+    # later) instead of the bundled source is not affected: the
+    # `sqlite-unbundled` feature, in place of `sqlite`, builds that way.
     #
     # Resolution: move to the sqlx release that accepts libsqlite3-sys 0.39,
-    # and drop this entry in the same commit.
+    # and drop this entry in the same commit. The weekly `advisory-fix-watch`
+    # workflow opens an issue when that release exists.
     "RUSTSEC-2026-0459",
 
     # crypto-bigint 0.5.5: timing variability in operations meant to be
     # constant-time (RUSTSEC-2026-0387). Patched only in 0.7.6.
     #
-    # Reachability: through p256 0.13 (local-idp keygen and PKCS#8 encoding,
-    # the FAPI client's key loading, ES256 signing and verification under
-    # `jwt-rust-crypto`), which axess-core and axess-factors depend on
-    # directly, and which jsonwebtoken 11.1 pins itself. openidconnect 4.1.0
-    # and crypto-glue 0.2 (webauthn-rs 0.6.2) are on p256 0.14 and
-    # crypto-bigint 0.7, so they no longer reach 0.5.5.
+    # Reachability: only through p256 0.13 and p384 0.13, which jsonwebtoken
+    # 11.1 requires for its `rust_crypto` backend (`jwt-rust-crypto`: ES256
+    # and ES384 signing and verification). axess-core (`local-idp`) and
+    # axess-factors (`oauth`, DPoP) use p256 0.14, as openidconnect 4.1.0 and
+    # crypto-glue 0.2 (webauthn-rs 0.6.2) do, so a build on `jwt-aws-lc`
+    # alone carries no crypto-bigint 0.5. A build on `jwt-rust-crypto`
+    # carries both curve lines: 0.13 under jsonwebtoken, and 0.14 wherever
+    # `local-idp`, `oauth` or `fido2` is on.
     #
     # Risk, read against the 0.5.5 source on 2026-10-24: the advisory's named
     # defects (`UintRef` equality exiting early, `BoxedMontyForm::invert`
@@ -80,9 +163,32 @@ ignore = [
     # that signs ES256 over an attacker-reachable interface can take the
     # `jwt-aws-lc` backend, which does not route through this crate.
     #
-    # Resolution: remove when jsonwebtoken moves to p256 0.14 (elliptic-curve
-    # 0.14, crypto-bigint 0.7) and axess's own p256 pin follows.
+    # Resolution: remove when jsonwebtoken has moved both p256 and p384 to
+    # 0.14 (elliptic-curve 0.14, crypto-bigint 0.7): either curve left on
+    # 0.13 keeps crypto-bigint 0.5 in the lock. The weekly
+    # `advisory-fix-watch` workflow watches each and opens an issue when its
+    # release exists.
     "RUSTSEC-2026-0387",
+
+    # chrono 0.4.45: unmaintained (RUSTSEC-2026-0543). An informational
+    # advisory, not a vulnerability: the crate is declared unmaintained in
+    # its own issue tracker, which the advisory cites, every version is
+    # affected, and no patched version exists. It reports no defect.
+    #
+    # Where it is used. No axess signature names it: the time types are
+    # axess-clock's own, on the standard library. It reaches the tree
+    # through cedar-policy-core (`authz`, which the `axess` facade always
+    # enables), and oauth2 and openidconnect (`oidc`, `oauth`); directly
+    # only as axess-factors' private boundary with openidconnect, behind
+    # `oauth`, and as axess-clock's dev-dependency for its tests.
+    # scripts/check-chrono-edges.sh refuses any other edge.
+    #
+    # Resolution: the entry goes when no crate in the lock depends on
+    # chrono, that is when cedar-policy-core, oauth2 and openidconnect have
+    # dropped it; axess-factors' boundary and axess-clock's dev-dependency
+    # go with them. No release fixes this advisory, so the weekly
+    # `advisory-fix-watch` workflow has no watch for it.
+    "RUSTSEC-2026-0543",
 ]
 
 [licenses]
@@ -109,9 +215,12 @@ allow-wildcard-paths = true
 
 # A third copy of a curve, RSA or big-integer stack fails the gate by name.
 # Two lines of each coexist today (p256 0.13 beside 0.14, rsa 0.9 beside
-# 0.10.0-rc, crypto-bigint 0.5 beside 0.7), each pair accepted below by the
-# skip-tree entry of the crate that pulls the newer line; any further version
-# is a new copy to audit and is refused.
+# 0.10.0-rc, crypto-bigint 0.5 beside 0.7). p256 0.13 and crypto-bigint 0.5
+# come from jsonwebtoken alone, and axess, openidconnect and webauthn-rs are
+# on p256 0.14; rsa 0.9 is what axess, jsonwebtoken and openidconnect use,
+# and the pre-release what webauthn-rs uses. Each pair is accepted below by
+# the skip-tree entry of an upstream that pulls the newer line. Any further
+# version is a new copy to audit and is refused.
 deny = [
     { crate = "p256", deny-multiple-versions = true, reason = "two copies of the curve stack already double the audit surface; a third is refused" },
     { crate = "rsa", deny-multiple-versions = true, reason = "rsa carries the Marvin advisory on its 0.9 line; every further copy is another place to track it" },
@@ -120,8 +229,9 @@ deny = [
 
 # Known-accepted transitive duplicate roots. Each entry documents why the
 # upstream cannot yet consolidate; see the workspace-preamble comment on
-# `[workspace.dependencies]` in Cargo.toml for the wider policy. Revisit
-# annually when upstream release cadence catches up.
+# `[workspace.dependencies]` in Cargo.toml for the wider policy. An entry
+# names its root at an exact version, so it stops matching, and the
+# duplicates it covered are reported again, as soon as that root is bumped.
 #
 # `skip-tree` matches any duplicate whose dependency path traces through
 # the named root, so one entry covers the whole RustCrypto cohort under a
@@ -130,13 +240,13 @@ skip-tree = [
     # `webauthn-rs v0.6.2` reaches, through `crypto-glue` 0.2, the
     # elliptic-curve 0.14 cohort (p256 / p384 0.14, ecdsa 0.17, crypto-bigint
     # 0.7, der 0.8, pkcs8 0.11, spki 0.8, sec1 0.8, signature 3) and a
-    # pre-release `rsa 0.10.0-rc`, while axess itself and jsonwebtoken stay on
-    # p256 0.13 and rsa 0.9; `argon2 0.5` (with password-hash 0.5 and
+    # pre-release `rsa 0.10.0-rc`, while jsonwebtoken stays on p256 0.13 and
+    # axess and jsonwebtoken on rsa 0.9; `argon2 0.5` (with password-hash 0.5 and
     # blake2 0.10) beside the argon2 0.6 axess uses; and scrypt 0.12,
     # pbkdf2 0.13 and salsa20 0.11 beside the older lines other crates
     # carry. Its hash and cipher crates are the digest 0.11 cohort axess
-    # uses, so those no longer duplicate.
-    { crate = "webauthn-rs@0.6.2", reason = "crypto-glue 0.2 is on elliptic-curve 0.14, rsa 0.10.0-rc and argon2 0.5 beside axess's p256 0.13, rsa 0.9 and argon2 0.6" },
+    # uses, so those do not duplicate.
+    { crate = "webauthn-rs@0.6.2", reason = "crypto-glue 0.2 is on elliptic-curve 0.14, rsa 0.10.0-rc and argon2 0.5 beside jsonwebtoken's p256 0.13, rsa 0.9 and axess's argon2 0.6" },
 
     # `getrandom 0.3.4` fans a WASI stdlib shim (`wasip2 → wit-bindgen
     # 0.57`) plus `r-efi 5` for UEFI targets, beside the `r-efi 6` of

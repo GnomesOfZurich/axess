@@ -1,7 +1,8 @@
-//! `tests`: extracted from `service_secret.rs` per the
-//! 200-LoC inline-test rule in AGENTS.md.
+//! `tests`: the unit tests of `service_secret.rs`, kept beside it per the
+//! 200-line inline-test rule in AGENTS.md.
 
 use super::*;
+use axess_clock::Timestamp;
 use axess_clock::testing::MockClock;
 use axum::{
     Router,
@@ -11,7 +12,6 @@ use axum::{
     },
     routing::post,
 };
-use chrono::{TimeZone, Utc};
 use std::time::Duration;
 use tower::ServiceExt;
 
@@ -213,7 +213,7 @@ fn signed(value: &str, at: i64, method: Method, target: &str, body: &str) -> Req
 }
 
 fn clock() -> MockClock {
-    MockClock::at(Utc.timestamp_opt(EPOCH, 0).single().expect("valid"))
+    MockClock::at(Timestamp::from_unix_seconds(EPOCH).expect("valid"))
 }
 
 #[tokio::test]
@@ -492,7 +492,8 @@ fn a_route_without_an_audience_or_a_window_refuses_to_build() {
     assert!(
         ServiceSecretLayer::signed(
             ServiceSecrets::new(),
-            SignedRequests::default().accept_unaddressed_until(Utc::now()),
+            SignedRequests::default()
+                .accept_unaddressed_until(axess_clock::testing::MockClock::reference_time()),
         )
         .is_ok(),
         "a window alone addresses the route"
@@ -504,7 +505,7 @@ fn a_route_without_an_audience_or_a_window_refuses_to_build() {
 #[tokio::test]
 async fn v1_is_read_inside_the_window_and_refused_once_the_clock_passes_it() {
     let clock = clock();
-    let until = Utc.timestamp_opt(EPOCH + 1_000, 0).single().expect("valid");
+    let until = Timestamp::from_unix_seconds(EPOCH + 1_000).expect("valid");
     let app = signed_app(&clock, addressed().accept_unaddressed_until(until));
 
     let inside = signed_v1(RELAY, EPOCH, "/hook", "a");
@@ -524,7 +525,7 @@ async fn v1_is_read_inside_the_window_and_refused_once_the_clock_passes_it() {
 #[tokio::test]
 async fn a_windowed_route_without_an_audience_reads_only_v1_until_the_instant() {
     let clock = clock();
-    let until = Utc.timestamp_opt(EPOCH + 100, 0).single().expect("valid");
+    let until = Timestamp::from_unix_seconds(EPOCH + 100).expect("valid");
     let app = signed_app(
         &clock,
         SignedRequests::default().accept_unaddressed_until(until),
@@ -722,7 +723,7 @@ fn the_warn_throttle_survives_a_clock_step_back() {
 async fn a_replay_after_a_clock_step_back_is_still_warned_about() {
     use axess_testing::mock_tracing::TracingCapture;
     let capture = TracingCapture::install();
-    let clock = MockClock::at(chrono::DateTime::from_timestamp(1000, 0).expect("in range"));
+    let clock = MockClock::at(Timestamp::from_unix_seconds(1000).expect("in range"));
     let (v, secrets) = verifier(&clock, addressed());
 
     assert_eq!(verdict(&v, &secrets, 1000, "a").await, StatusCode::OK);
@@ -738,7 +739,7 @@ async fn a_replay_after_a_clock_step_back_is_still_warned_about() {
         .count();
     assert_eq!(warns_before, 1, "the first replay warns");
 
-    clock.set(chrono::DateTime::from_timestamp(900, 0).expect("in range"));
+    clock.set(Timestamp::from_unix_seconds(900).expect("in range"));
     assert_eq!(
         verdict(&v, &secrets, 900, "b").await,
         StatusCode::OK,
@@ -855,7 +856,7 @@ async fn a_v2_only_signature_is_refused_unless_the_route_still_accepts_it() {
         StatusCode::UNAUTHORIZED
     );
 
-    let until = Utc.timestamp_opt(EPOCH + 1_000, 0).single().expect("valid");
+    let until = Timestamp::from_unix_seconds(EPOCH + 1_000).expect("valid");
     let app = signed_app(&clock, addressed().accept_v2_until(until));
     assert_eq!(send(&app, v2_only(EPOCH, "b")).await.0, StatusCode::OK);
     // Inside the window a header with a v3 is still judged by its v3: the
@@ -928,7 +929,7 @@ fn v2_header(at: i64, body: &str) -> String {
 }
 
 fn both_windows() -> SignedRequests {
-    let until = Utc.timestamp_opt(EPOCH + 1_000, 0).single().expect("valid");
+    let until = Timestamp::from_unix_seconds(EPOCH + 1_000).expect("valid");
     addressed()
         .accept_v2_until(until)
         .accept_unaddressed_until(until)

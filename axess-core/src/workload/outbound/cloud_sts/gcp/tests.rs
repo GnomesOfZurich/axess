@@ -117,6 +117,66 @@ async fn sts_invalid_target_audience_surfaces_as_sts_error() {
     }
 }
 
+/// The body of an STS refusal reaches the error with control characters and
+/// the Unicode line separators escaped, so the endpoint cannot forge a log
+/// line through it.
+#[tokio::test]
+async fn an_sts_error_body_is_log_safe() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/token"))
+        .respond_with(ResponseTemplate::new(400).set_body_raw(
+            "invalid_target\r\nINFO forged line\x1b[2J\u{2028}",
+            "text/plain",
+        ))
+        .mount(&server)
+        .await;
+    let client = GcpStsClient::new()
+        .expect("client")
+        .with_endpoint(sts_endpoint(&server));
+    let err = client
+        .exchange_token("token", &sample_audience(), &["scope"])
+        .await
+        .expect_err("400 must propagate");
+    let GcpError::Sts { body, .. } = &err else {
+        panic!("expected Sts error, got {err:?}");
+    };
+    assert!(!body.chars().any(char::is_control), "{body:?}");
+    assert!(!body.contains('\u{2028}'), "{body:?}");
+    assert!(
+        body.contains("invalid_target") && body.contains("forged line"),
+        "{body}"
+    );
+    assert!(!err.to_string().chars().any(char::is_control), "{err}");
+}
+
+/// A huge STS error body reaches the error cut at the reader's cap with its
+/// truncation suffix, which the sanitiser does not cut off.
+#[tokio::test]
+async fn a_huge_sts_error_body_keeps_its_truncation_suffix() {
+    use axess_factors::http_body::{ERROR_BODY_BYTES, TRUNCATED_SUFFIX};
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/token"))
+        .respond_with(
+            ResponseTemplate::new(400).set_body_raw(vec![b'x'; 10 * 1024 * 1024], "text/plain"),
+        )
+        .mount(&server)
+        .await;
+    let client = GcpStsClient::new()
+        .expect("client")
+        .with_endpoint(sts_endpoint(&server));
+    let err = client
+        .exchange_token("token", &sample_audience(), &["scope"])
+        .await
+        .expect_err("400 must propagate");
+    let GcpError::Sts { body, .. } = &err else {
+        panic!("expected Sts error, got {err:?}");
+    };
+    assert!(body.ends_with(TRUNCATED_SUFFIX), "{} bytes", body.len());
+    assert_eq!(body.len(), ERROR_BODY_BYTES + TRUNCATED_SUFFIX.len());
+}
+
 #[tokio::test]
 async fn sts_empty_access_token_rejects_as_malformed() {
     let server = MockServer::start().await;
@@ -136,6 +196,39 @@ async fn sts_empty_access_token_rejects_as_malformed() {
         .await
         .expect_err("empty access_token must reject");
     assert!(matches!(err, GcpError::MalformedResponse(_)));
+}
+
+/// An STS answer with a long string where a number belongs is refused with
+/// serde's message cut, not with the remote value whole.
+#[tokio::test]
+async fn an_sts_answer_that_does_not_parse_is_reported_bounded() {
+    let server = MockServer::start().await;
+    let long = "A".repeat(60 * 1024);
+    Mock::given(method("POST"))
+        .and(path("/v1/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "t",
+            "token_type": "Bearer",
+            "expires_in": long,
+        })))
+        .mount(&server)
+        .await;
+    let client = GcpStsClient::new()
+        .expect("client")
+        .with_endpoint(sts_endpoint(&server));
+
+    let err = client
+        .exchange_token("token", &sample_audience(), &["scope"])
+        .await
+        .expect_err("the answer does not parse");
+
+    let text = err.to_string();
+    assert!(matches!(err, GcpError::MalformedResponse(_)), "{err:?}");
+    assert!(text.len() <= 1024, "{} bytes in one error", text.len());
+    assert!(
+        text.contains("line 1 column"),
+        "the position is kept: {text}"
+    );
 }
 
 #[tokio::test]
@@ -173,9 +266,7 @@ async fn impersonation_happy_path_returns_sa_token() {
     assert_eq!(&*token.access_token, "ya29.sa-scoped-token");
     assert_eq!(
         token.expire_time,
-        chrono::DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc),
+        axess_clock::Timestamp::parse_rfc3339("2030-01-01T00:00:00Z").unwrap(),
     );
 }
 
@@ -319,10 +410,11 @@ async fn a_silent_sts_endpoint_times_out() {
     let client = GcpStsClient::new()
         .expect("client")
         .with_endpoint(sts_endpoint(&server))
-        .with_http_client(reqwest::Client::new())
+        .with_client_settings(|settings| settings.timeout(std::time::Duration::from_secs(3600)))
+        .expect("client settings")
         .with_timeout(std::time::Duration::from_millis(150));
 
-    let started = std::time::Instant::now();
+    let started = axess_testing::stopwatch::Stopwatch::start();
     let err = client
         .exchange_token("jwt", &sample_audience(), &["scope"])
         .await
@@ -353,10 +445,11 @@ async fn a_silent_iam_credentials_endpoint_times_out() {
     let client = GcpServiceAccountImpersonator::new()
         .expect("client")
         .with_endpoint_base(iam_base(&server))
-        .with_http_client(reqwest::Client::new())
+        .with_client_settings(|settings| settings.timeout(std::time::Duration::from_secs(3600)))
+        .expect("client settings")
         .with_timeout(std::time::Duration::from_millis(150));
 
-    let started = std::time::Instant::now();
+    let started = axess_testing::stopwatch::Stopwatch::start();
     let err = client
         .generate_access_token("federated", "sa@p.iam.gserviceaccount.com", &["s"], None)
         .await
@@ -405,13 +498,14 @@ async fn a_plain_http_remote_impersonation_base_is_refused_before_any_request() 
 }
 
 /// A client that cannot be built is an error, never `reqwest::Client::default()`
-/// (redirects followed, no connect timeout) in its place. A TLS configuration
-/// of a type no backend recognises is the one build failure a test can
-/// arrange whatever TLS backend the feature set resolves to.
+/// (redirects followed, no connect timeout) in its place. A `User-Agent` that
+/// is not a header value is a build failure a test can arrange whatever TLS
+/// backend the feature set resolves to.
 #[test]
 fn an_sts_client_that_cannot_be_built_is_an_error_not_a_default_client() {
-    let unbuildable = reqwest::Client::builder().use_preconfigured_tls(());
-    let err = GcpStsClient::from_builder(unbuildable)
+    let err = GcpStsClient::new()
+        .expect("client")
+        .with_client_settings(|settings| settings.user_agent("not a\nheader value"))
         .err()
         .expect("a failed build must surface, not fall back to an unhardened client");
     assert!(matches!(err, GcpError::ClientBuild(_)), "{err:?}");
@@ -424,8 +518,9 @@ fn an_sts_client_that_cannot_be_built_is_an_error_not_a_default_client() {
 /// The impersonator on the same terms as the STS client.
 #[test]
 fn an_impersonator_that_cannot_be_built_is_an_error_not_a_default_client() {
-    let unbuildable = reqwest::Client::builder().use_preconfigured_tls(());
-    let err = GcpServiceAccountImpersonator::from_builder(unbuildable)
+    let err = GcpServiceAccountImpersonator::new()
+        .expect("client")
+        .with_client_settings(|settings| settings.user_agent("not a\nheader value"))
         .err()
         .expect("a failed build must surface, not fall back to an unhardened client");
     assert!(matches!(err, GcpError::ClientBuild(_)), "{err:?}");

@@ -22,13 +22,14 @@
 //!
 //! Binding as early as possible (during `Identifying`) ensures that even
 //! pre-MFA sessions cannot be replayed from a different device. Once the
-//! fingerprint is set it is never overwritten; it persists for the lifetime
-//! of the session.
+//! fingerprint is set it persists for the lifetime of the session; the
+//! layer rewrites it only when it matched under the previous signing key
+//! during a rotation, to the value under the current key.
 //!
 //! # Usage
 //!
 //! ```text
-//! let layer = SessionLayer::new(store, key, registry)
+//! let layer = SessionLayer::new(store, key, registry, audit)
 //!     .with_binding(UserAgentBinding);
 //! ```
 //!
@@ -82,8 +83,9 @@ use hmac::Mac;
 pub trait SessionBinding: Send + Sync + 'static {
     /// Extract the raw binding material from the request.
     ///
-    /// The library will HMAC-SHA256 the returned bytes (keyed with the session
-    /// signing key) before storing/comparing, so implementations can return raw
+    /// The library will HMAC-SHA256 the returned bytes (keyed with a sub-key
+    /// derived from the session signing key) before storing/comparing, so
+    /// implementations can return raw
     /// header values without pre-hashing.
     fn extract(&self, req: &Request<Body>) -> Option<Vec<u8>>;
 }

@@ -60,7 +60,9 @@ axess uses the modern Rust convention: `foo.rs` + a sibling `foo/` directory hol
 
 ### Test-sideways-pull
 
-When `#[cfg(test)]` tests crowd a production file enough to make scrolling expensive, pull them into a sibling `tests.rs`:
+Tests live beside the module they test, in a sibling file declared with `#[cfg(test)] mod <name>;` or in the crate's `tests/` directory. An inline `#[cfg(test)] mod <name> { ... }` block in a production file is allowed while its body is at most 200 lines.
+
+A block past the limit moves to a sibling `tests.rs`:
 
 ```text
 axess-core/src/path/file.rs      ; production code +
@@ -69,7 +71,7 @@ axess-core/src/path/file/tests.rs; the actual tests, gated by
                                     #![cfg(test)]
 ```
 
-Applied so far across several files where the tests-to-production ratio exceeded ~40%.
+`./scripts/check-inline-tests.sh` enforces the limit for each block, and CI and the release preflight run it.
 
 ### `pub(crate)` for state-machine internals
 
@@ -81,7 +83,7 @@ Per-app workflow mutations (`set_identifying`, `set_pending_workflow`, `clear`, 
 
 ### No `#[deprecated]` pre-1.0
 
-Breaking changes happen freely across the 0.x line; adopters get one coordinated migration window per minor bump, not a long `#[deprecated]` trail. CHANGELOG documents each break under `### Changed (breaking)`.
+Breaking changes happen freely across the 0.x line; adopters get one coordinated migration window per minor bump, not a long `#[deprecated]` trail. CHANGELOG documents each break under `### Changed (breaking)`, or under `### Upgrade`, the first heading of a release, when an operator must act on it before upgrading.
 
 ### MSRV bumps are breaking changes
 
@@ -97,15 +99,29 @@ Procedure for an MSRV bump:
 3. Add an entry under `### Changed (breaking)` in CHANGELOG.md naming the new floor.
 4. Bump the workspace `version` (in `[workspace.package]`) accordingly.
 
-### `cargo semver-checks` does not catch everything
+### Every break `cargo semver-checks` reports is named on the migration page
 
-`./scripts/release-preflight.sh` runs it, and a pass means none of its covered
-classes regressed --- not that the release is non-breaking. It has no lint for
-a **public struct field changing type**, so
-`pub client_secret: String` becoming `ZeroizedString` is a breaking change that
-the tool reports clean against a real published baseline. Breaking changes are
-documented by hand under `### Changed (breaking)` in CHANGELOG.md; the tool is
-a backstop for what it does cover, not the record.
+`./scripts/check-semver.sh` (CI's SemVer Checks job and the release preflight) runs the tool against the last release tag as a minor release, so every lint that needs a major release runs. Each break the report names must then be named on the release's migration page (`docs/production/migrating/<previous>-to-<next>.md`) inside backticks, by its full path or its last two segments (`SessionStore::load`), or the check fails and lists the breaks the page leaves out. There is no allowlist: a break the release does not mean is fixed in the code.
+
+The tool does not see everything. It has no lint for a **public struct field changing type**, so `pub client_secret: String` becoming `ZeroizedString` is a breaking change that the tool reports clean, and it cannot see a change of behaviour. Those are written on the migration page and under `### Changed (breaking)` in CHANGELOG.md by hand.
+
+### New dependency versions wait seven days
+
+[`.cargo/config.toml`](.cargo/config.toml) sets `registry.global-min-publish-age = "7 days"`: cargo 1.100 and later resolve no crates.io version published less than seven days ago. `./scripts/check-lock-age.sh` holds every tracked `Cargo.lock` (the fuzz crate's included) to the same age, in CI's Lockfile Drift job and in the release preflight: each crates.io entry added since the last release tag must have been published at least that long ago, by the publish time the crates.io index gives, or the check fails. An entry whose publish time cannot be read fails too.
+
+The one exception is a fix for a published advisory. Take the young version with
+
+```bash
+CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow cargo update -p <crate> --precise <version>
+```
+
+and end the message of the commit that changes the lockfile with one trailer per crate so taken:
+
+```text
+Cooldown-Exempt: RUSTSEC-2026-0001 <crate>
+```
+
+The id is a `RUSTSEC-`, `GHSA-` or `CVE-` id. The trailer admits the crate it names, at the version that commit adds, and nothing else: a dependency the update pulls in at a young version needs a trailer of its own, and an advisory named anywhere else in the message admits nothing. A squash merge keeps the admission only when the squashed message ends with the same trailers.
 
 ### No `#[non_exhaustive]` on first-party enums
 
@@ -122,7 +138,7 @@ axess-core has accumulated significant surface. When proposing a new crate carve
 1. **No reverse dep from axess-core onto the carved module.** If the module's types appear in `AuthnService` method signatures or in any axess-core trait surface, the carve isn't yet feasible; invert the dependency first.
 2. **Module has its own external dep blast.** Carving `delegated/` into `axess-delegated` won because it pulls `aes-gcm` only when adopters opt in. A carve that pulls no extra deps is just churn.
 3. **Module is consumable in isolation.** A consumer who wants only the carved module should not transitively recompile axess-core's protocol surface.
-4. **Re-export via the facade preserves the import path.** Adopters write `axess::RateLimitLayer`, not `axess_core::middleware::ratelimit::RateLimitLayer`. The facade decides the shape, and it flattens: the middleware lives under `axess_core::middleware`, and the facade lifts the types an adopter needs to the root and the layers to their own modules (`axess::csrf`, `axess::request_id`, `axess::trace_id`).
+4. **Re-export via the facade preserves the import path.** Adopters write `axess::RateLimitLayer`, not `axess_core::middleware::ratelimit::RateLimitLayer`. The facade decides the shape, and it flattens: the middleware lives under `axess_core::middleware`, and the facade lifts the types an adopter needs to the root and the layers to their own modules (`axess::csrf`, `axess::request_id`, `axess::trace_context`).
 
 ## Security
 

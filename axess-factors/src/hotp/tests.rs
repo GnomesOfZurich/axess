@@ -1,9 +1,9 @@
-//! `tests`: extracted from `hotp.rs` per the
-//! 200-LoC inline-test rule in AGENTS.md.
+//! `tests`: the unit tests of `hotp.rs`, kept beside it per the
+//! 200-line inline-test rule in AGENTS.md.
 
 use super::*;
 
-/// Regression: a too-short HOTP secret (8 bytes / 64 bits)
+/// A too-short HOTP secret (8 bytes / 64 bits)
 /// must be refused at verification time per RFC 4226 §4 R6.
 #[test]
 fn hotp_rejects_short_secret() {
@@ -159,8 +159,8 @@ fn verify_hotp_window_walks_forward() {
 
 /// RFC 4226 only gives SHA-1 vectors; the SHA-256 and SHA-512 variants are
 /// pinned by RFC 6238 Appendix B, whose codes are HOTP at the counter
-/// `time / 30` with 8 digits and a secret per HMAC. Kills the surviving `&`,
-/// `<<`, `+` and `-` mutations on those two branches.
+/// `time / 30` with 8 digits and a secret per HMAC. These pin the `&`,
+/// `<<`, `+` and `-` of the truncation on those two branches.
 #[test]
 fn hotp_generate_matches_rfc_6238_appendix_b_for_sha256_and_sha512() {
     const SHA256_SECRET: &[u8] = b"12345678901234567890123456789012";
@@ -241,5 +241,49 @@ fn a_secret_of_hex_letters_and_base32_digits_verifies_as_base32() {
     assert_eq!(
         verify_hotp(secret, &code, 7, 6, 0, HotpAlgorithm::Sha1),
         Some(7)
+    );
+}
+
+/// The look-ahead window is bounded: a code within the window verifies up
+/// to `MAX_HOTP_LOOKAHEAD`, and a window past the bound verifies nothing,
+/// since an oversized window widens what a guess can match and makes one
+/// verify run billions of HMACs.
+#[test]
+fn the_lookahead_window_is_bounded() {
+    let b32 = rfc_4226_secret_b32();
+    let code_at_one = hotp_generate(RFC_4226_SECRET, 1, 6, HotpAlgorithm::Sha1);
+    assert_eq!(
+        verify_hotp(&b32, &code_at_one, 0, 6, 1, HotpAlgorithm::Sha1),
+        Some(1),
+        "a code one step ahead verifies under a window of one"
+    );
+    assert_eq!(
+        verify_hotp(
+            &b32,
+            &code_at_one,
+            0,
+            6,
+            u64::from(MAX_HOTP_LOOKAHEAD),
+            HotpAlgorithm::Sha1
+        ),
+        Some(1),
+        "the bound itself is allowed"
+    );
+    assert_eq!(
+        verify_hotp(
+            &b32,
+            &code_at_one,
+            0,
+            6,
+            u64::from(MAX_HOTP_LOOKAHEAD) + 1,
+            HotpAlgorithm::Sha1
+        ),
+        None,
+        "a window past the bound verifies nothing"
+    );
+    assert_eq!(
+        verify_hotp(&b32, &code_at_one, 0, 6, u64::MAX, HotpAlgorithm::Sha1),
+        None,
+        "nor does one that would run for ever"
     );
 }

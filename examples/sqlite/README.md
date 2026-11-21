@@ -7,6 +7,7 @@ This is the example to start with if you want to understand how the pieces fit t
 | Binary | Run with | Shows |
 |---|---|---|
 | The application (default) | `cargo run -p axess-example-sqlite` | Everything above |
+| The application with device keys | `AXESS_DEV_INSECURE_COOKIES=1 cargo run -p axess-example-sqlite --features device-keys` | Everything above, with sessions bound to a key the browser holds, on the plain HTTP address the binary listens on ([below](#device-keys---features-device-keys)) |
 | Device identity | `cargo run -p axess-example-sqlite --bin device` | Fingerprinting, the device trust ladder and its retention sweep, on the same SQLite pool ([below](#device-identity---bin-device)) |
 
 ## What it demonstrates
@@ -57,8 +58,8 @@ A debug build seeds two accounts. A release build seeds nothing unless you run i
 
 | Username | Password | MFA |
 |----------|----------|-----|
-| alice | Gnomes2+Example | Password only |
-| bob | Gnomes2+Example | Password + TOTP (secret printed in the server log at debug level, target `dev_seed`) |
+| alice | Sample2+Example | Password only |
+| bob | Sample2+Example | Password + TOTP (secret printed in the server log at debug level, target `dev_seed`) |
 
 Or sign up at `/signup` to create your own account, then enroll TOTP from the dashboard.
 
@@ -74,6 +75,20 @@ Signup is open to anyone and limited only by the per-IP rate limit. The address 
 
 Session and CSRF cookies are `Secure`. Browsers accept them on `http://localhost`; for a browser or host name that does not, set `AXESS_DEV_INSECURE_COOKIES=1` (a warning banner is logged). Never set it behind a real host name.
 
+### Device keys: `--features device-keys`
+
+With the feature, `web/device_keys.rs` adds a device store on the same pool, a `LifecycleDeviceResolver` that gives each signed-in browser a device, and a `DeviceKeyService` under the `Prefer` policy with the strict profile's lifetimes. The response to the first signed-in page offers a browser that can hold a key a registration, once; once the browser has registered its key, the session is served only with the short-lived proof cookie the key renews. A session cookie copied off the machine, with the device cookie beside it, is served as a guest and every page behind `require_authn!` sends it to the login (`tests/device_keys.rs`). A browser without a key store signs in as before.
+
+The key routes (`/axess/device-key` and its `/refresh`) are merged with the others, inside the session layer, and limited to 60 requests a minute per client address. The browser posts to them itself, with no form token: the session layer marks a `POST` to either path, and the CSRF layer lets a marked request through.
+
+The session description names the origin the application is reached at, and an app's key proof must name it too, so the keys are served only where that origin is known:
+
+- `AXESS_ORIGIN`, when it is set, such as `https://app.example`. With `Secure` cookies it must be an `https` origin.
+- Otherwise, on plain HTTP (`AXESS_DEV_INSECURE_COOKIES=1`), the address the binary listens on, `http://127.0.0.1:3000`.
+- Otherwise the application logs an error at start and serves no device keys: the session layer is given no key service, the key routes are not merged, no key is offered, and a session that was bound to a key runs as a guest.
+
+Device rows and key rows go to the `auth_events` table the logins write to, and `/metrics` exports `axess_device_keys_offered_total`, `axess_device_keys_registered_total`, `axess_device_key_proofs_refused_total` and `axess_bound_sessions_unproven_total`; the share of offers that end in a registration is the number to read before requiring keys. The book's page on device-bound sessions (`docs/sessions/device-bound-sessions.md`) has the design.
+
 ## Project structure
 
 ```
@@ -82,9 +97,9 @@ src/
   models/backend.rs    IdentityStore + FactorStore implementation against SQLite
   web/app.rs           Router, SessionLayer, RateLimitLayer, health/metrics endpoints
   web/auth.rs          Login, signup, TOTP, password reset handlers
+  web/device_keys.rs   Device keys where a person signs in (--features device-keys)
   web/protected.rs     Dashboard (require_authn! guard)
 migrations/            SQLx migration scripts
-templates/             HTML templates
 ```
 
 ## Key patterns
@@ -101,7 +116,7 @@ templates/             HTML templates
 
 **Recovery codes.** Enrollment generates them with `axess::generate_recovery_codes`, stores only the Argon2id hashes as `FactorConfig::RecoveryCodes`, and shows the plaintext once. Each code is spent through the factor store's compare-and-swap, so it works exactly once. `tests/backend_tests.rs` drives the whole flow through the router.
 
-**Metrics hook.** `AppMetrics` implements the metric traits of the concerns it exports (`AuthFlowMetrics`, `FactorMetrics`, `SessionMetrics`, `RotationMetrics`, `ProviderRegistryMetrics`, `RequestGuardMetrics`) and wires itself to every concern with `MetricSinks::all`. Counters are `AtomicU64`, named `axess_<what>_total`. The `/metrics` endpoint lists them. In production you would bridge this to Prometheus or OpenTelemetry.
+**Metrics hook.** `AppMetrics` implements the metric traits of the concerns it exports (`AuthFlowMetrics`, `FactorMetrics`, `SessionMetrics`, `RotationMetrics`, `ProviderRegistryMetrics`, `RequestGuardMetrics`, `DeviceKeyMetrics`) and wires itself to every concern with `MetricSinks::all`. Counters are `AtomicU64`, named `axess_<what>_total`. The `/metrics` endpoint lists them. In production you would bridge this to Prometheus or OpenTelemetry.
 
 ## License
 
@@ -175,7 +190,9 @@ care which session store you use, and vice versa.
 
 - Real authentication flow. The example demonstrates *device resolution*,
   not factor login. Wire `axess::AuthnService` + an `IdentityStore` to
-  drive a real login → `promote_on_authn(device_id, Unknown→Seen)` cascade.
+  drive a real login, and hand `DeviceLifecycleService::promote_on_authn`
+  what `AuthSession::user_device` answers to move the device from `Unknown`
+  to `Seen`.
 - Cookie-binding records (`DeviceBinding::Cookie`). Issuing a long-lived
   device-binding cookie + recording its HMAC as a `Cookie` binding on the
   device row is the next phase after the basic fingerprint flow.

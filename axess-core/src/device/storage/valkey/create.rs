@@ -14,9 +14,9 @@
 //! guard the first one set and conflicts; its next round finds the first
 //! one's device through the guard and returns it.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use axess_clock::Timestamp;
 use fred::prelude::*;
 
 use super::index::plan_indexes;
@@ -42,7 +42,7 @@ impl ValkeyDeviceStore {
     pub(super) async fn create_or_find_row(
         &self,
         device: &Device,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Result<Device, ValkeyDeviceStoreError> {
         let device = for_save(device, now);
         let tenant = device.tenant_id.to_string();
@@ -55,7 +55,7 @@ impl ValkeyDeviceStore {
         // A new row is in no index yet, so the plan only adds.
         let plan = plan_indexes(&self.prefix, None, Some(&device));
         for _ in 0..MAX_ATTEMPTS {
-            let read_at = Instant::now();
+            let read_at = tokio::time::Instant::now();
             let held: Option<String> = self.client.get(&guard).await?;
             if let Some(existing) = self.live_of_key(&device, held.as_deref()).await? {
                 return Ok(existing);
@@ -76,7 +76,7 @@ impl ValkeyDeviceStore {
                 &payload,
                 ttl,
                 &id,
-                device.last_seen_at.timestamp(),
+                device.last_seen_at.unix_seconds(),
             );
             match self.run_script(CREATE_ROW, keys.collect(), args).await? {
                 ScriptStatus::Ok => return Ok(device),
