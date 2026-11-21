@@ -6,8 +6,9 @@
 //! and only under the named opt-out let it through, and leave a tenant that
 //! turned the check off alone.
 
-mod common;
+use axess_core::testing::fixtures as common;
 
+use axess_clock::testing::MockClock;
 use axess_core::authn::event::{AuthEventStatus, AuthEventType, AuthFailureReason};
 use axess_core::authn::factor::{BreachCheckUnavailable, NewPasswordError, PasswordRules};
 use axess_core::authn::service::ChosenPasswordError;
@@ -19,7 +20,6 @@ use axess_core::authn::{
 use axess_core::testing::mock_authn::{MockFactorStore, MockIdentityStore};
 use axess_core::{BreachCheckOutage, BreachedPasswordList};
 use axess_testing::mock_tracing::TracingCapture;
-use chrono::Utc;
 use common::{test_tenant, tid, uid};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -27,10 +27,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// A password that meets the default rules and sits on the list.
 const BREACHED: &str = "Password123!";
 /// A password that meets the default rules and is not on the list.
-const CLEAN: &str = "Gnomes2+andmore";
+const CLEAN: &str = "Sample2+andmore";
 
 fn alice() -> User {
-    let now = Utc::now();
+    let now = common::start();
     User {
         id: uid("u1"),
         tenant_id: tid("t1"),
@@ -45,9 +45,10 @@ fn alice() -> User {
     }
 }
 
-fn identity(rules: Option<PasswordRules>) -> MockIdentityStore {
+fn identity(clock: &MockClock, rules: Option<PasswordRules>) -> MockIdentityStore {
     let user = alice();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(user.clone());
     match rules {
@@ -88,7 +89,7 @@ struct Counting(Arc<AtomicUsize>);
 impl BreachedPasswordCheck for Counting {
     fn is_breached<'a>(
         &'a self,
-        _password: &'a str,
+        _: &'a str,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
@@ -106,10 +107,12 @@ impl BreachedPasswordCheck for Counting {
 
 #[tokio::test]
 async fn a_reset_to_a_breached_password_is_refused_and_the_link_stays_usable() {
-    let identity = identity(None);
+    let clock = common::test_clock();
+    let identity = identity(&clock, None);
     let inspector = identity.clone();
     let svc = request(
         AuthnService::builder(identity, MockFactorStore::new())
+            .with_clock(clock.clone())
             .with_breached_password_check(BreachedPasswordList::new([BREACHED]))
             .build(),
     );
@@ -133,10 +136,12 @@ async fn a_reset_to_a_breached_password_is_refused_and_the_link_stays_usable() {
 
 #[tokio::test]
 async fn a_reset_while_the_check_is_down_is_refused_by_default() {
-    let identity = identity(None);
+    let clock = common::test_clock();
+    let identity = identity(&clock, None);
     let inspector = identity.clone();
     let svc = request(
         AuthnService::builder(identity, MockFactorStore::new())
+            .with_clock(clock.clone())
             .with_breached_password_check(BreachCheckOutage::new("range service timed out"))
             .build(),
     );
@@ -164,10 +169,12 @@ async fn a_reset_while_the_check_is_down_is_refused_by_default() {
 
 #[tokio::test]
 async fn a_reset_while_the_check_is_down_passes_under_the_opt_out() {
-    let identity = identity(None);
+    let clock = common::test_clock();
+    let identity = identity(&clock, None);
     let inspector = identity.clone();
     let svc = request(
         AuthnService::builder(identity, MockFactorStore::new())
+            .with_clock(clock.clone())
             .with_breached_password_check(BreachCheckOutage::new("range service timed out"))
             .allow_unchecked_when_breach_check_unavailable()
             .build(),
@@ -184,12 +191,17 @@ async fn a_reset_while_the_check_is_down_passes_under_the_opt_out() {
 
 #[tokio::test]
 async fn an_exempt_tenant_resets_to_a_password_the_check_knows() {
-    let identity = identity(Some(PasswordRules {
-        breached_check: false,
-        ..PasswordRules::default()
-    }));
+    let clock = common::test_clock();
+    let identity = identity(
+        &clock,
+        Some(PasswordRules {
+            breached_check: false,
+            ..PasswordRules::default()
+        }),
+    );
     let svc = request(
         AuthnService::builder(identity, MockFactorStore::new())
+            .with_clock(clock.clone())
             .with_breached_password_check(BreachedPasswordList::new([BREACHED]))
             .build(),
     );
@@ -204,7 +216,12 @@ async fn an_exempt_tenant_resets_to_a_password_the_check_knows() {
 
 #[tokio::test]
 async fn without_a_check_a_reset_is_not_screened() {
-    let svc = request(AuthnService::new(identity(None), MockFactorStore::new()));
+    let clock = common::test_clock();
+    let svc = request(
+        AuthnService::builder(identity(&clock, None), MockFactorStore::new())
+            .with_clock(clock.clone())
+            .build(),
+    );
     let token = reset_token(&svc).await;
     assert!(
         svc.complete_password_reset(&uid("u1"), &token, BREACHED)
@@ -215,15 +232,17 @@ async fn without_a_check_a_reset_is_not_screened() {
 
 #[tokio::test]
 async fn a_reset_with_a_wrong_token_does_not_consult_the_check() {
+    let clock = common::test_clock();
     let calls = Arc::new(AtomicUsize::new(0));
-    let identity = identity(None);
+    let identity = identity(&clock, None);
     let inspector = identity.clone();
     let svc = request(
         AuthnService::builder(identity, MockFactorStore::new())
+            .with_clock(clock.clone())
             .with_breached_password_check(Counting(calls.clone()))
             .build(),
     );
-    let _token = reset_token(&svc).await;
+    reset_token(&svc).await;
 
     assert!(
         !svc.complete_password_reset(&uid("u1"), "not-the-token", CLEAN)
@@ -240,11 +259,13 @@ async fn a_reset_with_a_wrong_token_does_not_consult_the_check() {
 
 #[tokio::test]
 async fn a_reset_that_fails_the_rules_does_not_consult_the_check() {
+    let clock = common::test_clock();
     let calls = Arc::new(AtomicUsize::new(0));
-    let identity = identity(None);
+    let identity = identity(&clock, None);
     let inspector = identity.clone();
     let svc = request(
         AuthnService::builder(identity, MockFactorStore::new())
+            .with_clock(clock.clone())
             .with_breached_password_check(Counting(calls.clone()))
             .build(),
     );
@@ -263,7 +284,9 @@ async fn a_reset_that_fails_the_rules_does_not_consult_the_check() {
 
 #[tokio::test]
 async fn check_chosen_password_refuses_a_breached_password_by_name() {
-    let svc = AuthnService::builder(identity(None), MockFactorStore::new())
+    let clock = common::test_clock();
+    let svc = AuthnService::builder(identity(&clock, None), MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_breached_password_check(BreachedPasswordList::new([BREACHED]))
         .build();
     let rules = PasswordRules::default();
@@ -285,7 +308,9 @@ async fn check_chosen_password_refuses_a_breached_password_by_name() {
 
 #[tokio::test]
 async fn check_chosen_password_refuses_an_outage_unless_opted_out() {
-    let refusing = AuthnService::builder(identity(None), MockFactorStore::new())
+    let clock = common::test_clock();
+    let refusing = AuthnService::builder(identity(&clock, None), MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_breached_password_check(BreachCheckOutage::new("down"))
         .build();
     assert_eq!(
@@ -295,7 +320,8 @@ async fn check_chosen_password_refuses_an_outage_unless_opted_out() {
         Err(NewPasswordError::BreachCheckUnavailable)
     );
 
-    let allowing = AuthnService::builder(identity(None), MockFactorStore::new())
+    let allowing = AuthnService::builder(identity(&clock, None), MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_breached_password_check(BreachCheckOutage::new("down"))
         .allow_unchecked_when_breach_check_unavailable()
         .build();
@@ -309,7 +335,9 @@ async fn check_chosen_password_refuses_an_outage_unless_opted_out() {
 
 #[tokio::test]
 async fn check_chosen_password_honours_an_exempt_tenant_and_no_check() {
-    let svc = AuthnService::builder(identity(None), MockFactorStore::new())
+    let clock = common::test_clock();
+    let svc = AuthnService::builder(identity(&clock, None), MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_breached_password_check(BreachedPasswordList::new([BREACHED]))
         .build();
     let exempt = PasswordRules {
@@ -318,7 +346,9 @@ async fn check_chosen_password_honours_an_exempt_tenant_and_no_check() {
     };
     assert_eq!(svc.check_chosen_password(BREACHED, &exempt).await, Ok(()));
 
-    let unchecked = AuthnService::new(identity(None), MockFactorStore::new());
+    let unchecked = AuthnService::builder(identity(&clock, None), MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build();
     assert_eq!(
         unchecked
             .check_chosen_password(BREACHED, &PasswordRules::default())
@@ -329,7 +359,9 @@ async fn check_chosen_password_honours_an_exempt_tenant_and_no_check() {
 
 #[tokio::test]
 async fn hash_chosen_password_hashes_an_admitted_password_and_refuses_the_rest() {
-    let svc = AuthnService::builder(identity(None), MockFactorStore::new())
+    let clock = common::test_clock();
+    let svc = AuthnService::builder(identity(&clock, None), MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_breached_password_check(BreachedPasswordList::new([BREACHED]))
         .build();
     let rules = PasswordRules::default();
@@ -347,8 +379,11 @@ async fn hash_chosen_password_hashes_an_admitted_password_and_refuses_the_rest()
 
 #[test]
 fn building_without_a_check_warns_once_and_with_one_does_not() {
+    let clock = common::test_clock();
     let capture = TracingCapture::install();
-    let _svc = AuthnService::builder(identity(None), MockFactorStore::new()).build();
+    let unchecked = AuthnService::builder(identity(&clock, None), MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build();
     assert!(
         capture.contains_at_level(tracing::Level::WARN, "without a breached-password check"),
         "events: {:?}",
@@ -356,7 +391,8 @@ fn building_without_a_check_warns_once_and_with_one_does_not() {
     );
     let before = capture.events().len();
 
-    let _svc = AuthnService::builder(identity(None), MockFactorStore::new())
+    let checked = AuthnService::builder(identity(&clock, None), MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_breached_password_check(BreachedPasswordList::new([BREACHED]))
         .build();
     let after: Vec<_> = capture.events().into_iter().skip(before).collect();
@@ -366,6 +402,8 @@ fn building_without_a_check_warns_once_and_with_one_does_not() {
             .any(|e| e.message.contains("breached-password check")),
         "a service with a check must not warn about one: {after:?}"
     );
+    drop(checked);
+    drop(unchecked);
 }
 
 #[test]

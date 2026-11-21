@@ -7,7 +7,11 @@
 
 #![cfg(all(feature = "testing", feature = "oauth"))]
 
+use axess_core::testing::fixtures as common;
+
+use axess_clock::testing::MockClock;
 use axess_core::authn::AuditContext;
+use axess_core::authn::service::OAuthCallbackRoute;
 use axess_core::authn::service::{AuthnService, RequestAuthnService};
 use axess_core::testing::{
     mock_authn::{MockFactorStore, MockIdentityStore},
@@ -180,7 +184,7 @@ impl Idp {
 
     /// An ID token for `nonce`, signed with `alg` and carrying `extra`.
     fn id_token(&self, alg: Algorithm, nonce: &str, extra: Value) -> String {
-        let now = chrono::Utc::now().timestamp();
+        let now = common::start().unix_seconds();
         let mut claims = json!({
             "iss": self.issuer,
             "sub": "alice-subject",
@@ -198,10 +202,9 @@ impl Idp {
     }
 
     fn sign(&self, alg: Algorithm, claims: &Value) -> String {
-        axess_factors::jwt::ensure_crypto_provider();
         let mut header = Header::new(alg);
         header.kid = Some(self.kid.clone());
-        jsonwebtoken::encode(
+        axess_factors::jwt::encode(
             &header,
             claims,
             &EncodingKey::from_rsa_der(&self.private_der),
@@ -209,21 +212,22 @@ impl Idp {
         .expect("sign")
     }
 
-    async fn provider(&self) -> OAuthProviderBuilder {
-        OAuthProviderConfig::discover(
+    async fn provider(&self, clock: &MockClock) -> OAuthProviderBuilder {
+        OAuthProviderConfig::discover_screened(
             "test",
             &self.issuer,
             CLIENT_ID,
             "test-secret",
             "http://localhost:3000/callback",
+            axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
         )
         .await
         .expect("discovery")
+        .with_clock(std::sync::Arc::new(clock.clone()))
     }
 
     /// The client's `private_key_jwt` signer.
     fn signer(&self) -> ClientAssertionSigner {
-        axess_factors::jwt::ensure_crypto_provider();
         ClientAssertionSigner::new(
             CLIENT_ID,
             EncodingKey::from_ec_der(&self.client_der),
@@ -235,8 +239,10 @@ impl Idp {
     /// A provider that can carry the FAPI profile: discovered with a secret,
     /// as [`provider`](Self::provider) is, then switched to
     /// `private_key_jwt`, which drops the secret.
-    async fn fapi_provider(&self) -> OAuthProviderBuilder {
-        self.provider().await.with_private_key_jwt(self.signer())
+    async fn fapi_provider(&self, clock: &MockClock) -> OAuthProviderBuilder {
+        self.provider(clock)
+            .await
+            .with_private_key_jwt(self.signer())
     }
 
     /// The claims of the client assertion `seen` carries, after its
@@ -260,9 +266,17 @@ impl Idp {
             .expect("key");
         let mut validation = jsonwebtoken::Validation::new(Algorithm::ES256);
         validation.set_audience(&[audience]);
-        jsonwebtoken::decode::<Value>(assertion, &key, &validation)
+        // The assertion's times come from the provider's clock, the test's
+        // mock; jsonwebtoken would judge them on the wall clock.
+        validation.validate_exp = false;
+        let claims = axess_factors::jwt::decode::<Value>(assertion, &key, &validation)
             .expect("the assertion verifies under the client's key, for the issuer")
-            .claims
+            .claims;
+        assert!(
+            claims["exp"].as_i64().expect("an exp") > common::start().unix_seconds(),
+            "the assertion is live at the test's time"
+        );
+        claims
     }
 }
 
@@ -281,11 +295,15 @@ fn assert_no_secret(seen: &Seen) {
     );
 }
 
-fn service(provider: OAuthProviderConfig) -> Authn {
-    AuthnService::builder(MockIdentityStore::new(), MockFactorStore::new())
-        .with_oauth_provider(provider)
-        .build()
-        .with_audit_context(AuditContext::default())
+fn service(clock: &MockClock, provider: OAuthProviderConfig) -> Authn {
+    AuthnService::builder(
+        MockIdentityStore::new().with_clock(clock.clone()),
+        MockFactorStore::new(),
+    )
+    .with_clock(clock.clone())
+    .with_oauth_provider(provider)
+    .build()
+    .with_audit_context(AuditContext::default())
 }
 
 /// The nonce and state the ceremony put in the session.
@@ -349,7 +367,6 @@ fn checked_proof(jwt: &str) -> (Value, Value) {
     let header = segment(jwt, 0);
     assert_eq!(header["typ"], "dpop+jwt");
     assert_eq!(header["alg"], "ES256");
-    axess_factors::jwt::ensure_crypto_provider();
     let key = jsonwebtoken::DecodingKey::from_ec_components(
         header["jwk"]["x"].as_str().unwrap(),
         header["jwk"]["y"].as_str().unwrap(),
@@ -358,7 +375,7 @@ fn checked_proof(jwt: &str) -> (Value, Value) {
     let mut validation = jsonwebtoken::Validation::new(Algorithm::ES256);
     validation.required_spec_claims.clear();
     validation.validate_exp = false;
-    let payload = jsonwebtoken::decode::<Value>(jwt, &key, &validation)
+    let payload = axess_factors::jwt::decode::<Value>(jwt, &key, &validation)
         .expect("the proof verifies under the key in its header")
         .claims;
     (header, payload)
@@ -372,8 +389,8 @@ fn dpop_provider_config() -> FapiConfig {
     FapiConfig::default()
 }
 
-async fn dpop_provider(idp: &Idp) -> OAuthProviderConfig {
-    idp.fapi_provider()
+async fn dpop_provider(clock: &MockClock, idp: &Idp) -> OAuthProviderConfig {
+    idp.fapi_provider(clock)
         .await
         .with_fapi(dpop_provider_config())
         .build()
@@ -382,10 +399,11 @@ async fn dpop_provider(idp: &Idp) -> OAuthProviderConfig {
 
 /// Log in through a DPoP provider whose token endpoint answers `token_type`.
 async fn dpop_login(
+    clock: &MockClock,
     idp: &Idp,
     token_type: &'static str,
 ) -> (Authn, Result<OAuthClaims, OAuthError>) {
-    let authn = service(dpop_provider(idp).await);
+    let authn = service(clock, dpop_provider(clock, idp).await);
     let session = test_session();
     let (nonce, csrf) = begin(&authn, &session).await;
     let id = idp.id_token(Algorithm::PS256, &nonce, json!({}));
@@ -402,7 +420,15 @@ async fn dpop_login(
         ResponseTemplate::new(200).set_body_json(token_json(token_type, Some(id.clone())))
     })
     .await;
-    let result = authn.finish_oauth_login("code", &csrf, &session).await;
+    let result = authn
+        .finish_oauth_login(
+            OAuthCallbackRoute::global("test"),
+            "code",
+            &csrf,
+            None,
+            &session,
+        )
+        .await;
     (authn, result)
 }
 
@@ -410,8 +436,9 @@ async fn dpop_login(
 
 #[tokio::test]
 async fn the_token_request_carries_a_proof_for_the_key_the_claims_return() {
+    let clock = common::test_clock();
     let idp = Idp::start(json!({})).await;
-    let (_authn, claims) = dpop_login(&idp, "DPoP").await;
+    let (authn, claims) = dpop_login(&clock, &idp, "DPoP").await;
     let claims = claims.expect("login");
 
     let requests = idp.requests_to("/token");
@@ -424,22 +451,26 @@ async fn the_token_request_carries_a_proof_for_the_key_the_claims_return() {
     assert_eq!(header_thumbprint(&header), key.thumbprint().unwrap());
     // A proof for a token request names no access token.
     assert!(payload.get("ath").is_none());
+    drop(authn);
 }
 
 #[tokio::test]
 async fn a_bearer_response_to_a_dpop_request_is_refused() {
+    let clock = common::test_clock();
     let idp = Idp::start(json!({})).await;
-    let (_authn, result) = dpop_login(&idp, "Bearer").await;
+    let (authn, result) = dpop_login(&clock, &idp, "Bearer").await;
     assert!(
         matches!(result, Err(OAuthError::TokenExchange(_))),
         "an unbound token must not be taken for a bound one: {result:?}"
     );
+    drop(authn);
 }
 
 #[tokio::test]
 async fn use_dpop_nonce_is_answered_with_a_proof_that_echoes_it() {
+    let clock = common::test_clock();
     let idp = Idp::start(json!({})).await;
-    let authn = service(dpop_provider(&idp).await);
+    let authn = service(&clock, dpop_provider(&clock, &idp).await);
     let session = test_session();
     let (nonce, csrf) = begin(&authn, &session).await;
     let id = idp.id_token(Algorithm::PS256, &nonce, json!({}));
@@ -459,7 +490,13 @@ async fn use_dpop_nonce_is_answered_with_a_proof_that_echoes_it() {
     .await;
 
     authn
-        .finish_oauth_login("code", &csrf, &session)
+        .finish_oauth_login(
+            OAuthCallbackRoute::global("test"),
+            "code",
+            &csrf,
+            None,
+            &session,
+        )
         .await
         .expect("the retry with the nonce succeeds");
 
@@ -478,8 +515,9 @@ async fn use_dpop_nonce_is_answered_with_a_proof_that_echoes_it() {
 
 #[tokio::test]
 async fn a_provider_configured_for_dpop_refuses_a_request_without_a_key() {
+    let clock = common::test_clock();
     let idp = Idp::start(json!({})).await;
-    let provider = dpop_provider(&idp).await;
+    let provider = dpop_provider(&clock, &idp).await;
     use axess_factors::oauth::OAuthProvider as _;
     let err = provider
         .exchange_code("code", "v".repeat(43), "n".to_string(), None)
@@ -493,8 +531,9 @@ async fn a_provider_configured_for_dpop_refuses_a_request_without_a_key() {
 
 #[tokio::test]
 async fn refresh_and_userinfo_use_the_key_the_login_returned() {
+    let clock = common::test_clock();
     let idp = Idp::start(json!({})).await;
-    let (authn, claims) = dpop_login(&idp, "DPoP").await;
+    let (authn, claims) = dpop_login(&clock, &idp, "DPoP").await;
     let claims = claims.expect("login");
     let key = claims.dpop_key.clone().expect("key");
 
@@ -505,6 +544,7 @@ async fn refresh_and_userinfo_use_the_key_the_login_returned() {
     .await;
 
     let outcome = authn
+        .oauth_global()
         .refresh_oauth_token("test", "rt1", "alice-subject", None, Some(&key))
         .await
         .expect("refresh");
@@ -519,6 +559,7 @@ async fn refresh_and_userinfo_use_the_key_the_login_returned() {
     assert_eq!(payload["htm"], "POST");
 
     authn
+        .oauth_global()
         .fetch_userinfo("test", "access-2", "alice-subject", Some(&key))
         .await
         .expect("userinfo");
@@ -536,6 +577,7 @@ async fn refresh_and_userinfo_use_the_key_the_login_returned() {
     // Without the key the call is refused before anything is sent.
     let before = idp.requests_to("/token").len();
     let err = authn
+        .oauth_global()
         .refresh_oauth_token("test", "rt2", "alice-subject", None, None)
         .await
         .expect_err("a bound token is not refreshed bare");
@@ -545,11 +587,13 @@ async fn refresh_and_userinfo_use_the_key_the_login_returned() {
 
 #[tokio::test]
 async fn a_restored_key_is_the_same_key() {
+    let clock = common::test_clock();
     let idp = Idp::start(json!({})).await;
-    let (_authn, claims) = dpop_login(&idp, "DPoP").await;
+    let (authn, claims) = dpop_login(&clock, &idp, "DPoP").await;
     let key = claims.expect("login").dpop_key.expect("key");
     let restored = DpopKey::from_seed(*key.to_seed_bytes());
     assert_eq!(restored.thumbprint().unwrap(), key.thumbprint().unwrap());
+    drop(authn);
 }
 
 // ── ID-token rules of the profile ────────────────────────────────────────────
@@ -560,14 +604,15 @@ async fn a_restored_key_is_the_same_key() {
 /// so is one whose `nbf` has passed.
 #[tokio::test]
 async fn fapi_login_refuses_only_an_nbf_in_the_future() {
-    let now = chrono::Utc::now().timestamp();
+    let clock = common::test_clock();
+    let now = common::start().unix_seconds();
     for (nbf, accepted) in [
         (None, true),
         (Some(now - 5), true),
         (Some(now + 600), false),
     ] {
         let idp = Idp::start(json!({})).await;
-        let authn = service(dpop_provider(&idp).await);
+        let authn = service(&clock, dpop_provider(&clock, &idp).await);
         let session = test_session();
         let (nonce, csrf) = begin(&authn, &session).await;
         let mut id_claims = json!({
@@ -582,7 +627,15 @@ async fn fapi_login_refuses_only_an_nbf_in_the_future() {
             ResponseTemplate::new(200).set_body_json(token_json("DPoP", Some(id.clone())))
         })
         .await;
-        let result = authn.finish_oauth_login("code", &csrf, &session).await;
+        let result = authn
+            .finish_oauth_login(
+                OAuthCallbackRoute::global("test"),
+                "code",
+                &csrf,
+                None,
+                &session,
+            )
+            .await;
         assert_eq!(result.is_ok(), accepted, "nbf {nbf:?}: {result:?}");
         if !accepted {
             // The provider reports every token-validation failure to the
@@ -597,6 +650,7 @@ async fn fapi_login_refuses_only_an_nbf_in_the_future() {
 
 #[tokio::test]
 async fn the_profile_refuses_an_rs256_id_token_unless_the_list_is_widened() {
+    let clock = common::test_clock();
     for (algs, accepted) in [
         (None, false),
         (Some(vec!["RS256".to_string(), "PS256".to_string()]), true),
@@ -607,7 +661,8 @@ async fn the_profile_refuses_an_rs256_id_token_unless_the_list_is_widened() {
             config.allowed_id_token_algs = algs;
         }
         let authn = service(
-            idp.fapi_provider()
+            &clock,
+            idp.fapi_provider(&clock)
                 .await
                 .with_fapi(config)
                 .build()
@@ -620,7 +675,15 @@ async fn the_profile_refuses_an_rs256_id_token_unless_the_list_is_widened() {
             ResponseTemplate::new(200).set_body_json(token_json("DPoP", Some(id.clone())))
         })
         .await;
-        let result = authn.finish_oauth_login("code", &csrf, &session).await;
+        let result = authn
+            .finish_oauth_login(
+                OAuthCallbackRoute::global("test"),
+                "code",
+                &csrf,
+                None,
+                &session,
+            )
+            .await;
         assert_eq!(result.is_ok(), accepted, "{result:?}");
     }
 }
@@ -629,6 +692,7 @@ async fn the_profile_refuses_an_rs256_id_token_unless_the_list_is_widened() {
 
 #[tokio::test]
 async fn with_fapi_refuses_what_the_profile_cannot_keep() {
+    let clock = common::test_clock();
     let idp = Idp::start(json!({})).await;
     let config_err = |r: Result<OAuthProviderConfig, OAuthError>| match r {
         Err(OAuthError::Config(m)) => m,
@@ -638,7 +702,7 @@ async fn with_fapi_refuses_what_the_profile_cannot_keep() {
     // No PAR endpoint at the IdP, none configured.
     let bare = Idp::start(json!({ "pushed_authorization_request_endpoint": null })).await;
     let msg = config_err(
-        bare.fapi_provider()
+        bare.fapi_provider(&clock)
             .await
             .with_fapi(FapiConfig::default())
             .build(),
@@ -651,7 +715,7 @@ async fn with_fapi_refuses_what_the_profile_cannot_keep() {
     // An empty list accepts no ID token; a symmetric name never verifies one.
     for algs in [vec![], vec!["HS256".to_string()], vec!["none".to_string()]] {
         let msg = config_err(
-            idp.fapi_provider()
+            idp.fapi_provider(&clock)
                 .await
                 .with_fapi(FapiConfig {
                     allowed_id_token_algs: algs,
@@ -664,7 +728,7 @@ async fn with_fapi_refuses_what_the_profile_cannot_keep() {
 
     // The default profile is available.
     assert!(
-        idp.fapi_provider()
+        idp.fapi_provider(&clock)
             .await
             .with_fapi(FapiConfig::default())
             .build()
@@ -708,20 +772,25 @@ fn same_verdict(outcomes: &[Result<OAuthProviderConfig, OAuthError>; 2], refusal
 }
 
 /// Every builder setting gives one verdict whatever the order of the
-/// calls: each pair that used to depend on it builds, or is refused, the
-/// same way both ways round. The refusals the profile makes still happen.
+/// calls: each pair of settings that bear on one another builds, or is
+/// refused, the same way both ways round. The refusals the profile makes
+/// still happen.
 #[tokio::test]
 async fn every_setting_gives_one_verdict_in_either_order() {
     use axess_factors::oauth::OAuthProvider as _;
+    let clock = common::test_clock();
     let idp = Idp::start(json!({})).await;
     let fapi: Setting = Box::new(|b| b.with_fapi(FapiConfig::default()));
 
     // The signer before or after the profile: built.
     let signer: Setting = Box::new(|b| b.with_private_key_jwt(idp.signer()));
-    same_verdict(&both_orders(|| idp.provider(), &signer, &fapi).await, None);
+    same_verdict(
+        &both_orders(|| idp.provider(&clock), &signer, &fapi).await,
+        None,
+    );
     // No signer at all: refused, as before.
     assert!(matches!(
-        idp.provider().await.with_fapi(FapiConfig::default()).build(),
+        idp.provider(&clock).await.with_fapi(FapiConfig::default()).build(),
         Err(OAuthError::Config(m)) if m.contains("private_key_jwt")
     ));
 
@@ -730,16 +799,16 @@ async fn every_setting_gives_one_verdict_in_either_order() {
     let bare = Idp::start(json!({ "pushed_authorization_request_endpoint": null })).await;
     let par: Setting = Box::new(|b| b.with_par_endpoint(format!("{}/par", bare.issuer)));
     same_verdict(
-        &both_orders(|| bare.fapi_provider(), &par, &fapi).await,
+        &both_orders(|| bare.fapi_provider(&clock), &par, &fapi).await,
         None,
     );
     same_verdict(
         &[
-            bare.fapi_provider()
+            bare.fapi_provider(&clock)
                 .await
                 .with_fapi(FapiConfig::default())
                 .build(),
-            bare.fapi_provider()
+            bare.fapi_provider(&clock)
                 .await
                 .with_fapi(FapiConfig::default())
                 .build(),
@@ -751,17 +820,17 @@ async fn every_setting_gives_one_verdict_in_either_order() {
     // it: built both ways.
     let rs256: Setting = Box::new(|b| b.with_id_token_signing_algs(["RS256"]));
     same_verdict(
-        &both_orders(|| idp.fapi_provider(), &rs256, &fapi).await,
+        &both_orders(|| idp.fapi_provider(&clock), &rs256, &fapi).await,
         Some("shares no algorithm"),
     );
     let es256: Setting = Box::new(|b| b.with_id_token_signing_algs(["ES256"]));
     same_verdict(
-        &both_orders(|| idp.fapi_provider(), &es256, &fapi).await,
+        &both_orders(|| idp.fapi_provider(&clock), &es256, &fapi).await,
         None,
     );
     // A bad list on its own names the pin, not the profile.
     match idp
-        .provider()
+        .provider(&clock)
         .await
         .with_id_token_signing_algs(["HS256"])
         .build()
@@ -773,13 +842,13 @@ async fn every_setting_gives_one_verdict_in_either_order() {
     // `without_dpop` against the DPoP profile: refused both ways.
     let off: Setting = Box::new(OAuthProviderBuilder::without_dpop);
     same_verdict(
-        &both_orders(|| idp.fapi_provider(), &off, &fapi).await,
+        &both_orders(|| idp.fapi_provider(&clock), &off, &fapi).await,
         Some("requires DPoP"),
     );
     // `with_dpop` with the DPoP profile at an IdP that does not advertise
     // DPoP: built and bound both ways, since the profile binds anyway.
     let on: Setting = Box::new(OAuthProviderBuilder::with_dpop);
-    let outcomes = both_orders(|| idp.fapi_provider(), &on, &fapi).await;
+    let outcomes = both_orders(|| idp.fapi_provider(&clock), &on, &fapi).await;
     same_verdict(&outcomes, None);
     for provider in outcomes.iter().flatten() {
         assert!(provider.binds_to_dpop());
@@ -793,7 +862,7 @@ async fn every_setting_gives_one_verdict_in_either_order() {
         })
     });
     same_verdict(
-        &both_orders(|| idp.provider(), &on, &mtls).await,
+        &both_orders(|| idp.provider(&clock), &on, &mtls).await,
         Some("mTLS"),
     );
 }
@@ -805,6 +874,7 @@ async fn every_setting_gives_one_verdict_in_either_order() {
 #[tokio::test]
 async fn the_mtls_aliases_win_over_a_named_endpoint_in_either_order() {
     use axess_factors::oauth::OAuthProvider as _;
+    let clock = common::test_clock();
     let idp = Idp::start(json!({ "mtls_endpoint_aliases": {
         "token_endpoint": "{issuer}/mtls/token",
         "pushed_authorization_request_endpoint": "{issuer}/mtls/par",
@@ -829,7 +899,7 @@ async fn the_mtls_aliases_win_over_a_named_endpoint_in_either_order() {
         b.with_par_endpoint(format!("{}/par", idp.issuer))
             .with_revocation_endpoint(format!("{}/revoke", idp.issuer))
     });
-    for provider in both_orders(|| idp.provider(), &named, &mtls).await {
+    for provider in both_orders(|| idp.provider(&clock), &named, &mtls).await {
         let provider = provider.expect("build");
         let rng = axess_rng::SystemRng;
         provider
@@ -856,6 +926,7 @@ async fn the_mtls_aliases_win_over_a_named_endpoint_in_either_order() {
 /// from the same IdP is accepted.
 #[tokio::test]
 async fn a_pin_narrows_the_profile_in_either_order() {
+    let clock = common::test_clock();
     let widened: Setting = Box::new(|b| {
         b.with_fapi(FapiConfig {
             allowed_id_token_algs: vec!["RS256".into(), "PS256".into()],
@@ -868,13 +939,13 @@ async fn a_pin_narrows_the_profile_in_either_order() {
             let idp =
                 Idp::start(json!({ "id_token_signing_alg_values_supported": ["RS256", "PS256"] }))
                     .await;
-            let builder = idp.fapi_provider().await;
+            let builder = idp.fapi_provider(&clock).await;
             let builder = if pin_first {
                 widened(ps256(builder))
             } else {
                 ps256(widened(builder))
             };
-            let authn = service(builder.build().expect("build"));
+            let authn = service(&clock, builder.build().expect("build"));
             let session = test_session();
             let (nonce, csrf) = begin(&authn, &session).await;
             let id = idp.id_token(alg, &nonce, json!({}));
@@ -882,7 +953,15 @@ async fn a_pin_narrows_the_profile_in_either_order() {
                 ResponseTemplate::new(200).set_body_json(token_json("DPoP", Some(id.clone())))
             })
             .await;
-            let result = authn.finish_oauth_login("code", &csrf, &session).await;
+            let result = authn
+                .finish_oauth_login(
+                    OAuthCallbackRoute::global("test"),
+                    "code",
+                    &csrf,
+                    None,
+                    &session,
+                )
+                .await;
             assert_eq!(
                 result.is_ok(),
                 accepted,
@@ -902,11 +981,12 @@ async fn a_pin_narrows_the_profile_in_either_order() {
 #[tokio::test]
 async fn a_fapi_provider_with_only_a_client_secret_is_refused() {
     use axess_factors::oauth::OAuthProvider as _;
+    let clock = common::test_clock();
     let idp = Idp::start(json!({})).await;
     grant_any(&idp, "Bearer").await;
 
     // The case: this provider authenticates with its secret.
-    idp.provider()
+    idp.provider(&clock)
         .await
         .build()
         .expect("build")
@@ -927,7 +1007,7 @@ async fn a_fapi_provider_with_only_a_client_secret_is_refused() {
     );
 
     for config in [FapiConfig::default(), jarm_provider_config()] {
-        match idp.provider().await.with_fapi(config).build() {
+        match idp.provider(&clock).await.with_fapi(config).build() {
             Err(OAuthError::Config(m)) => assert!(
                 m.contains("private_key_jwt") && m.contains("mTLS"),
                 "the refusal names the allowed methods: {m}"
@@ -937,7 +1017,7 @@ async fn a_fapi_provider_with_only_a_client_secret_is_refused() {
     }
 
     assert!(
-        idp.provider()
+        idp.provider(&clock)
             .await
             .with_private_key_jwt(idp.signer())
             .with_fapi(FapiConfig::default())
@@ -954,17 +1034,19 @@ async fn a_fapi_provider_with_only_a_client_secret_is_refused() {
 #[tokio::test]
 async fn a_fapi_provider_with_private_key_jwt_sends_an_assertion_and_no_secret() {
     use axess_factors::oauth::{DpopSigner, OAuthProvider as _};
+    let clock = common::test_clock();
     let idp = Idp::start(json!({})).await;
     idp.mount("POST", "/revoke", |_, _| ResponseTemplate::new(200))
         .await;
-    let (authn, claims) = dpop_login(&idp, "DPoP").await;
+    let (authn, claims) = dpop_login(&clock, &idp, "DPoP").await;
     let key = claims.expect("login").dpop_key.expect("key");
     authn
+        .oauth_global()
         .refresh_oauth_token("test", "rt1", "alice-subject", None, Some(&key))
         .await
         .expect("refresh");
     let provider = idp
-        .fapi_provider()
+        .fapi_provider(&clock)
         .await
         .with_fapi(dpop_provider_config())
         .with_revocation_endpoint(format!("{}/revoke", idp.issuer))
@@ -1016,10 +1098,11 @@ async fn a_fapi_provider_with_private_key_jwt_sends_an_assertion_and_no_secret()
 #[tokio::test]
 async fn a_fapi_provider_with_mtls_sends_no_secret() {
     use axess_factors::oauth::OAuthProvider as _;
+    let clock = common::test_clock();
     let idp = Idp::start(json!({})).await;
     let cert = ClientCert::new("nosecret");
     let mtls_provider = || async {
-        idp.provider()
+        idp.provider(&clock)
             .await
             .with_fapi(FapiConfig {
                 sender_constraint: cert.constraint(),
@@ -1027,7 +1110,7 @@ async fn a_fapi_provider_with_mtls_sends_no_secret() {
             })
             .with_revocation_endpoint(format!("{}/revoke", idp.issuer))
     };
-    let authn = service(mtls_provider().await.build().expect("with_fapi"));
+    let authn = service(&clock, mtls_provider().await.build().expect("with_fapi"));
     let session = test_session();
     let (nonce, csrf) = begin(&authn, &session).await;
     let id = idp.id_token(Algorithm::PS256, &nonce, json!({}));
@@ -1040,14 +1123,23 @@ async fn a_fapi_provider_with_mtls_sends_no_secret() {
         .await;
 
     authn
-        .finish_oauth_login("code", &csrf, &session)
+        .finish_oauth_login(
+            OAuthCallbackRoute::global("test"),
+            "code",
+            &csrf,
+            None,
+            &session,
+        )
         .await
         .expect("login");
     authn
+        .oauth_global()
         .refresh_oauth_token("test", "rt1", "alice-subject", None, None)
         .await
         .expect("refresh");
     authn
+        .oauth_for_session(&session)
+        .await
         .revoke_oauth_token("test", "rt1", Some("refresh_token"), None)
         .await
         .expect("revocation");
@@ -1099,17 +1191,18 @@ fn jarm_provider_config() -> FapiConfig {
 /// Begin a JARM login and finish it with a response JWT built from `claims`
 /// (`iss`, `aud`, `exp`, `code` and `state` filled in unless overridden).
 async fn jarm_login(
+    clock: &MockClock,
     idp: &Idp,
     tamper: impl Fn(&mut Value),
     finish: impl FnOnce(String, String) -> (String, bool),
 ) -> (Result<OAuthClaims, OAuthError>, Authn) {
     let provider = idp
-        .fapi_provider()
+        .fapi_provider(clock)
         .await
         .with_fapi(jarm_provider_config())
         .build()
         .expect("with_fapi");
-    let authn = service(provider);
+    let authn = service(clock, provider);
     let session = test_session();
     let (nonce, csrf) = begin(&authn, &session).await;
     let id = idp.id_token(Algorithm::PS256, &nonce, json!({}));
@@ -1120,7 +1213,7 @@ async fn jarm_login(
     let mut response = json!({
         "iss": idp.issuer,
         "aud": CLIENT_ID,
-        "exp": chrono::Utc::now().timestamp() + 60,
+        "exp": common::start().unix_seconds() + 60,
         "code": "the-code",
         "state": csrf,
     });
@@ -1128,27 +1221,115 @@ async fn jarm_login(
     let jwt = idp.sign(Algorithm::PS256, &response);
     let (jwt, plain) = finish(jwt, csrf);
     let result = if plain {
-        authn.finish_oauth_login("the-code", &jwt, &session).await
+        authn
+            .finish_oauth_login(
+                OAuthCallbackRoute::global("test"),
+                "the-code",
+                &jwt,
+                None,
+                &session,
+            )
+            .await
     } else {
-        authn.finish_oauth_login_jarm(&jwt, &session).await
+        authn
+            .finish_oauth_login_jarm(OAuthCallbackRoute::global("test"), &jwt, &session)
+            .await
     };
     (result, authn)
 }
 
 #[tokio::test]
 async fn jarm_asks_for_response_mode_jwt_and_accepts_a_signed_response() {
+    let clock = common::test_clock();
     let idp = Idp::start(json!({})).await;
-    let (result, _) = jarm_login(&idp, |_| {}, |jwt, _| (jwt, false)).await;
+    let (result, _) = jarm_login(&clock, &idp, |_| {}, |jwt, _| (jwt, false)).await;
     result.expect("a verified response finishes the login");
     let par = &idp.requests_to("/par")[0];
     assert_eq!(par.form("response_mode"), Some("jwt"));
 }
 
+/// The `error` member of a verified refusal is the identity provider's
+/// text: it comes out with control characters and the line separators
+/// escaped, so an application that logs the refusal logs one line.
+#[tokio::test]
+async fn the_error_member_of_a_jarm_refusal_is_log_safe() {
+    use axess_factors::oauth::OAuthProvider as _;
+    let clock = common::test_clock();
+    let idp = Idp::start(json!({})).await;
+    let provider = idp
+        .fapi_provider(&clock)
+        .await
+        .with_fapi(jarm_provider_config())
+        .build()
+        .expect("with_fapi");
+    let response = json!({
+        "iss": idp.issuer,
+        "aud": CLIENT_ID,
+        "exp": common::start().unix_seconds() + 60,
+        "state": "the-state",
+        "error": "access_denied\r\nINFO forged line\x1b[2J\u{2028}",
+    });
+
+    let verified = provider
+        .verify_authorization_response_jwt(&idp.sign(Algorithm::PS256, &response))
+        .expect("a signed refusal verifies");
+
+    let error = verified.error.expect("the refusal carries its error");
+    assert!(!error.chars().any(char::is_control), "{error:?}");
+    assert!(!error.contains('\u{2028}'), "{error:?}");
+    assert!(
+        error.contains("access_denied") && error.contains("forged line"),
+        "{error}"
+    );
+}
+
+/// A refused push keeps the PAR endpoint's answer in its message. The body
+/// is the identity provider's text: it comes out with control characters
+/// and the line separators escaped, and a body the reader cut keeps the
+/// mark of the cut.
+#[tokio::test]
+async fn the_body_of_a_par_refusal_is_log_safe() {
+    use axess_factors::http_body::{ERROR_SNIPPET_LOG_BYTES, TRUNCATED_SUFFIX};
+    use axess_factors::oauth::OAuthProvider as _;
+    let clock = common::test_clock();
+    let idp = Idp::start_with_par(json!({}), |_, _| {
+        // Longer than the 1 KiB the error reader keeps.
+        let mut body = "request refused\r\nINFO forged line\x1b[2J\u{2028}".to_string();
+        body.push_str(&"A".repeat(2048));
+        ResponseTemplate::new(400).set_body_string(body)
+    })
+    .await;
+    let provider = idp.fapi_provider(&clock).await.build().expect("build");
+
+    let err = provider
+        .push_authorization_request(&[("scope", "openid")], None)
+        .await
+        .expect_err("a refused push is an error");
+    let OAuthError::TokenExchange(text) = &err else {
+        panic!("expected TokenExchange, got {err:?}");
+    };
+    assert!(!text.chars().any(char::is_control), "{text:?}");
+    assert!(!text.contains('\u{2028}'), "{text:?}");
+    assert!(
+        text.contains("request refused\\r\\nINFO forged line\\u{1b}[2J\\u{2028}AAAA"),
+        "the body is kept, escaped: {text}"
+    );
+    assert!(text.ends_with(TRUNCATED_SUFFIX), "{text}");
+    let prefix = "PAR endpoint returned HTTP 400 Bad Request: ";
+    assert!(text.starts_with(prefix), "{text}");
+    assert!(
+        text.len() <= prefix.len() + ERROR_SNIPPET_LOG_BYTES,
+        "{} bytes",
+        text.len()
+    );
+}
+
 #[tokio::test]
 async fn a_plain_callback_to_a_jarm_provider_is_refused() {
+    let clock = common::test_clock();
     let idp = Idp::start(json!({})).await;
     // The plain form would pass `code` and `state` straight to the exchange.
-    let (result, _) = jarm_login(&idp, |_| {}, |_, csrf| (csrf, true)).await;
+    let (result, _) = jarm_login(&clock, &idp, |_| {}, |_, csrf| (csrf, true)).await;
     assert!(
         matches!(result, Err(OAuthError::InvalidParameter)),
         "{result:?}"
@@ -1161,6 +1342,7 @@ async fn a_plain_callback_to_a_jarm_provider_is_refused() {
 
 #[tokio::test]
 async fn a_response_that_does_not_verify_or_does_not_match_is_refused() {
+    let clock = common::test_clock();
     let cases: Vec<(&str, Tamper)> = vec![
         (
             "wrong audience",
@@ -1172,7 +1354,7 @@ async fn a_response_that_does_not_verify_or_does_not_match_is_refused() {
         ),
         (
             "expired",
-            Box::new(|c| c["exp"] = json!(chrono::Utc::now().timestamp() - 3600)),
+            Box::new(|c| c["exp"] = json!(common::start().unix_seconds() - 3600)),
         ),
         (
             "no exp",
@@ -1183,7 +1365,7 @@ async fn a_response_that_does_not_verify_or_does_not_match_is_refused() {
     ];
     for (name, tamper) in cases {
         let idp = Idp::start(json!({})).await;
-        let (result, _) = jarm_login(&idp, tamper, |jwt, _| (jwt, false)).await;
+        let (result, _) = jarm_login(&clock, &idp, tamper, |jwt, _| (jwt, false)).await;
         assert!(
             matches!(result, Err(OAuthError::IdTokenValidation(_))),
             "{name}: {result:?}"
@@ -1196,8 +1378,13 @@ async fn a_response_that_does_not_verify_or_does_not_match_is_refused() {
 
     // A state that is not the ceremony's is the same CSRF mismatch as ever.
     let idp = Idp::start(json!({})).await;
-    let (result, _) =
-        jarm_login(&idp, |c| c["state"] = json!("other"), |jwt, _| (jwt, false)).await;
+    let (result, _) = jarm_login(
+        &clock,
+        &idp,
+        |c| c["state"] = json!("other"),
+        |jwt, _| (jwt, false),
+    )
+    .await;
     assert!(
         matches!(result, Err(OAuthError::CsrfMismatch)),
         "{result:?}"
@@ -1206,6 +1393,7 @@ async fn a_response_that_does_not_verify_or_does_not_match_is_refused() {
     // A flipped signature byte.
     let idp = Idp::start(json!({})).await;
     let (result, _) = jarm_login(
+        &clock,
         &idp,
         |_| {},
         |jwt, _| {
@@ -1224,6 +1412,7 @@ async fn a_response_that_does_not_verify_or_does_not_match_is_refused() {
     // An unsigned response.
     let idp = Idp::start(json!({})).await;
     let (result, _) = jarm_login(
+        &clock,
         &idp,
         |_| {},
         |jwt, _| {
@@ -1241,8 +1430,10 @@ async fn a_response_that_does_not_verify_or_does_not_match_is_refused() {
 
 #[tokio::test]
 async fn an_error_response_ends_the_ceremony() {
+    let clock = common::test_clock();
     let idp = Idp::start(json!({})).await;
     let (result, _) = jarm_login(
+        &clock,
         &idp,
         |c| {
             c.as_object_mut().unwrap().remove("code");
@@ -1257,6 +1448,68 @@ async fn an_error_response_ends_the_ceremony() {
     );
 }
 
+/// The JARM finish names its callback route as the plain one does. A
+/// response that does not verify leaves the ceremony in place whatever the
+/// route, since anyone can post to a callback; the ceremony's own verified
+/// response on another registration's route (another provider name, or a
+/// tenant's route for this global provider) is a mix-up, refused before the
+/// code is exchanged, and ends the ceremony.
+#[tokio::test]
+async fn a_verified_jarm_response_on_another_registrations_route_is_refused() {
+    let clock = common::test_clock();
+    let elsewhere = axess_core::authn::ids::testing::tenant("elsewhere");
+    for wrong in [
+        OAuthCallbackRoute::global("other"),
+        OAuthCallbackRoute::of_tenant(&elsewhere, "test"),
+    ] {
+        let idp = Idp::start(json!({})).await;
+        let provider = idp
+            .fapi_provider(&clock)
+            .await
+            .with_fapi(jarm_provider_config())
+            .build()
+            .expect("with_fapi");
+        let authn = service(&clock, provider);
+        let session = test_session();
+        let (_, csrf) = begin(&authn, &session).await;
+        let real = idp.sign(
+            Algorithm::PS256,
+            &json!({
+                "iss": idp.issuer, "aud": CLIENT_ID,
+                "exp": common::start().unix_seconds() + 60,
+                "code": "the-code", "state": csrf,
+            }),
+        );
+
+        let err = authn
+            .finish_oauth_login_jarm(wrong, "not-a-jwt", &session)
+            .await
+            .expect_err("garbage is refused");
+        assert!(matches!(err, OAuthError::IdTokenValidation(_)), "{err:?}");
+        assert!(
+            session.get_custom("axess.oauth.csrf_state").await.is_some(),
+            "{wrong:?}: garbage ended the ceremony"
+        );
+
+        let err = authn
+            .finish_oauth_login_jarm(wrong, &real, &session)
+            .await
+            .expect_err("the ceremony's response on another route is a mix-up");
+        assert!(
+            matches!(err, OAuthError::CsrfMismatch),
+            "{wrong:?}: {err:?}"
+        );
+        assert!(
+            idp.requests_to("/token").is_empty(),
+            "{wrong:?}: the code was exchanged"
+        );
+        assert!(
+            session.get_custom("axess.oauth.csrf_state").await.is_none(),
+            "{wrong:?}: the ceremony stays after a mix-up"
+        );
+    }
+}
+
 /// A response that is not this ceremony's cannot end it. Garbage, and a
 /// signed error response an attacker obtained for their own flow, are
 /// refused and leave the victim's ceremony in place; the real response then
@@ -1264,14 +1517,15 @@ async fn an_error_response_ends_the_ceremony() {
 /// ends it.
 #[tokio::test]
 async fn a_response_that_is_not_the_ceremonys_leaves_the_flow_in_place() {
+    let clock = common::test_clock();
     let idp = Idp::start(json!({})).await;
     let provider = idp
-        .fapi_provider()
+        .fapi_provider(&clock)
         .await
         .with_fapi(jarm_provider_config())
         .build()
         .expect("with_fapi");
-    let authn = service(provider);
+    let authn = service(&clock, provider);
     let session = test_session();
     let (nonce, csrf) = begin(&authn, &session).await;
     let id = idp.id_token(Algorithm::PS256, &nonce, json!({}));
@@ -1279,7 +1533,7 @@ async fn a_response_that_is_not_the_ceremonys_leaves_the_flow_in_place() {
         ResponseTemplate::new(200).set_body_json(token_json("DPoP", Some(id.clone())))
     })
     .await;
-    let now = chrono::Utc::now().timestamp();
+    let now = common::start().unix_seconds();
     let response = |extra: Value| {
         let mut claims = json!({ "iss": idp.issuer, "aud": CLIENT_ID, "exp": now + 60 });
         claims
@@ -1290,36 +1544,36 @@ async fn a_response_that_is_not_the_ceremonys_leaves_the_flow_in_place() {
     };
 
     let err = authn
-        .finish_oauth_login_jarm("not-a-jwt", &session)
+        .finish_oauth_login_jarm(OAuthCallbackRoute::global("test"), "not-a-jwt", &session)
         .await
         .expect_err("garbage is refused");
     assert!(matches!(err, OAuthError::IdTokenValidation(_)), "{err:?}");
 
     let foreign_error = response(json!({ "error": "access_denied", "state": "someone-elses" }));
     let err = authn
-        .finish_oauth_login_jarm(&foreign_error, &session)
+        .finish_oauth_login_jarm(OAuthCallbackRoute::global("test"), &foreign_error, &session)
         .await
         .expect_err("another flow's error response is refused");
     assert!(matches!(err, OAuthError::CsrfMismatch), "{err:?}");
 
     let real = response(json!({ "code": "the-code", "state": csrf }));
     authn
-        .finish_oauth_login_jarm(&real, &session)
+        .finish_oauth_login_jarm(OAuthCallbackRoute::global("test"), &real, &session)
         .await
         .expect("the victim's ceremony survived both");
 
     // The ceremony's own error response ends it.
     let session = test_session();
-    let (_nonce, csrf) = begin(&authn, &session).await;
+    let (_, csrf) = begin(&authn, &session).await;
     let own_error = response(json!({ "error": "access_denied", "state": csrf }));
     let err = authn
-        .finish_oauth_login_jarm(&own_error, &session)
+        .finish_oauth_login_jarm(OAuthCallbackRoute::global("test"), &own_error, &session)
         .await
         .expect_err("the IdP refused this flow");
     assert!(matches!(err, OAuthError::TokenExchange(_)), "{err:?}");
     let real = response(json!({ "code": "the-code", "state": csrf }));
     let err = authn
-        .finish_oauth_login_jarm(&real, &session)
+        .finish_oauth_login_jarm(OAuthCallbackRoute::global("test"), &real, &session)
         .await
         .expect_err("the ceremony is over");
     assert!(matches!(err, OAuthError::NoFlow), "{err:?}");
@@ -1332,8 +1586,9 @@ async fn a_response_that_is_not_the_ceremonys_leaves_the_flow_in_place() {
 /// same refresh response is refused.
 #[tokio::test]
 async fn the_login_returns_its_nonce_and_a_refresh_id_token_that_repeats_it_is_accepted() {
+    let clock = common::test_clock();
     let idp = Idp::start(json!({})).await;
-    let authn = service(idp.provider().await.build().expect("build"));
+    let authn = service(&clock, idp.provider(&clock).await.build().expect("build"));
     let session = test_session();
     let (nonce, csrf) = begin(&authn, &session).await;
     let id = idp.id_token(Algorithm::PS256, &nonce, json!({}));
@@ -1344,7 +1599,13 @@ async fn the_login_returns_its_nonce_and_a_refresh_id_token_that_repeats_it_is_a
     })
     .await;
     let claims = authn
-        .finish_oauth_login("code", &csrf, &session)
+        .finish_oauth_login(
+            OAuthCallbackRoute::global("test"),
+            "code",
+            &csrf,
+            None,
+            &session,
+        )
         .await
         .expect("login");
     assert_eq!(
@@ -1359,6 +1620,7 @@ async fn the_login_returns_its_nonce_and_a_refresh_id_token_that_repeats_it_is_a
     );
 
     authn
+        .oauth_global()
         .refresh_oauth_token(
             "test",
             "rt1",
@@ -1369,6 +1631,7 @@ async fn the_login_returns_its_nonce_and_a_refresh_id_token_that_repeats_it_is_a
         .await
         .expect("a refresh ID token that repeats the login nonce is accepted");
     let err = authn
+        .oauth_global()
         .refresh_oauth_token("test", "rt1", "alice-subject", None, None)
         .await
         .expect_err("a nonce with no original to compare it with is refused");
@@ -1414,10 +1677,11 @@ impl Drop for ClientCert {
 
 #[tokio::test]
 async fn mtls_uses_the_advertised_alias_and_authenticates_with_the_certificate() {
+    let clock = common::test_clock();
     let idp = Idp::start(json!({})).await;
     let cert = ClientCert::new("alias");
     let provider = idp
-        .provider()
+        .provider(&clock)
         .await
         .with_fapi(FapiConfig {
             sender_constraint: cert.constraint(),
@@ -1425,7 +1689,7 @@ async fn mtls_uses_the_advertised_alias_and_authenticates_with_the_certificate()
         })
         .build()
         .expect("with_fapi");
-    let authn = service(provider);
+    let authn = service(&clock, provider);
     let session = test_session();
     let (nonce, csrf) = begin(&authn, &session).await;
     let id = idp.id_token(Algorithm::PS256, &nonce, json!({}));
@@ -1436,7 +1700,13 @@ async fn mtls_uses_the_advertised_alias_and_authenticates_with_the_certificate()
     .await;
 
     let claims = authn
-        .finish_oauth_login("code", &csrf, &session)
+        .finish_oauth_login(
+            OAuthCallbackRoute::global("test"),
+            "code",
+            &csrf,
+            None,
+            &session,
+        )
         .await
         .expect("login");
     assert!(claims.dpop_key.is_none(), "an mTLS login has no DPoP key");
@@ -1458,6 +1728,7 @@ async fn mtls_uses_the_advertised_alias_and_authenticates_with_the_certificate()
 
 #[tokio::test]
 async fn mtls_with_unusable_files_is_a_config_error() {
+    let clock = common::test_clock();
     let idp = Idp::start(json!({})).await;
     let cert = ClientCert::new("bad");
     let SenderConstraint::Mtls {
@@ -1469,7 +1740,7 @@ async fn mtls_with_unusable_files_is_a_config_error() {
     };
 
     let attempt = |constraint| async {
-        idp.provider()
+        idp.provider(&clock)
             .await
             .with_fapi(FapiConfig {
                 sender_constraint: constraint,
@@ -1510,9 +1781,10 @@ async fn grant_any(idp: &Idp, token_type: &'static str) {
 
 #[tokio::test]
 async fn client_credentials_on_a_dpop_provider_is_refused_bare() {
+    let clock = common::test_clock();
     let idp = Idp::start(json!({})).await;
     grant_any(&idp, "Bearer").await;
-    let provider = dpop_provider(&idp).await;
+    let provider = dpop_provider(&clock, &idp).await;
     use axess_factors::oauth::OAuthProvider as _;
     let err = provider
         .client_credentials(&["scope-a"], None)
@@ -1524,9 +1796,10 @@ async fn client_credentials_on_a_dpop_provider_is_refused_bare() {
 
 #[tokio::test]
 async fn the_device_grant_on_a_dpop_provider_is_refused_bare() {
+    let clock = common::test_clock();
     let idp = Idp::start(json!({})).await;
     grant_any(&idp, "Bearer").await;
-    let provider = dpop_provider(&idp).await;
+    let provider = dpop_provider(&clock, &idp).await;
     use axess_factors::oauth::OAuthProvider as _;
     let err = provider
         .poll_device_token("device-code-1", 5, None, None)
@@ -1539,9 +1812,10 @@ async fn the_device_grant_on_a_dpop_provider_is_refused_bare() {
 #[tokio::test]
 async fn client_credentials_with_a_key_carries_a_proof_and_wants_a_bound_answer() {
     use axess_factors::oauth::{DpopSigner, OAuthProvider as _};
+    let clock = common::test_clock();
     let idp = Idp::start(json!({})).await;
     grant_any(&idp, "DPoP").await;
-    let provider = dpop_provider(&idp).await;
+    let provider = dpop_provider(&clock, &idp).await;
     let rng = axess_rng::SystemRng;
     let key = DpopKey::generate(&rng);
     let signer = DpopSigner {
@@ -1564,7 +1838,7 @@ async fn client_credentials_with_a_key_carries_a_proof_and_wants_a_bound_answer(
     // A bearer answer to a bound request is refused.
     let bearer = Idp::start(json!({})).await;
     grant_any(&bearer, "Bearer").await;
-    let provider = dpop_provider(&bearer).await;
+    let provider = dpop_provider(&clock, &bearer).await;
     let err = provider
         .client_credentials(&["scope-a"], Some(signer))
         .await
@@ -1572,16 +1846,51 @@ async fn client_credentials_with_a_key_carries_a_proof_and_wants_a_bound_answer(
     assert!(matches!(err, OAuthError::TokenExchange(_)), "{err:?}");
 }
 
+/// The client-credentials request names the scopes it asks for, joined by a
+/// space, and carries no `scope` member at all when it asks for none: an
+/// empty `scope` is not a value RFC 6749 section 3.3 allows.
+#[tokio::test]
+async fn client_credentials_sends_scope_only_when_it_asks_for_one() {
+    use axess_factors::oauth::OAuthProvider as _;
+    let clock = common::test_clock();
+    let idp = Idp::start(json!({})).await;
+    grant_any(&idp, "Bearer").await;
+    let provider = idp.provider(&clock).await.build().expect("build");
+
+    provider
+        .client_credentials(&["scope-a", "scope-b"], None)
+        .await
+        .expect("a grant for two scopes");
+    provider
+        .client_credentials(&[], None)
+        .await
+        .expect("a grant for no scope");
+
+    let seen = idp.requests_to("/token");
+    assert_eq!(seen.len(), 2);
+    for request in &seen {
+        assert_eq!(request.form("grant_type"), Some("client_credentials"));
+    }
+    assert_eq!(seen[0].form("scope"), Some("scope-a scope-b"));
+    assert_eq!(
+        seen[1].form("scope"),
+        None,
+        "a request for no scope carries no `scope` member: {:?}",
+        seen[1].form
+    );
+}
+
 #[tokio::test]
 async fn the_device_grant_with_a_key_carries_a_proof_and_returns_the_key() {
     use axess_factors::oauth::{DpopSigner, OAuthProvider as _};
+    let clock = common::test_clock();
     let idp = Idp::start(json!({})).await;
     let id = idp.id_token(Algorithm::PS256, "", json!({}));
     idp.mount("POST", "/token", move |_, _| {
         ResponseTemplate::new(200).set_body_json(token_json("DPoP", Some(id.clone())))
     })
     .await;
-    let provider = dpop_provider(&idp).await;
+    let provider = dpop_provider(&clock, &idp).await;
     let rng = axess_rng::SystemRng;
     let key = DpopKey::generate(&rng);
     let signer = DpopSigner {
@@ -1616,11 +1925,12 @@ async fn the_device_grant_with_a_key_carries_a_proof_and_returns_the_key() {
 #[tokio::test]
 async fn revocation_sends_bare_and_carries_a_proof_when_given_the_key() {
     use axess_factors::oauth::{DpopSigner, OAuthProvider as _};
+    let clock = common::test_clock();
     let idp = Idp::start(json!({})).await;
     idp.mount("POST", "/revoke", |_, _| ResponseTemplate::new(200))
         .await;
     let provider = idp
-        .fapi_provider()
+        .fapi_provider(&clock)
         .await
         .with_fapi(dpop_provider_config())
         .with_revocation_endpoint(format!("{}/revoke", idp.issuer))
@@ -1658,8 +1968,9 @@ async fn revocation_sends_bare_and_carries_a_proof_when_given_the_key() {
 /// bound token as `Bearer`.
 #[tokio::test]
 async fn userinfo_on_a_dpop_provider_is_refused_bare() {
+    let clock = common::test_clock();
     let idp = Idp::start(json!({})).await;
-    let (authn, claims) = dpop_login(&idp, "DPoP").await;
+    let (authn, claims) = dpop_login(&clock, &idp, "DPoP").await;
     let access = claims
         .expect("login")
         .access_token
@@ -1670,12 +1981,13 @@ async fn userinfo_on_a_dpop_provider_is_refused_bare() {
     .await;
 
     let err = authn
+        .oauth_global()
         .fetch_userinfo("test", &access, "alice-subject", None)
         .await
         .expect_err("a bound token is not sent as Bearer");
     assert!(matches!(err, OAuthError::DpopKeyRequired), "{err:?}");
 
-    let provider = dpop_provider(&idp).await;
+    let provider = dpop_provider(&clock, &idp).await;
     use axess_factors::oauth::OAuthProvider as _;
     let err = provider
         .fetch_userinfo_unchecked(&access, None)
@@ -1691,8 +2003,9 @@ async fn userinfo_on_a_dpop_provider_is_refused_bare() {
 /// carries.
 #[tokio::test]
 async fn userinfo_retries_with_a_nonce_only_on_a_use_dpop_nonce_challenge() {
+    let clock = common::test_clock();
     let idp = Idp::start(json!({})).await;
-    let (authn, claims) = dpop_login(&idp, "DPoP").await;
+    let (authn, claims) = dpop_login(&clock, &idp, "DPoP").await;
     let claims = claims.expect("login");
     let key = claims.dpop_key.clone().expect("key");
     let access = claims.access_token.clone().expect("an access token");
@@ -1719,6 +2032,7 @@ async fn userinfo_retries_with_a_nonce_only_on_a_use_dpop_nonce_challenge() {
     .await;
 
     let err = authn
+        .oauth_global()
         .fetch_userinfo("test", &access, "alice-subject", Some(&key))
         .await
         .expect_err("invalid_token is a refusal");
@@ -1730,6 +2044,7 @@ async fn userinfo_retries_with_a_nonce_only_on_a_use_dpop_nonce_challenge() {
     );
 
     authn
+        .oauth_global()
         .fetch_userinfo("test", &access, "alice-subject", Some(&key))
         .await
         .expect("the challenge is answered with the nonce");
@@ -1753,8 +2068,9 @@ async fn userinfo_retries_with_a_nonce_only_on_a_use_dpop_nonce_challenge() {
 /// with it.
 #[tokio::test]
 async fn par_names_the_key_the_token_request_presents() {
+    let clock = common::test_clock();
     let idp = Idp::start(json!({})).await;
-    let (_authn, claims) = dpop_login(&idp, "DPoP").await;
+    let (authn, claims) = dpop_login(&clock, &idp, "DPoP").await;
     let key = claims.expect("login").dpop_key.expect("key");
     let jkt = key.thumbprint().unwrap();
 
@@ -1777,6 +2093,7 @@ async fn par_names_the_key_the_token_request_presents() {
         jkt,
         "the token request presents the key the push named"
     );
+    drop(authn);
 }
 
 /// A PAR endpoint that wants a nonce refuses the first push with
@@ -1784,6 +2101,7 @@ async fn par_names_the_key_the_token_request_presents() {
 /// token endpoint is.
 #[tokio::test]
 async fn a_par_use_dpop_nonce_refusal_is_answered_with_the_nonce() {
+    let clock = common::test_clock();
     let idp = Idp::start_with_par(json!({}), |seen, _| {
         let (_, payload) = proof_of(seen);
         if payload["nonce"] == "par-nonce-1" {
@@ -1796,9 +2114,9 @@ async fn a_par_use_dpop_nonce_refusal_is_answered_with_the_nonce() {
         }
     })
     .await;
-    let authn = service(dpop_provider(&idp).await);
+    let authn = service(&clock, dpop_provider(&clock, &idp).await);
     let session = test_session();
-    let (_nonce, _csrf) = begin(&authn, &session).await;
+    let (_, _) = begin(&authn, &session).await;
 
     let pushes = idp.requests_to("/par");
     assert_eq!(pushes.len(), 2, "one refusal, one retry");
@@ -1816,8 +2134,9 @@ async fn a_par_use_dpop_nonce_refusal_is_answered_with_the_nonce() {
 /// has the authorization server refuse an assertion whose `jti` it has seen.
 #[tokio::test]
 async fn the_nonce_retry_signs_a_fresh_client_assertion() {
+    let clock = common::test_clock();
     let idp = Idp::start(json!({})).await;
-    let authn = service(dpop_provider(&idp).await);
+    let authn = service(&clock, dpop_provider(&clock, &idp).await);
     let session = test_session();
     let (nonce, csrf) = begin(&authn, &session).await;
     let id = idp.id_token(Algorithm::PS256, &nonce, json!({}));
@@ -1837,7 +2156,13 @@ async fn the_nonce_retry_signs_a_fresh_client_assertion() {
     .await;
 
     authn
-        .finish_oauth_login("code", &csrf, &session)
+        .finish_oauth_login(
+            OAuthCallbackRoute::global("test"),
+            "code",
+            &csrf,
+            None,
+            &session,
+        )
         .await
         .expect("the retry with the nonce succeeds");
 
@@ -1860,6 +2185,7 @@ async fn the_nonce_retry_signs_a_fresh_client_assertion() {
 #[tokio::test]
 async fn the_device_authorization_request_carries_the_clients_assertion() {
     use axess_factors::oauth::OAuthProvider as _;
+    let clock = common::test_clock();
     let idp = Idp::start(json!({})).await;
     idp.mount("POST", "/device", |_, _| {
         ResponseTemplate::new(200).set_body_json(json!({
@@ -1872,7 +2198,7 @@ async fn the_device_authorization_request_carries_the_clients_assertion() {
     })
     .await;
     let provider = idp
-        .fapi_provider()
+        .fapi_provider(&clock)
         .await
         .with_device_authorization_endpoint(format!("{}/device", idp.issuer))
         .build()
@@ -1895,6 +2221,7 @@ async fn the_device_authorization_request_carries_the_clients_assertion() {
 #[tokio::test]
 async fn the_device_authorization_request_authenticates_the_client() {
     use axess_factors::oauth::OAuthProvider as _;
+    let clock = common::test_clock();
     let idp = Idp::start(json!({})).await;
     idp.mount("POST", "/device", |_, _| {
         ResponseTemplate::new(200).set_body_json(json!({
@@ -1906,7 +2233,7 @@ async fn the_device_authorization_request_authenticates_the_client() {
     })
     .await;
     let provider = idp
-        .provider()
+        .provider(&clock)
         .await
         .with_device_authorization_endpoint(format!("{}/device", idp.issuer))
         .build()
@@ -1946,6 +2273,7 @@ async fn the_device_authorization_request_authenticates_the_client() {
 #[tokio::test]
 async fn a_5xx_from_the_token_endpoint_is_transient_and_its_message_has_no_body() {
     use axess_factors::oauth::OAuthProvider as _;
+    let clock = common::test_clock();
     let idp = Idp::start(json!({})).await;
     idp.mount("POST", "/token", |_, _| {
         ResponseTemplate::new(503).set_body_string("upstream echo: client_secret=LEAKED-SECRET")
@@ -1956,7 +2284,7 @@ async fn a_5xx_from_the_token_endpoint_is_transient_and_its_message_has_no_body(
     })
     .await;
     let provider = idp
-        .provider()
+        .provider(&clock)
         .await
         .without_dpop()
         .with_revocation_endpoint(format!("{}/revoke", idp.issuer))
@@ -1996,9 +2324,15 @@ async fn a_5xx_from_the_token_endpoint_is_transient_and_its_message_has_no_body(
 #[tokio::test]
 async fn an_unreachable_token_endpoint_is_transient() {
     use axess_factors::oauth::OAuthProvider as _;
+    let clock = common::test_clock();
     // The discovery document names a token endpoint nothing listens on.
     let idp = Idp::start(json!({ "token_endpoint": "http://127.0.0.1:1/token" })).await;
-    let provider = idp.provider().await.without_dpop().build().expect("build");
+    let provider = idp
+        .provider(&clock)
+        .await
+        .without_dpop()
+        .build()
+        .expect("build");
     let err = provider
         .client_credentials(&["scope-a"], None)
         .await
@@ -2012,8 +2346,9 @@ async fn an_unreachable_token_endpoint_is_transient() {
 /// section 11.6.1); the nonce challenge is answered wherever it stands.
 #[tokio::test]
 async fn userinfo_answers_a_nonce_challenge_that_is_not_the_first_in_its_header() {
+    let clock = common::test_clock();
     let idp = Idp::start(json!({})).await;
-    let (authn, claims) = dpop_login(&idp, "DPoP").await;
+    let (authn, claims) = dpop_login(&clock, &idp, "DPoP").await;
     let claims = claims.expect("login");
     let key = claims.dpop_key.clone().expect("key");
     let access = claims.access_token.clone().expect("an access token");
@@ -2034,6 +2369,7 @@ async fn userinfo_answers_a_nonce_challenge_that_is_not_the_first_in_its_header(
     .await;
 
     authn
+        .oauth_global()
         .fetch_userinfo("test", &access, "alice-subject", Some(&key))
         .await
         .expect("the DPoP challenge is answered though a Bearer one comes first");
@@ -2045,27 +2381,30 @@ async fn userinfo_answers_a_nonce_challenge_that_is_not_the_first_in_its_header(
 /// the ceremony as the error response does, instead of leaving it open.
 #[tokio::test]
 async fn a_signed_response_with_no_code_and_no_error_ends_the_ceremony() {
+    let clock = common::test_clock();
     let idp = Idp::start(json!({})).await;
     let provider = idp
-        .fapi_provider()
+        .fapi_provider(&clock)
         .await
         .with_fapi(jarm_provider_config())
         .build()
         .expect("with_fapi");
-    let authn = service(provider);
+    let authn = service(&clock, provider);
     let session = test_session();
-    let (_nonce, csrf) = begin(&authn, &session).await;
+    let (_, csrf) = begin(&authn, &session).await;
     let jwt = idp.sign(
         Algorithm::PS256,
         &json!({
             "iss": idp.issuer,
             "aud": CLIENT_ID,
-            "exp": chrono::Utc::now().timestamp() + 60,
+            "exp": common::start().unix_seconds() + 60,
             "state": csrf,
         }),
     );
 
-    let result = authn.finish_oauth_login_jarm(&jwt, &session).await;
+    let result = authn
+        .finish_oauth_login_jarm(OAuthCallbackRoute::global("test"), &jwt, &session)
+        .await;
     assert!(
         matches!(result, Err(OAuthError::InvalidParameter)),
         "{result:?}"
@@ -2083,20 +2422,27 @@ async fn a_signed_response_with_no_code_and_no_error_ends_the_ceremony() {
 /// the provider is built, not by the IdP on every request.
 #[tokio::test]
 async fn a_signer_for_another_client_is_refused_at_build() {
+    let clock = common::test_clock();
     let idp = Idp::start(json!({})).await;
-    axess_factors::jwt::ensure_crypto_provider();
     let other = ClientAssertionSigner::new(
         "another-client",
         EncodingKey::from_ec_der(&idp.client_der),
         Algorithm::ES256,
     )
     .expect("signer");
-    let built = idp.provider().await.with_private_key_jwt(other).build();
+    let built = idp
+        .provider(&clock)
+        .await
+        .with_private_key_jwt(other)
+        .build();
     assert!(
         matches!(&built, Err(OAuthError::Config(m)) if m.contains("client")),
         "{:?}",
         built.map(|_| ())
     );
     // The signer of the provider's own client builds.
-    idp.fapi_provider().await.build().expect("same client id");
+    idp.fapi_provider(&clock)
+        .await
+        .build()
+        .expect("same client id");
 }

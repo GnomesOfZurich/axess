@@ -10,12 +10,13 @@ use crate::device::store::{
     BindingsUpdate, MemoryDeviceStore, OwnerClaim, SweepCounts, TrustTransition,
 };
 use crate::device::types::DeviceBinding;
-use chrono::TimeZone;
+use axess_clock::Timestamp;
+use axess_clock::testing::Shift;
 use std::pin::Pin;
 use std::sync::Mutex;
 
 /// The operation name and `now` of one store write.
-pub(crate) type WriteTime = (&'static str, DateTime<Utc>);
+pub(crate) type WriteTime = (&'static str, Timestamp);
 
 pub(crate) type Hook = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
 
@@ -50,12 +51,7 @@ impl<S: DeviceStore> AfterLoad<S> {
     }
 
     /// Arm the hook: `revoke` the device the next time it is loaded.
-    pub(crate) fn revoke_after_next_load(
-        &self,
-        tenant: TenantId,
-        id: DeviceId,
-        now: DateTime<Utc>,
-    ) {
+    pub(crate) fn revoke_after_next_load(&self, tenant: TenantId, id: DeviceId, now: Timestamp) {
         let inner = self.inner.clone();
         *self.hook.lock().unwrap() = Some(Box::new(move || {
             Box::pin(async move {
@@ -63,6 +59,24 @@ impl<S: DeviceStore> AfterLoad<S> {
                     .set_trust_level(&tenant, &id, DeviceTrustLevel::Revoked, now)
                     .await
                     .unwrap();
+            })
+        }));
+    }
+
+    /// Arm the hook: `user` claims the device the next time it is loaded,
+    /// i.e. after the caller has read it as having no owner.
+    pub(crate) fn claim_after_next_load(
+        &self,
+        tenant: TenantId,
+        id: DeviceId,
+        user: UserId,
+        now: Timestamp,
+    ) {
+        let inner = self.inner.clone();
+        *self.hook.lock().unwrap() = Some(Box::new(move || {
+            Box::pin(async move {
+                let claim = inner.claim_owner(&tenant, &id, &user, now).await.unwrap();
+                assert!(matches!(claim, OwnerClaim::Claimed), "the rival's claim");
             })
         }));
     }
@@ -94,6 +108,10 @@ impl<S: DeviceStore> AfterLoad<S> {
 
 impl<S: DeviceStore> DeviceStore for AfterLoad<S> {
     type Error = S::Error;
+
+    async fn load_fresh(&self, t: &TenantId, id: &DeviceId) -> Result<Option<Device>, Self::Error> {
+        self.inner.load_fresh(t, id).await
+    }
 
     async fn load(&self, t: &TenantId, id: &DeviceId) -> Result<Option<Device>, Self::Error> {
         let row = self.inner.load(t, id).await?;
@@ -146,7 +164,7 @@ impl<S: DeviceStore> DeviceStore for AfterLoad<S> {
     fn save(
         &self,
         d: &Device,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         self.write_times.lock().unwrap().push(("save", now));
         self.inner.save(d, now)
@@ -154,7 +172,7 @@ impl<S: DeviceStore> DeviceStore for AfterLoad<S> {
     fn create_or_find(
         &self,
         d: &Device,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<Device, Self::Error>> + Send {
         self.write_times
             .lock()
@@ -166,7 +184,7 @@ impl<S: DeviceStore> DeviceStore for AfterLoad<S> {
         &self,
         t: &TenantId,
         id: &DeviceId,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<DeviceTrustLevel, Self::Error>> + Send {
         self.inner.record_sighting(t, id, now)
     }
@@ -175,7 +193,7 @@ impl<S: DeviceStore> DeviceStore for AfterLoad<S> {
         t: &TenantId,
         id: &DeviceId,
         level: DeviceTrustLevel,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         self.inner.set_trust_level(t, id, level, now)
     }
@@ -185,7 +203,7 @@ impl<S: DeviceStore> DeviceStore for AfterLoad<S> {
         id: &DeviceId,
         expected: DeviceTrustLevel,
         level: DeviceTrustLevel,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<TrustTransition, Self::Error>> + Send {
         self.inner.set_trust_level_if(t, id, expected, level, now)
     }
@@ -195,7 +213,7 @@ impl<S: DeviceStore> DeviceStore for AfterLoad<S> {
         id: &DeviceId,
         expected: &[DeviceBinding],
         bindings: &[DeviceBinding],
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<BindingsUpdate, Self::Error>> + Send {
         self.write_times
             .lock()
@@ -208,7 +226,7 @@ impl<S: DeviceStore> DeviceStore for AfterLoad<S> {
         t: &TenantId,
         id: &DeviceId,
         user: &UserId,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<OwnerClaim, Self::Error>> + Send {
         self.write_times.lock().unwrap().push(("claim_owner", now));
         self.inner.claim_owner(t, id, user, now)
@@ -223,14 +241,14 @@ impl<S: DeviceStore> DeviceStore for AfterLoad<S> {
     fn sweep(
         &self,
         t: &TenantId,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<SweepCounts, Self::Error>> + Send {
         self.inner.sweep(t, now)
     }
 }
 
-fn at() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 1, 1, 9, 0, 0).unwrap()
+fn at() -> Timestamp {
+    Timestamp::from_utc(2026, 1, 1, 9, 0, 0).unwrap()
 }
 
 fn tenant() -> TenantId {
@@ -266,12 +284,19 @@ async fn unknown_device<S: DeviceStore>(store: &S) {
 async fn promotion_never_undoes_a_revocation<S: DeviceStore>(store: S) {
     let racing = AfterLoad::new(store);
     unknown_device(&racing).await;
-    let revoked_at = at() + chrono::Duration::minutes(5);
+    let revoked_at = at().plus(axess_clock::SignedDuration::minutes(5));
     racing.revoke_after_next_load(tenant(), device_id(), revoked_at);
 
     let svc = DeviceLifecycleService::new(racing.clone());
     let outcome = svc
-        .promote_on_authn(&tenant(), &device_id(), at() + chrono::Duration::minutes(6))
+        .promote_on_authn(
+            &UserDevice::for_tests(
+                tenant(),
+                crate::authn::ids::testing::user("user-1"),
+                ProvenDevice::for_tests(device_id()),
+            ),
+            at().plus(axess_clock::SignedDuration::minutes(6)),
+        )
         .await
         .unwrap();
 
@@ -299,7 +324,7 @@ async fn memory_promotion_never_undoes_a_revocation() {
     promotion_never_undoes_a_revocation(MemoryDeviceStore::new()).await;
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(any(feature = "sqlite", feature = "sqlite-unbundled"))]
 #[tokio::test]
 async fn sqlite_promotion_never_undoes_a_revocation() {
     promotion_never_undoes_a_revocation(
@@ -330,7 +355,7 @@ async fn webauthn_writes_never_undo_a_revocation<S: DeviceStore>(store: S) {
     );
 
     // Revoked between the load and the write of a second binding.
-    let revoked_at = at() + chrono::Duration::minutes(5);
+    let revoked_at = at().plus(axess_clock::SignedDuration::minutes(5));
     racing.revoke_after_next_load(tenant(), device_id(), revoked_at);
     let added = svc
         .bind_webauthn_credential(
@@ -366,9 +391,14 @@ async fn webauthn_writes_never_undo_a_revocation<S: DeviceStore>(store: S) {
     d2.fingerprint_hash = FingerprintHash::from_bytes([4u8; 32]);
     racing.save(&d2, crate::device::test_now()).await.unwrap();
     racing.revoke_after_next_load(fresh, id2, revoked_at);
-    svc.record_webauthn_usage(&fresh, &id2, "cred-1", at() + chrono::Duration::minutes(9))
-        .await
-        .unwrap();
+    svc.record_webauthn_usage(
+        &fresh,
+        &id2,
+        "cred-1",
+        at().plus(axess_clock::SignedDuration::minutes(9)),
+    )
+    .await
+    .unwrap();
     let row2 = racing.inner.load(&fresh, &id2).await.unwrap().unwrap();
     assert_eq!(row2.trust_level, DeviceTrustLevel::Revoked);
     assert_eq!(row2.revoked_at, Some(revoked_at));
@@ -380,7 +410,10 @@ async fn memory_webauthn_writes_never_undo_a_revocation() {
     webauthn_writes_never_undo_a_revocation(MemoryDeviceStore::new()).await;
 }
 
-#[cfg(all(feature = "fido2", feature = "sqlite"))]
+#[cfg(all(
+    feature = "fido2",
+    any(feature = "sqlite", feature = "sqlite-unbundled")
+))]
 #[tokio::test]
 async fn sqlite_webauthn_writes_never_undo_a_revocation() {
     webauthn_writes_never_undo_a_revocation(
@@ -432,7 +465,10 @@ async fn memory_concurrent_binding_edits_both_survive() {
     concurrent_binding_edits_both_survive(MemoryDeviceStore::new()).await;
 }
 
-#[cfg(all(feature = "fido2", feature = "sqlite"))]
+#[cfg(all(
+    feature = "fido2",
+    any(feature = "sqlite", feature = "sqlite-unbundled")
+))]
 #[tokio::test]
 async fn sqlite_concurrent_binding_edits_both_survive() {
     concurrent_binding_edits_both_survive(
@@ -449,7 +485,7 @@ async fn writes_carry_the_callers_now() {
     let svc = DeviceLifecycleService::new(store.clone());
     let fp = FingerprintHash::from_bytes([9u8; 32]);
     let guest_time = at();
-    let claim_time = at() + chrono::Duration::minutes(7);
+    let claim_time = at().plus(axess_clock::SignedDuration::minutes(7));
     let user = crate::authn::ids::testing::user("user-1");
 
     // A guest request creates the device: one `save` at the guest's time.

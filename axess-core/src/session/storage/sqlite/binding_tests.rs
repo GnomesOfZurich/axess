@@ -3,6 +3,7 @@
 use super::*;
 use crate::session::crypto::{BoundFormat, SessionCrypto};
 use crate::session::data::SessionData;
+use crate::session::id::{SessionId, SessionKey};
 use axess_rng::SystemRng;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use sqlx::sqlite::SqlitePoolOptions;
@@ -30,7 +31,7 @@ fn admin() -> SessionData {
     }
 }
 
-async fn raw(store: &SqliteSessionStore, id: &SessionId) -> Vec<u8> {
+async fn raw(store: &SqliteSessionStore, id: &SessionKey) -> Vec<u8> {
     sqlx::query_scalar("SELECT data_bin FROM sessions WHERE id = ?1")
         .bind(id.to_string())
         .fetch_one(&store.pool)
@@ -41,7 +42,10 @@ async fn raw(store: &SqliteSessionStore, id: &SessionId) -> Vec<u8> {
 #[tokio::test]
 async fn data_copied_into_another_sessions_row_does_not_load() {
     let store = store().await;
-    let (admin_id, attacker_id) = (SessionId::new(&SystemRng), SessionId::new(&SystemRng));
+    let (admin_id, attacker_id) = (
+        SessionKey::of(&SessionId::new(&SystemRng)),
+        SessionKey::of(&SessionId::new(&SystemRng)),
+    );
     let ttl = Duration::from_secs(60);
     store.save(&admin_id, &admin(), ttl).await.unwrap();
     store
@@ -61,10 +65,14 @@ async fn data_copied_into_another_sessions_row_does_not_load() {
     assert!(store.load(&admin_id).await.unwrap().is_some());
 }
 
+/// A legacy blob in the text column of a row is not the row's session: the
+/// load does not read the text column, though this store's crypto reads
+/// legacy blobs with no end date, and the session's next save writes the
+/// current form over it.
 #[tokio::test]
-async fn legacy_row_loads_and_is_resealed_on_save() {
+async fn a_legacy_text_row_is_refused_and_the_next_save_seals_the_current_form() {
     let store = store().await;
-    let id = SessionId::new(&SystemRng);
+    let id = SessionKey::of(&SessionId::new(&SystemRng));
     let legacy = BASE64.encode(
         SessionCrypto::new(KEY)
             .encrypt_unbound(&rmp_serde::to_vec_named(&admin()).unwrap())
@@ -78,22 +86,30 @@ async fn legacy_row_loads_and_is_resealed_on_save() {
         .await
         .unwrap();
 
-    let loaded = store.load(&id).await.unwrap().expect("legacy row loads");
-    assert_eq!(loaded.custom, admin().custom);
+    assert!(matches!(
+        store.load(&id).await,
+        Err(SqlStoreError::Decode(_))
+    ));
 
     store
-        .save(&id, &loaded, Duration::from_secs(60))
+        .save(&id, &admin(), Duration::from_secs(60))
         .await
         .unwrap();
     let after = raw(&store, &id).await;
-    assert!(BoundFormat::SESSION.marks(&after), "save re-encrypts");
+    assert!(
+        BoundFormat::SESSION.marks(&after),
+        "the save seals the current form"
+    );
     assert!(store.load(&id).await.unwrap().is_some());
 }
 
 #[tokio::test]
 async fn cycle_is_idempotent_when_the_new_row_already_exists() {
     let store = store().await;
-    let (old, new) = (SessionId::new(&SystemRng), SessionId::new(&SystemRng));
+    let (old, new) = (
+        SessionKey::of(&SessionId::new(&SystemRng)),
+        SessionKey::of(&SessionId::new(&SystemRng)),
+    );
     let ttl = Duration::from_secs(60);
     store.save(&old, &admin(), ttl).await.unwrap();
     // A retried rotation: the new row is already there.
@@ -115,7 +131,7 @@ async fn cycle_is_idempotent_when_the_new_row_already_exists() {
 #[tokio::test]
 async fn cycle_to_the_same_id_keeps_the_session() {
     let store = store().await;
-    let id = SessionId::new(&SystemRng);
+    let id = SessionKey::of(&SessionId::new(&SystemRng));
     let ttl = Duration::from_secs(60);
     store.save(&id, &admin(), ttl).await.unwrap();
     assert_eq!(
@@ -128,7 +144,10 @@ async fn cycle_to_the_same_id_keeps_the_session() {
 #[tokio::test]
 async fn failed_insert_leaves_the_old_session_in_place() {
     let store = store().await;
-    let (old, new) = (SessionId::new(&SystemRng), SessionId::new(&SystemRng));
+    let (old, new) = (
+        SessionKey::of(&SessionId::new(&SystemRng)),
+        SessionKey::of(&SessionId::new(&SystemRng)),
+    );
     let ttl = Duration::from_secs(60);
     store.save(&old, &admin(), ttl).await.unwrap();
     sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -150,7 +169,7 @@ async fn sqlite_store_never_revives_an_ended_session() {
 }
 
 /// Plant a row sealed without row binding in the binary column.
-async fn plant_unbound(store: &SqliteSessionStore, id: &SessionId, expires_at: i64) -> Vec<u8> {
+async fn plant_unbound(store: &SqliteSessionStore, id: &SessionKey, expires_at: i64) -> Vec<u8> {
     let blob = SessionCrypto::new(KEY)
         .encrypt_unbound(&rmp_serde::to_vec_named(&admin()).unwrap())
         .unwrap();
@@ -164,7 +183,7 @@ async fn plant_unbound(store: &SqliteSessionStore, id: &SessionId, expires_at: i
     blob
 }
 
-async fn expiry(store: &SqliteSessionStore, id: &SessionId) -> i64 {
+async fn expiry(store: &SqliteSessionStore, id: &SessionKey) -> i64 {
     sqlx::query_scalar("SELECT expires_at FROM sessions WHERE id = ?1")
         .bind(id.to_string())
         .fetch_one(&store.pool)
@@ -172,32 +191,35 @@ async fn expiry(store: &SqliteSessionStore, id: &SessionId) -> i64 {
         .unwrap()
 }
 
-/// A load reads a row that carries no row binding under the legacy window,
-/// but leaves it as it is: the blob proves nothing about the row it sits
-/// under, so a re-seal would bind a blob moved between rows to the row it was
-/// found under. The next save writes the bound form.
+/// A row that carries no row binding is refused, though this store's crypto
+/// reads legacy blobs with no end date: such a blob opens under any row, so
+/// reading it as a session would let a row be moved. The refused row is left
+/// as it is, and the session's next save writes the current form.
 #[tokio::test]
-async fn load_reads_an_unbound_row_without_resealing_it() {
+async fn an_unbound_row_is_refused_under_a_policy_that_reads_legacy_blobs() {
     let store = store().await;
-    let id = SessionId::new(&SystemRng);
-    let expires = store.clock.now().timestamp() + 600;
+    let id = SessionKey::of(&SessionId::new(&SystemRng));
+    let expires = store.clock.now().unix_seconds() + 600;
     let unbound = plant_unbound(&store, &id, expires).await;
     assert!(!BoundFormat::SESSION.marks(&unbound));
 
-    let loaded = store.load(&id).await.unwrap().expect("unbound row loads");
-    assert_eq!(loaded.custom, admin().custom);
+    assert!(matches!(
+        store.load(&id).await,
+        Err(SqlStoreError::Crypto(_))
+    ));
     assert_eq!(
         raw(&store, &id).await,
         unbound,
-        "the read leaves the blob as it found it"
+        "the refused blob is left as it was found"
     );
     assert_eq!(expiry(&store, &id).await, expires);
 
     store
-        .save(&id, &loaded, Duration::from_secs(60))
+        .save(&id, &admin(), Duration::from_secs(60))
         .await
         .unwrap();
     assert!(BoundFormat::SESSION.marks(&raw(&store, &id).await));
+    assert!(store.load(&id).await.unwrap().is_some());
 }
 
 /// A bound row that only the previous key opens is re-sealed under the
@@ -205,7 +227,7 @@ async fn load_reads_an_unbound_row_without_resealing_it() {
 #[tokio::test]
 async fn load_reseals_a_row_sealed_under_the_previous_key_and_keeps_its_expiry() {
     let store = store().await;
-    let id = SessionId::new(&SystemRng);
+    let id = SessionKey::of(&SessionId::new(&SystemRng));
     store
         .save(&id, &admin(), Duration::from_secs(600))
         .await
@@ -240,12 +262,14 @@ async fn load_reseals_a_row_sealed_under_the_previous_key_and_keeps_its_expiry()
     );
 }
 
-/// A bound row in the legacy text column is moved to the binary column by
-/// its load.
+/// A row whose binary column is NULL is not read, whatever its text column
+/// holds: base64 of a blob in the current sealed form, bound to the row, is
+/// refused as undecodable and left as it lies, and a conditional write that
+/// meets it is refused the same way.
 #[tokio::test]
-async fn load_moves_a_text_column_row_to_the_binary_column() {
+async fn a_text_column_row_is_not_read() {
     let store = store().await;
-    let id = SessionId::new(&SystemRng);
+    let id = SessionKey::of(&SessionId::new(&SystemRng));
     let text = BASE64.encode(store.codec.encode_bytes(&id, &admin()).unwrap());
     sqlx::query("INSERT INTO sessions (id, data, expires_at) VALUES (?1, ?2, ?3)")
         .bind(id.to_string())
@@ -254,16 +278,23 @@ async fn load_moves_a_text_column_row_to_the_binary_column() {
         .execute(&store.pool)
         .await
         .unwrap();
-
-    assert!(store.load(&id).await.unwrap().is_some());
-    let (bin, text): (Option<Vec<u8>>, String) =
+    assert!(matches!(
+        store.load(&id).await,
+        Err(SqlStoreError::Decode(_))
+    ));
+    assert!(matches!(
+        store
+            .update_if_revision(&id, 0, &admin(), Duration::from_secs(60))
+            .await,
+        Err(SqlStoreError::Decode(_))
+    ));
+    let columns: (Option<Vec<u8>>, String) =
         sqlx::query_as("SELECT data_bin, data FROM sessions WHERE id = ?1")
             .bind(id.to_string())
             .fetch_one(&store.pool)
             .await
             .unwrap();
-    assert!(bin.is_some_and(|b| BoundFormat::SESSION.marks(&b)));
-    assert!(text.is_empty());
+    assert_eq!(columns, (None, text), "left as it lies");
 }
 
 /// The re-seal is conditional on the bytes that were read: a save that
@@ -271,7 +302,7 @@ async fn load_moves_a_text_column_row_to_the_binary_column() {
 #[tokio::test]
 async fn a_reseal_never_overwrites_a_save_that_landed_meanwhile() {
     let store = store().await;
-    let id = SessionId::new(&SystemRng);
+    let id = SessionKey::of(&SessionId::new(&SystemRng));
     let stale = plant_unbound(&store, &id, i64::MAX).await;
     let newer = SessionData {
         custom: serde_json::json!({"role": "newer"}),
@@ -283,13 +314,7 @@ async fn a_reseal_never_overwrites_a_save_that_landed_meanwhile() {
         .unwrap();
 
     store
-        .reseal(
-            &id,
-            &admin(),
-            Some(&stale),
-            "",
-            store.clock.now().timestamp(),
-        )
+        .reseal(&id, &admin(), &stale, store.clock.now().unix_seconds())
         .await;
 
     let loaded = store.load(&id).await.unwrap().unwrap();
@@ -310,7 +335,10 @@ async fn rejecting_legacy_blobs_refuses_an_unbound_row() {
         SessionCrypto::new(KEY).with_legacy_blobs(crate::session::crypto::LegacyBlobs::Reject),
     );
     strict.init_schema().await.unwrap();
-    let (legacy_id, bound_id) = (SessionId::new(&SystemRng), SessionId::new(&SystemRng));
+    let (legacy_id, bound_id) = (
+        SessionKey::of(&SessionId::new(&SystemRng)),
+        SessionKey::of(&SessionId::new(&SystemRng)),
+    );
     plant_unbound(&strict, &legacy_id, i64::MAX).await;
     strict
         .save(&bound_id, &admin(), Duration::from_secs(60))

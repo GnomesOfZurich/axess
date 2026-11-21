@@ -1,4 +1,4 @@
-//! Regression: a backend whose `rotate_token` fails atomically
+//! A backend whose `rotate_token` fails atomically
 //! (revokes nothing, inserts nothing) leaves the parent token usable so
 //! the user is not silently logged out of every device.
 
@@ -167,12 +167,7 @@ impl RefreshTokenStore for AtomicRotateStore {
             .map_err(std::io::Error::other)
     }
 
-    async fn on_token_compromise(
-        &self,
-        _user_id: &UserId,
-        _family_id: &TokenFamilyId,
-        _compromised_devices: &[(TenantId, DeviceId)],
-    ) {
+    async fn on_token_compromise(&self, _: &UserId, _: &TokenFamilyId, _: &[(TenantId, DeviceId)]) {
         self.compromise_calls.fetch_add(1, Ordering::SeqCst);
     }
 
@@ -215,6 +210,7 @@ async fn atomic_rotate_failure_keeps_parent_usable() {
     store.arm_rotate_failure();
 
     let result = Refresh::any_tenant(&parent_plaintext, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, ts)
         .await;
     assert!(matches!(result, Err(RefreshError::Store(_))));
@@ -224,6 +220,7 @@ async fn atomic_rotate_failure_keeps_parent_usable() {
     // user can still authenticate from the same token.
     store.fail_rotate.store(false, Ordering::SeqCst);
     let (session, new_token) = Refresh::any_tenant(&parent_plaintext, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, ts)
         .await
         .expect("post-failure retry must succeed: silent-logout regression");
@@ -259,6 +256,7 @@ async fn rotate_token_on_memory_store_revokes_parent_and_stores_child() {
     .unwrap();
 
     let (_, new_token) = Refresh::any_tenant(&parent_plaintext, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, ts)
         .await
         .unwrap();
@@ -317,7 +315,7 @@ async fn second_refresh_with_one_token_is_refused_as_reuse() {
     let config = test_config();
     let rng = MockRng::new(458);
     let ts = now();
-    let (plaintext, _parent) = issue_refresh_token(
+    let (plaintext, _) = issue_refresh_token(
         IssueRequest {
             user_id: &fixture_user(),
             tenant_id: &fixture_tenant(),
@@ -334,11 +332,13 @@ async fn second_refresh_with_one_token_is_refused_as_reuse() {
     .unwrap();
     assert!(
         Refresh::any_tenant(&plaintext, |_| async { true })
+            .without_device_check()
             .run(&store, &config, &rng, ts)
             .await
             .is_ok()
     );
     let second = Refresh::any_tenant(&plaintext, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &rng, ts)
         .await;
     assert!(
@@ -366,7 +366,7 @@ async fn failed_family_revoke_on_reuse_still_runs_the_hook_and_answers_revoked()
         let config = test_config();
         let rng = MockRng::new(459);
         let ts = now();
-        let (plaintext, _parent) = issue_refresh_token(
+        let (plaintext, _) = issue_refresh_token(
             IssueRequest {
                 user_id: &fixture_user(),
                 tenant_id: &fixture_tenant(),
@@ -383,6 +383,7 @@ async fn failed_family_revoke_on_reuse_still_runs_the_hook_and_answers_revoked()
         .unwrap();
         if !lost_race {
             Refresh::any_tenant(&plaintext, |_| async { true })
+                .without_device_check()
                 .run(&store, &config, &rng, ts)
                 .await
                 .unwrap();
@@ -392,6 +393,7 @@ async fn failed_family_revoke_on_reuse_still_runs_the_hook_and_answers_revoked()
 
         store.fail_revoke_family.store(true, Ordering::SeqCst);
         let reuse = Refresh::any_tenant(&plaintext, |_| async { true })
+            .without_device_check()
             .run(&store, &config, &rng, ts)
             .await;
         assert!(
@@ -446,6 +448,7 @@ async fn a_lost_rotation_without_a_revoked_re_read_is_not_a_compromise() {
 
         store.lose_race(how);
         let result = Refresh::any_tenant(&plaintext, |_| async { true })
+            .without_device_check()
             .run(&store, &config, &rng, ts)
             .await;
         let verdict = match &result {

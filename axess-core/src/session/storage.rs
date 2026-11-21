@@ -6,16 +6,22 @@ pub mod in_memory_backend;
 
 #[cfg(any(
     feature = "sqlite",
+    feature = "sqlite-unbundled",
     feature = "postgres",
     feature = "mysql",
     feature = "valkey"
 ))]
 pub mod session_codec;
 
-#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
+#[cfg(any(
+    feature = "sqlite",
+    feature = "sqlite-unbundled",
+    feature = "postgres",
+    feature = "mysql"
+))]
 pub(crate) mod sql_helpers;
 
-#[cfg(feature = "sqlite")]
+#[cfg(any(feature = "sqlite", feature = "sqlite-unbundled"))]
 pub mod sqlite;
 
 #[cfg(feature = "postgres")]

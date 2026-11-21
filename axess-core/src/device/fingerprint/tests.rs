@@ -1,5 +1,5 @@
-//! `tests`: extracted from `fingerprint.rs` per the
-//! 200-LoC inline-test rule in AGENTS.md.
+//! `tests`: the unit tests of `fingerprint.rs`, kept beside it per the
+//! 200-line inline-test rule in AGENTS.md.
 
 use super::*;
 use axum::http::HeaderValue;
@@ -146,14 +146,12 @@ fn accept_language_takes_top_priority_only() {
     );
 }
 
-/// mutant kill: pins `accept_language_top` against
-/// constant-replacement mutants (`-> None`, `Some("")`,
-/// `Some("xyzzy")`). Each constant-replacement mutant collapses
-/// every request to a single AL contribution, so requests with
-/// *different* AL headers would all hash identically. That's the
-/// observable difference the previous tests didn't exercise. We
-/// pin (a) presence-of-AL changes the hash vs absence-of-AL, and
-/// (b) two distinct AL values produce two distinct hashes.
+/// Pins that the `Accept-Language` value feeds the hash. An
+/// `accept_language_top` that answered a constant (`None`, `Some("")`,
+/// any fixed string) would give every request the same AL
+/// contribution, so requests with *different* AL headers would hash
+/// identically. So (a) a present AL changes the hash against an absent
+/// one, and (b) two distinct AL values produce two distinct hashes.
 #[test]
 fn accept_language_value_actually_feeds_the_hash() {
     let ext = extractor();
@@ -177,11 +175,9 @@ fn accept_language_value_actually_feeds_the_hash() {
     );
 }
 
-/// mutant kill: `extract_from_request` is the
-/// `Request<B>`-flavoured convenience wrapper; previous tests went
-/// through `extract(&Parts, …)` directly so the helper body never
-/// ran. Pin its happy path: round-trips a UA-bearing request and
-/// matches what `extract` produces from the same headers.
+/// `extract_from_request` is the `Request<B>`-flavoured convenience
+/// wrapper over `extract(&Parts, …)`. Its happy path: a UA-bearing
+/// request gives what `extract` produces from the same headers.
 #[test]
 fn extract_from_request_matches_extract_on_equivalent_inputs() {
     let ext = extractor();
@@ -227,4 +223,61 @@ fn ipv4_mapped_addresses_are_told_apart_and_match_plain_ipv4() {
         truncate_ip(mapped(198, 51, 100, 7)),
         "different /24 ranges differ"
     );
+}
+
+/// Every IPv6 form that carries an IPv4 client (a translator, a NAT64
+/// gateway, a 6to4 site, a Teredo server) fingerprints like that client's
+/// /24 over IPv4, so the clients of one gateway are told apart; truncated as
+/// plain IPv6 they kept only the gateway's own bytes and shared one input.
+/// An address under the locally used NAT64 prefix keeps its /120.
+#[test]
+fn an_ipv6_form_that_carries_an_ipv4_client_fingerprints_as_that_client() {
+    use axess_testing::ipv6_forms::embedding_v4;
+    use std::net::IpAddr;
+
+    let (one, two) = (
+        Ipv4Addr::new(203, 0, 113, 7),
+        Ipv4Addr::new(198, 51, 100, 9),
+    );
+    let neighbour = Ipv4Addr::new(203, 0, 113, 99);
+    for (form_one, form_two) in embedding_v4(one).into_iter().zip(embedding_v4(two)) {
+        let (a, b) = (IpAddr::V6(form_one.addr), IpAddr::V6(form_two.addr));
+        assert_ne!(
+            truncate_ip(a),
+            truncate_ip(b),
+            "{}: two clients share one fingerprint input",
+            form_one.name
+        );
+        if form_one.name == "local-use nat64" {
+            let mut expected = form_one.addr.octets();
+            expected[15] = 0;
+            assert_eq!(truncate_ip(a), expected.to_vec(), "{}", form_one.name);
+            continue;
+        }
+        assert_eq!(
+            truncate_ip(a),
+            truncate_ip(IpAddr::V4(neighbour)),
+            "{}: not the /24 of the client it carries",
+            form_one.name
+        );
+    }
+}
+
+/// A plain IPv6 address, and one a bit outside a prefix that carries a
+/// client, keeps its /48.
+#[test]
+fn a_plain_ipv6_address_fingerprints_on_its_slash_48() {
+    for (address, kept) in [
+        ("2001:db8:1:2::1", "2001:db8:1::"),
+        ("64:ff9b:0:1::1", "64:ff9b::"),
+        ("2001:1::1", "2001:1::"),
+        ("2003::1", "2003::"),
+    ] {
+        let kept: Ipv6Addr = kept.parse().expect("an IPv6 prefix");
+        assert_eq!(
+            truncate_ip(address.parse().expect("an IPv6 address")),
+            kept.octets().to_vec(),
+            "{address}"
+        );
+    }
 }

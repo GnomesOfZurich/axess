@@ -2,7 +2,8 @@
 //! decisions) plus `#[ignore]` integration tests that need a live server:
 //! `VALKEY_URL=redis://127.0.0.1:6399 cargo test -p axess-core --features valkey -- --ignored valkey_device`.
 
-use chrono::{DateTime, Duration, TimeZone, Utc};
+use axess_clock::testing::Shift;
+use axess_clock::{SignedDuration, Timestamp};
 use fred::bytes::Bytes;
 
 use super::policy::{SweepStep, plan_sweep, ttl_seconds};
@@ -13,12 +14,13 @@ use super::scripts::{
     remove_args, row_keys, write_row_args,
 };
 use super::*;
+use crate::testing::valkey_sweep::Swept;
 
-fn t0() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()
+fn t0() -> Timestamp {
+    Timestamp::from_utc(2026, 1, 1, 0, 0, 0).unwrap()
 }
 
-fn device(level: DeviceTrustLevel, last_seen: DateTime<Utc>) -> Device {
+fn device(level: DeviceTrustLevel, last_seen: Timestamp) -> Device {
     Device {
         id: axess_identity::testing::device("dev-1"),
         tenant_id: axess_identity::testing::tenant("tenant-1"),
@@ -39,7 +41,7 @@ const DAY: i64 = 86_400;
 fn ttl_covers_the_whole_ladder_per_level() {
     let cfg = SweepConfig::default(); // 90 / 30 / 7
     let now = t0();
-    let idle = |days: i64| now - Duration::days(days);
+    let idle = |days: i64| now.minus(SignedDuration::days(i32::try_from(days).unwrap()));
     // (level, last_seen, expected ttl seconds)
     let mut revoked = device(DeviceTrustLevel::Revoked, idle(1));
     revoked.revoked_at = Some(idle(2));
@@ -72,7 +74,7 @@ fn ttl_covers_the_whole_ladder_per_level() {
 /// then simply has no expiry, and the save that computes it does not panic.
 #[test]
 fn a_window_too_long_to_add_means_no_expiry() {
-    let huge = Duration::seconds(i64::MAX / 1000);
+    let huge = std::time::Duration::from_secs(i64::MAX.unsigned_abs() / 1000);
     let cfg = SweepConfig::builder()
         .trusted_idle(huge)
         .seen_idle(huge)
@@ -90,7 +92,7 @@ fn a_window_too_long_to_add_means_no_expiry() {
     }
     // A long but representable window still yields a TTL.
     let long = SweepConfig::builder()
-        .trusted_idle(Duration::days(365 * 50))
+        .trusted_idle(std::time::Duration::from_hours(365 * 50 * 24))
         .build()
         .unwrap();
     assert!(ttl_seconds(&long, &device(DeviceTrustLevel::Trusted, t0()), t0()).is_some());
@@ -103,7 +105,8 @@ fn trusted_ttl_outlives_the_demotion_and_its_seen_window() {
     let ttl = ttl_seconds(&cfg, &d, t0()).unwrap();
     // A Trusted key must not expire at 90 days, before the sweep can demote
     // it, nor before the Seen window that follows the demotion.
-    assert!(ttl > (cfg.trusted_idle + cfg.seen_idle).num_seconds());
+    let two_windows = cfg.trusted_idle.checked_add(cfg.seen_idle).unwrap();
+    assert!(ttl > i64::try_from(two_windows.as_secs()).unwrap());
 }
 
 /// The shared ladder, through the Valkey planner and the stamp the sweep
@@ -136,7 +139,7 @@ fn sweep_plan_follows_the_ladder_table() {
 fn sweep_plan_table() {
     let cfg = SweepConfig::default();
     let now = t0();
-    let ago = |days: i64| now - Duration::days(days);
+    let ago = |days: i64| now.minus(SignedDuration::days(i32::try_from(days).unwrap()));
     let demote = |level, t2s, s2r| SweepStep::Demote {
         level,
         trusted_to_seen: t2s,
@@ -175,7 +178,10 @@ fn sweep_plan_table() {
 fn sweep_never_plans_a_revoked_row_to_a_less_revoked_level() {
     let cfg = SweepConfig::default();
     for days in [0, 5, 31, 121, 1000] {
-        let d = device(DeviceTrustLevel::Revoked, t0() - Duration::days(days));
+        let d = device(
+            DeviceTrustLevel::Revoked,
+            t0().minus(SignedDuration::days(days)),
+        );
         let step = plan_sweep(&d, &cfg, t0());
         assert!(
             matches!(step, SweepStep::Keep | SweepStep::Purge),
@@ -403,7 +409,7 @@ fn legacy_rows_are_accepted_only_until_the_cutoff() {
     let (tenant, id) = (a.tenant_id.to_string(), a.id.to_string());
     let clock = std::sync::Arc::new(MockClock::at(t0()));
     let crypto = SessionCrypto::new(crate::testing::test_key(7))
-        .with_legacy_blobs(LegacyBlobs::AcceptUntil(t0() + Duration::days(1)))
+        .with_legacy_blobs(LegacyBlobs::AcceptUntil(t0().plus(SignedDuration::days(1))))
         .with_clock(clock.clone());
     let legacy = crypto
         .encrypt_unbound(&rmp_serde::to_vec_named(&a).unwrap())
@@ -412,7 +418,7 @@ fn legacy_rows_are_accepted_only_until_the_cutoff() {
         ValkeyDeviceStore::with_crypto(Client::new(Config::default(), None, None, None), crypto);
 
     assert!(s.decode_row_checked(&tenant, &id, &legacy).is_ok());
-    clock.set(t0() + Duration::days(1));
+    clock.set(t0().plus(SignedDuration::days(1)));
     assert!(s.decode_row_checked(&tenant, &id, &legacy).is_err());
 }
 
@@ -445,9 +451,9 @@ fn a_row_without_demoted_at_reads_as_never_trusted() {
         user_id: Option<crate::authn::ids::UserId>,
         trust_level: DeviceTrustLevel,
         fingerprint_hash: FingerprintHash,
-        first_seen_at: DateTime<Utc>,
-        last_seen_at: DateTime<Utc>,
-        revoked_at: Option<DateTime<Utc>>,
+        first_seen_at: Timestamp,
+        last_seen_at: Timestamp,
+        revoked_at: Option<Timestamp>,
         bindings: Vec<DeviceBinding>,
     }
     let d = device(DeviceTrustLevel::Seen, t0());
@@ -499,15 +505,33 @@ fn the_absent_row_cleanup_checks_the_row_before_deleting() {
 }
 
 // ── live-server tests (ignored by default) ──────────────────────────────
+//
+// Every live test writes under a prefix of its own and removes what it
+// wrote when it ends, also when it fails: its store is held with the sweep
+// of that prefix.
 
-async fn live_store(prefix: &str) -> ValkeyDeviceStore {
-    let url = std::env::var("VALKEY_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+/// A connected client on the live node.
+async fn live_client() -> Client {
+    let url = crate::testing::valkey_sweep::node_url();
     let client = Client::new(Config::from_url(&url).expect("url"), None, None, None);
     client.init().await.expect("connect");
-    ValkeyDeviceStore::plaintext_insecure(client).with_prefix(prefix.to_string())
+    client
 }
 
-fn named(id: &str, fp: u8, level: DeviceTrustLevel, last_seen: DateTime<Utc>) -> Device {
+/// A plaintext store on the live node under `prefix`.
+async fn live_store_under(prefix: String) -> ValkeyDeviceStore {
+    ValkeyDeviceStore::plaintext_insecure(live_client().await).with_prefix(prefix)
+}
+
+/// A plaintext store on the live node under a fresh prefix named by `tag`,
+/// held with the sweep that removes its keys.
+async fn live_store(tag: &str) -> Swept<ValkeyDeviceStore> {
+    let sweep = crate::testing::valkey_sweep::on_node(tag);
+    let store = live_store_under(sweep.prefix().to_owned()).await;
+    sweep.hold(store)
+}
+
+fn named(id: &str, fp: u8, level: DeviceTrustLevel, last_seen: Timestamp) -> Device {
     let mut d = device(level, last_seen);
     d.id = axess_identity::testing::device(id);
     d.fingerprint_hash = FingerprintHash::from_bytes([fp; 32]);
@@ -517,14 +541,18 @@ fn named(id: &str, fp: u8, level: DeviceTrustLevel, last_seen: DateTime<Utc>) ->
 #[tokio::test]
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn valkey_device_missing_row_is_not_found() {
-    let s = live_store("axt_missing").await;
+    let s = live_store("missing").await;
     let (t, i) = (
         axess_identity::testing::tenant("tenant-1"),
         axess_identity::testing::device("nope"),
     );
     assert!(matches!(
-        s.record_sighting(&t, &i, crate::device::store::whole_second(Utc::now()))
-            .await,
+        s.record_sighting(
+            &t,
+            &i,
+            crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time())
+        )
+        .await,
         Err(ValkeyDeviceStoreError::NotFound { .. })
     ));
     assert!(matches!(
@@ -532,7 +560,7 @@ async fn valkey_device_missing_row_is_not_found() {
             &t,
             &i,
             DeviceTrustLevel::Seen,
-            crate::device::store::whole_second(Utc::now())
+            crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time())
         )
         .await,
         Err(ValkeyDeviceStoreError::NotFound { .. })
@@ -542,12 +570,15 @@ async fn valkey_device_missing_row_is_not_found() {
 #[tokio::test]
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn valkey_device_stale_swap_conflicts_and_revocation_survives() {
-    let s = live_store("axt_cas").await;
-    let now = crate::device::store::whole_second(Utc::now());
+    let s = live_store("cas").await;
+    let now = crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time());
     let d = named("dev-1", 0xaa, DeviceTrustLevel::Seen, now);
-    s.save(&d, crate::device::store::whole_second(Utc::now()))
-        .await
-        .unwrap();
+    s.save(
+        &d,
+        crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time()),
+    )
+    .await
+    .unwrap();
     let (tenant, id) = (d.tenant_id.to_string(), d.id.to_string());
     let row_key = device_key(&s.prefix, &tenant, &id);
     // A writer read the row ...
@@ -558,13 +589,13 @@ async fn valkey_device_stale_swap_conflicts_and_revocation_survives() {
         .unwrap();
     // The stale swap must be refused rather than resurrect the row.
     let mut resurrected = d.clone();
-    resurrected.last_seen_at = now + Duration::seconds(5);
+    resurrected.last_seen_at = now.plus(SignedDuration::seconds(5));
     let args = write_row_args(
         Some(&stale),
         &s.encode_row(&resurrected).unwrap(),
         Some(600),
         &id,
-        resurrected.last_seen_at.timestamp(),
+        resurrected.last_seen_at.unix_seconds(),
         &[],
     );
     let hex = fingerprint_hex(&d.fingerprint_hash);
@@ -577,7 +608,7 @@ async fn valkey_device_stale_swap_conflicts_and_revocation_survives() {
         .unwrap();
     assert_eq!(status, ScriptStatus::Conflict);
     // A sighting after revocation changes nothing.
-    s.record_sighting(&d.tenant_id, &d.id, now + Duration::seconds(9))
+    s.record_sighting(&d.tenant_id, &d.id, now.plus(SignedDuration::seconds(9)))
         .await
         .unwrap();
     let got = s.load(&d.tenant_id, &d.id).await.unwrap().unwrap();
@@ -589,16 +620,22 @@ async fn valkey_device_stale_swap_conflicts_and_revocation_survives() {
 #[tokio::test]
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn valkey_device_delete_keeps_a_shared_fingerprint_lookup() {
-    let s = live_store("axt_fp").await;
-    let now = crate::device::store::whole_second(Utc::now());
+    let s = live_store("fp").await;
+    let now = crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time());
     let a = named("dev-a", 0xbb, DeviceTrustLevel::Seen, now);
     let b = named("dev-b", 0xbb, DeviceTrustLevel::Seen, now);
-    s.save(&a, crate::device::store::whole_second(Utc::now()))
-        .await
-        .unwrap();
-    s.save(&b, crate::device::store::whole_second(Utc::now()))
-        .await
-        .unwrap(); // b saved last: the index points at b
+    s.save(
+        &a,
+        crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time()),
+    )
+    .await
+    .unwrap();
+    s.save(
+        &b,
+        crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time()),
+    )
+    .await
+    .unwrap(); // b saved last: the index points at b
     s.delete(&a.tenant_id, &a.id).await.unwrap();
     let found = s
         .find_by_fingerprint(&b.tenant_id, &b.fingerprint_hash)
@@ -616,17 +653,23 @@ async fn valkey_device_delete_keeps_a_shared_fingerprint_lookup() {
 #[tokio::test]
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn valkey_device_ttls_follow_the_ladder_and_sweep_uses_120_days() {
-    let s = live_store("axt_ttl").await;
-    let now = crate::device::store::whole_second(Utc::now());
+    let s = live_store("ttl").await;
+    let now = crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time());
     let tenant = axess_identity::testing::tenant("tenant-1");
     let trusted = named("dev-t", 1, DeviceTrustLevel::Trusted, now);
     let unknown = named("dev-u", 2, DeviceTrustLevel::Unknown, now);
-    s.save(&trusted, crate::device::store::whole_second(Utc::now()))
-        .await
-        .unwrap();
-    s.save(&unknown, crate::device::store::whole_second(Utc::now()))
-        .await
-        .unwrap();
+    s.save(
+        &trusted,
+        crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time()),
+    )
+    .await
+    .unwrap();
+    s.save(
+        &unknown,
+        crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time()),
+    )
+    .await
+    .unwrap();
     let ttl = |d: &Device| device_key(&s.prefix, &d.tenant_id.to_string(), &d.id.to_string());
     let t: i64 = s.client.ttl(ttl(&trusted)).await.unwrap();
     let u: i64 = s.client.ttl(ttl(&unknown)).await.unwrap();
@@ -637,11 +680,14 @@ async fn valkey_device_ttls_follow_the_ladder_and_sweep_uses_120_days() {
         "dev-o",
         3,
         DeviceTrustLevel::Trusted,
-        now - Duration::days(100),
+        now.minus(SignedDuration::days(100)),
     );
-    s.save(&old, crate::device::store::whole_second(Utc::now()))
-        .await
-        .unwrap();
+    s.save(
+        &old,
+        crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time()),
+    )
+    .await
+    .unwrap();
     let counts = s.sweep(&tenant, now).await.unwrap();
     assert_eq!((counts.trusted_to_seen, counts.seen_to_revoked), (1, 0));
     let got = s.load(&tenant, &old.id).await.unwrap().unwrap();
@@ -655,12 +701,15 @@ async fn valkey_device_ttls_follow_the_ladder_and_sweep_uses_120_days() {
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn valkey_device_conditional_writes_refuse_a_revoked_row() {
     use crate::device::store::{BindingsUpdate, TrustTransition};
-    let s = live_store("axt_cond").await;
-    let now = crate::device::store::whole_second(Utc::now());
+    let s = live_store("cond").await;
+    let now = crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time());
     let d = named("dev-1", 0xc1, DeviceTrustLevel::Seen, now);
-    s.save(&d, crate::device::store::whole_second(Utc::now()))
-        .await
-        .unwrap();
+    s.save(
+        &d,
+        crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time()),
+    )
+    .await
+    .unwrap();
     s.set_trust_level(&d.tenant_id, &d.id, DeviceTrustLevel::Revoked, now)
         .await
         .unwrap();
@@ -692,7 +741,7 @@ async fn valkey_device_conditional_writes_refuse_a_revoked_row() {
             &d.id,
             &[],
             &[binding],
-            crate::device::store::whole_second(Utc::now())
+            crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time())
         )
         .await
         .unwrap(),
@@ -723,13 +772,17 @@ async fn valkey_device_conditional_writes_refuse_a_revoked_row() {
 #[tokio::test]
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn valkey_device_a_racing_promotion_never_undoes_a_revocation() {
-    let s = live_store("axt_race").await;
+    let s = live_store("race").await;
     for round in 0..25u8 {
-        let now = crate::device::store::whole_second(Utc::now());
+        let now =
+            crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time());
         let d = named("dev-1", 0xc2 ^ round, DeviceTrustLevel::Seen, now);
-        s.save(&d, crate::device::store::whole_second(Utc::now()))
-            .await
-            .unwrap();
+        s.save(
+            &d,
+            crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time()),
+        )
+        .await
+        .unwrap();
         let (a, b) = tokio::join!(
             s.set_trust_level_if(
                 &d.tenant_id,
@@ -740,7 +793,18 @@ async fn valkey_device_a_racing_promotion_never_undoes_a_revocation() {
             ),
             s.set_trust_level(&d.tenant_id, &d.id, DeviceTrustLevel::Revoked, now),
         );
-        let _promotion = a.unwrap();
+        // The promotion either landed before the revocation or found it.
+        let promotion = a.unwrap();
+        assert!(
+            matches!(
+                promotion,
+                crate::device::store::TrustTransition::Applied
+                    | crate::device::store::TrustTransition::Refused {
+                        current: DeviceTrustLevel::Revoked
+                    }
+            ),
+            "round {round}: {promotion:?}"
+        );
         b.unwrap();
         let row = s.load(&d.tenant_id, &d.id).await.unwrap().unwrap();
         assert_eq!(row.trust_level, DeviceTrustLevel::Revoked, "round {round}");
@@ -752,8 +816,8 @@ async fn valkey_device_a_racing_promotion_never_undoes_a_revocation() {
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn valkey_device_replace_bindings_moves_the_family_index() {
     use crate::device::store::BindingsUpdate;
-    let s = live_store("axt_fam").await;
-    let now = crate::device::store::whole_second(Utc::now());
+    let s = live_store("fam").await;
+    let now = crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time());
     let refresh = |f: &str| DeviceBinding::Refresh {
         family_id: f.into(),
         issued_at: now,
@@ -761,16 +825,19 @@ async fn valkey_device_replace_bindings_moves_the_family_index() {
     };
     let mut d = named("dev-1", 0xc3, DeviceTrustLevel::Seen, now);
     d.bindings = vec![refresh("fam-a")];
-    s.save(&d, crate::device::store::whole_second(Utc::now()))
-        .await
-        .unwrap();
+    s.save(
+        &d,
+        crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time()),
+    )
+    .await
+    .unwrap();
     let written = s
         .replace_bindings(
             &d.tenant_id,
             &d.id,
             &[refresh("fam-a")],
             &[refresh("fam-b")],
-            crate::device::store::whole_second(Utc::now()),
+            crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time()),
         )
         .await
         .unwrap();
@@ -789,15 +856,18 @@ async fn valkey_device_replace_bindings_moves_the_family_index() {
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn valkey_device_sweep_follows_the_ladder_table() {
     use crate::device::store::ladder::LADDER;
-    let s = live_store("axt_ladder").await;
-    let now = crate::device::store::whole_second(Utc::now());
+    let s = live_store("ladder").await;
+    let now = crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time());
     let tenant = axess_identity::testing::tenant("tenant-1");
     for (i, r) in LADDER.iter().enumerate() {
         let mut d = named(&format!("row-{i}"), i as u8, r.level, r.last_seen(now));
         d.demoted_at = r.demoted_at(now);
-        s.save(&d, crate::device::store::whole_second(Utc::now()))
-            .await
-            .unwrap();
+        s.save(
+            &d,
+            crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time()),
+        )
+        .await
+        .unwrap();
     }
     s.sweep(&tenant, now).await.unwrap();
     for (i, r) in LADDER.iter().enumerate() {
@@ -813,14 +883,17 @@ async fn valkey_device_sweep_follows_the_ladder_table() {
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn valkey_device_racing_claims_have_one_winner() {
     use crate::device::store::OwnerClaim;
-    let s = live_store("axt_claim").await;
-    let now = crate::device::store::whole_second(Utc::now());
+    let s = live_store("claim").await;
+    let now = crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time());
     for round in 0..15u8 {
         let mut d = named("dev-1", 0xd0 ^ round, DeviceTrustLevel::Unknown, now);
         d.user_id = None;
-        s.save(&d, crate::device::store::whole_second(Utc::now()))
-            .await
-            .unwrap();
+        s.save(
+            &d,
+            crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time()),
+        )
+        .await
+        .unwrap();
         let (a, b) = (
             axess_identity::testing::user("a"),
             axess_identity::testing::user("b"),
@@ -830,13 +903,17 @@ async fn valkey_device_racing_claims_have_one_winner() {
                 &d.tenant_id,
                 &d.id,
                 &a,
-                crate::device::store::whole_second(Utc::now())
+                crate::device::store::whole_second(
+                    axess_clock::testing::MockClock::reference_time()
+                )
             ),
             s.claim_owner(
                 &d.tenant_id,
                 &d.id,
                 &b,
-                crate::device::store::whole_second(Utc::now())
+                crate::device::store::whole_second(
+                    axess_clock::testing::MockClock::reference_time()
+                )
             )
         );
         let (ra, rb) = (ra.unwrap(), rb.unwrap());
@@ -858,24 +935,27 @@ async fn valkey_device_racing_claims_have_one_winner() {
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn valkey_device_a_stale_bindings_write_conflicts() {
     use crate::device::store::BindingsUpdate;
-    let s = live_store("axt_bindcas").await;
-    let now = crate::device::store::whole_second(Utc::now());
+    let s = live_store("bindcas").await;
+    let now = crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time());
     let refresh = |f: &str| DeviceBinding::Refresh {
         family_id: f.into(),
         issued_at: now,
         last_used_at: now,
     };
     let d = named("dev-1", 0xd1, DeviceTrustLevel::Seen, now);
-    s.save(&d, crate::device::store::whole_second(Utc::now()))
-        .await
-        .unwrap();
+    s.save(
+        &d,
+        crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time()),
+    )
+    .await
+    .unwrap();
     let first = s
         .replace_bindings(
             &d.tenant_id,
             &d.id,
             &[],
             &[refresh("fam-1")],
-            crate::device::store::whole_second(Utc::now()),
+            crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time()),
         )
         .await
         .unwrap();
@@ -886,7 +966,7 @@ async fn valkey_device_a_stale_bindings_write_conflicts() {
             &d.id,
             &[],
             &[refresh("fam-2")],
-            crate::device::store::whole_second(Utc::now()),
+            crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time()),
         )
         .await
         .unwrap();
@@ -951,6 +1031,7 @@ mod consistency;
 mod owner_index;
 mod reseal;
 mod twins;
+mod valkey_cluster;
 
 /// A row moving between families, owners and fingerprints plans exactly the
 /// index changes that follow, and a removal plans only removals.
@@ -1043,8 +1124,8 @@ fn a_revoked_row_without_a_time_is_planned_for_stamping() {
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn valkey_device_concurrent_creators_end_on_one_device() {
     const CREATORS: u8 = 6;
-    let s = live_store("axt_create").await;
-    let now = crate::device::store::whole_second(Utc::now());
+    let s = live_store("create").await;
+    let now = crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time());
     for owned in [true, false] {
         for round in 0..20u8 {
             let fp = round ^ if owned { 0x40 } else { 0x80 };

@@ -14,7 +14,6 @@ use crate::authn::{
     store::{FactorStore, IdentityStore},
 };
 use crate::session::extractor::AuthSession;
-use crate::session::store::SessionLiveness;
 use crate::session::store::SessionRegistryHandle;
 use crate::session::store::note_revocation;
 use subtle::ConstantTimeEq;
@@ -32,6 +31,8 @@ mod concurrency;
 mod sid_map_upkeep;
 #[cfg(test)]
 mod subject_registry;
+#[cfg(test)]
+mod unrecorded;
 
 /// Enforce the tenant rail when the ceremony is bound to a tenant.
 ///
@@ -52,7 +53,7 @@ fn enforce_oauth_ceremony_tenant<E: std::error::Error + Send + Sync + 'static>(
         Err(super::state::UnreadableBinding) => {
             tracing::warn!(
                 user_id = %user.id,
-                provider = %claims.provider,
+                provider = %super::super::logged_provider_name(&claims.provider),
                 "OAuth completion refused; the ceremony's tenant binding does not read"
             );
             return Err(AuthnError::CrossTenant);
@@ -63,7 +64,7 @@ fn enforce_oauth_ceremony_tenant<E: std::error::Error + Send + Sync + 'static>(
             user_id = %user.id,
             user_tenant = %user.tenant_id,
             expected_tenant = %expected,
-            provider = %claims.provider,
+            provider = %super::super::logged_provider_name(&claims.provider),
             "OAuth completion refused; resolved user is in a different tenant than the ceremony is bound to"
         );
         return Err(AuthnError::CrossTenant);
@@ -105,7 +106,7 @@ where
             _ => {
                 tracing::warn!(
                     user_id = %user.id,
-                    provider = %claims.provider,
+                    provider = %super::super::logged_provider_name(&claims.provider),
                     "complete_oauth_login claim_lock missing or mismatched; \
                      refusing (caller likely bypassed finish_oauth_login)"
                 );
@@ -134,7 +135,7 @@ where
         user: &crate::authn::types::User,
         claims: &axess_factors::oauth::OAuthClaims,
         session: &AuthSession,
-        sid: &crate::session::id::SessionId,
+        sid: &crate::session::id::SessionKey,
     ) -> Result<(), AuthnError<I::Error>> {
         let Some(reg) = &self.inner.registry else {
             // No registry: nothing was registered, so nothing to revoke, but the
@@ -148,12 +149,14 @@ where
             tracing::error!(
                 user_id = %user.id,
                 tenant_id = %user.tenant_id,
-                provider = %claims.provider,
+                provider = %super::super::logged_provider_name(&claims.provider),
                 "complete_oauth_login register failed; clearing session and refusing"
             );
             session.clear().await;
             return Err(AuthnError::NoFlow);
         }
+        self.note_registration(reg.as_ref(), session, &user.id, *sid)
+            .await;
 
         // Re-read account status AFTER registering so a concurrent
         // `suspend_user` that fired `invalidate_user` between the
@@ -176,7 +179,7 @@ where
         user: &crate::authn::types::User,
         claims: &axess_factors::oauth::OAuthClaims,
         session: &AuthSession,
-        registered: Option<(&dyn SessionRegistryHandle, &crate::session::id::SessionId)>,
+        registered: Option<(&dyn SessionRegistryHandle, &crate::session::id::SessionKey)>,
     ) -> Result<(), AuthnError<I::Error>> {
         let status = self
             .inner
@@ -198,17 +201,20 @@ where
                 tracing::warn!(
                     user_id = %user.id,
                     tenant_id = %user.tenant_id,
-                    provider = %claims.provider,
+                    provider = %super::super::logged_provider_name(&claims.provider),
                     status = ?status,
                     "OAuth completion: account status does not allow login; refusing"
                 );
                 revoke.await;
                 self.inner.metrics.auth_flow.account_locked();
-                Err(match status {
-                    crate::authn::types::EntityState::Suspended(detail) => AuthnError::Locked {
-                        until: detail.until,
-                    },
-                    other => AuthnError::NotActive(other),
+                Err(if status.is_suspended() {
+                    AuthnError::Locked {
+                        until: crate::authn::service::factor_pipeline::shown_suspension_end(
+                            &status,
+                        ),
+                    }
+                } else {
+                    AuthnError::NotActive(status)
                 })
             }
             Ok(_) => Ok(()),
@@ -267,10 +273,10 @@ where
         &self,
         user: &crate::authn::types::User,
         claims: &axess_factors::oauth::OAuthClaims,
-        sid: &crate::session::id::SessionId,
-        now: chrono::DateTime<chrono::Utc>,
+        sid: &crate::session::id::SessionKey,
+        now: axess_clock::Timestamp,
         tenant_provider: bool,
-    ) -> pending_ends::PendingEnds {
+    ) -> Result<pending_ends::PendingEnds, pending_ends::Unrecorded> {
         use crate::federation::sid_map::SidKey;
 
         // Holds what the steps below owe an end to from the moment they
@@ -286,7 +292,7 @@ where
         // logout could end it, so a mapping or a subject entry would only
         // accumulate: neither is recorded.
         if self.inner.registry.is_none() {
-            return pending;
+            return Ok(pending);
         }
 
         // Cap oidc_sid length. A compromised IdP can return
@@ -303,7 +309,7 @@ where
         // do not trip the batch-eviction path and lose back-channel
         // logout precision on the evicted mappings.
         let max_sid_map_entries = self.inner.sid_map_capacity;
-        const SID_MAP_TTL: chrono::TimeDelta = chrono::TimeDelta::hours(24);
+        const SID_MAP_TTL: axess_clock::SignedDuration = axess_clock::SignedDuration::hours(24);
         const PRUNE_BATCH: usize = 128;
 
         // A tenant's provider is not in the global registry; the verified ID
@@ -329,22 +335,24 @@ where
             .unwrap_or_else(|| claims.provider.to_string());
 
         // Every login enters the subject registry, with or without a `sid`,
-        // so a logout by `sub` alone can always find the session.
+        // so a logout by `sub` alone can always find the session. A login
+        // whose record is not written is refused: no logout could reach it.
         if let Err(e) = store
             .register_subject_session(&issuer, &claims.subject, tenant, user.id, *sid)
             .await
         {
-            tracing::warn!(
+            tracing::error!(
                 error = %e,
-                "sid store: the login's subject record was not written; a logout by `sub` will not find it"
+                "sid store: the login's subject record was not written; refusing the login"
             );
+            return Err(pending_ends::Unrecorded(Box::new(pending)));
         }
         self.sweep_subject_registry().await;
 
         let Some(oidc_sid) = claims.oidc_sid.as_ref().filter(|s| {
             if s.len() > MAX_OIDC_SID_BYTES {
                 tracing::warn!(
-                    provider = %claims.provider,
+                    provider = %super::super::logged_provider_name(&claims.provider),
                     oidc_sid_len = s.len(),
                     "oidc_sid exceeds {MAX_OIDC_SID_BYTES} bytes; skipping sid_map entry \
                      (back-channel logout by `sid` will not work for this session; `sub` still works)"
@@ -354,13 +362,17 @@ where
                 true
             }
         }) else {
-            return pending;
+            return Ok(pending);
         };
 
         let key: SidKey = (issuer.clone(), oidc_sid.clone());
 
         // Phase 1: TTL prune, bounded per call.
-        let cutoff = now - SID_MAP_TTL;
+        // A reading within the TTL of the earliest one has no mapping
+        // older than it.
+        let cutoff = now
+            .checked_sub(SID_MAP_TTL)
+            .unwrap_or(axess_clock::Timestamp::MIN);
         let aged = store
             .evict_inserted_before(cutoff, PRUNE_BATCH)
             .await
@@ -370,8 +382,8 @@ where
             });
         for (evict_key, (evict_user, evict_sid, _)) in aged {
             tracing::debug!(
-                evicted_iss = %evict_key.0,
-                evicted_oidc_sid = %evict_key.1,
+                evicted_iss = %crate::authn::service::log_text::logged_request_text(&evict_key.0),
+                evicted_oidc_sid = %crate::authn::service::log_text::logged_request_text(&evict_key.1),
                 "sid_map: evicted stale entry (TTL expired)"
             );
             pending.age_out((evict_key.0, evict_user, evict_sid));
@@ -379,35 +391,38 @@ where
 
         self.evict_for_capacity(&store, max_sid_map_entries).await;
 
-        // Atomic swap with displaced-mapping invalidation.
-        let displaced = store
+        // Atomic swap with displaced-mapping invalidation. A login whose
+        // mapping is not written is refused, with what the prune took.
+        let displaced = match store
             .insert_displacing(key.clone(), &claims.subject, tenant, user.id, *sid, now)
             .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(
+        {
+            Ok(displaced) => displaced,
+            Err(e) => {
+                tracing::error!(
                     error = %e,
-                    "sid store: the login's `sid` mapping was not written; a logout by `sid` \
-                     will not find it (`sub` still does)"
+                    "sid store: the login's `sid` mapping was not written; refusing the login"
                 );
-                None
-            });
+                return Err(pending_ends::Unrecorded(Box::new(pending)));
+            }
+        };
         if let Some(displaced) = displaced {
             tracing::warn!(
-                iss = %issuer,
-                oidc_sid = %oidc_sid,
+                iss = %crate::authn::service::log_text::logged_request_text(&issuer),
+                oidc_sid = %crate::authn::service::log_text::logged_request_text(oidc_sid),
                 old_user = %displaced.user,
                 "SidMap atomic swap displaced existing mapping; invalidating old session"
             );
             pending.displace(key, displaced);
         }
-        pending
+        Ok(pending)
     }
 
     /// Capacity-based batch eviction, when the store is at `max_entries`.
     /// Drops the mapping only; the user's session is still valid. The subject
     /// registry keeps a live session reachable by `sub`; only a session the
-    /// registry reports gone is forgotten there, never one whose liveness it
-    /// could not answer. The liveness checks of the batch run concurrently.
+    /// registry holds under no key is forgotten there, never one it could
+    /// not answer for. The questions of the batch run concurrently.
     async fn evict_for_capacity(
         &self,
         store: &std::sync::Arc<dyn crate::federation::sid_store::SidStore>,
@@ -425,8 +440,8 @@ where
                 .sid_map_evicted(evicted.len() as u64);
             for (evict_key, (evict_user, _, _)) in &evicted {
                 tracing::warn!(
-                    evicted_iss = %evict_key.0,
-                    evicted_oidc_sid = %evict_key.1,
+                    evicted_iss = %crate::authn::service::log_text::logged_request_text(&evict_key.0),
+                    evicted_oidc_sid = %crate::authn::service::log_text::logged_request_text(&evict_key.1),
                     user_id = %evict_user,
                     "sid_map capacity reached; dropped oldest mapping (its session stays valid \
                  and a logout by `sub` still reaches it)"
@@ -440,20 +455,23 @@ where
         }
     }
 
-    /// Ask the registry about each `(issuer, user, session)`, concurrently,
-    /// and forget in the subject registry those it reports gone. A session
-    /// whose liveness the registry could not answer stays.
+    /// Ask the registry, concurrently, which key each `(issuer, user,
+    /// session)` is under now, and forget in the subject registry those it
+    /// holds under no key. The record holds the key the login registered: a
+    /// session that rotated since lives under another key, which the
+    /// registry answers, and stays. A session the registry could not answer
+    /// for stays too.
     async fn forget_gone_subject_sessions(&self, candidates: Vec<SubjectSession>) {
         let Some(reg) = &self.inner.registry else {
             return;
         };
         let answers = concurrent::bounded(candidates, |(_, user, session)| {
             let reg = std::sync::Arc::clone(reg);
-            async move { reg.liveness(&user, &session).await }
+            async move { reg.current_key(&user, &session).await }
         })
         .await;
-        for ((issuer, user, session), liveness) in answers {
-            if liveness == SessionLiveness::Gone
+        for ((issuer, user, session), current) in answers {
+            if matches!(current, Ok(None))
                 && let Err(e) = self
                     .inner
                     .sid_store()
@@ -467,9 +485,10 @@ where
 
     /// Check a bounded batch of the subject registry against the session
     /// registry and forget the sessions that are gone, so sessions that ended
-    /// by expiry or logout do not accumulate. Live sessions stay, and so do
-    /// sessions whose liveness the registry could not answer. Without a
-    /// registry nothing can be judged and nothing is forgotten.
+    /// by expiry or logout do not accumulate. Live sessions stay, whatever
+    /// key they rotated to, and so do sessions the registry could not answer
+    /// for. Without a registry nothing can be judged and nothing is
+    /// forgotten.
     async fn sweep_subject_registry(&self) {
         const SWEEP_BATCH: usize = 64;
         if self.inner.registry.is_none() {
@@ -489,7 +508,7 @@ where
 type SubjectSession = (
     String,
     crate::authn::ids::UserId,
-    crate::session::id::SessionId,
+    crate::session::id::SessionKey,
 );
 
 impl<I, F> RequestAuthnService<I, F>
@@ -520,6 +539,12 @@ where
         self.verify_oauth_claim_lock(user, claims, session).await?;
         // The binding is single-use: gone whether the check passes or not.
         let binding = super::state::take_ceremony_tenant(session).await;
+        // The kind of the ceremony's provider, which the session's assurance
+        // and the audit row record.
+        let kind = match &binding {
+            Ok(bound) => self.ceremony_provider_kind(*bound, &claims.provider).await,
+            Err(_) => crate::authn::factor::FederatedProvider::Custom(claims.provider.to_string()),
+        };
         let provider_tenant = binding
             .ok()
             .flatten()
@@ -529,8 +554,8 @@ where
         enforce_oauth_ceremony_tenant(user, claims, binding)?;
 
         // The tenant's own gates, as `begin_login` runs them: its status and
-        // its IP policy. The OAuth completion used to skip both, so a user
-        // of a suspended tenant still logged in through an IdP.
+        // its IP policy. Without them a user of a suspended tenant would
+        // still log in through an IdP.
         if let std::ops::ControlFlow::Break(_) = self
             .admit_tenant_by_id(&user.identifier, &user.tenant_id)
             .await?
@@ -538,7 +563,7 @@ where
             tracing::warn!(
                 user_id = %user.id,
                 tenant_id = %user.tenant_id,
-                provider = %claims.provider,
+                provider = %super::super::logged_provider_name(&claims.provider),
                 "OAuth completion refused; the tenant does not admit logins"
             );
             return Err(AuthnError::CrossTenant);
@@ -551,11 +576,7 @@ where
                 user.tenant_id,
                 now,
                 Some(crate::authn::assurance::FactorAssurance::for_kind(
-                    crate::authn::factor::FactorKind::Federated(
-                        crate::authn::factor::FederatedProvider::Custom(
-                            claims.provider.to_string(),
-                        ),
-                    ),
+                    crate::authn::factor::FactorKind::Federated(kind.clone()),
                     now,
                 )),
                 &self.inner.preserved_custom_keys,
@@ -574,14 +595,16 @@ where
                 )
                 .await;
         }
-        let sid = session.session_id().await;
+        // The registry, the sid store and the audit row name the session by
+        // its key.
+        let key = session.session_key().await;
 
         // Post-flip session-binding work: register-or-clear MUST come
-        // first because the session is already Authenticated;
-        // subsequent fail-soft operations may log on outage but
-        // cannot bubble Err here without leaking an un-trackable
-        // Authenticated session to the caller.
-        self.register_oauth_session_or_clear(user, claims, session, &sid)
+        // first because the session is already Authenticated. A later
+        // refusal (the sid store's records, the audit row) ends the
+        // registered session and clears it, so no refused login leaves an
+        // Authenticated session behind.
+        self.register_oauth_session_or_clear(user, claims, session, &key)
             .await?;
 
         // reset_failed_attempts must NOT propagate as Err(Store).
@@ -603,35 +626,29 @@ where
         // `sid`. Self-contained; see helper for the TTL-prune /
         // capacity-evict / atomic-swap-with-displaced-invalidation
         // sequence.
-        let pending = self
-            .maintain_oidc_sid_map(user, claims, &sid, now, tenant_provider)
-            .await;
+        let pending = match self
+            .maintain_oidc_sid_map(user, claims, &key, now, tenant_provider)
+            .await
+        {
+            Ok(pending) => pending,
+            Err(pending_ends::Unrecorded(pending)) => {
+                self.unwind_refused_login(user, session, &key, *pending)
+                    .await;
+                return Err(AuthnError::NoFlow);
+            }
+        };
 
         let emitted = self
             .emit_audit_at(
                 AuthEventBuilder::success(AuthEventType::Authenticated)
                     .attributed_to(&user.id, &user.tenant_id)
-                    .with_factor(FactorKind::Federated(
-                        crate::authn::factor::FederatedProvider::Custom(
-                            claims.provider.to_string(),
-                        ),
-                    ))
-                    .with_session(sid),
+                    .with_factor(FactorKind::Federated(kind))
+                    .with_session(key),
                 now,
             )
             .await;
         if let Err(e) = emitted {
-            // The login is refused, so nothing of it may stay reachable:
-            // not the registry entry, not the session state, and not the
-            // back-channel `sid` mapping installed above.
-            if let Err(e) = self.inner.sid_store().remove_session(&sid).await {
-                tracing::warn!(error = %e, "sid store: the refused login's mappings were not removed");
-            }
-            // The mapping this login displaced goes back (its user must stay
-            // reachable by a logout for that `sid`), and only the sessions
-            // that aged out are ended.
-            pending.refuse().await;
-            self.end_session_after_audit_failure(&user.id, session)
+            self.unwind_refused_login(user, session, &key, pending)
                 .await;
             return Err(e);
         }
@@ -641,5 +658,26 @@ where
         pending.commit().await;
 
         Ok(())
+    }
+
+    /// Undo a login refused after its session was registered, so nothing of
+    /// it stays reachable: the sid store's records of it go (its subject
+    /// record and its `sid` mappings), the mapping it displaced goes back
+    /// (that session's user must stay reachable by a logout for that `sid`)
+    /// and only the sessions that aged out end, and the registry entry and
+    /// the session state go.
+    async fn unwind_refused_login(
+        &self,
+        user: &crate::authn::types::User,
+        session: &AuthSession,
+        key: &crate::session::id::SessionKey,
+        pending: pending_ends::PendingEnds,
+    ) {
+        if let Err(e) = self.inner.sid_store().remove_session(key).await {
+            tracing::warn!(error = %e, "sid store: the refused login's records were not removed");
+        }
+        pending.refuse().await;
+        self.end_session_after_audit_failure(&user.id, session)
+            .await;
     }
 }

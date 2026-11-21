@@ -1,32 +1,12 @@
 //! The log filter the example starts with when `RUST_LOG` is not set.
 
 use axess_example_sqlite::DEFAULT_LOG_FILTER;
-use std::sync::{Arc, Mutex};
-use tracing_subscriber::{EnvFilter, fmt::MakeWriter};
-
-#[derive(Clone, Default)]
-struct Sink(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for Sink {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().expect("lock").extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for Sink {
-    type Writer = Sink;
-    fn make_writer(&'a self) -> Sink {
-        self.clone()
-    }
-}
+use axess_testing::mock_tracing::PrintedLines;
+use tracing_subscriber::EnvFilter;
 
 /// What the default filter lets through of one debug event on `target`.
 fn printed_by_default(target: &str) -> bool {
-    let sink = Sink::default();
+    let sink = PrintedLines::new();
     let subscriber = tracing_subscriber::fmt()
         .with_writer(sink.clone())
         .with_env_filter(EnvFilter::new(DEFAULT_LOG_FILTER))
@@ -35,7 +15,7 @@ fn printed_by_default(target: &str) -> bool {
         "dev_mail" => tracing::debug!(target: "dev_mail", "link"),
         _ => tracing::debug!(target: "axess_example_sqlite", "link"),
     });
-    !sink.0.lock().expect("lock").is_empty()
+    !sink.text().is_empty()
 }
 
 /// A debug build writes the password reset link to the `dev_mail` target and

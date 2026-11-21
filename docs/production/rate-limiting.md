@@ -1,12 +1,10 @@
 # Rate limiting
 
-A rate limiter is the layer that caps how many requests an
-identified caller may make per unit time. For an authentication
-surface, the rate limiter is one of the most consequential pieces
-of operational defence in depth: the lockout policy catches the
-specific case of failed credentials, but the rate limiter catches
-the broader case of brute-force and credential-stuffing
-distribution. This chapter covers the `RateLimitLayer` Tower
+A rate limiter caps how many requests an identified caller may make per unit
+time. On an authentication surface it is a central layer of defence in depth:
+the lockout policy catches failed credentials against one account, and the
+rate limiter catches brute force and credential stuffing spread across many
+accounts. This chapter covers the `RateLimitLayer` Tower
 middleware, the key-extraction strategies that determine what is
 rate-limited, the tuning patterns for different endpoints, and the
 SLI signal the layer produces.
@@ -18,7 +16,7 @@ pattern: many failures against one identifier. A rate limiter
 catches a wider pattern: a high volume of requests against an
 endpoint, regardless of identifier, regardless of success.
 
-The shapes of attack the rate limiter catches:
+The rate limiter catches these attacks:
 
 Credential stuffing. An attacker with a list of credentials tries
 each one against the login endpoint. Each individual attempt fails
@@ -37,14 +35,12 @@ shape for both cases), the attack becomes impractical.
 Token-replay forwarding. An attacker who has captured a valid
 session cookie forwards it through many connections to evade
 fingerprint detection. Each request looks legitimate on its own;
-the aggregate volume is the giveaway. The rate limiter keyed by
-session id catches the pattern.
+the aggregate volume is the giveaway. A rate limiter keyed by
+user (`UserId`) catches the pattern.
 
-Workload misbehaviour. A workload that for some reason has
-entered a tight loop calling your API. The
-authentication side validates the workload token on each request;
-the rate limiter catches the runaway pattern before it overwhelms
-the service.
+Workload misbehaviour. A workload caught in a tight loop calls the API over
+and over. Authentication validates its token on every request, and the rate
+limiter stops the loop before it overwhelms the service.
 
 ## Configuring the limiter
 
@@ -77,11 +73,10 @@ The window is a sliding-window counter. Each key keeps the number of
 requests admitted in the current fixed window and in the one before it. A
 request is admitted when the previous count, weighted by how much of it still
 overlaps the trailing window, plus the current count leaves room under
-`max_requests`. A burst split across a window boundary is therefore counted
-once: with a limit of five per minute, five requests at the end of one minute
+`max_requests`. A burst that straddles a window boundary therefore gets no second allowance: with a limit of five per minute, five requests at the end of one minute
 are followed by a refusal, not by five more at the start of the next, and the
 allowance comes back gradually as the old requests age out. `Retry-After` is
-the time at which the request would be admitted.
+the number of whole seconds until the request would be admitted.
 
 Keys are bounded so no one caller controls how many buckets exist. Every
 key starts with its kind (`ip:`, `user:`, `login:`), so a value a caller
@@ -89,7 +84,11 @@ chooses, such as a login name, can never equal a sentinel or another kind's
 key. A key longer than 187 bytes is cut to a fixed 256 bytes ending in a
 digest of the whole, so long identifiers that share a prefix keep separate
 buckets and no uncut key can be crafted to equal a cut one. An IPv6 client is
-keyed by its /64 prefix, and `KeyExtractor::Header` maps a user's header
+keyed by its /64 prefix. An address that carries an IPv4 client (NAT64
+`64:ff9b::/96`, IPv4-translated, IPv4-compatible, 6to4 or Teredo) is keyed and
+grouped as that IPv4 client, as the login throttle keys it, so each client
+behind one translator or relay has its own bucket. An address under the locally
+used NAT64 prefix (`64:ff9b:1::/48`) is keyed whole. `KeyExtractor::Header` maps a user's header
 values onto 16 sub-buckets, so one authenticated user cannot fill the table by
 sending distinct values. An authenticated user who sends no header, or one that
 is not text, holds one further fixed slot of their own; a request with no
@@ -116,7 +115,8 @@ a fixed constant. A very large site (a university behind one /48) can be
 squeezed into the overflow bucket by its own scale; where that matters, key on
 something the site controls (`UserId`) instead of its address. The budget does
 not stop an attacker who holds many separate /48s (an IPv6 /40 holds 256 of
-them, which is exactly the hard cap of 262,144 buckets), so once the table is
+them, and 256 full budgets of 1,024 buckets are exactly the hard cap of
+262,144 buckets), so once the table is
 three quarters full a new address folds into its prefix's overflow bucket
 instead of taking a slot, and a client in an unrelated prefix is still
 admitted. The hard cap stays as the last bound.
@@ -141,7 +141,7 @@ two layer instances fingerprint the same key differently.
 The remaining-requests header (`x-ratelimit-remaining`) is sent only when the
 bucket belongs to the caller (an address, a user, a header slot). A
 login-identifier, tenant or shared bucket is drawn on by other people, and its
-remaining count would tell the caller how many attempts they made, so it is
+remaining count would tell the caller how many attempts other people made, so it is
 left out; so is the count of a group's overflow bucket, which an address draws
 on once its /24 or /48 holds its budget of buckets.
 
@@ -152,9 +152,8 @@ later.
 The buckets live in this process, in a `Mutex<HashMap>`, and there is no
 option to put them anywhere else. That is a deliberate scope
 line rather than a missing backend: with N instances behind a load
-balancer, each one enforces the configured limit independently, so the
-effective limit is N times what you configured, and a caller that
-spreads its requests gets N times the budget.
+balancer, each one enforces the configured limit independently, so a caller that
+spreads its requests across them gets N times the configured budget.
 
 Distributed rate limiting belongs at the gateway, against a shared
 store (Valkey, Redis, or whatever your ingress already offers). Use
@@ -197,28 +196,28 @@ header, so a caller cannot pick its own bucket.
 
 Configuring that layer means naming the proxies you trust, and usually
 you can: managed front ends publish their ranges, and a sidecar is
-loopback. Where the list is the weak link rather than the check, because
-a rotating range has to be kept synced and a stale one quietly resolves
-every request to the proxy, `TrustedProxies::private_transport()` asserts
-the other true thing instead: nothing reaches this process except through
-your own infrastructure. That assertion does not go stale. It is the
+loopback. The list can be the weak link: a rotating range has to be kept in sync, and a
+stale one quietly resolves every request to the proxy. In that case,
+`TrustedProxies::private_transport()` asserts a different fact: nothing
+reaches this process except through your own infrastructure. That assertion does not go stale. It is the
 weaker of the two, and a direct caller reaching a process configured that
 way has its headers believed in full, so check that the listener is not
-reachable rather than assuming it. It replaced `ForwardedIp`
-in 0.7.0, which read `X-Real-IP` and then the leftmost `X-Forwarded-For`
-entry and believed both, which made rotating either a way to mint a fresh
-bucket per request. `UserId` catches a per-user runaway loop, `TenantId` a
+reachable rather than assuming it. No extractor reads `X-Real-IP` or the
+leftmost `X-Forwarded-For` entry and believes it: rotating either would
+mint a fresh bucket per request.
+
+`UserId` catches a per-user runaway loop, `TenantId` a
 per-tenant one, which is as often a noisy neighbour as an attack.
 
-`LoginIdentifier` is the one to read twice. Per-IP limiting alone does
+`LoginIdentifier` needs the most care. Per-IP limiting alone does
 not defend a login route: an attacker spreading attempts across many
 IPs stays under every per-IP budget while hammering one username, and
 with a lockout policy in place that is a denial of service against that
 account rather than a break-in attempt. Keying on the submitted
-identifier, normalised (Unicode NFKC, lowercase, zero-width and other
-invisible format characters removed) so `Alice`, `alice` and a spelling with a
-hidden character share a bucket, bounds the attempts per account regardless of
-where they came from. A store may fold more than that (a case-insensitive
+identifier bounds the attempts per account, wherever they come from. The
+identifier is normalised (Unicode NFKC, lowercase, zero-width and other
+invisible format characters removed), so `Alice`, `alice` and a spelling with a
+hidden character share a bucket. A store may fold more than that (a case-insensitive
 collation, a dotted local part), so where it does, add a second limiter on the
 resolved user id.
 
@@ -278,10 +277,9 @@ let login_route: axum::Router = axum::Router::new()
 ### Per-endpoint rate limits
 
 Different endpoints have different sensitivities. A login
-endpoint can tolerate a few requests per second per IP because
-real users do not log in fast; a search endpoint accepts hundreds
-per second because real users browse. The configuration shape is
-typically per-endpoint:
+endpoint needs only a few requests per minute per IP, because
+real users do not log in often; a search endpoint accepts hundreds
+per second because real users browse. Limits are therefore usually set per endpoint:
 
 ```rust,ignore
 let auth_routes = Router::new()
@@ -302,7 +300,7 @@ let api_routes = Router::new()
         RateLimitConfig::builder()
             .max_requests(300)
             .window(Duration::from_secs(60))
-            .key(KeyExtractor::SessionId)
+            .key(KeyExtractor::UserId) // reads RateLimitUserId, set by your auth layer
             .build(),
     ));
 
@@ -312,16 +310,14 @@ let app = Router::new()
     .layer(session_layer);
 ```
 
-The pattern is to layer the rate limit on the specific routes it
-applies to, with the most restrictive limits on the most
-sensitive endpoints. A login endpoint with a tight per-IP limit
-is the canonical case; a token-refresh endpoint with a
-per-session limit is the second canonical case.
+Layer each limit on the routes it applies to, with the tightest limits on the
+most sensitive endpoints: a tight per-IP limit on login, a per-user limit on
+token refresh.
 
 The trusted-proxy configuration covered in *Cookies, fingerprinting,
-hijack detection* applies to the `PeerIp` extractor here as well.
-Read the IP from the forwarded header only when the immediate
-peer is a trusted proxy; otherwise the rate limiter can be
+hijack detection* applies to the `ClientIp` extractor here as well.
+`client_ip::layer` reads the IP from the forwarded header only when the
+immediate peer is a trusted proxy; otherwise the rate limiter could be
 spoofed.
 
 #### The IdP logout routes
@@ -331,8 +327,8 @@ the token before any signature is checked, and with tenant providers each
 request that names a configured issuer costs a read of the tenant source and
 may rebuild or revalidate the providers it returns. Put a `PeerIp` limit in
 front of it, as in front of the front-channel route, and keep it low: an IdP
-sends a few tokens a minute, from a few addresses. The handler remembers an
-issuer no provider is configured for for 30 seconds
+sends a few tokens a minute, from a few addresses. The handler remembers, for 30 seconds, an
+issuer that no provider is configured for
 (`BackChannelLogoutHandler::with_unknown_issuer_memory`), which bounds a loop
 of made-up issuers; only the limit bounds a loop that names a real one.
 
@@ -340,11 +336,12 @@ of made-up issuers; only the limit bounds a loop that names a real one.
 
 For multi-tenant deployments, the rate limit configuration can
 be per-tenant. A tenant with a higher SLA gets a higher rate
-limit; a tenant with a lower SLA gets a tighter one. The
-mechanism is the same `RateLimitLayer`, with a `Custom` key
-extractor that composes the standard key (typically `PeerIp`)
-with the tenant id, and with separate `RateLimitConfig`s per
-tenant tier.
+limit; a tenant with a lower SLA gets a tighter one. There is
+no composite key, so the mechanism is stacking: a `TenantId`
+limiter (it reads the `RateLimitTenantId` extension) caps each
+tenant beside the per-address `PeerIp` or `ClientIp` limiter.
+One layer has one `RateLimitConfig`, so each tenant tier needs its
+own `TenantId` layer, on routes that serve only that tier.
 
 The pattern is operationally complex (one configuration per
 tenant tier), so most deployments use a single shared limit and
@@ -354,19 +351,18 @@ the operational overhead is justified.
 
 ### Tuning the windows
 
-Tuning the rate limit is more art than science, but a few
-guidelines hold up.
+No single setting fits every deployment; these are starting points.
 
 For login endpoints: 10 requests per minute per IP is the
 conservative starting point. Real users log in at most a few
 times a day from any one IP. Credential-stuffing attacks need
 hundreds per minute to be efficient; 10 is well below that.
-Tune up only if the warn rate is too high on legitimate traffic
+Tune up only if the reject rate is too high on legitimate traffic
 (many users behind a corporate NAT, for instance).
 
 For signup endpoints: 5 requests per minute per IP. Signup is
-even less frequent for legitimate users than login; account
-enumeration is best stopped tight.
+even less frequent for legitimate users than login, and account enumeration
+calls for a tight limit.
 
 For password reset: 3 requests per hour per IP. A reset is a
 once-in-a-while operation. Attackers spam reset to exhaust the
@@ -374,19 +370,17 @@ victim's inbox; the tight limit is the defence.
 
 For token refresh: matched to the session TTL. A session that
 refreshes every hour should have a rate limit of a few refreshes
-per hour per session id; an attacker who steals a session cannot
+per hour per user (`UserId`); an attacker who steals a session cannot
 extract value through rapid refresh.
 
 For data endpoints: matched to your expected use
 pattern. An API for human-driven dashboards sees a few requests
-per minute per session; an API for programmatic clients sees
-hundreds per second per workload. The pattern is
-deployment-specific.
+per minute per user; an API for programmatic clients sees
+hundreds per second per workload.
 
-The default to start with is to measure first. The metrics from
-`RequestGuardMetrics::rate_limit_rejected` (covered below) tell you the
-real reject rate; the calibration is then to set the limit just
-above the legitimate-traffic envelope.
+Measure first. `RequestGuardMetrics::rate_limit_rejected` (covered below)
+gives the real reject rate; then set the limit just above the
+legitimate-traffic envelope.
 
 ## Behaviour at the limit
 
@@ -403,23 +397,17 @@ A `Retry-After` header. The value is the number of seconds the
 client should wait before retrying. The header is read by
 browsers and well-behaved clients; attackers ignore it.
 
-A short JSON body explaining the limit. The body is generic
-("rate limit exceeded") rather than specific (no "you have 0
-of 10 requests remaining"); the latter leaks the limit
-configuration, which lets an attacker calibrate their attack to
-just under the limit.
+An empty body, and no `x-ratelimit-remaining` header. That header
+goes only on admitted responses, and only from a bucket the caller
+owns (see *The layer* above).
 
-The application's metrics record the rejection. The
-`RequestGuardMetrics::rate_limit_rejected` method is the metric;
-applications wire it to their Prometheus or OpenTelemetry
-counter.
+The rejection is recorded through `RequestGuardMetrics::rate_limit_rejected`,
+which the application wires to its Prometheus or OpenTelemetry counter.
 
 ### Distinguishing attack from misconfiguration
 
-A high rate of 429s is operationally interesting. The cause is
-either an attack (real attacker getting throttled) or a
-misconfiguration (legitimate traffic hitting a limit that was
-set too low).
+A high rate of 429s has one of two causes: an attack being throttled, or a
+limit set too low for legitimate traffic.
 
 The signals that distinguish them:
 
@@ -439,13 +427,10 @@ the endpoint at the point you install the middleware.
 
 ### Composing with the lockout policy
 
-The rate limiter and the lockout policy are different defences
-that compose. The rate limiter catches volume; the lockout policy
-catches credential pattern. Both fire on attacks, in different
-shapes.
+The rate limiter and the lockout policy compose: the rate limiter catches
+volume, and the lockout policy catches repeated failures against one account.
 
-The pattern that emerges: the rate limiter is the first line of
-defence against credential stuffing. It drops the attack to a
+Against credential stuffing, the rate limiter is the first line of defence. It drops the attack to a
 trickle before any individual user's lockout policy can fire.
 The lockout policy then catches the few attempts that get
 through, marking the targeted user accounts as locked.
@@ -453,8 +438,7 @@ through, marking the targeted user accounts as locked.
 A deployment that has rate limiting but no lockout policy is
 vulnerable to slow attacks that stay below the rate limit. A
 deployment that has lockout but no rate limiting is vulnerable
-to high-volume attacks that distribute across many users. Both
-together cover both attack shapes.
+to high-volume attacks that distribute across many users. Together they cover both attack shapes.
 
 ## Operating it
 
@@ -483,12 +467,9 @@ implementation suitable for adapting to a real metrics system.
 
 ### Where the limiter sits in the stack
 
-The rate limiter is the operational layer that sits between
-"the request was sent" and "the authentication logic runs." A
-deployment without it is vulnerable to a class of attack that
-the authentication logic alone cannot prevent; a deployment
-with it has the broader defence against volume-based attacks
-that complements the credential-pattern defence of lockout.
+The rate limiter runs before the authentication logic. Without it, a
+deployment is exposed to volume-based attacks that the authentication logic
+alone cannot prevent; with it, that volume defence complements lockout.
 
 ## Further reading
 
@@ -496,6 +477,6 @@ that complements the credential-pattern defence of lockout.
 rate limit. *Audit events* covers the trail the rate limiter does not
 write to. *Cookies, fingerprinting, hijack
 detection* covers the trusted-proxy configuration that
-determines how `PeerIp` reads the source IP. *Operations
+determines how `ClientIp` reads the source IP. *Operations
 runbook* covers the metrics dashboards and the SIEM rules that
 turn the rate-limit signal into alerts.

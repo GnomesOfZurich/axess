@@ -7,8 +7,9 @@
 //! Accept-Language top entry vs full list, screen-class bucket vs
 //! none) is a privacy/proportionality decision that varies by
 //! deployment. A regulated-fintech app will want the minimum useful
-//! set per [`docs/identity/device.md`] §4.3 (data minimisation
-//! Art 5(1)(c)); a hobby project may not bother with IP truncation.
+//! set (data minimisation, GDPR Art 5(1)(c); see
+//! [`docs/identity/device.md`], "PII tokenisation and GDPR"); a hobby
+//! project may not bother with IP truncation.
 //! axess ships a sensible default and lets consumers swap in their
 //! own implementation.
 //!
@@ -28,8 +29,8 @@
 //! The pepper is keyed per-tenant so the same physical device under
 //! tenants A and B produces different `FingerprintHash` values.
 //! Required for GDPR controller separation in multi-tenant SaaS
-//! ([`docs/identity/device.md`] §10, "Cross-tenant correlation by a
-//! malicious tenant"). The default extractor takes a closure that
+//! ([`docs/identity/device.md`], "The per-tenant pepper"). The default
+//! extractor takes a closure that
 //! resolves a tenant to its pepper, so applications can derive the
 //! pepper however suits them (per-tenant secret in a vault, KDF over
 //! a master key, …).
@@ -45,6 +46,7 @@ use axum::http::{HeaderMap, Request};
 use hmac::Mac;
 
 use crate::authn::ids::TenantId;
+use crate::client_ip::network::ClientNetwork;
 use crate::device::types::FingerprintHash;
 
 /// Pluggable strategy for deriving a [`FingerprintHash`] from an HTTP
@@ -56,9 +58,11 @@ use crate::device::types::FingerprintHash;
 pub trait DeviceFingerprintExtractor: Send + Sync + 'static {
     /// Compute the fingerprint hash. Returns `None` when the request
     /// lacks the inputs the extractor requires (e.g. missing
-    /// `User-Agent` for a UA-required extractor). Callers treat
-    /// `None` as "skip device tracking for this request", never as
-    /// an error.
+    /// `User-Agent` for a UA-required extractor).
+    /// [`LifecycleDeviceResolver`](crate::device::LifecycleDeviceResolver)
+    /// answers such a request with no device when it is a guest's, and
+    /// resolves one that carries a user by its token, its key or its
+    /// session's device, as any other, creating no device for it.
     ///
     /// Takes [`Parts`] rather than the full `Request<B>` so the
     /// extractor composes cleanly with
@@ -98,9 +102,10 @@ pub trait DeviceFingerprintExtractor: Send + Sync + 'static {
 
 /// Resolves a tenant to its 32-byte HMAC pepper.
 ///
-/// The pepper must be stable for the lifetime of the tenant: a
-/// rotation invalidates every existing fingerprint hash for that
-/// tenant. Most deployments derive the pepper from a master key via
+/// The pepper should be stable for the lifetime of the tenant: after a
+/// rotation no stored fingerprint hash of that tenant matches a request
+/// any more, which strands every device a lookup by fingerprint would
+/// find (a device found by its token is unaffected). Most deployments derive the pepper from a master key via
 /// HKDF-Expand with the tenant_id as `info`.
 ///
 /// `Arc<dyn>` so the same resolver can be cloned into the extractor
@@ -122,15 +127,18 @@ pub type TenantPepperResolver = Arc<dyn Fn(&TenantId) -> [u8; 32] + Send + Sync>
 /// `Accept-Language` headers are copied verbatim, and the address is
 /// truncated to a /24 or /48 range an attacker on the same network, or
 /// anywhere when no client address is supplied, can share. Anyone who knows
-/// a user's headers produces the same fingerprint and is matched to the same
-/// device row. A match therefore says "this request looks like that
+/// a user's headers produces the same fingerprint, and a lookup by
+/// fingerprint
+/// ([`ensure_device`](crate::device::DeviceLifecycleService::ensure_device))
+/// matches them to the same device row. A match therefore says "this request looks like that
 /// device", never "this is that device", and nothing that grants access
 /// should rest on it alone. The default
 /// [`StepUpPolicy`](crate::authn::service::StepUpPolicy) asks for a factor
 /// on a `Trusted` device for this reason. A device secret the client holds
 /// and presents (a cookie or an app-held key, compared in constant time
-/// against a stored hash) is the way to turn a match into proof; the
-/// extractor does not provide one.
+/// against a stored hash) is what proves a device; the extractor does not
+/// provide one, and the device token of
+/// [`proof`](crate::device::proof) is the one the stock resolver uses.
 pub struct DefaultFingerprintExtractor {
     pepper: TenantPepperResolver,
 }
@@ -149,8 +157,8 @@ impl DeviceFingerprintExtractor for DefaultFingerprintExtractor {
         parts: &Parts,
         client_ip: Option<IpAddr>,
     ) -> Option<FingerprintHash> {
-        // Skip when there's nothing meaningful to fingerprint;
-        // a request with no UA AND no IP is too thin to identify.
+        // The inputs begin with the User-Agent: a request without one is
+        // not fingerprinted, whatever its address.
         let headers = &parts.headers;
         let ua = headers.get(header::USER_AGENT)?;
         let pepper = (self.pepper)(tenant_id);
@@ -174,8 +182,8 @@ impl DeviceFingerprintExtractor for DefaultFingerprintExtractor {
             mac.update(b"\0");
         }
 
-        // Truncated client IP. /24 for IPv4, /48 for IPv6; the
-        // standard "user roams within their ISP / cellular network
+        // Truncated client IP. /24 for an IPv4 client, /48 for IPv6;
+        // the standard "user roams within their ISP / cellular network
         // without re-fingerprinting" tolerance.
         if let Some(ip) = client_ip {
             mac.update(b"ip\0");
@@ -188,8 +196,9 @@ impl DeviceFingerprintExtractor for DefaultFingerprintExtractor {
     }
 }
 
-/// Top-priority `Accept-Language` entry. `en-CH;q=0.9,en;q=0.5` →
-/// `"en-CH"`. Returns `None` when the header is absent or empty.
+/// Top-priority `Accept-Language` entry, in lower case.
+/// `en-CH;q=0.9,en;q=0.5` → `"en-ch"`. Returns `None` when the header is
+/// absent or empty.
 fn accept_language_top(headers: &HeaderMap) -> Option<String> {
     let raw = headers.get(header::ACCEPT_LANGUAGE)?.to_str().ok()?;
     let head = raw.split(',').next()?.trim();
@@ -200,32 +209,33 @@ fn accept_language_top(headers: &HeaderMap) -> Option<String> {
     Some(head.to_ascii_lowercase())
 }
 
-/// Truncate an IP address for fingerprinting:
-/// - IPv4: first 3 octets (drop last), /24.
-/// - IPv6: first 6 bytes (drop last 10), /48.
+/// Truncate an IP address for fingerprinting, on the network the throttle
+/// and the rate limiter key it as (see `ClientNetwork`):
+/// - an IPv4 client: the /24 of its address;
+/// - an IPv6 address that carries an IPv4 client (IPv4-mapped, which a
+///   dual-stack listener reports, IPv4-translated, IPv4-compatible, NAT64,
+///   6to4, Teredo): the /24 of that client, as if it had arrived over IPv4;
+/// - an address under the locally used NAT64 prefix: its /120, where an
+///   IPv4 /24 sits under the common /96 translator prefix;
+/// - any other IPv6 address: its /48.
 ///
-/// An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`, which a dual-stack
-/// listener reports for an IPv4 client) is first reduced to the IPv4
-/// address it carries. Truncated as an IPv6 address it would keep only six
-/// zero bytes, and every IPv4 client behind such a listener would share one
-/// fingerprint input.
+/// Truncated as plain IPv6 addresses, the carrying forms kept only what
+/// every client of one translator, relay or Teredo server shares (six zero
+/// bytes for the mapped form, `64:ff9b::/48` for NAT64), and all of those
+/// clients would share one fingerprint input.
 ///
 /// Returns the raw bytes (4 or 16) with the trailing portion
-/// zeroed, so a cellular user roaming within their ISP doesn't
-/// generate a new device row on every NAT change.
+/// zeroed, so a cellular user roaming within their ISP keeps one
+/// fingerprint across NAT changes.
 fn truncate_ip(ip: IpAddr) -> Vec<u8> {
-    match ip.to_canonical() {
-        IpAddr::V4(v4) => {
+    match ClientNetwork::of(ip) {
+        ClientNetwork::V4(v4) => {
             let o = v4.octets();
             vec![o[0], o[1], o[2], 0]
         }
-        IpAddr::V6(v6) => {
-            let mut o = v6.octets();
-            // Zero bytes 6..16 → /48.
-            for byte in &mut o[6..] {
-                *byte = 0;
-            }
-            o.to_vec()
+        ClientNetwork::Whole(v6) => (u128::from(v6) & (u128::MAX << 8)).to_be_bytes().to_vec(),
+        ClientNetwork::Prefix64(net) => {
+            (u128::from(net) & (u128::MAX << 80)).to_be_bytes().to_vec()
         }
     }
 }

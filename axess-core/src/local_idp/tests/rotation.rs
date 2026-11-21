@@ -6,12 +6,14 @@
 //! cross-algorithm rotation, snapshot semantics of `jwks_handle`, and
 //! clone-state visibility across handles.
 
+use axess_clock::testing::Shift;
 use std::sync::Arc;
 
 use super::super::*;
 use super::support::CustomClaims;
+use crate::testing::MockClock;
+use axess_clock::SignedDuration;
 use axess_factors::jwt::verifier::JwtVerifier;
-use chrono::{Duration, Utc};
 
 /// Key store that loads cleanly but always errors on `rotate`. Used
 /// to confirm `rotate_signing_key` returns `IssuanceError::KeyStore`
@@ -40,15 +42,15 @@ impl LocalIdpKeyStore for RotateFailingKeyStore {
         Err(RotateFailure)
     }
 
-    async fn retire(&self, _key_id: &str) -> Result<bool, Self::Error> {
+    async fn retire(&self, _: &str) -> Result<bool, Self::Error> {
         Err(RotateFailure)
     }
 }
 
 #[tokio::test]
 async fn rotate_signing_key_demotes_previous_current_to_historical() {
-    let k1 = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-1");
-    let k2 = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-2");
+    let k1 = LocalIdpSigningKey::generate_es256().with_key_id("key-1");
+    let k2 = LocalIdpSigningKey::generate_es256().with_key_id("key-2");
     let store = MemoryLocalIdpKeyStore::with_current(k1);
     let idp = LocalIdp::from_key_store("https://idp.local", store)
         .await
@@ -64,15 +66,15 @@ async fn rotate_signing_key_demotes_previous_current_to_historical() {
         .collect();
     assert_eq!(
         kids,
-        vec!["rsa-2", "rsa-1"],
+        vec!["key-2", "key-1"],
         "JWKS must list new current first, then demoted historical"
     );
 }
 
 #[tokio::test]
 async fn rotate_signing_key_persists_through_key_store() {
-    let k1 = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-1");
-    let k2 = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-2");
+    let k1 = LocalIdpSigningKey::generate_es256().with_key_id("key-1");
+    let k2 = LocalIdpSigningKey::generate_es256().with_key_id("key-2");
     let store = MemoryLocalIdpKeyStore::with_current(k1);
     let idp = LocalIdp::from_key_store("https://idp.local", store.clone())
         .await
@@ -83,22 +85,24 @@ async fn rotate_signing_key_persists_through_key_store() {
     // Independently re-load the store snapshot: the rotation must be
     // visible to a future `from_key_store` over the same backend.
     let reloaded = store.load_all().await.expect("reload");
-    assert_eq!(reloaded.current.key_id(), "rsa-2");
+    assert_eq!(reloaded.current.key_id(), "key-2");
     assert_eq!(reloaded.historical.len(), 1);
-    assert_eq!(reloaded.historical[0].key_id(), "rsa-1");
+    assert_eq!(reloaded.historical[0].key_id(), "key-1");
 }
 
 #[tokio::test]
 async fn rotate_signing_key_propagates_key_store_error_without_mutating_state() {
-    let initial = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-original");
+    let clock = MockClock::at_reference();
+    let initial = LocalIdpSigningKey::generate_es256().with_key_id("key-original");
     let store = RotateFailingKeyStore {
         initial: initial.clone(),
     };
     let idp = LocalIdp::from_key_store("https://idp.local", store)
         .await
-        .expect("load");
+        .expect("load")
+        .with_clock(Arc::new(clock.clone()));
 
-    let new_key = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-new");
+    let new_key = LocalIdpSigningKey::generate_es256().with_key_id("key-new");
     let err = idp
         .rotate_signing_key(new_key)
         .await
@@ -114,27 +118,28 @@ async fn rotate_signing_key_propagates_key_store_error_without_mutating_state() 
     assert_eq!(jwks.keys.len(), 1, "JWKS must not grow on failed rotation");
     assert_eq!(
         jwks.keys[0].common.key_id.as_deref(),
-        Some("rsa-original"),
+        Some("key-original"),
         "current key must still be the original"
     );
 
-    let now = Utc::now();
+    let now = axess_clock::testing::MockClock::reference_time();
     let token = idp
         .mint(
-            &MintClaims::new("worker-1", now + Duration::hours(1))
+            &MintClaims::new("worker-1", now.plus(SignedDuration::hours(1)))
                 .with_audience("https://api")
                 .with_issued_at(now),
         )
         .await
         .expect("mint after failed rotate still works under original key");
     let header = jsonwebtoken::decode_header(&token).expect("decode");
-    assert_eq!(header.kid.as_deref(), Some("rsa-original"));
+    assert_eq!(header.kid.as_deref(), Some("key-original"));
 }
 
 #[tokio::test]
 async fn mint_after_successful_rotation_uses_new_kid() {
-    let k1 = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-1");
-    let k2 = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-2");
+    let clock = MockClock::at_reference();
+    let k1 = LocalIdpSigningKey::generate_es256().with_key_id("key-1");
+    let k2 = LocalIdpSigningKey::generate_es256().with_key_id("key-2");
     let recorder = Arc::new(MockIssuanceListener::new());
     let idp = LocalIdp::from_key_store(
         "https://idp.local",
@@ -142,10 +147,11 @@ async fn mint_after_successful_rotation_uses_new_kid() {
     )
     .await
     .expect("load")
-    .with_issuance_listener(recorder.clone());
+    .with_issuance_listener(recorder.clone())
+    .with_clock(Arc::new(clock.clone()));
 
-    let now = Utc::now();
-    let claims = MintClaims::new("worker-1", now + Duration::hours(1))
+    let now = axess_clock::testing::MockClock::reference_time();
+    let claims = MintClaims::new("worker-1", now.plus(SignedDuration::hours(1)))
         .with_audience("https://api")
         .with_issued_at(now);
     idp.mint(&claims).await.expect("pre-rotation mint");
@@ -154,10 +160,11 @@ async fn mint_after_successful_rotation_uses_new_kid() {
 
     let events = recorder.events();
     assert_eq!(events.len(), 2, "listener captures both mints");
-    assert_eq!(events[0].key_id, "rsa-1", "first mint uses original key");
-    assert_eq!(events[1].key_id, "rsa-2", "second mint uses rotated key");
+    assert_eq!(events[0].key_id, "key-1", "first mint uses original key");
+    assert_eq!(events[1].key_id, "key-2", "second mint uses rotated key");
 }
 
+#[cfg(feature = "local-idp-rsa")]
 #[tokio::test]
 async fn verifier_algorithms_after_cross_alg_rotation_lists_both() {
     let rsa = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-1");
@@ -183,20 +190,22 @@ async fn verifier_algorithms_after_cross_alg_rotation_lists_both() {
 
 #[tokio::test]
 async fn rotated_idp_verifies_tokens_minted_before_and_after_rotation() {
+    let clock = MockClock::at_reference();
     // End-to-end: a token minted under the old key still verifies via
     // the post-rotation JWKS (because the old key is in historical),
     // and a token minted under the new key also verifies.
-    let k1 = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-1");
-    let k2 = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-2");
+    let k1 = LocalIdpSigningKey::generate_es256().with_key_id("key-1");
+    let k2 = LocalIdpSigningKey::generate_es256().with_key_id("key-2");
     let idp = LocalIdp::from_key_store(
         "https://idp.local",
         MemoryLocalIdpKeyStore::with_current(k1),
     )
     .await
-    .expect("load");
+    .expect("load")
+    .with_clock(Arc::new(clock.clone()));
 
-    let now = Utc::now();
-    let claims = MintClaims::new("worker-1", now + Duration::hours(1))
+    let now = axess_clock::testing::MockClock::reference_time();
+    let claims = MintClaims::new("worker-1", now.plus(SignedDuration::hours(1)))
         .with_audience("https://api")
         .with_issued_at(now);
     let token_old = idp.mint(&claims).await.expect("pre-rotation mint");
@@ -205,6 +214,7 @@ async fn rotated_idp_verifies_tokens_minted_before_and_after_rotation() {
     let token_new = idp.mint(&claims).await.expect("post-rotation mint");
 
     let verifier = JwtVerifier::new(idp.jwks_handle().await)
+        .with_clock(Arc::new(clock.clone()))
         .with_issuer("https://idp.local")
         .with_audience("https://api")
         .with_algorithms(idp.verifier_algorithms().await);
@@ -220,24 +230,26 @@ async fn rotated_idp_verifies_tokens_minted_before_and_after_rotation() {
 
 #[tokio::test]
 async fn clone_after_rotation_sees_new_state_through_both_handles() {
+    let clock = MockClock::at_reference();
     // LocalIdp shares state via Arc<AsyncRwLock<...>>, so a rotation on
     // one clone must be visible to subsequent mints on every other clone.
-    let k1 = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-1");
-    let k2 = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-2");
+    let k1 = LocalIdpSigningKey::generate_es256().with_key_id("key-1");
+    let k2 = LocalIdpSigningKey::generate_es256().with_key_id("key-2");
     let idp_a = LocalIdp::from_key_store(
         "https://idp.local",
         MemoryLocalIdpKeyStore::with_current(k1),
     )
     .await
-    .expect("load");
+    .expect("load")
+    .with_clock(Arc::new(clock.clone()));
     let idp_b = idp_a.clone();
 
     idp_a.rotate_signing_key(k2).await.expect("rotate via A");
 
-    let now = Utc::now();
+    let now = axess_clock::testing::MockClock::reference_time();
     let token = idp_b
         .mint(
-            &MintClaims::new("worker-1", now + Duration::hours(1))
+            &MintClaims::new("worker-1", now.plus(SignedDuration::hours(1)))
                 .with_audience("https://api")
                 .with_issued_at(now),
         )
@@ -246,7 +258,7 @@ async fn clone_after_rotation_sees_new_state_through_both_handles() {
     let header = jsonwebtoken::decode_header(&token).expect("decode");
     assert_eq!(
         header.kid.as_deref(),
-        Some("rsa-2"),
+        Some("key-2"),
         "clone must observe rotation performed on sibling handle"
     );
 }
@@ -257,8 +269,8 @@ async fn jwks_handle_taken_before_rotation_is_a_snapshot() {
     // rotation continues to reflect the pre-rotation JWKS. Adopters
     // who need live propagation should re-call jwks_handle after
     // rotating; the discovery/handler module documents this.
-    let k1 = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-1");
-    let k2 = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-2");
+    let k1 = LocalIdpSigningKey::generate_es256().with_key_id("key-1");
+    let k2 = LocalIdpSigningKey::generate_es256().with_key_id("key-2");
     let idp = LocalIdp::from_key_store(
         "https://idp.local",
         MemoryLocalIdpKeyStore::with_current(k1),
@@ -279,7 +291,7 @@ async fn jwks_handle_taken_before_rotation_is_a_snapshot() {
     };
     assert_eq!(
         stale_kids,
-        vec!["rsa-1"],
+        vec!["key-1"],
         "handle taken before rotation must remain the pre-rotation snapshot"
     );
 
@@ -294,7 +306,7 @@ async fn jwks_handle_taken_before_rotation_is_a_snapshot() {
     };
     assert_eq!(
         fresh_kids,
-        vec!["rsa-2", "rsa-1"],
+        vec!["key-2", "key-1"],
         "handle taken after rotation reflects current + historical"
     );
 }
@@ -368,8 +380,8 @@ async fn replicas_rotating_in_turn_converge_on_the_stores_key_set() {
 
 #[tokio::test]
 async fn rotating_to_a_kid_already_in_the_jwks_is_refused() {
-    let k1 = LocalIdpSigningKey::generate_rsa().with_key_id("same");
-    let k2 = LocalIdpSigningKey::generate_rsa().with_key_id("same");
+    let k1 = LocalIdpSigningKey::generate_es256().with_key_id("same");
+    let k2 = LocalIdpSigningKey::generate_es256().with_key_id("same");
     let store = MemoryLocalIdpKeyStore::with_current(k1);
     let idp = LocalIdp::from_key_store("https://idp.local", store)
         .await
@@ -385,6 +397,11 @@ fn generated_keys_get_distinct_kids() {
     let a = LocalIdpSigningKey::generate_es256();
     let b = LocalIdpSigningKey::generate_es256();
     assert_ne!(a.key_id(), b.key_id());
+}
+
+#[cfg(feature = "local-idp-rsa")]
+#[test]
+fn generated_rsa_keys_get_distinct_kids() {
     let r = LocalIdpSigningKey::generate_rsa();
     let s = LocalIdpSigningKey::generate_rsa();
     assert_ne!(r.key_id(), s.key_id());

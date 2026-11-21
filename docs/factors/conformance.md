@@ -3,10 +3,10 @@
 This chapter records a run of the [OpenID Foundation conformance
 suite](https://gitlab.com/openid/conformance-suite) against the `examples/oauth`
 binary. The suite acts as the OpenID Provider and judges the relying party:
-axess in its OpenID Connect login and its logout paths. The run is recorded
-here, in the repository. It is not published on the OpenID Foundation site and
-it is not a certification; the same plans can be run on the hosted suite when
-one is wanted.
+axess in its OpenID Connect login and its logout paths. The record lives in
+the repository; it is not published on the OpenID Foundation site and is not a
+certification. The same plans can run on the hosted suite when a certification
+is wanted.
 
 Every verdict below is what the suite reported. Nothing is listed as passed that
 the suite reported otherwise, and the runner decides nothing itself.
@@ -28,11 +28,11 @@ response mode:
 The Basic certification plan fixes `client_secret_basic` and has no
 `client_auth_type` variant, so the `private_key_jwt` run uses the suite's
 generic client plan, `oidcc-client-test-plan`, which has one, and runs the same
-14 module names the Basic plan holds. That plan instance holds 28 modules for
-this variant (the others are discovery, WebFinger, aggregated and distributed
+14 module names the Basic plan holds. For this variant that plan instance
+holds 28 modules (the others are discovery, WebFinger, aggregated and distributed
 claims and signing-key rotation, which need dynamic registration or discovery
-from an identifier; see the refusals below); only the Basic 14 were run, so
-the plan instance is not complete and the run is not the Basic certification
+from an identifier; see the refusals below). Only the Basic 14 were run, so
+the plan instance is incomplete and the run is not the Basic certification
 plan under another variant.
 
 For each module the runner starts a fresh `axess-example-oauth` process against
@@ -44,18 +44,23 @@ browser is involved; the RP tests need none.
 
 ## Results
 
-The plans were first run on the integration branch with the per-tenant
-providers and `private_key_jwt` work merged (commit 0a8be5e) plus the fixes
-listed below. The results below are from a full re-run of all five on 0.14.0 in
-progress (the example gained the refresh route and the `private_key_jwt`
-switch for it), on the date recorded under each plan.
+The section below opens with the date of the run its verdicts come from
+and the tree that run was made against, and names under each plan its run,
+its tree and, for `private_key_jwt`, the key the client signed with. The
+runner writes all of it, from `scripts/conformance/results.json`, so a
+fresh run cannot leave a statement of an earlier one behind. A fresh run of
+all five plans (see *Re-running*) is a release step for the maintainer: it
+needs the suite's containers, which the release's automated gates do not
+start.
 
 <!-- results:start -->
+**The verdicts below are from a run of 2026-10-30, against the tree that became axess 0.14.0.** They say nothing of what changed after that tree.
+
 Suite version 5.3.4, image `registry.gitlab.com/openid/conformance-suite@sha256:ad39ddfcab955805327f3a4c75fc4f2999dfe6b740ca5cc87a96b2690ea98009`.
 
 ### `oidcc-client-basic-certification-test-plan`
 
-Run 2026-10-30 21:00 (UTC). Plan instance on the suite: FMiwfJiShcsd6. Variant: `{"client_registration": "static_client", "request_type": "plain_http_request"}`. Modules run: 14 (13 passed, 1 skipped).
+Run 2026-10-30 21:00 (UTC), against the tree that became axess 0.14.0. Plan instance on the suite: FMiwfJiShcsd6. Variant: `{"client_registration": "static_client", "request_type": "plain_http_request"}`. Modules run: 14 (13 passed, 1 skipped).
 
 | Module | Result | Client saw | Suite findings |
 |---|---|---|---|
@@ -76,7 +81,7 @@ Run 2026-10-30 21:00 (UTC). Plan instance on the suite: FMiwfJiShcsd6. Variant: 
 
 ### `oidcc-client-rp-initiated-logout-rp-basic`
 
-Run 2026-10-30 21:00 (UTC). Plan instance on the suite: tdAcaxOGfrfDi. Variant: `{"client_auth_type": "client_secret_basic", "client_registration": "static_client", "request_type": "plain_http_request", "response_mode": "default"}`. Modules run: 3 (3 passed).
+Run 2026-10-30 21:00 (UTC), against the tree that became axess 0.14.0. Plan instance on the suite: tdAcaxOGfrfDi. Variant: `{"client_auth_type": "client_secret_basic", "client_registration": "static_client", "request_type": "plain_http_request", "response_mode": "default"}`. Modules run: 3 (3 passed).
 
 | Module | Result | Client saw | Suite findings |
 |---|---|---|---|
@@ -86,7 +91,7 @@ Run 2026-10-30 21:00 (UTC). Plan instance on the suite: tdAcaxOGfrfDi. Variant: 
 
 ### `oidcc-client-back-channel-logout-rp-basic`
 
-Run 2026-10-30 21:00 (UTC). Plan instance on the suite: nGpvoHrgPXbhf. Variant: `{"client_auth_type": "client_secret_basic", "client_registration": "static_client", "request_type": "plain_http_request", "response_mode": "default"}`. Modules run: 8 (8 passed).
+Run 2026-10-30 21:00 (UTC), against the tree that became axess 0.14.0. Plan instance on the suite: nGpvoHrgPXbhf. Variant: `{"client_auth_type": "client_secret_basic", "client_registration": "static_client", "request_type": "plain_http_request", "response_mode": "default"}`. Modules run: 8 (8 passed).
 
 | Module | Result | Client saw | Suite findings |
 |---|---|---|---|
@@ -101,7 +106,7 @@ Run 2026-10-30 21:00 (UTC). Plan instance on the suite: nGpvoHrgPXbhf. Variant: 
 
 ### `oidcc-client-refreshtoken-test-plan`
 
-Run 2026-10-30 21:01 (UTC). Plan instance on the suite: EYHuS18d2vgVc. Variant: `{"client_auth_type": "client_secret_basic", "client_registration": "static_client", "request_type": "plain_http_request", "response_mode": "default", "response_type": "code"}`. Modules run: 3 (3 passed).
+Run 2026-10-30 21:01 (UTC), against the tree that became axess 0.14.0. Plan instance on the suite: EYHuS18d2vgVc. Variant: `{"client_auth_type": "client_secret_basic", "client_registration": "static_client", "request_type": "plain_http_request", "response_mode": "default", "response_type": "code"}`. Modules run: 3 (3 passed).
 
 | Module | Result | Client saw | Suite findings |
 |---|---|---|---|
@@ -111,9 +116,11 @@ Run 2026-10-30 21:01 (UTC). Plan instance on the suite: EYHuS18d2vgVc. Variant: 
 
 ### `oidcc-client-test-plan` (client_auth_type `private_key_jwt`)
 
-Run 2026-10-30 21:04 (UTC). Plan instance on the suite: bZaePN8cR8J4Y. Variant: `{"client_auth_type": "private_key_jwt", "client_registration": "static_client", "request_type": "plain_http_request", "response_mode": "default", "response_type": "code"}`. Modules run: 14 (1 failed, 12 passed, 1 skipped).
+Run 2026-10-30 21:04 (UTC), against the tree that became axess 0.14.0. Plan instance on the suite: bZaePN8cR8J4Y. Variant: `{"client_auth_type": "private_key_jwt", "client_registration": "static_client", "request_type": "plain_http_request", "response_mode": "default", "response_type": "code"}`. Modules run: 14 (1 failed, 12 passed, 1 skipped).
 
 The plan instance holds 28 modules for this variant; the 14 run are the ones listed.
+
+The client assertions were signed with a 2048-bit RSA key (RS256), which `examples/oauth` accepted then.
 
 | Module | Result | Client saw | Suite findings |
 |---|---|---|---|
@@ -136,22 +143,27 @@ The plan instance holds 28 modules for this variant; the 14 run are the ones lis
 
 ## How the example is configured for the run
 
-The example is the one in `examples/oauth`; the run uses its environment
-variables and nothing else:
+The example is the one in `examples/oauth`. The run changes none of its code:
+it sets the example's environment variables and calls its routes. Besides the
+issuer, the provider name and the client credentials (`OAUTH_ISSUER`,
+`OAUTH_PROVIDER_NAME`, `OAUTH_CLIENT_ID` and, outside the `private_key_jwt`
+run, `OAUTH_CLIENT_SECRET`), these settings and one route matter:
 
 - `OAUTH_ID_TOKEN_ALGS=RS256` pins the algorithms of ID tokens and logout
   tokens to the registration's `id_token_signed_response_alg`, the OpenID
-  Connect default. Without a pin the example accepts what the provider's key
-  set can verify, and the suite's wrong-algorithm logout test (a token signed
-  with ES256 by a key the provider publishes) is accepted.
+  Connect default. Without a pin the example accepts any algorithm the provider's
+  key set can verify, so it accepts the token in the suite's wrong-algorithm
+  logout test (a token signed with ES256 by a key the provider publishes).
 - `OAUTH_PRIVATE_KEY_FILE`, for the `private_key_jwt` run only: a PEM key the
-  runner generates for the run (2048-bit RSA, `RS256`, `kid`
-  `axess-conformance-key`), with its public JWK handed to the suite as the
-  client's `jwks`. The example then builds its provider with
-  `OAuthProviderConfig::discover_with_private_key_jwt` and a
+  runner generates for the run (a P-256 key, the example's default
+  algorithm, which needs no RSA feature), with its algorithm and key id
+  set by `OAUTH_PRIVATE_KEY_ALG=ES256` and
+  `OAUTH_PRIVATE_KEY_KID=axess-conformance-key` and its public JWK handed to
+  the suite as the client's `jwks`. The example then builds its provider with
+  `OAuthProviderConfig::discover_screened_with_private_key_jwt` and a
   `ClientAssertionSigner`, and `OAUTH_CLIENT_SECRET` is not set, so a secret
   cannot be sent.
-- `POST /auth/refresh`, the example's refresh on demand, which the driver calls
+- `POST /auth/refresh`, the example's refresh on demand, which the runner calls
   after login in the refresh plan: it exchanges the stored refresh token
   through `refresh_oauth_token`, keeps the rotated token and asks userinfo
   about the same subject with the new access token.
@@ -163,7 +175,7 @@ variables and nothing else:
 - **Loopback HTTP.** The suite's origin is `http://localhost:9080`. axess
   accepts `http` for loopback issuers only and trusts the public web PKI for
   `https`, so it cannot be pointed at the suite's self-signed TLS endpoint. A
-  small nginx in front of the suite says `X-Forwarded-Proto: https` because the
+  small nginx in front of the suite sets `X-Forwarded-Proto: https` because the
   suite refuses any request that does not look like HTTPS. The code paths
   under test are the same; the TLS handshake is not exercised.
 - **Static client registration.** axess does not implement dynamic client
@@ -183,8 +195,8 @@ variables and nothing else:
   `alg: none`; this is a profile refusal, and the suite counts it as a skip
   (in the Basic run and in the `private_key_jwt` run alike).
 
-- `oidcc-client-test-client-secret-basic` under `private_key_jwt`: FAILED, by
-  the variant and not by a defect. The module asserts that the token request
+- `oidcc-client-test-client-secret-basic` under `private_key_jwt`: FAILED because
+  of the variant, not a defect. The module asserts that the token request
   carries an `Authorization: Basic` header (the suite's finding: "expected the
   client to perform client_secret_basic client authorization, but the incoming
   http request does not contain an authorization header"), which a client
@@ -194,13 +206,17 @@ variables and nothing else:
 
 ## Defects the run found, and their fixes
 
-1. **The userinfo response was never asked about its subject.**
+The plans were first run on the tree of commit 0a8be5e, which added the
+per-tenant providers and `private_key_jwt` support. That run found the
+defects below, each fixed since:
+
+1. **The example never checked the userinfo subject.**
    `oidcc-client-test`, `-userinfo-invalid-sub` and `-scope-userinfo-claims`
    wait for a userinfo request. The library already checks the subject
    (`fetch_userinfo`); the example did not call it. The example now calls it
    after the ID token is accepted and refuses a login whose userinfo names
    another subject (OIDC Core 5.3.2).
-2. **The back-channel logout endpoint did not say `Cache-Control: no-store`**
+2. **The back-channel logout endpoint did not send `Cache-Control: no-store`**
    (Back-Channel Logout 1.0 section 2.8), a warning on every logout module.
    `BackChannelLogoutHandler::handle_backchannel_logout` now returns a
    `Response` with the header on every answer, tested for a 200 and a 400.
@@ -256,9 +272,15 @@ name, replaces only its own entry in the results and keeps the others:
 scripts/conformance/run-rp.sh --plans refresh
 scripts/conformance/run-rp.sh --plans basic-private-key-jwt
 ```
-`KEEP_SUITE=1` leaves the suite up to read its logs at
+`python3 -I scripts/conformance/run_rp_tests.py` checks, without the
+suite or the network, that the results section above is what the runner
+writes from `results.json`, and that a fresh run's section names its own
+date and tree and none of an earlier run's. CI's Source Rules job and the
+release preflight run it.
+
+`KEEP_SUITE=1` leaves the suite running so its logs can be read at
 `http://localhost:9080/log-detail.html?log=<module id>`.
 
 A plan instance id (a short random string) belongs to the local suite
-database that run created; it is gone when the containers are. The plan
+database the run created and disappears with the containers. The plan
 names are the stable identifiers and exist on the hosted suite too.

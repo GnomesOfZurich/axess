@@ -11,7 +11,10 @@
 //!
 //! # Quick start
 //!
-//! ```
+//! The example derives serde's traits, so it is a test where `serde` is on.
+//!
+#![cfg_attr(feature = "serde", doc = "```")]
+#![cfg_attr(not(feature = "serde"), doc = "```ignore")]
 //! use axess_events::{Event, EventBody, EventId, EventPayload, EventStatus, KindTag};
 //! use serde::{Serialize, Deserialize};
 //!
@@ -75,17 +78,18 @@ pub mod trace;
 // workspace's exact internal pin.
 pub use axess_strings::ShortString;
 
-#[allow(deprecated)]
-pub use encryption::envelope_aad;
 pub use encryption::{
-    AeadAlgorithm, EncryptedBlob, EnvelopeFields, KeyId, envelope_aad_for, envelope_aad_v2,
-    open_aads_for,
+    AeadAlgorithm, EncryptedBlob, EnvelopeFields, FirstTag, KeyId, envelope_aad_for,
+    envelope_aad_v2, open_aads_for,
 };
-pub use id::{DeviceId, EventId, SessionId, TenantId, UserId};
+pub use id::{
+    DeviceId, EventId, SESSION_KEY_DOMAIN, SessionId, SessionKey, SessionKeyError,
+    SessionKeyPrefix, TenantId, UserId,
+};
 pub use kind::{EventPayload, KindTag};
 pub use sink::{EventSink, LogAndSwallow, NoopEventSink, SinkError};
 pub use status::EventStatus;
-pub use subject::{EventSubject, EventSubjectRef};
+pub use subject::{EventSubject, EventSubjectRef, RecordedSessionId};
 pub use trace::TraceContext;
 
 /// Cross-cutting event envelope. Domain-specific payload `P` lives in
@@ -221,6 +225,10 @@ mod tests {
     fn kind_tag_is_derived_from_payload() {
         let event = sample_event();
         assert_eq!(event.kind.as_str(), "test.login_attempt.v1");
+        let device = TestPayload::DeviceFirstSeen {
+            device: DeviceId::NIL,
+        };
+        assert_eq!(device.kind_tag().as_str(), "test.device_first_seen.v1");
     }
 
     #[test]

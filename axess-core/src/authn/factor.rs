@@ -40,9 +40,11 @@ pub use template::{FactorTemplate, default_catalog};
 #[cfg(feature = "fido2")]
 pub use axess_factors::{
     AttestationCaList, AuthenticationResult, AuthenticatorAttachment, CredentialID,
-    Fido2Credential, Fido2Key, Fido2Options,
+    DiscoverableCredential, DiscoverablePrompt, Fido2Credential, Fido2Key, Fido2Options,
 };
-pub use axess_factors::{DEFAULT_FIDO2_CEREMONY, Fido2Ceremony, SecurityKeyVerification};
+pub use axess_factors::{
+    DEFAULT_FIDO2_CEREMONY, DEFAULT_FIDO2_MAX_AUTHN_AGE, Fido2Ceremony, SecurityKeyVerification,
+};
 
 use serde::{Deserialize, Serialize};
 use std::{fmt, sync::Arc};
@@ -200,6 +202,14 @@ impl FederatedProvider {
     }
 }
 
+/// The tag [`as_str`](FederatedProvider::as_str) returns, as it is: a custom
+/// tag is written as configured, not escaped.
+impl std::fmt::Display for FederatedProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 // ── FactorConfig ─────────────────────────────────────────────────────────────
 
 /// Typed factor configuration: one variant per factor kind.
@@ -321,7 +331,7 @@ mod factor_tests {
     //! `FactorStep`, `FederatedProvider`, and `FactorCredential`.
     use super::*;
 
-    /// Kills line 78 `FactorKind::fmt -> Ok(Default::default())`:
+    /// Kills the mutant `FactorKind::fmt -> Ok(Default::default())`:
     /// Display must emit the canonical `as_str()` tag, not an empty
     /// formatter write.
     #[test]
@@ -336,7 +346,7 @@ mod factor_tests {
         );
     }
 
-    /// Kills line 108 `FactorStep::as_required -> None`: a Required
+    /// Kills the mutant `FactorStep::as_required -> None`: a Required
     /// step must return `Some(&kind)`.
     #[test]
     fn factor_step_as_required_returns_some_for_required_variant() {
@@ -352,7 +362,7 @@ mod factor_tests {
         assert!(step.as_required().is_none());
     }
 
-    /// Kills line 116 `accepts -> true/false` and line 117 `== → !=`:
+    /// Kills the mutants `accepts -> true/false` and `== → !=`:
     /// `accepts` must be true ONLY for the matching `Required` kind
     /// or membership in an `AnyOf` choice list.
     #[test]
@@ -371,7 +381,7 @@ mod factor_tests {
         assert!(!step.accepts(&FactorKind::EmailOtp));
     }
 
-    /// Kills line 147 `FederatedProvider::as_str -> ""` and
+    /// Kills the mutant `FederatedProvider::as_str -> ""` and
     /// `-> "xyzzy"`: must return the canonical lower-case tag per
     /// variant. Includes the Custom arm to defend the match against
     /// arm reordering.

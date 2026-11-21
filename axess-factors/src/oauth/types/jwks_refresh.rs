@@ -16,6 +16,11 @@ use std::sync::Arc;
 use super::error::OAuthError;
 use super::provider::OAuthProvider;
 
+/// The most bytes of a provider's name a log line keeps. A tenant's
+/// provider is named by its tenant, so the name is written as every text
+/// bound for a log line is: escaped and cut.
+const PROVIDER_NAME_LOG_BYTES: usize = 128;
+
 /// How many providers a pass refreshes at once.
 pub const JWKS_REFRESH_CONCURRENCY: usize = 8;
 
@@ -64,7 +69,7 @@ pub async fn refresh_providers_jwks(
                     .remove(&ended.id())
                     .unwrap_or_else(|| Arc::from("unknown provider"));
                 tracing::warn!(
-                    provider = %name,
+                    provider = %crate::log_text::log_safe(&name, PROVIDER_NAME_LOG_BYTES),
                     "JWKS refresh task ended abnormally; will retry next tick"
                 );
                 failures.push((
@@ -75,10 +80,13 @@ pub async fn refresh_providers_jwks(
             }
         };
         match outcome {
-            Ok(()) => tracing::debug!(provider = %provider.name(), "JWKS refresh ok"),
+            Ok(()) => tracing::debug!(
+                provider = %crate::log_text::log_safe(provider.name(), PROVIDER_NAME_LOG_BYTES),
+                "JWKS refresh ok"
+            ),
             Err(e) => {
                 tracing::warn!(
-                    provider = %provider.name(),
+                    provider = %crate::log_text::log_safe(provider.name(), PROVIDER_NAME_LOG_BYTES),
                     error = %e,
                     "JWKS refresh failed; will retry next tick"
                 );
@@ -137,7 +145,7 @@ fn refresh_ticker(interval: std::time::Duration) -> tokio::time::Interval {
 ///
 /// ```rust,ignore
 /// let provider = Arc::new(OAuthProviderConfig::discover(...).await?);
-/// let _jwks = spawn_jwks_refresh(provider.clone(), Duration::from_secs(3600));
+/// let refresh_task = spawn_jwks_refresh(provider.clone(), Duration::from_secs(3600));
 /// ```
 pub fn spawn_jwks_refresh(
     provider: Arc<dyn OAuthProvider>,

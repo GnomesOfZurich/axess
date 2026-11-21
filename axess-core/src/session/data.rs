@@ -5,53 +5,70 @@ use crate::authn::{
     factor::{FactorKind, FactorStep},
     ids::{DeviceId, TenantId, UserId},
 };
-use chrono::{DateTime, Utc};
+use axess_clock::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 /// Current session data schema version.
 ///
-/// Increment this when the `SessionData` structure changes in a way that
-/// requires migration. The session layer checks this on load and calls
-/// [`SessionData::migrate`] if the stored version is older.
+/// Raise it when the stored shape of [`SessionData`] changes. A stored row
+/// below it is no session of this release and is not served: the session
+/// layer runs the request as a guest, counts the row
+/// ([`SessionMetrics::session_row_refused`](crate::metrics::SessionMetrics::session_row_refused))
+/// and logs it, and leaves it to expire.
 ///
 /// # History
 ///
 /// - `v1`: initial schema (`auth_state`, `fingerprint`, `custom`).
-/// - `v2`: added `device_id: Option<DeviceId>`. Existing v1
-///   sessions deserialise with `device_id = None` via `serde(default)`;
-///   the migration step bumps the version field so a re-save reflects
-///   the new schema.
-pub const SESSION_DATA_VERSION: u8 = 2;
+/// - `v2`: added `device_id: Option<DeviceId>`.
+/// - `v3`: `Authenticating` gained `flow` and `Authenticated` gained
+///   `signed_in_at`; the same version added `key_binding`, the device key
+///   a session is bound to.
+pub const SESSION_DATA_VERSION: u8 = 3;
 
 /// The complete session payload stored in the session store.
 ///
 /// All authentication state is captured here in a flat, serializable form.
-/// Session data is serialized as JSON once per request, not per field access.
+/// The stores serialize it as MessagePack, whole, when the session is written, not per field access.
 ///
 /// # Schema versioning
 ///
-/// The `version` field is persisted with each session. When the library evolves
-/// and `SessionData` gains or removes fields, bump [`SESSION_DATA_VERSION`] and
-/// add a migration step in [`SessionData::migrate`]. The session layer calls
-/// `migrate` automatically on load, so existing sessions are upgraded in-place
-/// without requiring a coordinated session wipe.
+/// The `version` field is persisted with each session. When the stored shape
+/// of `SessionData` changes, [`SESSION_DATA_VERSION`] is raised, and a row
+/// below the current version is not served: sessions stored by an earlier
+/// release are not carried over, and their holders sign in again.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionData {
-    /// Schema version of this session data. Used for forward-compatible
-    /// deserialization: if a newer library version adds fields, older sessions
-    /// are migrated transparently on load.
+    /// Schema version of this session data, written on every save. A row
+    /// with no `version` member reads as 1. The session layer serves no row
+    /// below [`SESSION_DATA_VERSION`]; a row above it, written by a later
+    /// release during a rolling upgrade, is served.
     #[serde(default = "default_version")]
     pub version: u8,
     /// Authentication state of the session principal.
     pub auth_state: AuthState,
     /// Fingerprint identifying the expected client for this session.
     ///
-    /// Set automatically by [`SessionBinding`](super::binding::SessionBinding)
-    /// when the session first becomes authenticated. Checked on every subsequent
-    /// request: a mismatch invalidates the session (possible hijacking).
+    /// Set automatically from the
+    /// [`SessionBinding`](super::binding::SessionBinding) at the session's
+    /// first step out of `Guest` (identifying, the start of a login, a
+    /// workflow step, or authentication itself). Checked on every subsequent
+    /// request: on a mismatch the request runs as a guest (possible
+    /// hijacking).
     pub fingerprint: Option<String>,
     /// Opaque [`DeviceId`] resolved for the request that owns this session.
+    ///
+    /// It holds for the person it was resolved for: the person at the
+    /// session's browser when the request began (the administrator of an
+    /// impersonation, else the signed-in user), while that person is at the
+    /// browser or, with nobody signed in, is the one a login in progress
+    /// names; or for nobody, for a guest's request and one inside a login,
+    /// whose device holds for whoever signs in. When another person signs in on the session within a request,
+    /// this field, as [`AuthSession::data`](super::extractor::AuthSession::data)
+    /// shows it, still names the first person's device for the rest of that
+    /// request;
+    /// [`AuthSession::device_id`](super::extractor::AuthSession::device_id)
+    /// answers `None`, and the row is written without it.
     ///
     /// `None` when the device subsystem is disabled (the `device` feature is
     /// off) or when the request was handled before the device resolver had
@@ -68,18 +85,62 @@ pub struct SessionData {
     /// [`docs/identity/device.md`](../../../docs/identity/device.md).
     #[serde(default)]
     pub device_id: Option<DeviceId>,
-    /// Whether `device_id` is a device the client proved it holds (the
-    /// secret token on its cookie, through
-    /// [`DeviceLifecycleService::resolve_proven`](crate::device::DeviceLifecycleService::resolve_proven)),
-    /// and not one a resolver found by fingerprint alone. Only the session
-    /// layer sets it, from what the device resolver reports; a lockout
-    /// exemption reads the device through
+    /// Whether the request this session is serving proved `device_id`: its
+    /// device resolver answered
+    /// [`BoundDevice::Proven`](crate::device::BoundDevice::Proven), which the
+    /// library's resolver does for a request that presents the device's
+    /// secret cookie token and for the device it creates on that request,
+    /// and not for a device found by other means or kept from an earlier
+    /// request of the session.
+    ///
+    /// The answer is the request's own and is never read from a store: the
+    /// serialised form does not carry it, the session layer clears it on
+    /// every row it loads (a store that keeps the value as it was handed
+    /// over may return it), and sets it on every request from what the
+    /// resolver reports. A lockout exemption reads the device through
     /// [`AuthSession::proven_device`](super::extractor::AuthSession::proven_device),
-    /// which answers only when this is `true`. A session stored before this
-    /// field existed reads `false` until its next request resolves the device
-    /// again.
-    #[serde(default)]
+    /// which answers only when this is `true`.
+    #[serde(skip)]
     pub device_proven: bool,
+    /// The key the request this session is serving proved its device by,
+    /// when it did, with the tenant and device the proof names: set beside
+    /// [`device_proven`](Self::device_proven) from what the device resolver
+    /// reports, for a device proven by a signature of its key and not by
+    /// its token. The request's own answer, never stored, like
+    /// `device_proven`.
+    #[serde(skip)]
+    pub device_key: Option<crate::device_key::ProvenKey>,
+    /// Whether the request this session is serving proved the key the
+    /// session is bound to ([`key_binding`](Self::key_binding)): the
+    /// session layer's own verdict, from a proof cookie or a request proof,
+    /// whether or not the request also presented the device's token. The
+    /// request's own answer, never stored, like `device_proven`. What
+    /// [`AuthSession::key_bound`](super::extractor::AuthSession::key_bound)
+    /// answers.
+    #[serde(skip)]
+    pub key_proven: bool,
+    /// The device key this session is bound to, when it is, and the person
+    /// the binding was made for
+    /// ([`SessionKeyBinding::owner`](crate::device_key::SessionKeyBinding::owner)).
+    ///
+    /// The raw field: a binding holds only while its owner is the person at
+    /// the session's browser, and every reader that asks whether the session
+    /// is bound reads [`key_binding_in_force`](Self::key_binding_in_force).
+    /// When another person signs in, or a new login begins, the binding is
+    /// no longer in force, and the session layer drops it from the row at
+    /// the next write.
+    ///
+    /// Set when a factor verification completes on a request that proved
+    /// its device by key and the device is the signed-in user's (owned by
+    /// that user, or unowned and claimed for them); when a key registration
+    /// succeeds on a freshly authenticated session; and on the session a
+    /// refresh token builds after a proof by the key of the token's device.
+    /// A bound session is served only to a request that proves the same
+    /// key; see [`device_key`](crate::device_key).
+    /// Carried whatever the features so a stored session has one shape.
+    /// Absent from the row of a session that is not bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_binding: Option<crate::device_key::SessionKeyBinding>,
     /// Escape hatch for application-specific data stored alongside the session.
     pub custom: serde_json::Value,
     /// Write counter: the session layer raises it on every write to the
@@ -95,75 +156,28 @@ pub struct SessionData {
     /// for a session stored before the field existed, which is refreshed on
     /// its next request.
     #[serde(default)]
-    pub touched_at: Option<DateTime<Utc>>,
-}
-
-/// Custom key under which the login service stamps the flow in flight. The
-/// transition to `Authenticated` keeps it: the registration step that follows
-/// reads it to check the credentials did not change meanwhile.
-pub(crate) const LOGIN_FLOW_KEY: &str = "axess.login.flow";
-
-/// Custom key under which a step-up begun for a named FIDO2 ceremony keeps
-/// it, for the challenge the step's `prepare_factor` issues. A new login
-/// removes it and the transition to `Authenticated` drops it (it is not one
-/// of the keys [`retain_across_login`] keeps), so it never outlives its
-/// step-up.
-pub(crate) const STEP_UP_CEREMONY_KEY: &str = "axess.step_up.ceremony";
-
-/// Drop the pre-login contents of the custom bag when a session becomes
-/// authenticated, keeping the key the login service owns (the flow in
-/// flight) and the keys the application registered to be carried across.
-///
-/// State an anonymous visitor could put in a session (a cart, a locale, a
-/// planted value) must not ride into the authenticated session, so the
-/// default keeps nothing else.
-pub(crate) fn retain_across_login(custom: &mut serde_json::Value, preserved: &[String]) {
-    match custom {
-        serde_json::Value::Object(map) => {
-            map.retain(|key, _| key == LOGIN_FLOW_KEY || preserved.iter().any(|p| p == key));
-        }
-        other => *other = serde_json::Value::default(),
-    }
-}
-
-/// Length in bytes of `value` serialized as compact JSON, counted without
-/// building the string.
-pub(crate) fn json_byte_len(value: &serde_json::Value) -> usize {
-    struct Count(usize);
-    impl std::io::Write for Count {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0 += buf.len();
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut count = Count(0);
-    // A `Value` always serializes, so the error arm is unreachable; a count of
-    // zero is the same fallback the size check has always used.
-    if serde_json::to_writer(&mut count, value).is_err() {
-        return 0;
-    }
-    count.0
-}
-
-/// Clear a custom bag that exceeds `max_bytes` serialized (zero is no cap).
-/// Every write of a session applies it, so data loaded, migrated or merged
-/// from a concurrent write cannot be stored oversized.
-pub(crate) fn cap_custom(custom: &mut serde_json::Value, max_bytes: usize) {
-    if max_bytes == 0 {
-        return;
-    }
-    let custom_size = json_byte_len(custom);
-    if custom_size > max_bytes {
-        tracing::warn!(
-            custom_size,
-            max = max_bytes,
-            "session custom data exceeds size limit; clearing custom data"
-        );
-        *custom = serde_json::Value::default();
-    }
+    pub touched_at: Option<Timestamp>,
+    /// The session layer's claim on this session while it ends it. `None`
+    /// on every session the load hands to a handler.
+    ///
+    /// The layer ends a session it finds past an age cap, or gone from the
+    /// registry, in three steps: it writes this claim as a compare-and-swap
+    /// on the revision (which exactly one of several requests carrying the
+    /// same cookie wins), writes the audit row, and deletes the row. The
+    /// claim is the decision to end the session. A request that loads a row
+    /// claimed less than [`ENDING_CLAIM_LEASE`] ago is refused the session
+    /// and ends nothing, so one ending leaves one audit row. A request that
+    /// loads an older claim, left by a request that did not finish,
+    /// finishes the ending for the reason the claim holds: a claimed
+    /// session is never served again. Only the request that made a claim
+    /// takes it back, and only when the audit row could not be written.
+    ///
+    /// A request that was already running when the claim was made, and
+    /// writes the session afterwards, writes onto the claimed row and
+    /// leaves the claim in place; a rotation of the id is not carried out
+    /// for a claimed session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ending: Option<EndingClaim>,
 }
 
 fn default_version() -> u8 {
@@ -178,40 +192,14 @@ impl Default for SessionData {
             fingerprint: None,
             device_id: None,
             device_proven: false,
+            device_key: None,
+            key_proven: false,
+            key_binding: None,
             custom: serde_json::Value::default(),
             revision: 0,
             touched_at: None,
+            ending: None,
         }
-    }
-}
-
-impl SessionData {
-    /// Migrate session data from an older schema version to the current version.
-    ///
-    /// Called automatically by the session layer on load. Each version bump
-    /// should add a migration step here. Returns `true` if a migration was
-    /// applied (session should be re-saved).
-    pub fn migrate(&mut self) -> bool {
-        if self.version >= SESSION_DATA_VERSION {
-            return false;
-        }
-
-        // v1 → v2: added `device_id: Option<DeviceId>`. The
-        // serde `default` attribute on the field already supplied `None`
-        // during deserialisation, so the in-memory representation is
-        // already correct; the only work left is bumping the persisted
-        // version field so a re-save reflects the current schema.
-        //
-        // Each per-version step is responsible for bumping `self.version`
-        // to the next number. No unconditional trailing assignment to
-        // `SESSION_DATA_VERSION`; that hid the per-step bump from
-        // observation (mutation tests couldn't distinguish "this branch
-        // ran" from "the trailing line ran"). Future steps follow the
-        // same shape: `if self.version == 2 { ...; self.version = 3; }`.
-        if self.version == 1 {
-            self.version = 2;
-        }
-        true
     }
 }
 
@@ -252,7 +240,7 @@ impl SessionData {
 /// Calling [`AuthSession::clear`](super::extractor::AuthSession::clear) from
 /// any state resets the session back to `Guest` (logout).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(tag = "kind", from = "AuthStateWire")]
+#[serde(tag = "kind")]
 pub enum AuthState {
     /// No authentication started; anonymous visitor.
     #[default]
@@ -275,39 +263,39 @@ pub enum AuthState {
         /// Human-readable method name, e.g. `"password+totp"`.
         method_name: Arc<str>,
         /// The method's steps still to be completed, in order. A step may
-        /// offer a choice ([`FactorStep::AnyOf`]). Sessions written before
-        /// steps were kept here hold a plain list of kinds, read as
-        /// required steps.
+        /// offer a choice ([`FactorStep::AnyOf`]).
         remaining: Vec<FactorStep>,
         /// Factor kinds that have already been verified in this flow, each
         /// with the time it was verified, in the order they were completed.
         /// Carried into [`AuthState::Authenticated::factors_completed`] on
-        /// transition so audit events can record the full list. A session
-        /// written before the times were kept reads each of its factors as
-        /// verified at the Unix epoch: the row knows no better, and that
-        /// never passes a freshness check.
-        completed: Vec<(FactorKind, DateTime<Utc>)>,
+        /// transition so audit events can record the full list.
+        completed: Vec<(FactorKind, Timestamp)>,
         /// Number of failed attempts on the current factor step.
         attempt_count: u32,
         /// Timestamp of last attempt (for rate limiting / lockout).
-        last_attempt: Option<DateTime<Utc>>,
+        last_attempt: Option<Timestamp>,
         /// The groups the directory returned when an LDAP bind step of this
         /// login verified, carried into
         /// [`AuthState::Authenticated::ldap_groups`]; `None` until then.
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         ldap_groups: Option<Vec<String>>,
         /// The impersonation of the `Authenticated` state a step-up began
         /// from, kept so the state the step-up completes into is still the
         /// administrator's; `None` for a login and for a step-up of the
         /// user's own session.
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         impersonator: Option<Impersonation>,
         /// What each factor verified so far proved, the most recent proof
         /// of each kind; carried into
         /// [`AuthState::Authenticated::assurance`]. A step-up begins with
         /// the record of the state it began from.
-        #[serde(skip_serializing_if = "Vec::is_empty")]
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         assurance: Vec<FactorAssurance>,
+        /// What the pending step is for: a login, or a step-up of a session
+        /// that was signed in. Set by the transition that opened it, and
+        /// always stored: a pending state is read only with its flow, so no
+        /// stored row is taken for a login that does not say it is one.
+        flow: AuthFlow,
     },
 
     /// All factors verified: user is fully authenticated.
@@ -316,30 +304,33 @@ pub enum AuthState {
         user_id: UserId,
         /// Tenant the user belongs to.
         tenant_id: TenantId,
-        /// Wall-clock time when authentication completed (from injectable
-        /// Clock): the moment the most recent factor completed. A step-up
-        /// moves it forward; the factors of the original login keep their
-        /// own times in `factors_completed`.
-        authn_time: DateTime<Utc>,
+        /// When the person last proved presence (from the injectable
+        /// Clock): the moment the most recent factor completed, the login's
+        /// or a later step-up's. Recency checks read it
+        /// (`AuthSession::authenticated_within`, a FIDO2 `max_authn_age`).
+        /// The factors of the original login keep their own times in
+        /// `factors_completed`.
+        authn_time: Timestamp,
+        /// When the login that created the session completed: what the
+        /// absolute age cap counts from. A step-up and an id rotation keep
+        /// it; only a new login sets it.
+        signed_in_at: Timestamp,
         /// Factor kinds that were verified to reach this state, each with
         /// the time it was verified, in completion order. Used by the audit log to distinguish
         /// "user logged in with password only because the tenant
         /// disables TOTP" (legitimate single-factor) from "user
         /// reached Authenticated without verifying TOTP" (bypass
-        /// attack). Empty for sessions whose state predates this
-        /// field; `serde(default)` keeps existing serialized
-        /// sessions readable. A session written as a plain list of kinds
-        /// (0.15.0 and earlier) reads each of them as verified at its
-        /// `authn_time`, the only time that row knew.
-        factors_completed: Vec<(FactorKind, DateTime<Utc>)>,
+        /// attack). Empty for a session that reached this state without
+        /// verifying a factor (impersonation, signup).
+        factors_completed: Vec<(FactorKind, Timestamp)>,
         /// The administrator acting in `user_id`'s name and when the
         /// impersonation began, for a session `begin_impersonation` made;
         /// `None` for the user's own session. Part of the authenticated
         /// state, so nothing done to the custom data can remove it; it
         /// ends with the state (`end_impersonation`, logout, a new login).
-        /// Stored as an object (`{"admin": .., "since": ..}`). Sessions
-        /// written before this field read as `None`.
-        #[serde(skip_serializing_if = "Option::is_none")]
+        /// Stored as an object (`{"admin": .., "since": ..}`), and not at
+        /// all when `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         impersonator: Option<Impersonation>,
         /// The groups the directory returned when this login's LDAP bind
         /// factor verified (empty when the provider searches no groups);
@@ -348,17 +339,16 @@ pub enum AuthState {
         /// handler cannot overwrite them, the custom-data cap cannot drop
         /// them, and they end with the state. Read with
         /// `AuthSession::ldap_groups`.
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         ldap_groups: Option<Vec<String>>,
         /// What each verified factor proved, and when: the most recent
         /// proof of each factor kind (see
         /// [`FactorAssurance`]). Part of the authenticated state for the
         /// same reasons as `impersonator`. Empty for a session that reached
-        /// this state without verifying a factor (impersonation, signup)
-        /// and for a session written before the field existed, and an empty
-        /// record satisfies no policy that asks for assurance. Read with
-        /// [`AuthState::assurance`].
-        #[serde(skip_serializing_if = "Vec::is_empty")]
+        /// this state without verifying a factor (impersonation, signup),
+        /// and an empty record satisfies no policy that asks for assurance.
+        /// Read with [`AuthState::assurance`].
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         assurance: Vec<FactorAssurance>,
     },
 
@@ -415,7 +405,7 @@ impl AuthState {
     /// When `kind` was last verified in this authenticated state, or `None`
     /// from any other state or when it was not. A step-up that verifies a
     /// kind again moves its time forward; earlier factors keep theirs.
-    pub fn factor_completed_at(&self, kind: &FactorKind) -> Option<DateTime<Utc>> {
+    pub fn factor_completed_at(&self, kind: &FactorKind) -> Option<Timestamp> {
         match self {
             AuthState::Authenticated {
                 factors_completed, ..
@@ -512,6 +502,7 @@ impl AuthState {
             ldap_groups: None,
             impersonator: None,
             assurance: Vec::new(),
+            flow: AuthFlow::Login,
         };
     }
 
@@ -525,6 +516,7 @@ impl AuthState {
         let AuthState::Authenticated {
             user_id,
             tenant_id,
+            signed_in_at,
             factors_completed,
             ldap_groups,
             impersonator,
@@ -537,7 +529,7 @@ impl AuthState {
         *self = AuthState::Authenticating {
             user_id: *user_id,
             tenant_id: *tenant_id,
-            method_name: Arc::from("step-up"),
+            method_name: Arc::from(STEP_UP_LABEL),
             remaining: steps,
             completed: std::mem::take(factors_completed),
             attempt_count: 0,
@@ -547,6 +539,9 @@ impl AuthState {
             ldap_groups: ldap_groups.take(),
             impersonator: impersonator.take(),
             assurance: std::mem::take(assurance),
+            flow: AuthFlow::StepUp {
+                signed_in_at: *signed_in_at,
+            },
         };
         true
     }
@@ -568,7 +563,7 @@ impl AuthState {
         &mut self,
         user_id: UserId,
         tenant_id: TenantId,
-        authn_time: DateTime<Utc>,
+        authn_time: Timestamp,
     ) {
         self.set_authenticated_with(user_id, tenant_id, authn_time, None);
     }
@@ -579,13 +574,14 @@ impl AuthState {
         &mut self,
         user_id: UserId,
         tenant_id: TenantId,
-        authn_time: DateTime<Utc>,
+        authn_time: Timestamp,
         proof: Option<FactorAssurance>,
     ) {
         *self = AuthState::Authenticated {
             user_id,
             tenant_id,
             authn_time,
+            signed_in_at: authn_time,
             factors_completed: Vec::new(),
             impersonator: None,
             ldap_groups: None,
@@ -595,7 +591,7 @@ impl AuthState {
 
     /// Mark an `Authenticated` state as an impersonation by `admin` begun
     /// at `since`. Returns `false`, changing nothing, from any other state.
-    pub(crate) fn set_impersonator(&mut self, admin: UserId, since: DateTime<Utc>) -> bool {
+    pub(crate) fn set_impersonator(&mut self, admin: UserId, since: Timestamp) -> bool {
         let AuthState::Authenticated { impersonator, .. } = self else {
             return false;
         };
@@ -654,9 +650,15 @@ impl AuthState {
                 ldap_groups,
                 impersonator,
                 assurance,
+                flow,
                 ..
             } => {
                 let authn_time = proof.at;
+                // A step-up keeps the session's login; a login is its own.
+                let signed_in_at = match flow {
+                    AuthFlow::StepUp { signed_in_at } => *signed_in_at,
+                    AuthFlow::Login => authn_time,
+                };
                 // The step this factor satisfies is done; the factor itself
                 // (not the step's other choices) is what was completed, and
                 // what it proved is recorded beside it.
@@ -676,6 +678,7 @@ impl AuthState {
                         user_id: uid,
                         tenant_id: tid,
                         authn_time,
+                        signed_in_at,
                         factors_completed: factors,
                         impersonator,
                         ldap_groups,
@@ -698,7 +701,7 @@ impl AuthState {
     /// persist on every wrong attempt because that scales DB writes
     /// with brute-force traffic. `AuthSession::record_attempt_at`
     /// preserves that property by not setting `modified = true`.
-    pub(crate) fn record_attempt_at(&mut self, now: DateTime<Utc>) {
+    pub(crate) fn record_attempt_at(&mut self, now: Timestamp) {
         if let AuthState::Authenticating {
             attempt_count,
             last_attempt,
@@ -729,18 +732,39 @@ pub(crate) enum AdvanceOutcome {
     Completed,
 }
 
+mod flow;
+pub use flow::AuthFlow;
+pub(crate) use flow::{STEP_UP_LABEL, SignedIn};
+mod device;
 mod impersonation;
 pub use impersonation::Impersonation;
 mod workflow;
 pub use workflow::{WorkflowKind, WorkflowState};
-mod wire;
-use wire::AuthStateWire;
+mod version;
+#[cfg(any(
+    feature = "sqlite",
+    feature = "sqlite-unbundled",
+    feature = "postgres",
+    feature = "mysql",
+    feature = "valkey"
+))]
+pub(crate) use version::stored_version;
 mod merge;
 pub(crate) use merge::{merge_concurrent, merge_rotating};
+mod claim;
+pub use claim::{ENDING_CLAIM_LEASE, EndingClaim};
+mod custom;
+pub(crate) use custom::{
+    LOGIN_FLOW_KEY, STEP_UP_CEREMONY_KEY, cap_custom, json_byte_len, retain_across_login,
+};
 
 #[cfg(test)]
 mod assurance_tests;
 #[cfg(test)]
 pub(crate) mod assured_fixture;
+#[cfg(test)]
+mod flow_tests;
+#[cfg(test)]
+mod signed_in_tests;
 #[cfg(test)]
 mod tests;

@@ -3,7 +3,7 @@
 //! a named number of live tokens, a request beyond that is refused as
 //! throttled and audited, and using any one token consumes them all.
 
-mod common;
+use axess_core::testing::fixtures as common;
 
 use axess_core::authn::event::{AuthEventStatus, AuthEventType};
 use axess_core::authn::service::DEFAULT_MAX_LIVE_RESET_TOKENS;
@@ -19,11 +19,14 @@ const NEW_PASSWORD: &str = "A-Fresh-Passw0rd!x";
 type Svc = RequestAuthnService<MockIdentityStore, MockFactorStore>;
 
 fn world(max: Option<usize>) -> (Svc, MockIdentityStore) {
+    let clock = common::test_clock();
     let user: User = test_user("u1", "alice");
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(user);
     let mut builder = AuthnService::builder(identity.clone(), MockFactorStore::new())
+        .with_clock(clock.clone())
         .without_password_reset_cooldown();
     if let Some(max) = max {
         builder = builder.with_max_live_reset_tokens(max);
@@ -120,10 +123,10 @@ async fn the_limit_is_the_builders() {
 
 #[tokio::test]
 async fn an_expired_token_frees_its_slot() {
-    use axess_clock::testing::MockClock;
-    let clock = MockClock::now();
+    let clock = common::test_clock();
     let user: User = test_user("u1", "alice");
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(user);
     let svc = AuthnService::builder(identity, MockFactorStore::new())
@@ -135,7 +138,7 @@ async fn an_expired_token_frees_its_slot() {
     assert!(ask(&svc).await.is_some());
     assert!(ask(&svc).await.is_none());
 
-    clock.advance(chrono::Duration::seconds(3601));
+    clock.advance(axess_clock::SignedDuration::seconds(3601));
 
     assert!(ask(&svc).await.is_some(), "an expired token held its slot");
 }

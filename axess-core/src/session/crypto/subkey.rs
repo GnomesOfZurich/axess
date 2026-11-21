@@ -32,6 +32,10 @@ pub(crate) struct SubkeyError;
 /// Length of the per-record salt.
 pub(crate) const SALT_LEN: usize = 16;
 
+/// The shortest body a seal produces: the salt and the tag of an empty
+/// plaintext.
+pub(crate) const MIN_BODY_LEN: usize = SALT_LEN + crate::aead::TAG_LEN;
+
 const DOMAIN: &[u8] = b"axess.subkey.v1";
 
 /// The subkey for the record `(salt, aad)` under `key`.
@@ -41,9 +45,7 @@ pub(crate) fn derive(key: &[u8; 32], salt: &[u8], aad: &[u8]) -> Zeroizing<[u8; 
     mac.update(&[0]);
     mac.update(salt);
     mac.update(aad);
-    let mut out = Zeroizing::new([0u8; 32]);
-    out.copy_from_slice(&mac.finalize().into_bytes());
-    out
+    crate::session::hmac::finalize_key(mac)
 }
 
 /// Seal `plaintext` as `salt || ciphertext` under a fresh subkey.
@@ -72,12 +74,12 @@ pub(crate) fn seal(
     Ok(out)
 }
 
-/// Open `salt || ciphertext` under `key`, or fail.
+/// Open `salt || ciphertext` under `key`, or fail. A body too short for
+/// [`MIN_BODY_LEN`] is refused by the caller before any key is tried; here a
+/// body that cannot even hold the salt fails like any other that does not
+/// authenticate.
 pub(crate) fn open(key: &[u8; 32], aad: &[u8], body: &[u8]) -> Result<Vec<u8>, SubkeyError> {
-    if body.len() <= SALT_LEN {
-        return Err(SubkeyError);
-    }
-    let (salt, ciphertext) = body.split_at(SALT_LEN);
+    let (salt, ciphertext) = body.split_at_checked(SALT_LEN).ok_or(SubkeyError)?;
     let subkey = derive(key, salt, aad);
     let cipher = Aes256Gcm::new_from_slice(&subkey[..]).map_err(|_| SubkeyError)?;
     cipher

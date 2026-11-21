@@ -8,13 +8,13 @@ Session signing keys and encryption keys can be rotated without invalidating act
 
 ### Signing key rotation
 
-The signing key is the 32-byte master fed to `SessionLayer::new(store, signing_key, registry)`. HKDF-Expand derives two sub-keys from it: one for session-cookie HMAC and one for session-binding fingerprint HMAC. `SessionLayer` supports zero-downtime rotation via `with_previous_signing_key(old_master)`; sessions signed under the previous master transparently re-authenticate and their cookies + stored fingerprints are re-issued under the new master.
+The signing key is the 32-byte master fed to `SessionLayer::new(store, signing_key, registry, audit)`. HKDF-Expand derives two sub-keys from it: one for session-cookie HMAC and one for session-binding fingerprint HMAC. `SessionLayer` supports zero-downtime rotation via `with_previous_signing_key(old_master)`; sessions signed under the previous master transparently re-authenticate and their cookies + stored fingerprints are re-issued under the new master.
 
 **Procedure:**
 1. Generate a new 32-byte signing master in your secrets manager.
 2. Deploy with both masters wired: new as current, old as previous.
    ```rust,ignore
-   let layer = SessionLayer::new(store, new_master, registry)
+   let layer = SessionLayer::new(store, new_master, registry, audit)
        .with_previous_signing_key(old_master);
    ```
 3. On every request, the layer tries current-master verification first; on mismatch it falls back to the previous master. Fallback matches trigger:
@@ -52,8 +52,8 @@ let crypto = SessionCrypto::new(new_key)
 | Signing key | **Must be identical** across all instances |
 | Encryption key | **Must be identical** across all instances |
 | Session store | Valkey, PostgreSQL, or MySQL (shared). SQLite is single-instance only. |
-| Session registry | Valkey-backed (`ValkeySessionRegistry`). In-memory is single-instance only. |
-| OIDC sid_map | In-memory per instance by default. Back-channel logout then works when the IdP sends to the instance that handled the login. With several instances, keep it in Valkey: `AuthnServiceBuilder::with_sid_store(ValkeySidStore)` and the handlers pointed at `authn.sid_store()` with `with_sid_store`, plus `with_replay_log(ValkeyReplayLog)`. Count the misses with `back_channel_logout_unmatched`. |
+| Session registry | Valkey-backed (`ValkeySessionRegistry`). In-memory is single-instance only. Its prefix must not open a hash tag it does not close, and its server must run scripts (an ACL user with `+@scripting`) for every rotation of a signed-in session and for the cut-off of a user's other sessions; the registry refuses to start otherwise. |
+| OIDC sid_map | In-memory per instance by default. Back-channel logout then works when the IdP sends to the instance that handled the login. With several instances, keep it in Valkey: `AuthnServiceBuilder::with_sid_store(ValkeySidStore)` and the handlers pointed at `authn.sid_store()` with `with_sid_store`, plus `with_replay_log(ValkeyReplayLog)`. The Valkey sid store puts its whole prefix in a hash tag, so it needs no hash tag of yours on a cluster. A login whose sid-store records cannot be written is refused, so an outage of the sid store is an outage of federated sign-in. Count the misses with `back_channel_logout_unmatched`. |
 | Rate limit buckets | In-memory per instance. For distributed rate limiting, use an external solution (e.g. Valkey-based sliding window at the reverse proxy). |
 
 ### Health checks
@@ -95,7 +95,7 @@ the built-in helper:
 ```rust,ignore
 let store = SqliteSessionStore::new(pool, crypto);
 store.init_schema().await?;
-let _cleanup = store.spawn_cleanup_task(Duration::from_secs(3600));
+let cleanup = store.spawn_cleanup_task(Duration::from_secs(3600));
 ```
 
 `PostgresSessionStore::spawn_cleanup_task` and `MysqlSessionStore::spawn_cleanup_task` work the same way. Dropping the returned `JoinHandle` leaves the loop running; keep it so the shutdown path can call `abort` (see below).

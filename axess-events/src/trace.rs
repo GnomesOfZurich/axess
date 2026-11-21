@@ -1,7 +1,7 @@
 //! [`TraceContext`]: W3C Trace Context for cross-service span
 //! correlation.
 //!
-//! The axess `trace-id` middleware populates this from the inbound
+//! The axess `trace-context` middleware populates this from the inbound
 //! `traceparent` header; subscribers can join an event back onto its
 //! originating request span.
 

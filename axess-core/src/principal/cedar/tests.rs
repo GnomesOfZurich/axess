@@ -15,14 +15,14 @@ fn sample_human() -> HumanPrincipal {
 }
 
 fn sample_workload() -> WorkloadPrincipal {
-    let trust = TrustDomain::new("gnomes.local").unwrap();
-    let wid = WorkloadId::build(&trust, "compute-worker", "gnomes").unwrap();
+    let trust = TrustDomain::new("example.org").unwrap();
+    let wid = WorkloadId::build(&trust, "compute-worker", "acme").unwrap();
     WorkloadPrincipal {
         workload_id: wid,
         trust_domain: trust,
         issuer: Issuer::Cli,
         tenant_id: TenantId::from_bytes([30u8; 16]),
-        tenant_slug: "gnomes".to_string(),
+        tenant_slug: "acme".to_string(),
         service_name: "compute-worker".to_string(),
         attributes: BTreeMap::new(),
     }
@@ -40,7 +40,7 @@ fn workload_entity_uid_is_namespaced_under_axess_workload() {
     let uid = sample_workload().cedar_entity_uid().unwrap();
     let s = format!("{uid}");
     assert!(s.starts_with("axess::Workload::"), "actual: {s}");
-    assert!(s.contains("spiffe://gnomes.local/compute-worker/gnomes"));
+    assert!(s.contains("spiffe://example.org/compute-worker/acme"));
 }
 
 #[test]
@@ -58,9 +58,14 @@ fn human_to_cedar_entity_includes_required_attrs() {
 #[test]
 fn human_to_cedar_entity_includes_session_id_when_present() {
     let mut h = sample_human();
-    h.session_id = Some(axess_identity::SessionId::from_bytes([7u8; 16]));
+    let key = axess_identity::SessionKey::of(&axess_identity::SessionId::from_bytes([7u8; 16]));
+    h.session_id = Some(key);
     let entity = h.to_cedar_entity().unwrap();
-    assert!(entity.attr("session_id").is_some());
+    let attribute = format!("{:?}", entity.attr("session_id").expect("set").unwrap());
+    assert!(
+        attribute.contains(&key.to_string()),
+        "the attribute is the key's 64 characters: {attribute}"
+    );
 }
 
 /// A built-in attribute name is reserved whether or not the principal
@@ -112,7 +117,9 @@ fn workload_to_cedar_entity_includes_all_built_in_attrs() {
 #[test]
 fn the_reserved_names_are_the_attributes_the_library_writes() {
     let mut h = sample_human();
-    h.session_id = Some(axess_identity::SessionId::from_bytes([7u8; 16]));
+    h.session_id = Some(axess_identity::SessionKey::of(
+        &axess_identity::SessionId::from_bytes([7u8; 16]),
+    ));
     h.impersonator = Some(UserId::from_bytes([30u8; 16]));
     let mut written: Vec<String> = h
         .to_cedar_entity()
@@ -170,7 +177,7 @@ fn user_supplied_attributes_cannot_replace_built_ins() {
     assert_eq!(string_attr(&entity, "workload_id"), Some(workload_id));
     assert_eq!(
         string_attr(&entity, "trust_domain").as_deref(),
-        Some("gnomes.local")
+        Some("example.org")
     );
 }
 

@@ -1,0 +1,41 @@
+# The dated nightly nightly-toolchain.toml names, installed for a job that
+# needs what only a nightly has (cargo-fuzz, Miri, `doc_cfg`), and selected
+# for the job's later steps. The date is read from that file and written
+# nowhere else, so moving it is one line there.
+#
+# The later steps run with RUSTUP_TOOLCHAIN set to that nightly, which rustup
+# takes over rust-toolchain.toml (the stable pin a checkout builds with), so
+# they call `cargo fuzz` and `cargo miri` with no `+toolchain` of their own.
+# scripts/check-workflow-pins.sh holds every nightly a workflow names to the
+# file's, and refuses an undated nightly in a workflow that runs on a push,
+# a pull request or a release.
+name: Pinned nightly toolchain
+description: Installs the dated nightly nightly-toolchain.toml names, with the components a job names, and selects it for the job's later steps.
+inputs:
+  components:
+    description: Components beside the minimal profile, comma-separated (miri, rust-src).
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - id: pin
+      name: Read the nightly nightly-toolchain.toml names
+      shell: bash
+      run: |
+        set -eu
+        channel=$(sed -n 's/^channel *= *"\(nightly-[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\)" *$/\1/p' nightly-toolchain.toml)
+        if [ -z "$channel" ]; then
+          echo "::error::nightly-toolchain.toml names no dated nightly (channel = \"nightly-YYYY-MM-DD\")."
+          exit 1
+        fi
+        echo "channel=$channel" >> "$GITHUB_OUTPUT"
+    - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+      with:
+        toolchain: ${{ steps.pin.outputs.channel }}
+        components: ${{ inputs.components }}
+    - name: Select it for the job's later steps
+      shell: bash
+      env:
+        CHANNEL: ${{ steps.pin.outputs.channel }}
+      run: echo "RUSTUP_TOOLCHAIN=$CHANNEL" >> "$GITHUB_ENV"

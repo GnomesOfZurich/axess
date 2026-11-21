@@ -3,11 +3,13 @@
 //! Adds typed claim deserialisation, `iss` pinning, clock-skew tuning,
 //! `nbf` requirement, and an optional pluggable replay-store for `jti`
 //! protection. Layered on top of the shared verification primitive so
-//! existing consumers (OAuth, back-channel logout, future workload
-//! identity) can opt in to the richer surface without re-implementing
-//! signature plumbing.
+//! its consumers (OAuth, back-channel logout, workload identity) can
+//! opt in to the richer surface without re-implementing signature
+//! plumbing.
 
-use crate::jwt::validation::{ALLOWED_ALGORITHMS, JwtError, ValidationConfig, verify_jwt_with_typ};
+use crate::jwt::validation::{
+    ALLOWED_ALGORITHMS, JwtError, KeyChoice, ValidationConfig, verify_jwt_choosing,
+};
 use axess_clock::{Clock, SystemClock};
 use jsonwebtoken::Algorithm;
 use jsonwebtoken::jwk::JwkSet;
@@ -16,13 +18,71 @@ use std::future::Future;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+/// The most bytes of a replay key (a token's issuer and its `jti`) that an
+/// error or a log line carries.
+pub const MAX_JTI_ECHO_BYTES: usize = 128;
+
+/// A replay key as an error or a log line may carry it. The issuer and the
+/// `jti` in it are the token's own text, as long as the token allows:
+/// every character [`escapes`](crate::log_text::escapes) names (control
+/// characters, the line and paragraph separators, bidirectional controls,
+/// zero-width characters, the byte order mark, the Hangul fillers) is
+/// escaped and the whole is cut to [`MAX_JTI_ECHO_BYTES`] bytes at a
+/// character boundary,
+/// the mark of the cut included.
+fn echo_jti(jti: &str) -> String {
+    crate::log_text::log_safe(jti, MAX_JTI_ECHO_BYTES)
+}
+
+/// The replay key a [`JtiReplayError::AlreadyUsed`] carries: the token's
+/// own text, escaped and cut to [`MAX_JTI_ECHO_BYTES`] bytes.
+///
+/// Only [`JtiReplayError::already_used`] builds one, so the variant cannot
+/// be filled with a key as the token wrote it. Neither of these compiles.
+/// The error codes are named for the reader: rustdoc on this toolchain
+/// does not check them, and the proof is the crate's ui test
+/// (`tests/replayed_jti_unconstructible.rs`), which holds each case to its
+/// recorded compiler error.
+///
+/// ```compile_fail,E0308
+/// use axess_factors::jwt::verifier::JtiReplayError;
+///
+/// let _ = JtiReplayError::AlreadyUsed(String::from("the key as the token wrote it"));
+/// ```
+///
+/// ```compile_fail,E0423
+/// use axess_factors::jwt::verifier::ReplayedJti;
+///
+/// let _ = ReplayedJti(String::from("the key as the token wrote it"));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayedJti(String);
+
+impl ReplayedJti {
+    /// The key as it is kept: escaped, and no longer than
+    /// [`MAX_JTI_ECHO_BYTES`] bytes.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ReplayedJti {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Errors raised by a [`JtiReplayStore`].
 #[derive(Debug, thiserror::Error)]
 pub enum JtiReplayError {
     /// The token's `jti` has been seen within its acceptance window:
     /// replay detected, reject.
+    ///
+    /// Built by [`already_used`](Self::already_used) and by nothing else:
+    /// what it carries is a [`ReplayedJti`], an escaped copy of the key cut
+    /// to [`MAX_JTI_ECHO_BYTES`] bytes, which has no other constructor.
     #[error("JWT `jti` already used: {0}")]
-    AlreadyUsed(String),
+    AlreadyUsed(ReplayedJti),
 
     /// Storage failure independent of replay detection (e.g. backend
     /// connection lost). Treated as a verification failure to fail closed.
@@ -30,22 +90,54 @@ pub enum JtiReplayError {
     Backend(String),
 }
 
+impl JtiReplayError {
+    /// The refusal of a key that was already recorded. The key is the
+    /// token's own text, so the error keeps it escaped and cut to
+    /// [`MAX_JTI_ECHO_BYTES`] bytes rather than whole.
+    ///
+    /// ```
+    /// use axess_factors::jwt::verifier::{JtiReplayError, MAX_JTI_ECHO_BYTES};
+    ///
+    /// let key = format!("tok\n{}", "x".repeat(4096));
+    /// let JtiReplayError::AlreadyUsed(kept) = JtiReplayError::already_used(&key) else {
+    ///     unreachable!()
+    /// };
+    /// assert!(kept.as_str().len() <= MAX_JTI_ECHO_BYTES);
+    /// assert!(kept.as_str().starts_with("tok\\n"));
+    /// ```
+    pub fn already_used(jti: &str) -> Self {
+        Self::AlreadyUsed(ReplayedJti(echo_jti(jti)))
+    }
+}
+
 /// Pluggable backend that records `jti` claims and rejects re-use.
 ///
 /// Implementations should atomically check whether `jti` is already
-/// recorded (return [`JtiReplayError::AlreadyUsed`]) and, if not, persist
+/// recorded (return [`JtiReplayError::already_used`]) and, if not, persist
 /// it with the supplied `ttl` so the entry can be GC'd after the token
 /// expires. In-memory backends (`HashSet` keyed by jti) are fine for
 /// single-process deployments; multi-instance services should back the
 /// store on a shared key/value store (Valkey, etc.).
+///
+/// The `jti` handed in is the token's issuer and `jti` claim together, as
+/// long as the token made them. A store that logs it, or puts it in a
+/// [`JtiReplayError::Backend`] message, cuts and escapes it first.
 pub trait JtiReplayStore: Send + Sync {
     /// Record `jti` for at least `ttl` seconds; return
-    /// [`JtiReplayError::AlreadyUsed`] if it was already present.
+    /// [`JtiReplayError::already_used`] if it was already present.
     fn check_and_record(
         &self,
         jti: &str,
         ttl: Duration,
     ) -> impl Future<Output = Result<(), JtiReplayError>> + Send;
+
+    /// Whether the store keeps what it is handed, so that a second
+    /// presentation is refused. `true` unless overridden; a store that
+    /// accepts everything ([`NoReplay`]) answers `false`, and a caller that
+    /// depends on single use refuses to be built on it.
+    fn records(&self) -> bool {
+        true
+    }
 }
 
 /// No-op replay store. Used when a [`JwtVerifier`] is built without
@@ -57,11 +149,15 @@ impl JtiReplayStore for NoReplay {
     async fn check_and_record(&self, jti: &str, ttl: Duration) -> Result<(), JtiReplayError> {
         tracing::trace!(
             target: "axess::factors::jwt",
-            %jti,
+            jti = %echo_jti(jti),
             ttl_secs = ttl.as_secs(),
             "NoReplay: replay detection disabled, accepting jti",
         );
         Ok(())
+    }
+
+    fn records(&self) -> bool {
+        false
     }
 }
 
@@ -232,7 +328,9 @@ impl<R> JwtVerifier<R> {
     /// so `verify` refuses a verifier built with none. This call states the
     /// decision, for a key set that belongs to the application alone. The
     /// resolvers that turn a JWT into a workload identity still require a
-    /// pinned issuer.
+    /// pinned issuer, with one exception: `JwtSvidResolver` takes this
+    /// waiver, because a JWT-SVID need not carry `iss` and its signer is
+    /// named by the key set of the trust domain in its `sub`.
     #[must_use]
     pub fn allow_any_issuer(mut self) -> Self {
         self.issuer_waived = true;
@@ -242,6 +340,12 @@ impl<R> JwtVerifier<R> {
     /// Whether an `iss` is pinned.
     pub fn has_issuer(&self) -> bool {
         self.expected_issuer.is_some()
+    }
+
+    /// Whether accepting any issuer was stated by name, with
+    /// [`allow_any_issuer`](Self::allow_any_issuer).
+    pub fn allows_any_issuer(&self) -> bool {
+        self.issuer_waived
     }
 
     /// Whether an `aud` is pinned.
@@ -254,7 +358,20 @@ impl<R> JwtVerifier<R> {
         self.clock_skew
     }
 
+    /// The JOSE `typ` a token must carry, set by [`with_typ`](Self::with_typ);
+    /// `None` when the header is not read.
+    pub fn expected_typ(&self) -> Option<&str> {
+        self.expected_typ.as_deref()
+    }
+
     /// Override the clock-skew tolerance applied to `exp` and `nbf`.
+    ///
+    /// The tolerance is a whole number of seconds, as `exp` and `nbf` are,
+    /// and is bounded at [`MAX_LEEWAY`](super::validation::MAX_LEEWAY): a
+    /// verifier whose skew has a fraction of a second or is above the bound
+    /// refuses every token with [`JwtError::VerificationFailed`] naming the
+    /// leeway, since a fraction would be dropped and a skew that large keeps
+    /// an expired token valid for as long as it says.
     pub fn with_clock_skew(mut self, skew: Duration) -> Self {
         self.clock_skew = skew;
         self
@@ -330,10 +447,43 @@ impl<R: JtiReplayStore> JwtVerifier<R> {
     /// Returns [`VerifiedClaims<C>`] on success. Failures map to
     /// [`JwtError`]; replay-store errors are folded into
     /// [`JwtError::VerificationFailed`] so callers can treat them
-    /// uniformly with signature failures.
+    /// uniformly with signature failures. A token without a `kid` header is
+    /// [`JwtError::MissingKid`].
     pub async fn verify<C: DeserializeOwned>(
         &self,
         token: &str,
+    ) -> Result<VerifiedClaims<C>, JwtError> {
+        self.verify_with(token, KeyChoice::ByKid, &self.allowed_algorithms)
+            .await
+    }
+
+    /// As [`verify`](Self::verify), for the JWT-SVID resolver alone: only an
+    /// algorithm both this verifier and `algorithms` allow is accepted, and
+    /// a token without a `kid` is verified against each key of the set
+    /// ([`KeyChoice::EachKey`]) instead of refused. Crate-private, so no
+    /// other path verifies a token that names no key.
+    #[cfg(feature = "jwt-svid")]
+    pub(crate) async fn verify_for_svid<C: DeserializeOwned>(
+        &self,
+        token: &str,
+        algorithms: &[Algorithm],
+    ) -> Result<VerifiedClaims<C>, JwtError> {
+        let allowed: Vec<Algorithm> = self
+            .allowed_algorithms
+            .iter()
+            .copied()
+            .filter(|algorithm| algorithms.contains(algorithm))
+            .collect();
+        self.verify_with(token, KeyChoice::EachKey, &allowed).await
+    }
+
+    /// The body of [`verify`](Self::verify): the key picked as `choice`
+    /// says, under the algorithms `allowed`.
+    async fn verify_with<C: DeserializeOwned>(
+        &self,
+        token: &str,
+        choice: KeyChoice,
+        allowed: &[Algorithm],
     ) -> Result<VerifiedClaims<C>, JwtError> {
         if self.expected_audience.is_none() && !self.audience_waived {
             return Err(JwtError::VerificationFailed(
@@ -354,7 +504,7 @@ impl<R: JtiReplayStore> JwtVerifier<R> {
         let config = ValidationConfig {
             issuer: self.expected_issuer.clone(),
             audience: self.expected_audience.clone(),
-            leeway_secs: self.clock_skew.as_secs(),
+            leeway: self.clock_skew,
             require_nbf: self.require_nbf,
             require_exp: self.require_exp,
             allow_any_audience: self.audience_waived,
@@ -368,13 +518,14 @@ impl<R: JtiReplayStore> JwtVerifier<R> {
                 .jwks
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            verify_jwt_with_typ(
+            verify_jwt_choosing(
                 token,
                 &guard,
                 &config,
-                &self.allowed_algorithms,
+                allowed,
                 &*self.clock,
                 self.expected_typ.as_deref(),
+                choice,
             )?
         };
 
@@ -404,11 +555,23 @@ impl<R: JtiReplayStore> JwtVerifier<R> {
             store
                 .check_and_record(&replay_key(iss.as_deref(), jti_value), ttl)
                 .await
-                .map_err(|e| JwtError::VerificationFailed(format!("jti replay: {e}")))?;
+                // The store's text may quote the key it was handed, which
+                // is the token's: escaped and cut as every other remote
+                // text.
+                .map_err(|e| {
+                    JwtError::VerificationFailed(format!(
+                        "jti replay: {}",
+                        crate::remote_text::error_text(&e)
+                    ))
+                })?;
         }
 
-        let custom: C = serde_json::from_value(raw)
-            .map_err(|e| JwtError::VerificationFailed(format!("deserialise custom claims: {e}")))?;
+        let custom: C = serde_json::from_value(raw).map_err(|e| {
+            JwtError::VerificationFailed(format!(
+                "deserialise custom claims: {}",
+                crate::remote_text::parse_error(&e)
+            ))
+        })?;
 
         Ok(VerifiedClaims {
             iss,
@@ -429,16 +592,6 @@ impl<R: JtiReplayStore> JwtVerifier<R> {
 /// its `jti` is remembered for a day rather than forgotten at once.
 const REPLAY_TTL_WITHOUT_EXP: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Compute the TTL for a replay store entry: time until the token stops
-/// being accepted, which is `exp` PLUS the clock-skew leeway (the verifier
-/// accepts a token until `exp + skew`), floored at zero. A TTL of `exp -
-/// now` alone would forget a token's `jti` while the verifier still took
-/// the token, so a replay inside the leeway window would pass.
-///
-/// `now` is sourced from the injected
-/// [`Clock`](axess_clock::Clock) rather than a direct
-/// `chrono::Utc::now()` call, so DST tests can drive the TTL
-/// calculation deterministically.
 /// The replay-store key of a token: its issuer and its `jti` together, so two
 /// issuers that pick the same `jti` and share one store do not block each
 /// other. The issuer is length-prefixed, so no pair of values can collide.
@@ -447,11 +600,21 @@ fn replay_key(iss: Option<&str>, jti: &str) -> String {
     format!("{}:{iss}{jti}", iss.len())
 }
 
+/// Compute the TTL for a replay store entry: time until the token stops
+/// being accepted, which is `exp` PLUS the clock-skew leeway (the verifier
+/// accepts a token until `exp + skew`), floored at zero. A TTL of `exp -
+/// now` alone would forget a token's `jti` while the verifier still took
+/// the token, so a replay inside the leeway window would pass.
+///
+/// `now` is sourced from the injected
+/// [`Clock`](axess_clock::Clock) rather than a direct
+/// `SystemTime::now()` call, so DST tests can drive the TTL
+/// calculation deterministically.
 fn compute_replay_ttl(exp: Option<i64>, skew: Duration, clock: &dyn Clock) -> Duration {
     let Some(exp) = exp else {
         return REPLAY_TTL_WITHOUT_EXP;
     };
-    let now = clock.now().timestamp();
+    let now = clock.now().unix_seconds();
     let skew = i64::try_from(skew.as_secs()).unwrap_or(i64::MAX);
     // `+ 1`: in the last accepted second (exp + skew == now) the token is
     // still accepted, so it must be remembered for that second too.
@@ -463,6 +626,8 @@ fn compute_replay_ttl(exp: Option<i64>, skew: Duration, clock: &dyn Clock) -> Du
     Duration::from_secs(secs)
 }
 
+#[cfg(test)]
+mod remote_text_tests;
 #[cfg(test)]
 mod tests;
 

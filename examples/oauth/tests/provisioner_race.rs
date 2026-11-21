@@ -2,10 +2,11 @@
 //! the call that loses the link race signs in as the winner's user, and the
 //! user it created for itself is removed.
 
+use axess::SystemRng;
 use axess::authn::{EntityState, IdentityAdmin, IdentityLookup, Tenant, TenantId, User, UserId};
 use axess::federation::oauth::OAuthClaims;
+use axess::testing::MockClock;
 use axess::testing::MockIdentityStore;
-use axess::{Clock, SystemClock, SystemRng};
 use axess_example_oauth::identities::FederatedIdentities;
 use axess_example_oauth::provisioning::{Provisioner, Provisioning, TenantPolicy};
 use std::sync::Arc;
@@ -17,11 +18,11 @@ struct LostRace {
 }
 
 impl FederatedIdentities for LostRace {
-    async fn find(&self, _issuer: &str, _subject: &str) -> Option<UserId> {
+    async fn find(&self, _: &str, _: &str) -> Option<UserId> {
         None
     }
 
-    async fn link_if_absent(&self, _issuer: &str, _subject: &str, _user: UserId) -> UserId {
+    async fn link_if_absent(&self, _: &str, _: &str, _: UserId) -> UserId {
         self.winner
     }
 }
@@ -47,18 +48,21 @@ fn claims() -> OAuthClaims {
 
 #[tokio::test]
 async fn the_race_winner_is_the_user_returned_and_the_loser_is_removed() {
+    let clock = MockClock::at_reference();
     let tenant = TenantId::new(&SystemRng);
-    let identity = MockIdentityStore::new().with_tenant(
-        Tenant::new(
-            tenant.to_string(),
-            "race",
-            "Race tenant",
-            EntityState::Active,
-            UserId::system(),
-            SystemClock.now(),
-        )
-        .expect("tenant"),
-    );
+    let identity = MockIdentityStore::new()
+        .with_clock(Arc::new(clock.clone()))
+        .with_tenant(
+            Tenant::new(
+                tenant.to_string(),
+                "race",
+                "Race tenant",
+                EntityState::Active,
+                UserId::system(),
+                MockClock::reference_time(),
+            )
+            .expect("tenant"),
+        );
     let winner = User::new(
         UserId::new(&SystemRng).to_string(),
         tenant.to_string(),
@@ -66,7 +70,7 @@ async fn the_race_winner_is_the_user_returned_and_the_loser_is_removed() {
         "Winner",
         EntityState::Active,
         UserId::system(),
-        SystemClock.now(),
+        MockClock::reference_time(),
     )
     .expect("user");
     identity.create_user(winner.clone()).await.expect("winner");
@@ -79,7 +83,7 @@ async fn the_race_winner_is_the_user_returned_and_the_loser_is_removed() {
             provisioning: Provisioning::JustInTime,
             require_verified_email: false,
         },
-        Arc::new(SystemClock),
+        Arc::new(clock.clone()),
         Arc::new(SystemRng),
     );
 

@@ -133,12 +133,20 @@ pub(super) async fn push_authorization_request(
         .await?;
 
     if !status.is_success() {
-        let error_body = String::from_utf8_lossy(&body);
+        // The body is the IdP's text and callers log the error: its first
+        // KiB, escaped as every other upstream error text, with the mark of
+        // the cut.
+        let error_body =
+            crate::http_body::log_safe_snippet(&crate::http_body::error_snippet_of(&body));
         return Err(OAuthError::TokenExchange(format!(
             "PAR endpoint returned HTTP {status}: {error_body}"
         )));
     }
 
-    serde_json::from_slice(&body)
-        .map_err(|e| OAuthError::TokenExchange(format!("PAR response parse failed: {e}")))
+    serde_json::from_slice(&body).map_err(|e| {
+        OAuthError::TokenExchange(format!(
+            "PAR response parse failed: {}",
+            crate::remote_text::parse_error(&e)
+        ))
+    })
 }

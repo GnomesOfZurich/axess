@@ -6,7 +6,7 @@
 //! machine-readable fact an eligibility decision reads, so that nobody keys
 //! a security decision on the spelling of a sentence.
 
-use chrono::{DateTime, Utc};
+use axess_clock::{Timestamp, Until};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -74,13 +74,15 @@ pub struct StatusDetail {
     /// a decision reads `cause`.
     pub reason: Arc<str>,
     /// When this state was entered.
-    pub since: DateTime<Utc>,
-    /// Optional expiry: `None` means indefinite.
-    pub until: Option<DateTime<Utc>>,
+    pub since: Timestamp,
+    /// Optional expiry: `None` means indefinite, and so does an end that
+    /// never comes ([`Until::Forever`]), which a store writes as the latest
+    /// reading ([`Until::to_timestamp`]).
+    pub until: Option<Until>,
 }
 
 impl StatusDetail {
-    fn with_cause(cause: StatusCause, reason: impl Into<Arc<str>>, since: DateTime<Utc>) -> Self {
+    fn with_cause(cause: StatusCause, reason: impl Into<Arc<str>>, since: Timestamp) -> Self {
         StatusDetail {
             cause,
             reason: reason.into(),
@@ -91,41 +93,37 @@ impl StatusDetail {
 
     /// An operator's act ([`StatusCause::Administrative`]), indefinite until
     /// [`with_until`](Self::with_until) sets an end.
-    pub fn administrative(reason: impl Into<Arc<str>>, since: DateTime<Utc>) -> Self {
+    pub fn administrative(reason: impl Into<Arc<str>>, since: Timestamp) -> Self {
         Self::with_cause(StatusCause::Administrative, reason, since)
     }
 
     /// Awaiting activation ([`StatusCause::Verification`]).
-    pub fn verification(reason: impl Into<Arc<str>>, since: DateTime<Utc>) -> Self {
+    pub fn verification(reason: impl Into<Arc<str>>, since: Timestamp) -> Self {
         Self::with_cause(StatusCause::Verification, reason, since)
     }
 
     /// A lockout a store materialises as a state ([`StatusCause::Lockout`]).
     /// The library never builds one; see the variant.
-    pub fn lockout(reason: impl Into<Arc<str>>, since: DateTime<Utc>) -> Self {
+    pub fn lockout(reason: impl Into<Arc<str>>, since: Timestamp) -> Self {
         Self::with_cause(StatusCause::Lockout, reason, since)
     }
 
     /// A closed account ([`StatusCause::Closure`]).
-    pub fn closure(reason: impl Into<Arc<str>>, since: DateTime<Utc>) -> Self {
+    pub fn closure(reason: impl Into<Arc<str>>, since: Timestamp) -> Self {
         Self::with_cause(StatusCause::Closure, reason, since)
     }
 
     /// An adopter's own cause under `key` ([`StatusCause::Other`]).
-    pub fn other(
-        key: impl Into<Arc<str>>,
-        reason: impl Into<Arc<str>>,
-        since: DateTime<Utc>,
-    ) -> Self {
+    pub fn other(key: impl Into<Arc<str>>, reason: impl Into<Arc<str>>, since: Timestamp) -> Self {
         Self::with_cause(StatusCause::Other(key.into()), reason, since)
     }
 
-    /// Set the end of the state: `Some(t)` for a timed suspension, `None`
-    /// for an indefinite one. A `Suspended` state whose `until` has passed
-    /// reads as `Active` through
+    /// Set the end of the state: `Some(Until::At(t))` for a timed
+    /// suspension, `None` for an indefinite one. A `Suspended` state whose
+    /// `until` has passed reads as `Active` through
     /// [`EntityState::effective_at`](super::EntityState::effective_at).
     #[must_use]
-    pub fn with_until(mut self, until: Option<DateTime<Utc>>) -> Self {
+    pub fn with_until(mut self, until: Option<Until>) -> Self {
         self.until = until;
         self
     }

@@ -25,15 +25,22 @@ struct App {
 }
 
 fn app() -> App {
-    let registry = MemorySessionRegistry::new();
-    let svc = AuthnService::builder(MockIdentityStore::new(), MockFactorStore::new())
-        .with_registry(registry.clone())
-        .build();
+    let clock = axess::testing::MockClock::at_reference();
+    let registry = MemorySessionRegistry::new().with_clock(std::sync::Arc::new(clock.clone()));
+    let svc = AuthnService::builder(
+        MockIdentityStore::new().with_clock(clock.clone()),
+        MockFactorStore::new(),
+    )
+    .with_clock(clock.clone())
+    .with_registry(registry.clone())
+    .build();
     let reg = registry.clone();
     let session_layer = SessionLayer::without_registry_insecure(
-        MemorySessionStore::new(),
+        MemorySessionStore::new().with_clock(std::sync::Arc::new(clock.clone())),
         axess::testing::test_key(42),
+        std::sync::Arc::new(axess::session::UnrecordedSessionEnds),
     )
+    .with_clock(clock.clone())
     .with_ttl(Duration::from_secs(3600))
     .with_secure(false);
     let plain = Router::new()
@@ -55,9 +62,13 @@ fn app() -> App {
                 let reg = reg.clone();
                 async move {
                     let user = axess::testing::user("u1");
-                    s.set_authenticated(user, axess::testing::tenant("t1"), chrono::Utc::now())
-                        .await;
-                    reg.register(&user, &s.session_id().await).await.unwrap();
+                    s.set_authenticated(
+                        user,
+                        axess::testing::tenant("t1"),
+                        axess::testing::MockClock::reference_time(),
+                    )
+                    .await;
+                    reg.register(&user, &s.session_key().await).await.unwrap();
                     "in"
                 }
             }),

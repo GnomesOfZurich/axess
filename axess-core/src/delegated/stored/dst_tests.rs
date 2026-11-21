@@ -2,15 +2,16 @@
 //! injected RNG and clock, and single-flight refresh against a
 //! rotating IdP.
 
+use axess_clock::testing::Shift;
 use std::sync::{Arc, Mutex};
 
 use axess_clock::testing::MockClock;
+use axess_clock::{SignedDuration, Timestamp};
 use axess_identity::{TenantId, UserId};
 use axess_rng::SecureRng;
 use axess_rng::testing::MockRng;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use chrono::{DateTime, Duration, Utc};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -20,8 +21,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use super::*;
 use crate::delegated::error::DelegatedError;
 
-fn t0() -> DateTime<Utc> {
-    DateTime::from_timestamp(1_500_000_000, 0).expect("fixed t0")
+fn t0() -> Timestamp {
+    Timestamp::from_unix_seconds(1_500_000_000).expect("fixed t0")
 }
 
 fn provider(server_uri: &str) -> Arc<DelegatedProvider> {
@@ -38,9 +39,10 @@ fn provider(server_uri: &str) -> Arc<DelegatedProvider> {
 fn stale(refresh: &str, provider: &DelegatedProvider) -> StoredDelegation {
     StoredDelegation {
         provider: provider.name.clone(),
+        registration: Some(GrantRegistration::of(provider)),
         access_token: "stale".into(),
         refresh_token: Some(refresh.into()),
-        expires_at: Some(t0() - Duration::seconds(10)),
+        expires_at: Some(t0().minus(SignedDuration::seconds(10))),
         scopes: vec![],
         token_type: "Bearer".into(),
     }
@@ -82,32 +84,42 @@ async fn complete_grant_at_measures_expiry_from_the_supplied_instant() {
         .mount(&server)
         .await;
     let provider = provider(&server.uri());
-    let (_url, ctx) = begin_grant(&provider, &[], &MockRng::new(1)).expect("begin_grant");
+    let (_, ctx) = begin_grant(&provider, &[], &MockRng::new(1)).expect("begin_grant");
     let cred = complete_grant_at(
         &provider,
         &ctx,
         "code",
         &ctx.state,
-        &reqwest::Client::new(),
+        &grant_client(|settings| settings).expect("client"),
         t0(),
     )
     .await
     .expect("complete");
-    assert_eq!(cred.expires_at, Some(t0() + Duration::seconds(3600)));
+    assert_eq!(
+        cred.expires_at,
+        Some(t0().plus(SignedDuration::seconds(3600)))
+    );
 }
 
 #[tokio::test]
 async fn complete_grant_rejects_a_state_of_the_same_length_and_a_prefix() {
     let provider = provider("https://idp.example");
-    let (_url, ctx) = begin_grant(&provider, &[], &MockRng::new(1)).expect("begin_grant");
-    let http = reqwest::Client::new();
+    let (_, ctx) = begin_grant(&provider, &[], &MockRng::new(1)).expect("begin_grant");
+    let http = grant_client(|settings| settings).expect("client");
     let mut flipped = ctx.state.clone().into_bytes();
     flipped[0] = if flipped[0] == b'A' { b'B' } else { b'A' };
     let flipped = String::from_utf8(flipped).unwrap();
     for bad in [flipped.as_str(), &ctx.state[..ctx.state.len() - 1], ""] {
-        let err = complete_grant(&provider, &ctx, "c", bad, &http, &axess_clock::SystemClock)
-            .await
-            .expect_err("state must match exactly");
+        let err = complete_grant(
+            &provider,
+            &ctx,
+            "c",
+            bad,
+            &http,
+            &axess_clock::testing::MockClock::at_reference(),
+        )
+        .await
+        .expect_err("state must match exactly");
         assert!(matches!(err, DelegatedError::StateMismatch), "{bad}");
     }
 }
@@ -136,7 +148,10 @@ async fn session_refresh_expiry_follows_the_injected_clock() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(saved.expires_at, Some(t0() + Duration::seconds(3600)));
+    assert_eq!(
+        saved.expires_at,
+        Some(t0().plus(SignedDuration::seconds(3600)))
+    );
 }
 
 /// A rotating IdP: the first redemption of `r1` succeeds, any replay is
@@ -195,9 +210,9 @@ struct ScriptedStore {
 impl DelegatedCredentialStore for ScriptedStore {
     async fn load(
         &self,
-        _tenant: &TenantId,
-        _user: &UserId,
-        _provider: &str,
+        _: &TenantId,
+        _: &UserId,
+        _: &str,
     ) -> Result<Option<StoredDelegation>, String> {
         let mut loads = self.loads.lock().unwrap();
         let next = if loads.len() > 1 {
@@ -235,7 +250,7 @@ async fn rejected_refresh_reloads_and_uses_a_credential_another_node_rotated() {
     let provider = provider(&server.uri());
     let mut rotated = stale("r2", &provider);
     rotated.access_token = "from-other-node".into();
-    rotated.expires_at = Some(t0() + Duration::seconds(3600));
+    rotated.expires_at = Some(t0().plus(SignedDuration::seconds(3600)));
     // Loads: initial, after the lock, then after the rejection.
     let store = Arc::new(ScriptedStore {
         loads: Mutex::new(vec![
@@ -261,7 +276,7 @@ async fn rejected_refresh_reloads_and_uses_a_credential_another_node_rotated() {
 /// `fresh`.
 async fn token_with_skew(
     row: impl FnOnce(&DelegatedProvider) -> StoredDelegation,
-    skew: i64,
+    skew: std::time::Duration,
 ) -> String {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -276,32 +291,38 @@ async fn token_with_skew(
     let session = StoredDelegationSession::new(provider, store, tenant, user)
         .expect("the default client builds")
         .with_clock(Arc::new(MockClock::at(t0())))
-        .with_refresh_skew_secs(skew);
+        .with_refresh_skew(skew);
     session.get_access_token().await.unwrap()
 }
 
 #[tokio::test]
-async fn a_negative_refresh_skew_does_not_make_an_expired_token_fresh() {
-    assert_eq!(token_with_skew(|p| stale("r1", p), -3600).await, "fresh");
+async fn a_refresh_skew_of_no_time_does_not_make_an_expired_token_fresh() {
+    assert_eq!(
+        token_with_skew(|p| stale("r1", p), std::time::Duration::ZERO).await,
+        "fresh"
+    );
 }
 
 #[tokio::test]
 async fn a_huge_refresh_skew_refreshes_instead_of_panicking() {
     let row = |p: &DelegatedProvider| StoredDelegation {
-        expires_at: Some(t0() + Duration::seconds(3600)),
+        expires_at: Some(t0().plus(SignedDuration::seconds(3600))),
         ..stale("r1", p)
     };
-    assert_eq!(token_with_skew(row, i64::MAX).await, "fresh");
+    assert_eq!(
+        token_with_skew(row, std::time::Duration::MAX).await,
+        "fresh"
+    );
 }
 
 #[test]
-fn is_fresh_treats_a_negative_skew_as_none_and_a_huge_one_as_stale() {
+fn is_fresh_treats_no_skew_as_none_and_a_huge_one_as_stale() {
     let p = provider("https://idp.example");
     let row = stale("r1", &p);
-    assert!(!row.is_fresh(t0(), Duration::seconds(-3600)));
+    assert!(!row.is_fresh(t0(), std::time::Duration::ZERO));
     let live = StoredDelegation {
-        expires_at: Some(t0() + Duration::seconds(3600)),
+        expires_at: Some(t0().plus(SignedDuration::seconds(3600))),
         ..row
     };
-    assert!(!live.is_fresh(t0(), Duration::MAX));
+    assert!(!live.is_fresh(t0(), std::time::Duration::MAX));
 }

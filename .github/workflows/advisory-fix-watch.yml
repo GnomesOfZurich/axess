@@ -1,0 +1,97 @@
+name: Advisory fix watch
+
+# .cargo/audit.toml and deny.toml accept three advisories because a crate
+# axess depends on still requires the affected release line of another (a
+# fourth, RUSTSEC-2026-0543, says chrono is unmaintained, and no release
+# fixes it, so there is none to watch for): jsonwebtoken and openidconnect on rsa 0.9, and crypto-glue on an
+# rsa 0.10 pre-release (RUSTSEC-2023-0071, fixed in rsa 0.10.0),
+# jsonwebtoken on p256 0.13 and p384 0.13 and with them crypto-bigint 0.5
+# (RUSTSEC-2026-0387, fixed in crypto-bigint 0.7.6), and sqlx-sqlite on
+# libsqlite3-sys below 0.38 (RUSTSEC-2026-0459, fixed in 0.39.0). Weekly,
+# scripts/watch-advisory-fixes.sh reads crates.io for the newest release of
+# each dependent and its requirement on the pinned crate. For each
+# requirement that admits the fixed release (or a dependency that is gone),
+# the second job opens one tracking issue. The issue's title names the
+# watch, and a watch is a hit every week until it is removed from the
+# script, so the job opens an issue only when none has that title, open or
+# closed: an open one is left as it is, and a closed one is named in a
+# warning (reopen it, or remove the watch) and not opened again.
+#
+# The job that reads crates.io holds no secret and a token that can only
+# read; the job that opens issues runs only gh and jq. A failed or
+# unreadable crates.io answer fails the first job, after the hits of the
+# other watches are written, so a blind run is a red run and a hit is still
+# reported. The script needs python3, which is on the runner image, and no
+# Rust toolchain.
+
+on:
+  schedule:
+    # Every Monday at 09:15 UTC.
+    - cron: "15 9 * * 1"
+  workflow_dispatch:
+
+jobs:
+  poll:
+    name: Read crates.io
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      hits: ${{ steps.poll.outputs.hits }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read crates.io for every watch
+        id: poll
+        run: scripts/watch-advisory-fixes.sh --all
+
+  issue:
+    name: Open tracking issues
+    needs: poll
+    if: ${{ !cancelled() && needs.poll.outputs.hits != '' && needs.poll.outputs.hits != '[]' }}
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open one tracking issue for each watch that can be fixed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HITS: ${{ needs.poll.outputs.hits }}
+        run: |
+          set -euo pipefail
+          read -r -d '' advice <<'ADVICE' || true
+          Bump the dependent to the release named above and move the
+          requirement axess has on the pinned crate with it. Check
+          `cargo tree --workspace --all-features -i` for the affected
+          release line. When it has left the tree, drop the advisory from
+          the ignore lists in .cargo/audit.toml and deny.toml in the same
+          commit, with its entry under "Awaiting upstream" in ROADMAP.md and
+          the skip-tree comments in deny.toml that name the duplicate, and
+          remove this watch from scripts/lib/upstream_watch.py.
+          ADVICE
+          jq -c '.[]' <<<"$HITS" | while read -r hit; do
+            watch=$(jq -r '.watch' <<<"$hit")
+            summary=$(jq -r '.summary' <<<"$hit")
+            title="An accepted advisory can be fixed: $watch"
+            # Every issue the search finds, open or closed; the search
+            # matches loosely, so the title is compared whole.
+            found=$(gh issue list \
+              --repo "$GITHUB_REPOSITORY" \
+              --state all \
+              --search "\"$title\" in:title" \
+              --json number,state,title)
+            open=$(jq -r --arg title "$title" '[.[] | select(.title == $title and .state == "OPEN")][0].number // empty' <<<"$found")
+            closed=$(jq -r --arg title "$title" '[.[] | select(.title == $title and .state != "OPEN")][0].number // empty' <<<"$found")
+            if [ -n "$open" ]; then
+              echo "Tracking issue #$open is already open for $watch."
+              continue
+            fi
+            if [ -n "$closed" ]; then
+              echo "::warning::$watch is still a hit and its tracking issue #$closed is closed. Reopen it, or remove the watch from scripts/lib/upstream_watch.py; no new issue is opened."
+              continue
+            fi
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" \
+              --body "$summary"$'\n\n'"$advice"
+          done

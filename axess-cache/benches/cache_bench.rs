@@ -4,12 +4,12 @@
 //!
 //! # Why these benches exist
 //!
-//! Iteration ROI for the deferred items in the queue (sharded mutex,
-//! W-TinyLFU, async API, …) hinges on contention or hit-ratio data
-//! that we don't have today. Committing these benches gives every
-//! future iteration a regression target; both for "did my change
-//! regress p50 latency on the hot path" and for "is the contention
-//! actually painful enough to justify a sharded mutex."
+//! Whether a change to the cache's design (a sharded mutex, W-TinyLFU,
+//! an async API) is worth making hinges on contention and hit-ratio
+//! data. These benches are that data and the regression target for any
+//! change: both for "did my change regress p50 latency on the hot path"
+//! and for "is the contention painful enough to justify a sharded
+//! mutex."
 //!
 //! # Running
 //!
@@ -23,8 +23,7 @@
 //!
 //! Criterion writes raw samples and HTML reports to `target/criterion/`
 //! (gitignored). The numbers below are *committed* documentation;
-//! when an iteration moves them, update both this file and
-//! `project_axess_cache_iteration_queue.md`.
+//! a change that moves them updates this file.
 //!
 //! # Baseline (Apple Silicon; default criterion timings;
 //! 3 s warmup + 5 s measurement per bench. Updates welcome on regression.)
@@ -63,22 +62,19 @@
 //! ops/s) is *worse* than single-threaded (~103M ops/s). The single
 //! `std::sync::Mutex` serializes every read.
 //!
-//! Implication for the deferred sharded-mutex iteration: the
-//! contention bottleneck is real and quantified. **But** the gating
-//! question is unchanged; does any current axess-cache consumer
-//! sustain enough concurrent read pressure to feel this? Authz
-//! entity caches in Gnomes today are read-heavy but not at 8-thread
-//! sustained per-key contention. Defer until profiling shows it
-//! mattering in practice.
+//! So the contention bottleneck is real and quantified, and the cache
+//! keeps its single mutex all the same: what a sharded map buys is
+//! throughput under sustained reads of one key from many threads, and
+//! an authz entity cache is read-heavy without being that. A consumer
+//! whose profile shows this lock is the case for sharding.
 //!
-//! Numbers will be re-pinned by the iteration that runs them; treat
-//! the *shape* (hit ≈ miss < invalidate < single-flight cold; mutex
-//! contention is the dominant scaling cost) as the more durable claim.
+//! Treat the *shape* (hit ≈ miss < invalidate < single-flight cold;
+//! mutex contention is the dominant scaling cost) as the more durable
+//! claim than the numbers.
 
 use axess_cache::ClockTtlCache;
 use axess_clock::Clock;
 use axess_clock::testing::MockClock;
-use chrono::{TimeZone, Utc};
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use std::cell::Cell;
 use std::hint::black_box;
@@ -92,9 +88,7 @@ use std::time::{Duration, Instant};
 /// for performance characterisation, which is about the lock + LRU
 /// + atomics overhead, not the expiry math.
 fn fixed_clock() -> Arc<dyn Clock> {
-    Arc::new(MockClock::at(
-        Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
-    ))
+    Arc::new(MockClock::at_reference())
 }
 
 fn build_cache(capacity: usize) -> ClockTtlCache<u64, u64> {

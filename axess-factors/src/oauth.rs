@@ -6,14 +6,14 @@
 //! 1. `AuthnService::begin_oauth_login`: generates an authorization URL with
 //!    PKCE, state, and nonce. Redirect the user's browser there.
 //! 2. The IdP authenticates the user and redirects back with an authorization code.
-//! 3. `AuthnService::finish_oauth_login`: exchanges the code for tokens,
+//! 3. `RequestAuthnService::finish_oauth_login`: exchanges the code for tokens,
 //!    validates the ID token, and returns the OIDC claims. The application maps
 //!    these to a local user and completes the session.
 //!
 //! # Token refresh
 //!
 //! If the IdP returned a refresh token (e.g. `offline_access` scope was
-//! requested), use `AuthnService::refresh_oauth_token` to exchange it for
+//! requested), use `ScopedOAuth::refresh_oauth_token` to exchange it for
 //! new tokens without re-authenticating the user. Pass the subject the login
 //! recorded: a refresh response for any other subject is refused.
 //!
@@ -22,11 +22,13 @@
 //! Under the `testing` feature, `MockOAuthProvider` simulates OIDC discovery and token exchange
 //! without HTTP. Configure it with its `with_user` or `with_failure` builders.
 
+pub mod client_auth_probe;
 #[cfg(any(test, feature = "testing"))]
 pub mod mock;
 pub mod provider;
 pub mod types;
 
+pub use client_auth_probe::{ClientAuthProbe, ProbeClientAuth, probe_client_authentication};
 #[cfg(any(test, feature = "testing"))]
 pub use mock::MockOAuthProvider;
 pub use provider::dpop_verify::{

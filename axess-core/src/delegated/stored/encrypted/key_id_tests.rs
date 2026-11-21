@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::delegated::stored::credential::MemoryDelegatedCredentialStore;
-use chrono::{TimeZone, Utc};
+use axess_clock::Timestamp;
 
 struct FixedKeys {
     id: &'static str,
@@ -26,9 +26,13 @@ impl KeyProvider for FixedKeys {
 fn credential() -> StoredDelegation {
     StoredDelegation {
         provider: "gmail".to_string(),
+        registration: Some(crate::delegated::stored::GrantRegistration {
+            provider: "gmail".to_string(),
+            fingerprint: "gmail-registration".to_string(),
+        }),
         access_token: ZeroizedString::from("at-plaintext"),
         refresh_token: None,
-        expires_at: Some(Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap()),
+        expires_at: Some(Timestamp::from_utc(2030, 1, 1, 0, 0, 0).unwrap()),
         scopes: vec!["gmail.send".to_string()],
         token_type: "Bearer".to_string(),
     }

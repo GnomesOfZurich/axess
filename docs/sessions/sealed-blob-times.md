@@ -6,13 +6,12 @@ it waits for one decision, stated at the end.
 ## The gap
 
 A session row is one sealed blob. The seal authenticates the row's identity
-(the session id) as additional authenticated data, so a blob cannot be moved
-to another row. It does not authenticate when the session was created or when
-it ends. Both live outside the seal, in the row's expiry column or the key's
-expiry, and in the data inside it as relative values. A party that can write
-the store (or restore an old backup of it) can therefore extend a row's life by
-rewriting the expiry beside an untouched blob, or put back a blob that was
-revoked and deleted, and the blob still opens.
+(the session's key) as additional authenticated data, so a blob cannot be moved
+to another row. It does not authenticate when the row expires: the idle expiry
+lives outside the seal, in the row's expiry column or the key's expiry. What
+the sealed data does hold is the time of authentication, from which the layer
+already enforces the absolute age cap (seven days by default), and the time of
+the last write. A party that can write the store, or restore an old backup of it, can therefore do either of two things, and the blob still opens: extend a row's idle life (up to that cap for an authenticated session) by rewriting the expiry beside an untouched blob, or put back a blob that was revoked and deleted.
 
 ## The design
 
@@ -30,7 +29,9 @@ is opened:
   sealed value is the one that decides.
 - A save that extends the session (the idle window slides) seals a new blob
   with the new `expires_at`; `created_at` never changes after the first seal,
-  so the absolute lifetime cap can also be checked against it.
+  so a lifetime cap for sessions that never authenticate can be checked
+  against it, as the age cap is checked against the time of authentication
+  today.
 
 The blob header grows by sixteen bytes and carries a format marker, as the
 row-binding format did. The codec's existing marker logic tells the formats
@@ -49,6 +50,7 @@ Blobs sealed today have no times. Two ways to cross the upgrade:
    as a decryption failure and its user signs in again. The gap closes the
    moment the release is deployed.
 
-The first matches how the row-binding upgrade was done (`LegacyBlobs` with an
-end date); the second is the stricter one. The choice, and for the first the
-length of the window, is the owner's.
+Session rows take the second way today: a session blob is read in the
+current sealed form only, and `LegacyBlobs` (`AcceptUntil` for a window,
+`Reject` by default) applies to device rows and factor secrets, not to
+sessions. The first way would be new code for this one upgrade. The owner chooses the way and, for the first, the length of the window.

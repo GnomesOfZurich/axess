@@ -49,7 +49,9 @@
 //! `invalid_principal` (a UID could not be built; `principal`, `action` and
 //! `resource` are then the strings it would have been built from),
 //! `entity_provider_error` (the provider failed or timed out),
-//! `context_error` (the request context could not be built). A request
+//! `context_error` (the request context could not be built),
+//! `context_required` (a session begun without a context met a policy set
+//! that reads `context`, after a reload). A request
 //! rejected for having no authenticated session (401) is not an
 //! authorization decision and emits nothing here.
 //!

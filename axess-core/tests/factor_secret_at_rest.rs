@@ -4,10 +4,14 @@
 
 #![cfg(feature = "testing")]
 
-mod common;
+mod hotp_code;
+use axess_clock::testing::Shift;
+use axess_core::testing::fixtures as common;
+use hotp_code::generate_hotp_code;
 
 use axess_clock::Clock;
 use axess_clock::testing::MockClock;
+use axess_clock::{SignedDuration, Timestamp};
 use axess_core::authn::AuditContext;
 use axess_core::authn::error::AuthnError;
 use axess_core::authn::factor_secret::{FactorSecretBinding, FactorSecretCipher};
@@ -25,8 +29,7 @@ use axess_core::{
     },
 };
 use axess_factors::FactorSecret;
-use chrono::{DateTime, Duration, Utc};
-use common::{generate_hotp_code, test_tenant, test_user, tid, uid, user_scope};
+use common::{test_tenant, test_user, tid, uid, user_scope};
 use std::sync::Arc;
 
 const SECRET: &str = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
@@ -45,8 +48,8 @@ fn hotp_method() -> AuthMethod {
     AuthMethod::sequential("hotp", vec![FactorKind::Hotp], user_scope())
 }
 
-fn cipher(key: [u8; 32]) -> FactorSecretCipher {
-    FactorSecretCipher::new(key)
+fn cipher(clock: &MockClock, key: [u8; 32]) -> FactorSecretCipher {
+    FactorSecretCipher::new(key).with_clock(Arc::new(clock.clone()))
 }
 
 fn sealed_for(
@@ -68,13 +71,15 @@ fn sealed_for(
 }
 
 fn service(
+    clock: &MockClock,
     factors: MockFactorStore,
     cipher: Option<FactorSecretCipher>,
 ) -> axess_core::authn::service::RequestAuthnService<MockIdentityStore, MockFactorStore> {
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
-    let mut builder = AuthnService::builder(identity, factors);
+    let mut builder = AuthnService::builder(identity, factors).with_clock(clock.clone());
     if let Some(cipher) = cipher {
         builder = builder.with_factor_secret_cipher(Arc::new(cipher));
     }
@@ -106,17 +111,18 @@ fn secret_of(config: &FactorConfig) -> &FactorSecret {
     }
 }
 
-fn future() -> DateTime<Utc> {
-    Utc::now() + Duration::days(30)
+fn future() -> Timestamp {
+    common::start().plus(SignedDuration::days(30))
 }
 
 #[tokio::test]
 async fn a_plain_secret_is_sealed_by_the_login_that_verifies_it() {
+    let clock = common::test_clock();
     let factors = MockFactorStore::new()
         .with_factor(user_scope(), hotp(SECRET.into(), 0))
         .with_method(&uid("u1"), hotp_method());
-    let cipher = cipher(KEY_A).with_plain_secrets(LegacyBlobs::AcceptUntil(future()));
-    let svc = service(factors.clone(), Some(cipher));
+    let cipher = cipher(&clock, KEY_A).with_plain_secrets(LegacyBlobs::AcceptUntil(future()));
+    let svc = service(&clock, factors.clone(), Some(cipher));
 
     let outcome = login(&svc, 0).await.unwrap();
     assert!(
@@ -138,12 +144,13 @@ async fn a_plain_secret_is_sealed_by_the_login_that_verifies_it() {
 
 #[tokio::test]
 async fn a_sealed_secret_verifies_and_stays_as_it_was() {
-    let cipher = cipher(KEY_A);
+    let clock = common::test_clock();
+    let cipher = cipher(&clock, KEY_A);
     let (config, _) = sealed_for(&cipher, &user_scope(), 0);
     let factors = MockFactorStore::new()
         .with_factor(user_scope(), config.clone())
         .with_method(&uid("u1"), hotp_method());
-    let svc = service(factors.clone(), Some(cipher));
+    let svc = service(&clock, factors.clone(), Some(cipher));
 
     assert!(matches!(
         login(&svc, 0).await.unwrap(),
@@ -163,12 +170,13 @@ async fn a_sealed_secret_verifies_and_stays_as_it_was() {
 
 #[tokio::test]
 async fn a_wrong_code_against_a_sealed_secret_fails_like_any_other() {
-    let cipher = cipher(KEY_A);
+    let clock = common::test_clock();
+    let cipher = cipher(&clock, KEY_A);
     let (config, _) = sealed_for(&cipher, &user_scope(), 0);
     let factors = MockFactorStore::new()
         .with_factor(user_scope(), config)
         .with_method(&uid("u1"), hotp_method());
-    let svc = service(factors.clone(), Some(cipher));
+    let svc = service(&clock, factors.clone(), Some(cipher));
 
     let session = test_session();
     svc.begin_login("alice", "default", &session).await.unwrap();
@@ -186,10 +194,11 @@ async fn a_wrong_code_against_a_sealed_secret_fails_like_any_other() {
 
 #[tokio::test]
 async fn the_default_policy_refuses_a_plain_secret_and_leaves_the_row() {
+    let clock = common::test_clock();
     let factors = MockFactorStore::new()
         .with_factor(user_scope(), hotp(SECRET.into(), 0))
         .with_method(&uid("u1"), hotp_method());
-    let svc = service(factors.clone(), Some(cipher(KEY_A)));
+    let svc = service(&clock, factors.clone(), Some(cipher(&clock, KEY_A)));
 
     let err = login(&svc, 0).await.unwrap_err();
     assert!(
@@ -202,28 +211,27 @@ async fn the_default_policy_refuses_a_plain_secret_and_leaves_the_row() {
 
 #[tokio::test]
 async fn a_plain_secret_is_refused_once_the_window_closes() {
-    let clock = MockClock::at(Utc::now());
-    let until = clock.now() + Duration::days(1);
-    let cipher = cipher(KEY_A)
-        .with_clock(Arc::new(clock.clone()))
-        .with_plain_secrets(LegacyBlobs::AcceptUntil(until));
+    let clock = common::test_clock();
+    let until = clock.now().plus(SignedDuration::days(1));
+    let cipher = cipher(&clock, KEY_A).with_plain_secrets(LegacyBlobs::AcceptUntil(until));
     let factors = MockFactorStore::new()
         .with_factor(user_scope(), hotp(SECRET.into(), 0))
         .with_method(&uid("u1"), hotp_method());
-    let svc = service(factors, Some(cipher));
+    let svc = service(&clock, factors, Some(cipher));
 
-    clock.advance(Duration::days(2));
+    clock.advance(SignedDuration::days(2));
     let err = login(&svc, 0).await.unwrap_err();
     assert!(matches!(err, AuthnError::Internal(_)), "{err:?}");
 }
 
 #[tokio::test]
 async fn a_sealed_secret_with_no_cipher_is_a_clear_error() {
-    let (config, _) = sealed_for(&cipher(KEY_A), &user_scope(), 0);
+    let clock = common::test_clock();
+    let (config, _) = sealed_for(&cipher(&clock, KEY_A), &user_scope(), 0);
     let factors = MockFactorStore::new()
         .with_factor(user_scope(), config)
         .with_method(&uid("u1"), hotp_method());
-    let svc = service(factors, None);
+    let svc = service(&clock, factors, None);
 
     let err = login(&svc, 0).await.unwrap_err();
     assert!(
@@ -236,10 +244,11 @@ async fn a_sealed_secret_with_no_cipher_is_a_clear_error() {
 /// refused by name: the write would put the seed in the table in clear text.
 #[tokio::test]
 async fn with_no_cipher_a_plain_secret_is_refused_and_the_row_left() {
+    let clock = common::test_clock();
     let factors = MockFactorStore::new()
         .with_factor(user_scope(), hotp(SECRET.into(), 0))
         .with_method(&uid("u1"), hotp_method());
-    let svc = service(factors.clone(), None);
+    let svc = service(&clock, factors.clone(), None);
 
     let err = login(&svc, 0).await.unwrap_err();
     assert!(
@@ -256,13 +265,16 @@ async fn with_no_cipher_a_plain_secret_is_refused_and_the_row_left() {
 
 #[tokio::test]
 async fn with_the_plaintext_opt_out_a_plain_secret_works_as_before() {
+    let clock = common::test_clock();
     let factors = MockFactorStore::new()
         .with_factor(user_scope(), hotp(SECRET.into(), 0))
         .with_method(&uid("u1"), hotp_method());
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let svc = AuthnService::builder(identity, factors.clone())
+        .with_clock(clock.clone())
         .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());
@@ -277,16 +289,17 @@ async fn with_the_plaintext_opt_out_a_plain_secret_works_as_before() {
 
 #[tokio::test]
 async fn a_secret_sealed_for_another_user_does_not_open_on_this_row() {
+    let clock = common::test_clock();
     let other = AuthnScope::User {
         tenant_id: tid("t1"),
         user_id: uid("u2"),
     };
-    let cipher = cipher(KEY_A);
+    let cipher = cipher(&clock, KEY_A);
     let (copied, _) = sealed_for(&cipher, &other, 0);
     let factors = MockFactorStore::new()
         .with_factor(user_scope(), copied)
         .with_method(&uid("u1"), hotp_method());
-    let svc = service(factors, Some(cipher));
+    let svc = service(&clock, factors, Some(cipher));
 
     let err = login(&svc, 0).await.unwrap_err();
     assert!(
@@ -297,13 +310,14 @@ async fn a_secret_sealed_for_another_user_does_not_open_on_this_row() {
 
 #[tokio::test]
 async fn a_secret_sealed_under_the_previous_key_is_sealed_again_under_the_current_one() {
-    let old = cipher(KEY_A);
+    let clock = common::test_clock();
+    let old = cipher(&clock, KEY_A);
     let (config, old_id) = sealed_for(&old, &user_scope(), 0);
-    let rotated = cipher(KEY_B).with_previous_key(KEY_A);
+    let rotated = cipher(&clock, KEY_B).with_previous_key(KEY_A);
     let factors = MockFactorStore::new()
         .with_factor(user_scope(), config)
         .with_method(&uid("u1"), hotp_method());
-    let svc = service(factors.clone(), Some(rotated.clone()));
+    let svc = service(&clock, factors.clone(), Some(rotated.clone()));
 
     assert!(matches!(
         login(&svc, 0).await.unwrap(),
@@ -321,13 +335,14 @@ async fn a_secret_sealed_under_the_previous_key_is_sealed_again_under_the_curren
 
 #[tokio::test]
 async fn a_tenant_template_is_copied_to_the_user_row_sealed_for_that_user() {
+    let clock = common::test_clock();
     let tenant_scope = AuthnScope::Tenant(tid("t1"));
-    let cipher = cipher(KEY_A);
+    let cipher = cipher(&clock, KEY_A);
     let (template, _) = sealed_for(&cipher, &tenant_scope, 0);
     let factors = MockFactorStore::new()
         .with_factor(tenant_scope.clone(), template.clone())
         .with_method(&uid("u1"), hotp_method());
-    let svc = service(factors.clone(), Some(cipher.clone()));
+    let svc = service(&clock, factors.clone(), Some(cipher.clone()));
 
     assert!(matches!(
         login(&svc, 0).await.unwrap(),

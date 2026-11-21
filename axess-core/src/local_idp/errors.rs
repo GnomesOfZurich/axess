@@ -1,19 +1,27 @@
 //! Errors from [`LocalIdp`](super::LocalIdp) issuance and key-store operations.
 
-use chrono::Duration;
+use axess_clock::SignedDuration;
+use std::time::Duration;
 
 /// Why a lifetime is refused as unusable, as opposed to over the cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum LifetimeFault {
-    /// `max_ttl` is zero or negative, so no token fits under it.
-    #[error("the max-TTL cap is zero or negative")]
-    NonPositiveCap,
+    /// `max_ttl` is a cap of no time, so no token fits under it.
+    #[error("the max-TTL cap is no time")]
+    ZeroCap,
     /// `exp` is not after the IdP clock's now: the token is born expired.
     #[error("the token expires at or before now")]
     AlreadyExpired,
     /// `nbf` is after `exp`: the token is never valid.
     #[error("not-before is after expiry")]
     NotBeforeAfterExpiry,
+}
+
+/// A cap as the span a message prints. A cap past the longest signed span
+/// is over no lifetime, so it reaches no message; it would print as the
+/// longest span.
+pub(crate) fn cap_text(max: Duration) -> SignedDuration {
+    SignedDuration::try_from(max).unwrap_or(SignedDuration::MAX)
 }
 
 /// Errors from `LocalIdp` issuance and key-store operations.
@@ -28,15 +36,16 @@ pub enum IssuanceError<KE: std::error::Error + Send + Sync + 'static> {
     /// the claim set's `iat`, so a backdated `iat` cannot stretch it.
     /// Production refuses the mint rather than producing a token a
     /// downstream verifier would honour despite the policy.
-    #[error("token lifetime {observed} exceeds configured max-TTL {max}")]
+    #[error("token lifetime {observed} exceeds configured max-TTL {}", cap_text(*.max))]
     LifetimeExceedsCap {
-        /// The computed lifetime of the proposed token.
-        observed: Duration,
+        /// The computed lifetime of the proposed token: `exp` less now, the
+        /// difference of two readings.
+        observed: SignedDuration,
         /// The configured cap.
         max: Duration,
     },
-    /// The cap or the claim set cannot produce a usable token: the cap is zero
-    /// or negative, `exp` is not after the IdP clock's now, or `nbf` is after
+    /// The cap or the claim set cannot produce a usable token: the cap is of
+    /// no time, `exp` is not after the IdP clock's now, or `nbf` is after
     /// `exp`. The reason says which.
     #[error("invalid token lifetime: {0}")]
     InvalidLifetime(LifetimeFault),

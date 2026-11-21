@@ -11,7 +11,8 @@ pub enum ResponseMode {
     /// transmit the URL fragment in the HTTP request. Selecting this mode
     /// requires a client-side shim (HTML page served at `redirect_uri` that
     /// reads `window.location.hash` and re-POSTs the parameters back to the
-    /// server) before `AuthnService::finish_oauth_login` can complete. For a
+    /// server) before `RequestAuthnService::finish_oauth_login` can
+    /// complete. For a
     /// pure server-side flow, prefer [`Query`](Self::Query) (default) or
     /// [`FormPost`](Self::FormPost); both deliver the `code` directly.
     Fragment,
@@ -37,6 +38,14 @@ impl ResponseMode {
             Self::Fragment => "fragment",
             Self::FormPost => "form_post",
         }
+    }
+}
+
+/// The `response_mode` parameter value, as [`as_str`](ResponseMode::as_str)
+/// returns it.
+impl std::fmt::Display for ResponseMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 

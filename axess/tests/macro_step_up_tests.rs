@@ -2,13 +2,13 @@
 //! device-bound passkey: it lets that session through, and answers every
 //! other one with the step-up the policy's annotation names.
 
-#![cfg(all(feature = "memory", feature = "authz"))]
+#![cfg(all(feature = "memory", feature = "authz", feature = "testing"))]
 
 use axess::testing::AuthSessionTestExt;
 use std::sync::Arc;
 
 use axess::authz::{
-    AssuranceContextProvider, PolicyStore, RequestContextProvider, RequestEntityProvider,
+    AssuranceContextProvider, AuthzInstallation, PolicyStore, RequestEntityProvider,
     merge_assurance_schema,
 };
 use axess::{MemorySessionStore, SessionLayer, require_authz};
@@ -16,7 +16,7 @@ use axess_core::authn::assurance::FactorAssurance;
 use axess_core::authn::factor::FactorKind;
 use axess_core::authz::AuthzError;
 use axum::{
-    Extension, Router,
+    Router,
     body::Body,
     http::{Method, Request, StatusCode, header},
     routing::{get, post},
@@ -57,11 +57,12 @@ fn schema() -> String {
     schema.to_string()
 }
 
-fn session_validator() -> axess::authn::SessionValidator {
+fn session_validator(clock: &axess::testing::MockClock) -> axess::authn::SessionValidator {
     axess::authn::AuthnService::builder(
-        axess::testing::MockIdentityStore::new(),
+        axess::testing::MockIdentityStore::new().with_clock(clock.clone()),
         axess::testing::MockFactorStore::new(),
     )
+    .with_clock(clock.clone())
     .build()
     .session_validator()
 }
@@ -88,8 +89,8 @@ impl RequestEntityProvider for NoEntities {
 async fn log_in(session: axess::AuthSession, proof: FactorAssurance) -> StatusCode {
     session
         .begin_authenticating(
-            axess::testing::user("gnomes-approver"),
-            axess::testing::tenant("gnomes"),
+            axess::testing::user("acme-approver"),
+            axess::testing::tenant("acme"),
             Arc::from("one-factor"),
             vec![proof.kind.clone()],
         )
@@ -98,15 +99,24 @@ async fn log_in(session: axess::AuthSession, proof: FactorAssurance) -> StatusCo
     StatusCode::NO_CONTENT
 }
 
-fn ago(seconds: i64) -> chrono::DateTime<chrono::Utc> {
-    chrono::Utc::now() - chrono::Duration::seconds(seconds)
+fn ago(seconds: i64) -> axess::Timestamp {
+    use axess::testing::Shift as _;
+    axess::testing::MockClock::reference_time().minus(axess::SignedDuration::seconds(seconds))
 }
 
 fn app() -> Router {
+    let clock = axess::testing::MockClock::at_reference();
     let store = Arc::new(PolicyStore::from_text(RULE, &schema()).expect("policies"));
-    let entities: Arc<dyn RequestEntityProvider> = Arc::new(NoEntities);
-    let context: Arc<dyn RequestContextProvider> =
-        Arc::new(AssuranceContextProvider::new(Arc::new(axess::SystemClock)));
+    // The rule reads `context.assurance`, so the installation is given the
+    // provider that supplies it.
+    let installation = AuthzInstallation::new(
+        store,
+        Arc::new(NoEntities),
+        Some(Arc::new(AssuranceContextProvider::new(Arc::new(
+            clock.clone(),
+        )))),
+    )
+    .expect("the provider is given");
     Router::new()
         .route(
             "/payments/{id}/approve",
@@ -114,7 +124,7 @@ fn app() -> Router {
                 "App",
                 "ApprovePayment",
                 "Payment:{id}",
-                validator = session_validator()
+                validator = session_validator(&clock)
             )),
         )
         .route(
@@ -144,14 +154,14 @@ fn app() -> Router {
                 log_in(s, FactorAssurance::for_kind(FactorKind::Password, ago(10)))
             }),
         )
-        .layer(Extension(context))
-        .layer(Extension(store))
-        .layer(Extension(entities))
+        .layer(installation)
         .layer(
             SessionLayer::without_registry_insecure(
-                MemorySessionStore::new(),
+                MemorySessionStore::new().with_clock(std::sync::Arc::new(clock.clone())),
                 axess::testing::test_key(42),
+                std::sync::Arc::new(axess::session::UnrecordedSessionEnds),
             )
+            .with_clock(clock.clone())
             .with_ttl(std::time::Duration::from_secs(3600))
             .with_secure(false),
         )

@@ -3,8 +3,9 @@
 //! suspending them, deleting them or ending their sessions ends the
 //! impersonation on its next request.
 
-mod common;
+use axess_core::testing::fixtures as common;
 
+use axess_core::Clock;
 use axess_core::authn::{Actor, AuditContext, RequestAuthnService};
 use axess_core::authn::{service::AuthnService, types::StatusDetail};
 use axess_core::session::{
@@ -15,6 +16,7 @@ use axess_core::session::{
     },
 };
 use axess_core::testing::AuthSessionTestExt;
+use axess_core::testing::MockClock;
 use axess_core::testing::mock_authn::{MockFactorStore, MockIdentityStore};
 use axum::{
     Router,
@@ -22,8 +24,7 @@ use axum::{
     http::{Request, header},
     routing::get,
 };
-use chrono::Utc;
-use common::{test_tenant, test_user};
+use common::{test_clock, test_tenant, test_user};
 use std::sync::Arc;
 use tower::ServiceExt;
 
@@ -36,36 +37,47 @@ type Svc = RequestAuthnService<MockIdentityStore, MockFactorStore>;
 
 struct Rig {
     app: Router,
+    clock: MockClock,
     svc: Svc,
     reg: MemorySessionRegistry,
     admin: axess_core::authn::types::User,
 }
 
 fn rig() -> Rig {
+    let clock = test_clock();
     let admin = test_user("admin", "ops");
     let target = test_user("u2", "bob");
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(admin.clone())
         .with_user(target.clone());
-    let reg = MemorySessionRegistry::new();
+    let reg = MemorySessionRegistry::new().with_clock(Arc::new(clock.clone()));
     let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_registry(reg.clone())
         .build()
         .with_audit_context(AuditContext::default());
     let handle: Arc<dyn SessionRegistryHandle> = Arc::new(SessionRegistryAdapter(reg.clone()));
-    let layer =
-        SessionLayer::new(MemorySessionStore::new(), KEY, handle.clone()).with_secure(false);
-    let (login_admin, login_reg) = (admin.clone(), handle);
+    let store = MemorySessionStore::new().with_clock(Arc::new(clock.clone()));
+    let layer = SessionLayer::new(
+        store,
+        KEY,
+        handle.clone(),
+        std::sync::Arc::new(axess_core::session::UnrecordedSessionEnds),
+    )
+    .with_clock(clock.clone())
+    .with_secure(false);
+    let (login_admin, login_reg, login_clock) = (admin.clone(), handle, clock.clone());
     let (imp_svc, imp_admin, imp_target) = (svc.clone(), admin.clone(), target);
     let app = Router::new()
         .route(
             "/login",
             get(move |s: AuthSession| {
-                let (u, reg) = (login_admin.clone(), login_reg.clone());
+                let (u, reg, at) = (login_admin.clone(), login_reg.clone(), login_clock.now());
                 async move {
-                    s.set_authenticated(u.id, u.tenant_id, Utc::now()).await;
-                    reg.register(&u.id, &s.session_id().await).await;
+                    s.set_authenticated(u.id, u.tenant_id, at).await;
+                    reg.register(&u.id, &s.session_key().await).await;
                     "in"
                 }
             }),
@@ -94,6 +106,7 @@ fn rig() -> Rig {
         .layer(layer);
     Rig {
         app,
+        clock,
         svc,
         reg,
         admin,
@@ -139,7 +152,7 @@ async fn an_impersonation_stands_while_the_administrator_does() {
 async fn suspending_the_administrator_ends_the_impersonation() {
     let r = rig();
     let mut jar = impersonating(&r).await;
-    let detail = StatusDetail::administrative("compromised", Utc::now());
+    let detail = StatusDetail::administrative("compromised", r.clock.now());
     r.svc
         .suspend_user(Actor::System, &r.admin.id, &r.admin.tenant_id, detail)
         .await

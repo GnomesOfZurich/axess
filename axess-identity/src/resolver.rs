@@ -167,12 +167,12 @@ mod tests {
     )]
     #[tokio::test]
     async fn cli_resolver_builds_workload_principal() {
-        let trust = TrustDomain::new("gnomes.local").unwrap();
+        let trust = TrustDomain::new("example.org").unwrap();
         let resolver = CliResolver::builder()
             .trust_domain(trust.clone())
             .service_name("compute-worker")
             .tenant_id(sample_tenant())
-            .tenant_slug("gnomes")
+            .tenant_slug("acme")
             .build()
             .unwrap();
         let principal = resolver.resolve().await.unwrap();
@@ -180,12 +180,12 @@ mod tests {
             Principal::Workload(w) => {
                 assert_eq!(
                     w.workload_id.as_str(),
-                    "spiffe://gnomes.local/compute-worker/gnomes"
+                    "spiffe://example.org/compute-worker/acme"
                 );
                 assert_eq!(w.trust_domain, trust);
                 assert_eq!(w.issuer, Issuer::Cli);
                 assert_eq!(w.tenant_id, sample_tenant());
-                assert_eq!(w.tenant_slug, "gnomes");
+                assert_eq!(w.tenant_slug, "acme");
                 assert_eq!(w.service_name, "compute-worker");
                 assert!(w.attributes.is_empty());
             }
@@ -199,12 +199,12 @@ mod tests {
     )]
     #[tokio::test]
     async fn cli_resolver_resolve_is_idempotent() {
-        let trust = TrustDomain::new("gnomes.local").unwrap();
+        let trust = TrustDomain::new("example.org").unwrap();
         let resolver = CliResolver::builder()
             .trust_domain(trust)
             .service_name("feed-worker")
             .tenant_id(sample_tenant())
-            .tenant_slug("gnomes")
+            .tenant_slug("acme")
             .build()
             .unwrap();
         let a = resolver.resolve().await.unwrap();
@@ -217,7 +217,7 @@ mod tests {
         let err = CliResolver::builder()
             .service_name("compute-worker")
             .tenant_id(sample_tenant())
-            .tenant_slug("gnomes")
+            .tenant_slug("acme")
             .build()
             .unwrap_err();
         assert!(matches!(err, IdentityError::InvalidComponent(_)));
@@ -225,11 +225,11 @@ mod tests {
 
     #[test]
     fn cli_resolver_builder_rejects_missing_service_name() {
-        let trust = TrustDomain::new("gnomes.local").unwrap();
+        let trust = TrustDomain::new("example.org").unwrap();
         let err = CliResolver::builder()
             .trust_domain(trust)
             .tenant_id(sample_tenant())
-            .tenant_slug("gnomes")
+            .tenant_slug("acme")
             .build()
             .unwrap_err();
         assert!(matches!(err, IdentityError::InvalidComponent(_)));
@@ -237,11 +237,11 @@ mod tests {
 
     #[test]
     fn cli_resolver_builder_rejects_missing_tenant_id() {
-        let trust = TrustDomain::new("gnomes.local").unwrap();
+        let trust = TrustDomain::new("example.org").unwrap();
         let err = CliResolver::builder()
             .trust_domain(trust)
             .service_name("compute-worker")
-            .tenant_slug("gnomes")
+            .tenant_slug("acme")
             .build()
             .unwrap_err();
         assert!(matches!(err, IdentityError::InvalidComponent(_)));
@@ -249,7 +249,7 @@ mod tests {
 
     #[test]
     fn cli_resolver_builder_rejects_missing_tenant_slug() {
-        let trust = TrustDomain::new("gnomes.local").unwrap();
+        let trust = TrustDomain::new("example.org").unwrap();
         let err = CliResolver::builder()
             .trust_domain(trust)
             .service_name("compute-worker")
@@ -261,12 +261,12 @@ mod tests {
 
     #[test]
     fn cli_resolver_builder_rejects_invalid_service_name() {
-        let trust = TrustDomain::new("gnomes.local").unwrap();
+        let trust = TrustDomain::new("example.org").unwrap();
         let err = CliResolver::builder()
             .trust_domain(trust)
             .service_name("compute worker")
             .tenant_id(sample_tenant())
-            .tenant_slug("gnomes")
+            .tenant_slug("acme")
             .build()
             .unwrap_err();
         assert!(matches!(err, IdentityError::InvalidComponent(_)));
@@ -278,12 +278,12 @@ mod tests {
     )]
     #[tokio::test]
     async fn cli_resolver_carries_attributes() {
-        let trust = TrustDomain::new("gnomes.local").unwrap();
+        let trust = TrustDomain::new("example.org").unwrap();
         let resolver = CliResolver::builder()
             .trust_domain(trust)
             .service_name("compute-worker")
             .tenant_id(sample_tenant())
-            .tenant_slug("gnomes")
+            .tenant_slug("acme")
             .attribute("worker_pid", serde_json::json!(12345))
             .attribute("hostname", serde_json::json!("worker-1.local"))
             .build()

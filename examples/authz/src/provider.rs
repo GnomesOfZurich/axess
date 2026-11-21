@@ -148,7 +148,7 @@ impl AuthzEntityProvider for DocEntityProvider {
         &self,
         principal: &EntityUid,
         resource_id: &String,
-        _action: &EntityUid,
+        _: &EntityUid,
     ) -> Result<Entities, Self::Error> {
         let mut entities = Vec::new();
 

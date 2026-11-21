@@ -34,6 +34,14 @@
 #
 # # Test invocation
 #
+# Each mutant is tested with cargo-nextest (`test_tool` below) under the
+# `mutants` profile of `.config/nextest.toml`, which stops at the first
+# failing test and ends a test that hangs. cargo-mutants reads this file
+# in a local run and in CI alike, so both test a mutant the same way;
+# cargo-nextest must be installed (the version is the one
+# `.github/workflows/mutants.yml` installs). nextest does not run
+# doctests, so a behaviour that only a doctest pins shows as missed.
+#
 # `--all-features` is non-negotiable: many mutation sites only get
 # exercised under specific feature combinations (device, sqlite,
 # postgres, valkey, fido2, oauth, …). Running anything narrower
@@ -71,12 +79,49 @@ exclude_globs = [
     # already invisible to the production build, but listing them
     # explicitly speeds up cargo-mutants's planning pass.
     "**/test_*.rs",
+    # Test files beside the module they test: `name_tests.rs` and
+    # `name/tests.rs`. cargo-mutants passes over a module declared
+    # `#[cfg(test)]`, but not one declared `#[cfg(all(test, feature = "x"))]`,
+    # so the helpers in such a file were mutated as if they were library
+    # code (a `serve` helper in a `recv_tests.rs` was).
+    "**/*_tests.rs",
+    "**/tests.rs",
+    # Test support of the same kind under other names, each compiled only
+    # under `#[cfg(all(test, feature = "..."))]`: the in-process Valkey fake
+    # and the cluster helpers the Valkey tests run on, the helpers of the
+    # live PostgreSQL and MySQL tests, and the contract suite those stores'
+    # device tests share. A mutant in one of them changes what a test
+    # checks with, not the library.
+    "axess-core/src/testing/valkey_fake.rs",
+    "axess-core/src/testing/valkey_cluster.rs",
+    "axess-core/src/testing/sql_live.rs",
+    "axess-core/src/device/store/sql_contract.rs",
     # Macros emit code at expansion time; mutating the macro source
     # produces mutants we can rarely kill without test-only macro
     # invocations. axess-macros has its own dedicated tests.
     "axess-macros/src/**",
     # Build / generated boilerplate.
     "**/build.rs",
+]
+
+# Mutants that cannot be told from the code they replace, each with the
+# reason. A pattern is matched against the name `--list` prints, and names
+# one function.
+exclude_re = [
+    # The default `generation` of `TenantOAuthProviders` is a constant. Its
+    # only reader, the back-channel logout route, compares the value for
+    # equality with one read from the same source, so every constant
+    # behaves as this one does. An implementation's own `generation` (the
+    # directory's, the `Arc` forwarding) is not matched and stays mutated.
+    "replace TenantOAuthProviders::generation -> u64 with",
+    # The size guard on a proof cookie value and on a registration offer
+    # bounds the work done on a long value and decides nothing. Every field
+    # of a value the layer minted has a bounded length (two ids, a 32-byte
+    # thumbprint, an integer in its one spelling, a 32-byte MAC), so a
+    # genuine value is far shorter than the bound, and a value at or past it
+    # fails the MAC or a decode whichever way the comparison reads. `<` is
+    # not matched: it refuses every genuine value and is caught.
+    "device_key/cookie\\.rs.*replace > with (==|>=) in (read_proof|offer_holds)$",
 ]
 
 # Extra arguments passed to `cargo` (BOTH `cargo test --no-run` and
@@ -87,12 +132,26 @@ exclude_globs = [
 # `#[ignore]`'d integration tests (Postgres, Valkey) don't run by
 # default, so we don't need `--lib` to gate them out.
 #
-# In cargo-mutants 27.x, `additional_cargo_args` flows to both
-# build and test invocations as cargo-side arguments (before `--`);
-# `additional_cargo_test_args` flows AFTER `--` to the test runner
-# (e.g. `--test-threads=N`). `--all-features` is a cargo-side flag,
-# hence the `additional_cargo_args` slot here.
+# In cargo-mutants 27.x, `additional_cargo_args` flows to both the
+# build (`cargo nextest run --no-run`) and the test (`cargo nextest run`)
+# invocations; `additional_cargo_test_args` flows to the test invocation
+# only, appended as written, after any `--cargo-test-arg` and any
+# arguments after `--` on the command line. `--all-features` is needed
+# by both, hence the `additional_cargo_args` slot here.
 additional_cargo_args = ["--all-features"]
+
+# The test tool: `cargo nextest run` in place of `cargo test`.
+test_tool = "nextest"
+
+# The nextest options of the test invocation. `--profile=mutants` selects
+# the profile described at the top of this file. `--no-tests=warn` keeps
+# a mutant whose package runs no test from reading as caught: nextest
+# exits 4 when no test ran, and cargo-mutants counts any failing exit as
+# a caught mutant, where `cargo test` passed such a run and the mutant
+# was missed. A command line that adds test arguments must give them as
+# nextest options (`--cargo-test-arg=...`), never after a `--`, which
+# would hand these two to the test binaries.
+additional_cargo_test_args = ["--profile=mutants", "--no-tests=warn"]
 
 # Multiplier on the unmutated baseline test time. Slow CI runners
 # need headroom; without this, healthy mutants get falsely flagged

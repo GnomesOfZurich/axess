@@ -22,7 +22,7 @@
 //!
 //! The typed [`TenantId`](axess_identity::TenantId) is adopter-supplied
 //! at resolver construction; the same registry-agnostic pattern as
-//! [`MtlsResolver`](crate::mtls::MtlsResolver). Adopter middleware
+//! [`MtlsResolver`]. Adopter middleware
 //! peeks at the JWT (or whatever issuer-specific claim drives tenant
 //! selection) to look up the tenant id before constructing the resolver.
 //!

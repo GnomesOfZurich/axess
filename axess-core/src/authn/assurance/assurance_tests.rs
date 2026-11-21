@@ -4,8 +4,8 @@
 use super::*;
 use crate::authn::factor::FederatedProvider;
 
-fn at(seconds: i64) -> DateTime<Utc> {
-    DateTime::<Utc>::from_timestamp(1_700_000_000 + seconds, 0).expect("valid time")
+fn at(seconds: i64) -> Timestamp {
+    Timestamp::from_unix_seconds(1_700_000_000 + seconds).expect("valid time")
 }
 
 #[test]

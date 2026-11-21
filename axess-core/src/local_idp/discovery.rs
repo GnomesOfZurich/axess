@@ -13,7 +13,7 @@
 //!   algorithms to expect mid-rotation.
 //!
 //! Most adopters mount both endpoints via [`LocalIdp::router`]. The
-//! standalone [`handlers`](crate::local_idp::discovery::handlers) surface custom paths.
+//! standalone [`handlers`] surface custom paths.
 //!
 //! [`LocalIdp`]: crate::local_idp::LocalIdp
 //! [`LocalIdp::from_key_store`]: crate::local_idp::LocalIdp::from_key_store

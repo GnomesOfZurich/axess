@@ -4,10 +4,15 @@
 use super::races::AfterLoad;
 use super::*;
 use crate::device::store::MemoryDeviceStore;
-use chrono::TimeZone;
+use axess_clock::Timestamp;
+use axess_clock::testing::Shift;
 
-fn at(minutes: i64) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 1, 1, 9, 0, 0).unwrap() + chrono::Duration::minutes(minutes)
+fn at(minutes: i64) -> Timestamp {
+    Timestamp::from_utc(2026, 1, 1, 9, 0, 0)
+        .unwrap()
+        .plus(axess_clock::SignedDuration::minutes(
+            i32::try_from(minutes).unwrap(),
+        ))
 }
 
 fn tenant() -> TenantId {
@@ -46,7 +51,10 @@ async fn revoked_after_the_load_is_reported<S: DeviceStore>(store: S, level: Dev
     racing.revoke_after_next_load(tenant(), device.id, at(5));
 
     let outcome = DeviceLifecycleService::new(racing.clone())
-        .promote_on_authn(&tenant(), &device.id, at(6))
+        .promote_on_authn(
+            &UserDevice::for_tests(tenant(), user(), ProvenDevice::for_tests(device.id)),
+            at(6),
+        )
         .await
         .unwrap();
 
@@ -75,7 +83,7 @@ async fn a_trusted_device_revoked_after_the_load_is_reported_revoked() {
     revoked_after_the_load_is_reported(MemoryDeviceStore::new(), DeviceTrustLevel::Trusted).await;
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(any(feature = "sqlite", feature = "sqlite-unbundled"))]
 #[tokio::test]
 async fn sqlite_a_seen_device_revoked_after_the_load_is_reported_revoked() {
     revoked_after_the_load_is_reported(
@@ -254,9 +262,10 @@ async fn a_proven_device_revoked_after_the_load_is_not_served() {
             DeviceRequest {
                 tenant: &tenant(),
                 user: Some(&user()),
-                fingerprint: fingerprint(),
-                presented: Some(&presented),
+                fingerprint: Some(fingerprint()),
+                presented: std::slice::from_ref(&presented),
                 session_device: None,
+                keys: crate::device_key::KeyEnforcement::none_for_tests(),
             },
             at(6),
             &rng,
@@ -287,9 +296,10 @@ async fn a_session_device_revoked_after_the_load_is_not_served() {
             DeviceRequest {
                 tenant: &tenant(),
                 user: Some(&user()),
-                fingerprint: fingerprint(),
-                presented: None,
+                fingerprint: Some(fingerprint()),
+                presented: &[],
                 session_device: Some(&device.id),
+                keys: crate::device_key::KeyEnforcement::none_for_tests(),
             },
             at(6),
             &rng,
@@ -361,7 +371,7 @@ async fn memory_racing_user_creates_never_leave_two_devices() {
     racing_creates_never_leave_two_devices(MemoryDeviceStore::new(), Some(user())).await;
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(any(feature = "sqlite", feature = "sqlite-unbundled"))]
 #[tokio::test]
 async fn sqlite_racing_guest_creates_never_leave_two_devices() {
     racing_creates_never_leave_two_devices(
@@ -371,7 +381,7 @@ async fn sqlite_racing_guest_creates_never_leave_two_devices() {
     .await;
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(any(feature = "sqlite", feature = "sqlite-unbundled"))]
 #[tokio::test]
 async fn sqlite_racing_user_creates_never_leave_two_devices() {
     racing_creates_never_leave_two_devices(
@@ -410,4 +420,228 @@ async fn concurrent_first_sightings_create_one_device() {
         assert_eq!(ids.len(), 1, "round {round}: every request got the same id");
         assert_eq!(store.len(), 1, "round {round}: one device remains");
     }
+}
+
+/// A request of a signed-in user that presents no token keeps the device its
+/// session is bound to, as a device it did not prove; asked only for what it
+/// proves, it proves nothing, and no device is created for it either way.
+#[tokio::test]
+async fn a_session_device_is_kept_and_not_proven_by_a_request_without_a_token() {
+    let rng = crate::testing::mock_random::MockRng::new(6);
+    let store = MemoryDeviceStore::new();
+    let device = device_at("bound", DeviceTrustLevel::Seen, Some(user()), 0);
+    store.save(&device, at(0)).await.unwrap();
+    let service = DeviceLifecycleService::new(store.clone());
+    let fresh = crate::authn::ids::testing::device("fresh");
+    let (tenant, user) = (tenant(), user());
+    let request = DeviceRequest {
+        tenant: &tenant,
+        user: Some(&user),
+        fingerprint: Some(fingerprint()),
+        presented: &[],
+        session_device: Some(&device.id),
+        keys: crate::device_key::KeyEnforcement::none_for_tests(),
+    };
+
+    let kept = service
+        .resolve_or_keep(request, at(1), &rng, || fresh)
+        .await
+        .unwrap()
+        .expect("the session's device");
+    assert_eq!(kept, ResolvedOrKept::Kept(device.id));
+    assert_eq!(kept.id(), device.id);
+    assert_eq!(
+        kept.bound(),
+        crate::device::BoundDevice::Unproven(device.id)
+    );
+    assert!(kept.issued().is_none());
+
+    let proven = service
+        .resolve_proven(request, at(1), &rng, || fresh)
+        .await
+        .unwrap();
+    assert_eq!(proven, None, "nothing on the request proves the device");
+    assert_eq!(store.len(), 1, "and no second device is created");
+}
+
+/// The device a request is created on is proven by that request, which
+/// holds the token it was just issued.
+#[tokio::test]
+async fn a_device_created_for_a_request_is_proven_by_it() {
+    let rng = crate::testing::mock_random::MockRng::new(7);
+    let service = DeviceLifecycleService::new(MemoryDeviceStore::new());
+    let fresh = crate::authn::ids::testing::device("fresh");
+    let (tenant, user) = (tenant(), user());
+    let request = DeviceRequest {
+        tenant: &tenant,
+        user: Some(&user),
+        fingerprint: Some(fingerprint()),
+        presented: &[],
+        session_device: None,
+        keys: crate::device_key::KeyEnforcement::none_for_tests(),
+    };
+
+    let created = service
+        .resolve_or_keep(request, at(1), &rng, || fresh)
+        .await
+        .unwrap()
+        .expect("a device");
+    assert_eq!(created.id(), fresh);
+    assert!(created.issued().is_some(), "the new device gets a token");
+    assert!(matches!(
+        created.bound(),
+        crate::device::BoundDevice::Proven(proof) if proof.id() == fresh
+    ));
+    assert!(matches!(created, ResolvedOrKept::Proven(_)));
+}
+
+/// A new device stores the request's fingerprint, so a request of a
+/// signed-in user that has none, proves no device and keeps none is given
+/// none, and nothing is deleted or written for it: the user's `Unknown`
+/// device stays although the bound leaves no room beside it. The same
+/// request that presents the device's token proves the device.
+#[tokio::test]
+async fn a_request_without_a_fingerprint_is_given_no_device() {
+    let rng = crate::testing::mock_random::MockRng::new(8);
+    let store = MemoryDeviceStore::new();
+    let service = DeviceLifecycleService::new(store.clone()).with_max_unknown_devices_per_user(1);
+    let fresh = crate::authn::ids::testing::device("fresh");
+    let (tenant, user) = (tenant(), user());
+    let first = DeviceRequest {
+        tenant: &tenant,
+        user: Some(&user),
+        fingerprint: Some(fingerprint()),
+        presented: &[],
+        session_device: None,
+        keys: crate::device_key::KeyEnforcement::none_for_tests(),
+    };
+    let created = service
+        .resolve_or_keep(first, at(0), &rng, || fresh)
+        .await
+        .unwrap()
+        .expect("a device");
+    let token = created.issued().cloned().expect("its token");
+
+    let bare = DeviceRequest {
+        fingerprint: None,
+        ..first
+    };
+    let other = crate::authn::ids::testing::device("other");
+    let answer = service
+        .resolve_or_keep(bare, at(1), &rng, || other)
+        .await
+        .unwrap();
+    assert_eq!(answer, None, "no device without a fingerprint");
+    assert_eq!(store.len(), 1, "the Unknown device stays");
+    assert!(store.load(&tenant, &fresh).await.unwrap().is_some());
+
+    let entry = crate::device::proof::PresentedDevice { id: fresh, token };
+    let presenting = DeviceRequest {
+        presented: std::slice::from_ref(&entry),
+        ..bare
+    };
+    let proven = service
+        .resolve_or_keep(presenting, at(2), &rng, || other)
+        .await
+        .unwrap()
+        .expect("the token proves it");
+    assert!(matches!(proven, ResolvedOrKept::Proven(ref resolved) if resolved.id == fresh));
+    assert!(proven.issued().is_none());
+    assert_eq!(store.len(), 1);
+}
+
+/// A device nobody owns yet, presented with its token by a signed-in user,
+/// becomes that user's and is the device of the request: no other is
+/// created.
+#[tokio::test]
+async fn an_unowned_device_is_claimed_by_the_user_who_presents_its_token() {
+    use crate::device::proof::{DeviceToken, PresentedDevice};
+    let rng = crate::testing::mock_random::MockRng::new(8);
+    let store = MemoryDeviceStore::new();
+    let token = DeviceToken::mint(&rng);
+    let mut device = device_at("unowned", DeviceTrustLevel::Seen, None, 0);
+    device.bindings = vec![token.binding(at(0))];
+    store.save(&device, at(0)).await.unwrap();
+    let fresh = crate::authn::ids::testing::device("fresh");
+    let presented = PresentedDevice {
+        id: device.id,
+        token,
+    };
+
+    let resolved = DeviceLifecycleService::new(store.clone())
+        .resolve_or_keep(
+            DeviceRequest {
+                tenant: &tenant(),
+                user: Some(&user()),
+                fingerprint: Some(fingerprint()),
+                presented: std::slice::from_ref(&presented),
+                session_device: None,
+                keys: crate::device_key::KeyEnforcement::none_for_tests(),
+            },
+            at(6),
+            &rng,
+            || fresh,
+        )
+        .await
+        .unwrap()
+        .expect("a device");
+
+    assert_eq!(resolved.id(), device.id, "the device whose token it holds");
+    assert!(matches!(resolved, ResolvedOrKept::Proven(_)));
+    assert!(resolved.issued().is_none());
+    let row = store.load(&tenant(), &device.id).await.unwrap().unwrap();
+    assert_eq!(row.user_id, Some(user()), "claimed by the user");
+    assert_eq!(store.len(), 1, "no second device");
+}
+
+/// An unowned device that another user claims between this request's load
+/// and its own claim is the other user's: its token does not make it this
+/// request's device, and the request gets a device of its own.
+#[tokio::test]
+async fn an_unowned_device_another_user_claimed_first_is_not_served() {
+    use crate::device::proof::{DeviceToken, PresentedDevice};
+    let rng = crate::testing::mock_random::MockRng::new(9);
+    let racing = AfterLoad::new(MemoryDeviceStore::new());
+    let token = DeviceToken::mint(&rng);
+    let mut device = device_at("unowned", DeviceTrustLevel::Seen, None, 0);
+    device.bindings = vec![token.binding(at(0))];
+    racing.save(&device, at(0)).await.unwrap();
+    let other = crate::authn::ids::testing::user("someone-else");
+    racing.claim_after_next_load(tenant(), device.id, other, at(5));
+    let fresh = crate::authn::ids::testing::device("fresh");
+    let presented = PresentedDevice {
+        id: device.id,
+        token,
+    };
+
+    let resolved = DeviceLifecycleService::new(racing.clone())
+        .resolve_or_keep(
+            DeviceRequest {
+                tenant: &tenant(),
+                user: Some(&user()),
+                fingerprint: Some(fingerprint()),
+                presented: std::slice::from_ref(&presented),
+                session_device: None,
+                keys: crate::device_key::KeyEnforcement::none_for_tests(),
+            },
+            at(6),
+            &rng,
+            || fresh,
+        )
+        .await
+        .unwrap()
+        .expect("a device");
+
+    assert_eq!(
+        resolved.id(),
+        fresh,
+        "the other user's device is not served"
+    );
+    let row = racing
+        .inner
+        .load(&tenant(), &device.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.user_id, Some(other));
 }

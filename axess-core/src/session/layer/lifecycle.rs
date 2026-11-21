@@ -3,8 +3,9 @@
 //! (`HeaderMap`, the request's fingerprints, the service's dependencies by
 //! reference) so it can be tested without axum.
 //!
-//! - Load: [`load_session`], here, verifies the cookie, loads the row and
-//!   applies the fingerprint, age and registry checks.
+//! - Load: [`load_session`], here, verifies the cookie and applies the
+//!   fingerprint, age and registry checks; `load` reads the row behind a
+//!   verified cookie and ends a session the checks refuse.
 //! - Finalize: [`finalize_session`], in `finalize`, saves, swaps or cycles
 //!   the row for the response.
 //! - Registry: [`settle_registry`], in `registry`, moves the registry entry
@@ -20,8 +21,8 @@
 use crate::cookies::MAX_COOKIE_VALUE_BYTES;
 use crate::session::config::SessionConfig;
 use crate::session::data::SessionData;
-use crate::session::id::SessionId;
-use crate::session::layer::signing::SigningKeyRing;
+use crate::session::layer::audit::{SessionEndAudit, SessionEndReason};
+use crate::session::layer::signing::{CookieSession, SigningKeyRing};
 use crate::session::store::{SessionLiveness, SessionRegistryHandle, SessionStore};
 use axess_clock::Clock;
 use axess_rng::SecureRng;
@@ -39,7 +40,8 @@ pub(crate) struct Fingerprints<'a> {
 
 /// What a stored session may be asked beyond its cookie and its fingerprint:
 /// whether the registry still holds it, and whether it has outlived the
-/// configured absolute age. Both apply to `Authenticated` records only.
+/// configured absolute age. Both apply to signed-in records only (an
+/// authenticated session, or one in a step-up of it).
 #[derive(Clone, Copy)]
 pub(crate) struct LoadPolicy<'a> {
     /// Registry consulted for every authenticated record, when configured.
@@ -50,28 +52,60 @@ pub(crate) struct LoadPolicy<'a> {
     pub(crate) clock: &'a dyn Clock,
     /// Metrics hook for the binding-mismatch counter.
     pub(crate) metrics: Option<&'a crate::metrics::MetricSinks>,
+    /// Told of every session the load ends (an age cap, a registry entry
+    /// gone), and of one the device-key check after it ends, before its row
+    /// is removed. Owned by the task that ends the
+    /// session, so it is handed over as the `Arc`.
+    pub(crate) audit: &'a std::sync::Arc<dyn SessionEndAudit>,
+}
+
+/// Where the finalize stage reports: the metric sinks, when any are
+/// attached, and the audit sink told of a session the stage ends.
+#[derive(Clone, Copy)]
+pub(crate) struct Reporting<'a> {
+    pub(crate) metrics: Option<&'a crate::metrics::MetricSinks>,
+    pub(crate) audit: &'a dyn SessionEndAudit,
+}
+
+#[cfg(test)]
+impl Reporting<'static> {
+    /// No metric sinks, and the sink that records nothing.
+    pub(crate) fn unrecorded() -> Self {
+        Self {
+            metrics: None,
+            audit: &crate::session::layer::audit::UnrecordedSessionEnds,
+        }
+    }
 }
 
 #[cfg(test)]
 impl LoadPolicy<'static> {
-    /// No registry, no extra checks beyond the age cap in the config.
+    /// No registry, no extra checks beyond the age cap in the config, on a
+    /// clock at the reference instant.
     pub(crate) fn bare() -> Self {
-        static CLOCK: axess_clock::SystemClock = axess_clock::SystemClock;
+        static CLOCK: std::sync::LazyLock<axess_clock::testing::MockClock> =
+            std::sync::LazyLock::new(axess_clock::testing::MockClock::at_reference);
+        static UNRECORDED: std::sync::LazyLock<std::sync::Arc<dyn SessionEndAudit>> =
+            std::sync::LazyLock::new(|| {
+                std::sync::Arc::new(crate::session::layer::audit::UnrecordedSessionEnds)
+            });
         Self {
             registry: None,
             unknown: crate::session::layer::UnknownLiveness::Reject,
-            clock: &CLOCK,
+            clock: &*CLOCK,
             metrics: None,
+            audit: &UNRECORDED,
         }
     }
 }
 
 /// Outcome of [`load_session`].
 ///
-/// `id` is always the id this request will run under (existing-and-trusted
-/// or freshly-minted). `existing_id` is `Some` only when the cookie's
-/// signature verified, the store had live data, and the fingerprint check
-/// passed: i.e. when the load was fully trusted. `binding_invalidated`
+/// `session` is always the session this request will run under (the
+/// cookie's, when it is trusted, or a freshly minted one). `stored` is
+/// `true` only when the cookie's signature verified, the store had live
+/// data, and the fingerprint check passed: i.e. when the load was fully
+/// trusted, and `session` is then the cookie's. `binding_invalidated`
 /// is `true` when the fingerprint check actively reset the session
 /// (separate signal from "no cookie at all" because the response must
 /// cycle the id and emit metrics distinctly).
@@ -85,61 +119,143 @@ impl LoadPolicy<'static> {
 /// load bound an authenticated session that stored no fingerprint, so the
 /// fingerprint is written back.
 pub(crate) struct LoadOutcome {
-    pub(crate) id: SessionId,
+    pub(crate) session: CookieSession,
     pub(crate) data: SessionData,
-    pub(crate) existing_id: Option<SessionId>,
+    pub(crate) stored: bool,
     pub(crate) binding_invalidated: bool,
     pub(crate) rotation_fallback_used: bool,
-    /// `true` when a stored authenticated session was refused because the
-    /// registry no longer holds it or it outlived the absolute age cap. Its
-    /// row has been deleted; the response replaces the client's cookie with
-    /// one for the fresh guest.
+    /// `true` when this request ended a stored signed-in session: the
+    /// registry no longer holds it, it outlived an absolute age cap, or
+    /// device keys are required and it outlived its registration window
+    /// unbound; its ending is recorded and its row removed. The response replaces the
+    /// client's cookie with one for the fresh guest. `false` for a session
+    /// that was refused without being ended (another request is ending it,
+    /// or its ending could not be recorded).
     pub(crate) session_ended: bool,
     /// The row as the store held it, when the load was trusted (`Some`
-    /// exactly when `existing_id` is): before migration and re-binding. It
+    /// exactly when `stored`): before re-binding. It
     /// is the base against which this request's changes are merged when a
     /// write finds the row changed by a concurrent request.
     pub(crate) loaded_row: Option<SessionData>,
 }
 
+impl LoadOutcome {
+    /// A fresh guest in place of a session this request may not run as. The
+    /// stored row is not touched unless the caller deleted it.
+    pub(crate) fn guest(rng: &dyn axess_rng::SecureRng, session_ended: bool) -> Self {
+        Self {
+            session: CookieSession::mint(rng),
+            data: SessionData::default(),
+            stored: false,
+            binding_invalidated: false,
+            rotation_fallback_used: false,
+            session_ended,
+            loaded_row: None,
+        }
+    }
+
+    /// Fail closed on a row bound to a device key that this layer cannot
+    /// hold to its key: the request runs as a guest and the row stays, for
+    /// a layer that can check it. A layer that checks keys, or was told to
+    /// serve bound rows without one, passes the row on.
+    pub(crate) fn refuse_unchecked_binding(
+        self,
+        unchecked: &UncheckedBinding,
+        rng: &dyn axess_rng::SecureRng,
+    ) -> Self {
+        let (Some(why), true) = (unchecked.why, self.data.key_binding.is_some()) else {
+            return self;
+        };
+        if unchecked
+            .reported
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::debug!(why, "a session bound to a device key was not served");
+        } else {
+            tracing::error!(
+                why,
+                "a session bound to a device key reached a session layer that cannot check \
+                 the key; it is served as a guest, never as an unbound session. Give every \
+                 layer that shares the session store the device-key service, or one whose \
+                 policy is `Off` to serve bound sessions as bearer sessions on purpose"
+            );
+        }
+        Self::guest(rng, false)
+    }
+}
+
+/// What a layer does with a row bound to a device key when it cannot check
+/// the key.
+pub(crate) struct UncheckedBinding {
+    /// `Some` when the layer cannot check a key and was not told to serve
+    /// bound rows without one: what is missing. Such a row is refused.
+    why: Option<&'static str>,
+    /// Set once the refusal has been logged as an error.
+    reported: std::sync::atomic::AtomicBool,
+}
+
+impl UncheckedBinding {
+    pub(crate) fn new(why: Option<&'static str>) -> Self {
+        Self {
+            why,
+            reported: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
 /// Outcome of [`finalize_session`].
 ///
-/// `final_id` is the id the response cookie should carry.
+/// `session` is the session the response cookie should carry.
 /// `session_changed` says whether the response sets the session cookie: the
 /// session was created or changed and its row was written. A write that
 /// failed, found the row gone, or lost to concurrent writes sets no cookie;
 /// the one exception is a failed rotation, whose cookie replaces the retired
 /// id in the client's jar with one no row backs.
 pub(crate) struct FinalizeOutcome {
-    pub(crate) final_id: SessionId,
+    pub(crate) session: CookieSession,
     pub(crate) session_changed: bool,
-    /// Set when an authenticated session's id was rotated and its row moved:
-    /// the registry still holds the session under the old id, and the layer
-    /// (when it has a registry) must move the entry.
+    /// Set when a signed-in session's key was rotated and its row moved:
+    /// the registry still holds the session under the key the request knows
+    /// of, and the layer (when it has a registry) moves the entry.
     pub(crate) rotation: Option<Rotation>,
+    /// The registry entries of a stored session this finish ended (a failed
+    /// rotation, an ending a handler asked for): the layer removes them
+    /// once the response is settled.
+    pub(crate) released: Vec<Entry>,
 }
 
-/// An authenticated session whose id changed during a request.
+/// A signed-in session (authenticated, or in a step-up of that session)
+/// whose key changed during a request, and what the request knows of its
+/// registry entry.
 pub(crate) struct Rotation {
-    /// Whether the session was already authenticated when the request loaded
-    /// it, so the registry held its old id (a login rotates a guest id the
-    /// registry never held).
-    pub(crate) was_authenticated: bool,
     pub(crate) user_id: crate::authn::ids::UserId,
-    pub(crate) old_id: SessionId,
-    pub(crate) new_id: SessionId,
+    /// The tenant the session authenticated into and the administrator
+    /// impersonating its user, if any: what the audit row of the session's
+    /// ending names beside the user.
+    pub(crate) tenant_id: crate::authn::ids::TenantId,
+    pub(crate) impersonator: Option<crate::authn::ids::UserId>,
+    /// The key the request arrived with: the row's key before the rotation.
+    pub(crate) arrived: crate::session::id::SessionKey,
+    /// The key the response cookie carries.
+    pub(crate) new: crate::session::id::SessionKey,
+    /// The key the registry holds the session under, when this request
+    /// knows one for the user the response names.
+    pub(crate) held: Option<crate::session::id::SessionKey>,
+    /// The entry an impersonation stands on under its administrator, which
+    /// goes when the settlement ends the session.
+    pub(crate) anchor: Option<Entry>,
 }
 
-/// Extract + verify the session cookie, load (and migrate) the stored
-/// session, check the binding fingerprint, and mint a fresh id when
-/// any of those steps fails closed.
+/// Extract + verify the session cookie, load the stored session (a row
+/// below the current schema version is not served), check the binding
+/// fingerprint, and mint a fresh id when any of those steps fails closed.
 ///
 /// **Invariant:** the handler never runs under a client-supplied id we
 /// do not trust the data behind. If the cookie verifies but the store
 /// has no record (expired, evicted, attempted fixation), if the store
 /// errors, or if the fingerprint mismatches, the load returns
-/// `existing_id = None` and `id` is a freshly-minted value: the
-/// in-flight request executes under that id, the response cycles to it.
+/// `stored = false` and `session` is a freshly minted one: the
+/// in-flight request executes under it, the response cycles to it.
 pub(crate) async fn load_session<S>(
     store: &S,
     signing_keys: &SigningKeyRing,
@@ -177,119 +293,45 @@ where
         .unwrap_or(false);
 
     let StoredSession {
-        mut existing_id,
+        mut stored,
         data: mut session_data,
         loaded_row,
         session_ended,
     } = match verified {
-        Some(verified) => load_stored_session(store, verified.id, config, policy).await,
+        Some(verified) => load_stored_session(store, verified.session.key(), config, policy).await,
         None => StoredSession::fresh(),
     };
 
     let binding = check_binding(&mut session_data, fingerprints, policy);
     let binding_invalidated = binding.invalidated;
     if binding_invalidated {
-        // The cookie's id is now untrusted; clear it so a fresh id is
-        // minted below before the inner handler runs. Without this the
+        // The cookie's session is now untrusted; a fresh one is minted
+        // below before the inner handler runs. Without this the
         // in-flight request would still execute under the
         // attacker-plantable id (the response cookie would only rotate
         // it on the way out).
-        existing_id = None;
+        stored = false;
     }
     rotation_fallback_used |= binding.fingerprint_rewritten;
 
-    let id = existing_id.unwrap_or_else(|| SessionId::new(rng));
+    // The cookie's session only for a row that is trusted. Every other
+    // request (no cookie, no row, a row refused or distrusted) runs under a
+    // session minted here, so nothing is ever stored under a name a client
+    // chose.
+    let session = match verified {
+        Some(verified) if stored => verified.session,
+        _ => CookieSession::mint(rng),
+    };
 
     LoadOutcome {
-        id,
+        session,
         data: session_data,
-        existing_id,
+        stored,
         binding_invalidated,
         rotation_fallback_used,
         session_ended,
         // A binding mismatch distrusts the row after it loaded.
-        loaded_row: existing_id.and(loaded_row),
-    }
-}
-
-/// The stored record behind a verified session cookie, as the load found it.
-struct StoredSession {
-    /// The cookie's id, when the row is trusted so far.
-    existing_id: Option<SessionId>,
-    data: SessionData,
-    /// The row as the store held it, before migration and re-binding.
-    loaded_row: Option<SessionData>,
-    /// The row was refused as revoked or too old, and deleted.
-    session_ended: bool,
-}
-
-impl StoredSession {
-    /// No trusted row: the request runs as a fresh guest.
-    fn fresh() -> Self {
-        Self {
-            existing_id: None,
-            data: SessionData::default(),
-            loaded_row: None,
-            session_ended: false,
-        }
-    }
-}
-
-/// Load, migrate and vet the row of a session whose cookie verified. Any
-/// failure (no row, a store error, a revoked or over-age record) yields a
-/// fresh guest; a revoked or over-age row is deleted on the way.
-async fn load_stored_session<S>(
-    store: &S,
-    id: SessionId,
-    config: &SessionConfig,
-    policy: &LoadPolicy<'_>,
-) -> StoredSession
-where
-    S: SessionStore + Send + Sync + 'static,
-    S::Error: std::fmt::Display + Send + Sync + 'static,
-{
-    match store.load(&id).await {
-        Ok(Some(mut data)) => {
-            let row = data.clone();
-            if data.migrate() {
-                tracing::debug!(
-                    new_version = data.version,
-                    "session data migrated to newer schema version"
-                );
-            }
-            match authenticated_session_verdict(&data, config, policy, &id).await {
-                SessionVerdict::Keep => StoredSession {
-                    existing_id: Some(id),
-                    data,
-                    loaded_row: Some(row),
-                    session_ended: false,
-                },
-                SessionVerdict::End => {
-                    // Revoked or too old: the row must not stay
-                    // Authenticated, so it goes now (best effort), and the
-                    // request runs as a fresh guest.
-                    if let Err(e) = store.delete(&id).await {
-                        tracing::error!(
-                            error = %e,
-                            "deleting an ended session failed; the row may remain until its TTL"
-                        );
-                    }
-                    StoredSession {
-                        session_ended: true,
-                        ..StoredSession::fresh()
-                    }
-                }
-                SessionVerdict::Distrust => StoredSession::fresh(),
-            }
-        }
-        Ok(None) => StoredSession::fresh(),
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "session store load failed; falling back to empty session"
-            );
-            StoredSession::fresh()
-        }
+        loaded_row: loaded_row.filter(|_| stored),
     }
 }
 
@@ -382,49 +424,59 @@ fn check_binding(
 enum SessionVerdict {
     /// Trust it.
     Keep,
-    /// Refuse it and delete its row: the registry says it is gone, or it
-    /// outlived the absolute age cap.
-    End,
+    /// Refuse it and end it: the registry says it is gone, or it outlived
+    /// the absolute age cap. Carries the reason the audit sink is told.
+    End(SessionEndReason),
     /// Refuse it for this request without touching the row: the registry
     /// could not answer and the policy fails closed.
     Distrust,
 }
 
-/// Apply the absolute-age cap and the registry to an authenticated record.
-/// Guests and part-way logins are never checked: neither is registered yet.
+/// Apply the age caps and the registry to a stored session that is signed
+/// in: an authenticated record, or one in a step-up, which is still the
+/// signed-in session it began from and is checked as that session (the
+/// registry entry of its user, its login's time, its impersonation). The
+/// absolute cap counts from the login that created the session
+/// (`signed_in_at`), which a step-up does not move.
+/// A guest, a login in progress and a pending workflow are not checked: no
+/// registry holds them yet.
 async fn authenticated_session_verdict(
     data: &SessionData,
     config: &SessionConfig,
     policy: &LoadPolicy<'_>,
-    id: &SessionId,
+    key: &crate::session::id::SessionKey,
 ) -> SessionVerdict {
-    let crate::session::data::AuthState::Authenticated {
+    let Some(crate::session::data::SignedIn {
         user_id,
-        authn_time,
+        signed_in_at,
         impersonator,
         ..
-    } = &data.auth_state
+    }) = data.auth_state.signed_in()
     else {
         return SessionVerdict::Keep;
     };
-    let outlived = |cap: Option<std::time::Duration>, since: &chrono::DateTime<chrono::Utc>| {
-        cap.and_then(|cap| chrono::Duration::from_std(cap).ok())
-            .is_some_and(|cap| policy.clock.now().signed_duration_since(*since) > cap)
+    let outlived = |cap: Option<std::time::Duration>, since: &axess_clock::Timestamp| {
+        cap.and_then(|cap| axess_clock::SignedDuration::try_from(cap).ok())
+            .is_some_and(|cap| policy.clock.now().since(*since) > cap)
     };
-    if outlived(config.max_authenticated_age, authn_time) {
+    if outlived(config.max_authenticated_age, signed_in_at) {
         tracing::info!("authenticated session outlived its absolute age cap; ending it");
-        return SessionVerdict::End;
+        return SessionVerdict::End(SessionEndReason::AgeCap);
     }
     if let Some(crate::session::data::Impersonation { since, .. }) = impersonator
         && outlived(config.max_impersonation_age, since)
     {
         tracing::info!("impersonated session outlived the impersonation age cap; ending it");
-        return SessionVerdict::End;
+        return SessionVerdict::End(SessionEndReason::ImpersonationAgeCap);
     }
     let Some(registry) = policy.registry else {
         return SessionVerdict::Keep;
     };
-    let own = registry_verdict(registry.liveness(user_id, id).await, policy);
+    let own = registry_verdict(
+        registry.liveness(user_id, key).await,
+        policy,
+        SessionVerdict::End(SessionEndReason::NotRegistered),
+    );
     let (SessionVerdict::Keep, Some(imp)) = (&own, impersonator) else {
         return own;
     };
@@ -432,20 +484,29 @@ async fn authenticated_session_verdict(
     // `begin_impersonation` registered under them goes when their sessions
     // do (a suspension, a deletion, a forced logout).
     let anchor = imp.registry_anchor(user_id);
-    let held = registry_verdict(registry.liveness(&imp.admin, &anchor).await, policy);
-    if matches!(held, SessionVerdict::End) {
+    let held = registry_verdict(
+        registry.liveness(&imp.admin, &anchor).await,
+        policy,
+        SessionVerdict::End(SessionEndReason::ImpersonationNotRegistered),
+    );
+    if matches!(held, SessionVerdict::End(_)) {
         tracing::info!("the administrator of an impersonation no longer holds it; ending it");
     }
     held
 }
 
-/// What the registry's answer about one entry means for the session.
-fn registry_verdict(liveness: SessionLiveness, policy: &LoadPolicy<'_>) -> SessionVerdict {
+/// What the registry's answer about one entry means for the session: `gone`
+/// is the verdict when the registry no longer holds the entry.
+fn registry_verdict(
+    liveness: SessionLiveness,
+    policy: &LoadPolicy<'_>,
+    gone: SessionVerdict,
+) -> SessionVerdict {
     match liveness {
         SessionLiveness::Valid => SessionVerdict::Keep,
         SessionLiveness::Gone => {
             tracing::info!("session is no longer held by the registry; ending it");
-            SessionVerdict::End
+            gone
         }
         SessionLiveness::Unknown => match policy.unknown {
             crate::session::layer::UnknownLiveness::Reject => SessionVerdict::Distrust,
@@ -454,8 +515,14 @@ fn registry_verdict(liveness: SessionLiveness, policy: &LoadPolicy<'_>) -> Sessi
     }
 }
 
+pub(super) mod ending;
 mod finalize;
+mod load;
+pub(crate) use ending::{Entry, ended_record, release_entries};
+pub(crate) use load::load_current;
 mod registry;
+
+use load::{StoredSession, load_stored_session};
 
 pub(crate) use finalize::finalize_session;
 pub(crate) use registry::settle_registry;
@@ -506,7 +573,7 @@ pub(crate) fn apply_session_cookie(
 ) {
     if outcome.session_changed
         && registered
-        && let Some(hv) = build_set_cookie(signing_keys, config, outcome.final_id)
+        && let Some(hv) = build_set_cookie(signing_keys, config, &outcome.session)
     {
         headers.append(axum::http::header::SET_COOKIE, hv);
         mark_cookie_response(headers);
@@ -523,11 +590,11 @@ pub(crate) fn apply_session_cookie(
 pub(crate) fn build_set_cookie(
     signing_keys: &SigningKeyRing,
     config: &SessionConfig,
-    id: SessionId,
+    session: &CookieSession,
 ) -> Option<axum::http::HeaderValue> {
     // Always sign new/re-issued cookies under the CURRENT sub-key.
     // Previous-key signing only exists on the verify side (fallback).
-    let cookie_value = signing_keys.sign_cookie(id);
+    let cookie_value = signing_keys.sign_cookie(session);
 
     let mut cookie = Cookie::new(config.cookie_name.as_ref().to_string(), cookie_value);
     cookie.set_http_only(config.http_only);
@@ -541,20 +608,36 @@ pub(crate) fn build_set_cookie(
     axum::http::HeaderValue::from_str(&cookie.to_string()).ok()
 }
 
-/// Direct unit tests on the `pub(crate)` lifecycle helpers extracted
-/// from `SessionService::call`. The Tower-service integration tests
-/// don't exercise the boolean/relational boundaries inside these
-/// helpers; cargo-mutants flagged them as missed. Each test below pins
-/// a specific mutation by feeding the helper a constructed input the
-/// real call site never produces.
+/// Direct unit tests on the `pub(crate)` lifecycle helpers that
+/// `SessionService::call` composes. The Tower-service integration tests
+/// don't reach the boolean and relational boundaries inside these
+/// helpers, so each test here pins one of them by feeding the helper a
+/// constructed input the real call site never produces.
 #[cfg(test)]
 mod helper_tests;
 
 #[cfg(test)]
+mod audit_support;
+#[cfg(test)]
+mod audit_tests;
+#[cfg(test)]
+mod ending_tests;
+#[cfg(test)]
 mod policy_tests;
+#[cfg(test)]
+mod rotation_audit_tests;
 
 #[cfg(test)]
 mod concurrency_tests;
 
 #[cfg(test)]
-mod reread_tests;
+mod settle_tests;
+
+#[cfg(test)]
+mod step_up_tests;
+
+#[cfg(test)]
+mod stored_version_tests;
+
+#[cfg(all(test, any(feature = "sqlite", feature = "sqlite-unbundled")))]
+mod planted_row_tests;

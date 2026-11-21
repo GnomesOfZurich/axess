@@ -2,25 +2,25 @@
 
 `axess::local_idp` is an in-process workload-identity issuer. It mints
 JWTs against a signing key it holds locally, exposes the matching
-JWKS, and serves the RFC 8414 discovery document. The crate exposes
-this surface in two layers, both built on the same primitives:
+JWKS, and serves an OpenID Connect Discovery document (the RFC 8414
+metadata shape). The crate offers
+this surface in two layers built on the same primitives:
 
 - **Production** [`LocalIdp`](https://docs.rs/axess/latest/axess/local_idp/struct.LocalIdp.html).
-  Adopter wires a [`LocalIdpKeyStore`] implementation (file system,
-  Vault, KMS, ...) and the [`LocalIdp`] reads the current + historical
-  keys, mints, and rotates on operator request through the store's rotate.
+  The adopter wires a [`LocalIdpKeyStore`] implementation (file system,
+  Vault, KMS, ...); [`LocalIdp`] reads the current and historical
+  keys from it, mints, and rotates through the store on operator request.
 
-- **Testing** [`LocalIdpFixture`](https://docs.rs/axess/latest/axess/testing/local_idp/struct.LocalIdpFixture.html).
-  In-process value that mints JWTs with a generated keypair and
-  exposes a `JwkSet` handle that a [`JwtVerifier`] can read. No HTTP
-  endpoints, no key store; just `mint()` + `jwks_handle()`.
+- **Testing** [`LocalIdpFixture`](https://docs.rs/axess/latest/axess/local_idp/struct.LocalIdpFixture.html).
+  An in-process value that mints JWTs with a generated keypair and
+  exposes a `JwkSet` handle that a [`JwtVerifier`] can read. It has no HTTP
+  endpoints and no key store: just `mint()` and `jwks_handle()`.
 
 Both layers share [`MintClaims`], [`LocalIdpSigningKey`], and the
 issuance pipeline that lives in
 [`axess::local_idp::primitives`](https://docs.rs/axess/latest/axess/local_idp/primitives/index.html).
 A token minted by either layer verifies against the same JWKS shape,
-which is the property that lets adopters run the same downstream
-verifier in tests and in production.
+so adopters can run the same downstream verifier in tests and in production.
 
 ## What both layers do NOT do
 
@@ -40,7 +40,7 @@ JWTs for service-to-service flows it controls.
 The feature flag is `local-idp` (off by default), enabled with
 `features = ["local-idp", "jwt-rust-crypto"]` on the `axess` facade. It
 pulls in `jwt` transitively and nothing else: minting and the JWKS need no
-OAuth machinery, so enabling this does not bring `oauth` or `oidc` with it.
+OAuth machinery, so the feature does not enable `oauth` or `oidc`.
 `jwt` needs a crypto backend named beside it: `jwt-rust-crypto` (pure Rust) or `jwt-aws-lc`
 (FIPS-capable, needs a C toolchain).
 
@@ -63,9 +63,9 @@ OAuth machinery, so enabling this does not bring `oauth` or `oidc` with it.
 
 ### When not to use
 
-If you need a user-facing IdP with login UI, OIDC authorization code
-flow, refresh tokens, or federation, reach for Keycloak / Ory Hydra
-/ similar. `LocalIdp` deliberately stops at issuance.
+For a user-facing IdP with a login UI, the OIDC authorization code
+flow, refresh tokens or federation, use Keycloak, Ory Hydra or a
+similar server. `LocalIdp` stops at issuance.
 
 ### The `LocalIdpKeyStore` trait
 
@@ -89,14 +89,14 @@ pub struct LoadedKeys {
 }
 ```
 
-`load_all` returns current + historical keys from a single
+`load_all` returns the current and historical keys from one
 consistent read. The JWKS published at `/jwks.json`
-includes all of them so tokens already in flight under a rotated-out
-historical key continue to verify until the operator removes that
+includes all of them, so tokens already in flight under a rotated-out
+key keep verifying until the operator removes that
 key from the store.
 
-`rotate` persists a new current key, demoting the previous current
-to historical. The store makes that step atomic (a pointer flip, a
+`rotate` persists a new current key and demotes the previous current
+key to historical. The store makes that step atomic (a pointer flip, a
 transaction); axess does not add atomicity on top of it. The store also
 refuses a key whose `kid` it already holds, current or historical, and
 leaves the set as it was: `LocalIdp` checks the `kid` against its own
@@ -129,49 +129,52 @@ let idp = LocalIdp::from_key_store("https://idp.example.com", store)
 ```
 
 Memory storage is not for production: restarts lose the keys, and
-every restart produces fresh JWKS that breaks tokens already in
+every restart produces a fresh JWKS that breaks tokens already in
 flight. The `local-idp` binary of `examples/workload-identity/` implements a file-backed
-[`LocalIdpKeyStore`] with atomic rotation that the production path
-should pattern after; the same shape adapts to Vault, AWS KMS, GCP
+[`LocalIdpKeyStore`] with atomic rotation for a production store to
+follow; the same shape adapts to Vault, AWS KMS, GCP
 KMS, or any other key management backend.
 
 ### Minting
 
 ```rust,ignore
 use axess::local_idp::MintClaims;
-use chrono::{Duration, Utc};
+use axess::{Clock, SignedDuration};
 
+// `clock` is the one the deployment gave the IdP (`with_clock`).
+let now = clock.now();
+let expires = now.checked_add(SignedDuration::minutes(5)).expect("inside the range");
 let token = idp
     .mint(
-        &MintClaims::new("worker-1", Utc::now() + Duration::minutes(5))
+        &MintClaims::new("worker-1", expires)
             .with_audience("https://api.example.com")
-            .with_issued_at(Utc::now()),
+            .with_issued_at(now),
     )
     .await?;
 ```
 
 A new `LocalIdp` is strict by default:
 
-- Tokens are capped at one hour (`DEFAULT_MAX_TTL`). Raise it with
-  `with_max_ttl(...)`, or remove the cap with `without_max_ttl()` when long
-  lived tokens are intended. A mint over the cap returns
+- Tokens are capped at one hour (`DEFAULT_MAX_TTL`). Set a higher or
+  lower cap with `with_max_ttl(...)`, which takes a `std::time::Duration`, or remove it
+  with `without_max_ttl()` when long-lived tokens are intended. A mint over the cap returns
   `IssuanceError::LifetimeExceedsCap`.
-- A mint without an audience returns `IssuanceError::MissingAudience`. A
-  token with no `aud` is accepted by every verifier that does not pin an
-  audience, so minting one is a choice: `allow_no_audience()` makes it.
+- A mint without an audience returns `IssuanceError::MissingAudience`. Every
+  verifier that does not pin an audience accepts a token with no `aud`, so
+  minting one is an explicit choice: `allow_no_audience()` makes it.
 
 [`MintClaims`] is a builder: `new(subject, exp)` is the minimum;
 `with_audience`, `with_audiences` (multi-aud), `with_issued_at`,
 `with_not_before`, `with_jwt_id`, and `with_custom_claim` cover the
 standard JWT fields. `mint_with_header` accepts a caller-supplied
 `jsonwebtoken::Header` for cases that need custom header fields
-(`typ`, `cty`, etc.). `kid` and `alg` are the signing key's, and the
-key-location fields `jku`, `jwk`, `x5u` and `x5c` are cleared, because a
-token the IdP signs must be checked with the IdP's own key.
+(`typ`, `cty`, etc.). The IdP sets `kid` and `alg` from the signing
+key and clears the key-location fields `jku`, `jwk`, `x5u` and `x5c`,
+because a token the IdP signs must be checked with the IdP's own key.
 
-The clock is injectable via `.with_clock(...)`. Production wires
-`SystemClock`; DST tests wire `MockClock` for reproducible
-issuance.
+`.with_clock(...)` injects the clock. Production wires
+`SystemClock`; [deterministic simulation tests](../intro/architecture.md#deterministic-simulation-testing)
+wire `MockClock` for reproducible issuance.
 
 ### Rotation
 
@@ -206,7 +209,7 @@ only when they re-read it. To rotate a fleet:
 2. Rotate on exactly one replica (an admin call routed to one instance).
 3. Call `reload()` on every other replica. Until a replica reloads, it keeps
    signing under the previous key, which is still published, so tokens verify
-   throughout; it just has not switched yet.
+   throughout.
 4. Retire a historical key only after the longest token lifetime has passed,
    then `reload()` the others.
 
@@ -217,14 +220,21 @@ rotation, retirement or reload does not see it: build a new handle from
 
 ### Key algorithms and imported keys
 
-Prefer ES256 (`generate_es256`). RSA signing goes through the `rsa` crate,
-whose private-key operations carry a timing side channel (the Marvin
-advisory, not fixed upstream); use RSA only for a verifier that cannot take
-ES256. Constructors that load a key (`from_rsa_pem`, `from_ec_pem`, the DER
-forms) return `LocalIdpKeyError` instead of panicking: an unsupported
-algorithm is `UnsupportedAlgorithm`, and an RSA key under 2048 bits is
-`WeakKey`. `try_generate_rsa_with_algorithm` is the non-panicking RSA
-generator.
+A local IdP key is ES256 (`generate_es256`, the `from_ec_*` loaders)
+unless the `local-idp-rsa` feature is on. That feature adds the RSA
+constructors (`generate_rsa`, `from_rsa_pem`, the DER forms) and compiles
+the `rsa` crate, which `local-idp` alone does not. Under `jwt-rust-crypto`,
+RSA signing goes through the 0.9 line of that crate, whose private-key
+operations carry a timing side channel: RUSTSEC-2023-0071, the Marvin
+attack, fixed in rsa 0.10.0, which `jsonwebtoken` does not accept yet.
+Under `jwt-aws-lc` it runs in aws-lc-rs. Use RSA only for a verifier that
+cannot take ES256, and then on `jwt-aws-lc` wherever someone else can time
+the signing.
+
+Constructors that load a key (`from_ec_pem`, `from_rsa_pem`, the DER forms)
+return `LocalIdpKeyError` instead of panicking: an unsupported algorithm is
+`UnsupportedAlgorithm`, and an RSA key under 2048 bits is `WeakKey`.
+`try_generate_rsa_with_algorithm` is the non-panicking RSA generator.
 
 ### Discovery + JWKS endpoints
 
@@ -239,7 +249,8 @@ let app = axum::Router::new()
 
 Routes:
 
-- `GET /.well-known/openid-configuration`: RFC 8414 metadata.
+- `GET /.well-known/openid-configuration`: the OIDC Discovery document
+  (RFC 8414 shape).
 - `GET /jwks.json`: current + historical public JWKs.
 
 `with_base_url(...)` overrides the URL the discovery document
@@ -250,7 +261,7 @@ FAPI fields, etc.).
 
 For full control, the lower-level handlers in
 [`axess::local_idp::discovery`](https://docs.rs/axess/latest/axess/local_idp/discovery/index.html)
-expose `openid_configuration` and `jwks` as standalone axum
+expose `openid_configuration` and `jwks` as standalone Axum
 handlers.
 
 ### Production-pattern example
@@ -260,7 +271,7 @@ The `local-idp` binary in [`examples/workload-identity/`](https://github.com/Gno
 reference implementation:
 
 - File-backed `LocalIdpKeyStore` (`FileLocalIdpKeyStore`) with the
-  directory layout pattern `historical/{kid}.pem` + atomic
+  directory layout `historical/{kid}.pem` and an atomic
   `current.kid` pointer file.
 - `POST /admin/rotate` and `POST /admin/retire` operator endpoints.
 - `POST /issue` mint endpoint; it requires an audience and caps the
@@ -294,35 +305,43 @@ The fixture is **not an HTTP service**. It is a value with `mint()`,
 3. Wiring a `JwtVerifier` to `idp.jwks_handle()` so verification
    reads the same JWKS the fixture signed against.
 
-There is no authorize endpoint, no token endpoint, no Tower service
-wrapping; the fixture just produces signed tokens and exposes the
-verification key set.
+The fixture has no authorize endpoint, no token endpoint and no Tower service
+wrapping.
 
-The feature flag is `testing` plus `local-idp`. The fixture lives
-under `axess::testing::local_idp::LocalIdpFixture`.
+The feature flags are `testing` and `local-idp`. The fixture lives
+under `axess::local_idp::LocalIdpFixture`.
 
 ### Construction
 
 ```rust,ignore
-use axess::testing::local_idp::LocalIdpFixture;
+use axess::local_idp::LocalIdpFixture;
 
 let idp = LocalIdpFixture::new("https://test.idp.local");
 ```
 
 `new(issuer)` generates a fresh P-256 keypair per call and signs with
-ES256 (see the key material notes above for why RSA is not the default).
+ES256 (see *Key algorithms and imported keys* above for why RSA is not the default).
 Other constructors:
 
-- `LocalIdpFixture::new_rsa(issuer)`: a fresh RSA-2048 keypair under
-  RS256, for a verifier that cannot take ES256.
+- `LocalIdpFixture::new_rsa(issuer)` (feature `local-idp-rsa`): a fresh
+  RSA-2048 keypair under RS256, for a verifier that cannot take ES256.
 - `LocalIdpFixture::with_algorithm(issuer, Algorithm::RS384)`:
-  generate with a specific signing algorithm. Supported: RS256,
-  RS384, RS512, ES256; `try_with_algorithm` returns
-  `UnsupportedAlgorithm` for any other instead of panicking.
+  generate a key for a specific signing algorithm: ES256, or RS256, RS384
+  and RS512 with `local-idp-rsa`. `try_with_algorithm` returns
+  `UnsupportedAlgorithm` instead of panicking for any other algorithm, and
+  for an RSA algorithm without that feature.
 - `LocalIdpFixture::with_signing_key(issuer, key)`: explicit key
-  (use when the test needs a stable signature across runs).
+  (use when the test needs a stable keypair across runs, loaded from a
+  checked-in PEM file or an environment variable).
 
 Builder methods (chained on the constructed fixture):
+
+- `.with_clock(clock)`: mint at `clock`'s time. `mint`,
+  `mint_with_header` and `mint_jwt_svid` measure the max-TTL cap, and
+  the JWT-SVID's `iat` and `exp`, from the fixture's clock, which is the
+  system clock unless one is set. A test passes the `MockClock` its world
+  runs on, so its tokens belong to that world. The `_at` forms take
+  the instant as an argument instead.
 
 - `.with_historical_signing_key(key)`: add a key to the JWKS without
   rotating to it. Drives JWKS-cache-refresh tests.
@@ -330,23 +349,26 @@ Builder methods (chained on the constructed fixture):
   JWK to the published set.
 - `.rotate_signing_key(new_key)`: swap the signing key; the old key
   moves to historical and remains in the JWKS.
-- `.with_max_ttl(duration)`: cap minted token lifetime. Over-cap
-  mints panic (test-time misuse).
+- `.with_max_ttl(duration)`: cap the minted token lifetime at a
+  `std::time::Duration`. A mint over the cap panics (test-time misuse).
 - `.with_issuance_listener(arc)`: install an [`IssuanceListener`]
-  for assertion-side recording.
+  that records issuances for test assertions.
 - `.with_key_id(kid)`: override the auto-generated `kid`.
 
 ### Minting
 
 ```rust,ignore
-use axess::testing::local_idp::{LocalIdpFixture, MintClaims};
-use chrono::{Duration, Utc};
+use axess::local_idp::{LocalIdpFixture, MintClaims};
+use axess::testing::{MockClock, Shift};
+use axess::{Clock, SignedDuration};
 
-let idp = LocalIdpFixture::new("https://test.idp.local");
+// The fixture mints at the time of the clock the test's world runs on.
+let clock = MockClock::at_reference();
+let idp = LocalIdpFixture::new("https://test.idp.local").with_clock(clock.clone());
 
 // Standard JWT.
 let token = idp.mint(
-    &MintClaims::new("alice", Utc::now() + Duration::hours(1))
+    &MintClaims::new("alice", clock.now().plus(SignedDuration::hours(1)))
         .with_audience("https://api.example.com"),
 );
 
@@ -354,11 +376,11 @@ let token = idp.mint(
 // Subject is spiffe://<trust_domain>/<service>/<tenant>, the same
 // segment order `WorkloadId::build` renders. All five are required.
 let svid = idp.mint_jwt_svid(
-    "test.gnomes",                  // trust domain
+    "test.example.org",             // trust domain
     "worker",                       // service
     "acme",                         // tenant
     "sts.amazonaws.com",            // audience
-    Duration::minutes(5),
+    SignedDuration::minutes(5),     // signed, so a test can mint an expired token
 );
 ```
 
@@ -381,7 +403,7 @@ let claims = verifier.verify::<MyClaims>(&token).await?;
 `jwks_handle()` returns an `Arc<RwLock<JwkSet>>` holding a snapshot of the
 JWKS at the time of the call. `rotate_signing_key` on the fixture returns a
 new fixture and does not touch a handle handed out earlier, so after a
-rotation call `jwks_handle()` again and build a new verifier from it.
+rotation, call `jwks_handle()` again and build a new verifier from it.
 
 ### Feeding a cloud STS adapter
 
@@ -393,9 +415,9 @@ use axess::workload::outbound::cloud_sts::aws::AwsStsClient;
 
 let idp = LocalIdpFixture::new("https://oidc.test.local");
 let token = idp.mint_jwt_svid(
-    "test.gnomes", "worker", "acme",
+    "test.example.org", "worker", "acme",
     "sts.amazonaws.com",
-    Duration::minutes(5),
+    SignedDuration::minutes(5),
 );
 
 // Hand the token to a mocked AWS STS endpoint to exercise the
@@ -415,19 +437,18 @@ layers route their `mint()` calls through these primitives.
 The consequence: a token minted by the fixture in a test verifies
 identically against a `JwtVerifier` configured with production
 `LocalIdp`'s published JWKS, given the same signing key. Tests
-that pin a specific JWT signature exercise the same code paths that
-sign in production.
+that sign with a fixed key exercise the same code paths that sign in
+production.
 
 The split exists for what each layer adds on top:
 
 - Production carries the [`LocalIdpKeyStore`] abstraction so keys
   survive process restarts and can rotate without code changes.
 - Testing carries the in-memory key generation, the
-  `MockIssuanceListener`, and ergonomic builders that match what
-  test code typically wants to assert.
+  `MockIssuanceListener`, and builders for what test code typically
+  asserts.
 
-Neither subsumes the other; the production class is not the right
-fit for a unit test (no key store means no mint), and the fixture
-is not the right fit for production (in-memory keys lose on
-restart). The shared primitives are what lets both shapes claim
-"this is the same JWT issuer" without code duplication.
+Neither replaces the other: the production type cannot mint without a
+key store, which a unit test does not want, and the fixture loses its
+in-memory keys on restart, which production cannot accept. Through the
+shared primitives both run the same JWT issuance code, with no duplication.

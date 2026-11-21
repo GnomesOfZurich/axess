@@ -2,9 +2,10 @@
 //! With a window set, an administrator whose authentication is older than it
 //! cannot begin an impersonation; a recent one can.
 
-mod common;
+use axess_clock::testing::Shift;
+use axess_core::testing::fixtures as common;
 
-use axess_clock::{Clock, testing::MockClock};
+use axess_clock::Clock;
 use axess_core::authn::AuditContext;
 use axess_core::authn::error::AuthnError;
 use axess_core::authn::event::{AuthEventStatus, AuthEventType};
@@ -18,10 +19,11 @@ use common::{test_tenant, test_user};
 
 #[tokio::test]
 async fn an_impersonation_needs_a_recent_administrator_authentication_when_asked() {
-    let clock = MockClock::now();
+    let clock = common::test_clock();
     let admin = test_user("admin", "ops");
     let target = test_user("u2", "bob");
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(admin.clone())
         .with_user(target.clone());
@@ -35,7 +37,7 @@ async fn an_impersonation_needs_a_recent_administrator_authentication_when_asked
         .set_authenticated(
             admin.id,
             admin.tenant_id,
-            clock.now() - chrono::Duration::minutes(10),
+            clock.now().minus(axess_clock::SignedDuration::minutes(10)),
         )
         .await;
 
@@ -59,7 +61,7 @@ async fn an_impersonation_needs_a_recent_administrator_authentication_when_asked
         .set_authenticated(
             admin.id,
             admin.tenant_id,
-            clock.now() - chrono::Duration::minutes(1),
+            clock.now().minus(axess_clock::SignedDuration::minutes(1)),
         )
         .await;
     svc.begin_impersonation(&admin, &target, &fresh)

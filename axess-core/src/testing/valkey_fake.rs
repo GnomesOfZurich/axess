@@ -23,6 +23,7 @@ pub(crate) struct FakeValkey {
     strings: Mutex<HashMap<String, String>>,
     log: Mutex<Vec<String>>,
     hooks: Mutex<HashMap<&'static str, VecDeque<Hook>>>,
+    faults: Mutex<HashMap<&'static str, VecDeque<bool>>>,
 }
 
 impl FakeValkey {
@@ -36,14 +37,6 @@ impl FakeValkey {
             .insert(member.to_owned());
     }
 
-    /// Store `value` at `key`, as another client would.
-    pub(crate) fn set_now(&self, key: &str, value: &str) {
-        self.strings
-            .lock()
-            .expect("fake lock")
-            .insert(key.to_owned(), value.to_owned());
-    }
-
     /// Whether the SET at `key` holds `member`.
     pub(crate) fn is_member(&self, key: &str, member: &str) -> bool {
         self.sets
@@ -53,18 +46,13 @@ impl FakeValkey {
             .is_some_and(|s| s.contains(member))
     }
 
-    /// Whether a string is stored at `key`.
-    pub(crate) fn exists(&self, key: &str) -> bool {
-        self.strings.lock().expect("fake lock").contains_key(key)
-    }
-
     /// The commands received so far, in order.
     pub(crate) fn commands(&self) -> Vec<String> {
         self.log.lock().expect("fake lock").clone()
     }
 
-    /// Run `hook` once, right after the next `command` (`"SPOP"`, `"DEL"`)
-    /// completes: the moment another pod gets to write.
+    /// Run `hook` once, right after the next `command` (`"SPOP"`, `"DEL"`,
+    /// `"SADD"`, `"SET"`) completes: the moment another pod gets to write.
     pub(crate) fn after_next(
         &self,
         command: &'static str,
@@ -76,15 +64,6 @@ impl FakeValkey {
             .entry(command)
             .or_default()
             .push_back(Box::new(hook));
-    }
-
-    /// Delete the SETs and strings at `keys` (`DEL`).
-    fn del_now(&self, keys: &[String]) {
-        self.record(format!("DEL {}", keys.join(" ")), "DEL");
-        for k in keys {
-            self.sets.lock().expect("fake lock").remove(k);
-            self.strings.lock().expect("fake lock").remove(k);
-        }
     }
 
     fn record(&self, line: String, command: &'static str) {
@@ -101,8 +80,65 @@ impl FakeValkey {
     }
 }
 
-impl IndexOps for FakeValkey {
-    async fn pop_members(&self, key: &str, count: usize) -> Result<Vec<String>, Error> {
+/// The string keyspace and the faults: what the entity index's commands
+/// need beside the sets.
+impl FakeValkey {
+    /// Store `value` at `key`, as another client would.
+    pub(crate) fn set_now(&self, key: &str, value: &str) {
+        self.strings
+            .lock()
+            .expect("fake lock")
+            .insert(key.to_owned(), value.to_owned());
+    }
+
+    /// Whether a string is stored at `key`.
+    pub(crate) fn exists(&self, key: &str) -> bool {
+        self.strings.lock().expect("fake lock").contains_key(key)
+    }
+
+    /// Fail the call of `command` (`"SADD"` for a whole `add_members`,
+    /// `"DEL"`, `"SET"`) that comes `skip` calls from now, before it has any
+    /// effect: Valkey stopped answering that one.
+    pub(crate) fn fail_call(&self, command: &'static str, skip: usize) {
+        let mut faults = self.faults.lock().expect("fake lock");
+        let queue = faults.entry(command).or_default();
+        while queue.len() < skip {
+            queue.push_back(false);
+        }
+        queue.push_back(true);
+    }
+
+    /// Whether this call of `command` is one [`fail_call`](Self::fail_call)
+    /// named, and the error it then answers.
+    fn fault(&self, command: &'static str) -> Result<(), Error> {
+        let fail = self
+            .faults
+            .lock()
+            .expect("fake lock")
+            .get_mut(command)
+            .and_then(VecDeque::pop_front)
+            .unwrap_or(false);
+        if fail {
+            self.log
+                .lock()
+                .expect("fake lock")
+                .push(format!("{command} failed"));
+            return Err(Error::new(fred::error::ErrorKind::IO, "connection lost"));
+        }
+        Ok(())
+    }
+
+    /// Delete the SETs and strings at `keys` (`DEL`).
+    fn del_now(&self, keys: &[String]) {
+        self.record(format!("DEL {}", keys.join(" ")), "DEL");
+        for k in keys {
+            self.sets.lock().expect("fake lock").remove(k);
+            self.strings.lock().expect("fake lock").remove(k);
+        }
+    }
+
+    /// Take up to `count` members out of the SET at `key` (`SPOP`).
+    fn pop_now(&self, key: &str, count: usize) -> Vec<String> {
         let taken: Vec<String> = {
             let mut sets = self.sets.lock().expect("fake lock");
             let mut taken = Vec::new();
@@ -120,11 +156,51 @@ impl IndexOps for FakeValkey {
             taken
         };
         self.record(format!("SPOP {key} {count}"), "SPOP");
-        Ok(taken)
+        taken
+    }
+
+    /// Empty the index SET at `key` and delete the entries it named, as the
+    /// invalidation on another pod does, from inside a hook.
+    pub(crate) fn drain_now(&self, key: &str) {
+        loop {
+            let members = self.pop_now(key, 256);
+            if members.is_empty() {
+                return;
+            }
+            self.del_now(&members);
+        }
+    }
+}
+
+impl IndexOps for FakeValkey {
+    async fn pop_members(&self, key: &str, count: usize) -> Result<Vec<String>, Error> {
+        Ok(self.pop_now(key, count))
     }
 
     async fn delete(&self, keys: Vec<String>) -> Result<(), Error> {
+        self.fault("DEL")?;
         self.del_now(&keys);
+        Ok(())
+    }
+
+    async fn add_members(
+        &self,
+        indexes: &[String],
+        member: &str,
+        ttl_ms: i64,
+    ) -> Result<(), Error> {
+        self.fault("SADD")?;
+        for index in indexes {
+            self.sadd_now(index, member);
+            self.record(format!("SADD {index} {member} PEXPIRE {ttl_ms}"), "SADD");
+        }
+        Ok(())
+    }
+
+    async fn set_entry(&self, key: &str, value: &str, ttl_ms: i64) -> Result<(), Error> {
+        self.fault("SET")?;
+        self.set_now(key, value);
+        self.record(format!("SET {key} PX {ttl_ms}"), "SET");
         Ok(())
     }
 }

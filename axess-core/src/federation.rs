@@ -6,15 +6,15 @@
 //! the pieces that compose those primitives on the **orchestrator**
 //! side:
 //!
-//! - **OAuth provider registry** ([`oauth::OAuthProviderRegistry`](crate::federation::oauth::OAuthProviderRegistry)):
+//! - **OAuth provider registry** ([`oauth::OAuthProviderRegistry`]):
 //!   the per-`AuthnService` map of configured OAuth providers.
-//! - **Per-tenant OAuth providers** ([`oauth_tenant`](crate::federation::oauth_tenant)):
+//! - **Per-tenant OAuth providers** ([`oauth_tenant`]):
 //!   bring-your-own IdP resolved by `(tenant, name)` from a store at
 //!   request time.
-//! - **LDAP health check** ([`ldap`](crate::federation::ldap)): `HealthCheck` impl for
+//! - **LDAP health check** ([`ldap`]): `HealthCheck` impl for
 //!   `LdapProviderConfig` (the trait lives in axess-core).
-//! - **Back-channel logout** ([`backchannel_logout`](crate::federation::backchannel_logout)) and
-//!   **front-channel logout** ([`frontchannel_logout`](crate::federation::frontchannel_logout)): IdP-initiated
+//! - **Back-channel logout** ([`backchannel_logout`]) and
+//!   **front-channel logout** ([`frontchannel_logout`]): IdP-initiated
 //!   logout flows.
 //!
 //! Each submodule is feature-gated; pure factor primitives are reached

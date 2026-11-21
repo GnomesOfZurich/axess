@@ -169,7 +169,7 @@ where
             AuthEventBuilder::success(AuthEventType::FactorVerified)
                 .attributed_to(user_id, tenant_id)
                 .with_factor(FactorKind::LdapBind)
-                .with_session(session.session_id().await),
+                .with_session(session.session_key().await),
         )
         .await?;
 
@@ -218,7 +218,7 @@ where
             AuthEventBuilder::failure(AuthEventType::FactorVerified)
                 .attributed_to(user_id, tenant_id)
                 .with_factor(FactorKind::LdapBind)
-                .with_session(session.session_id().await)
+                .with_session(session.session_key().await)
                 .with_error(AuthFailureReason::from("external_service")),
         )
         .await?;

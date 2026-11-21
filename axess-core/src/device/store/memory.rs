@@ -8,7 +8,7 @@ use crate::authn::ids::{DeviceId, TenantId, UserId};
 use crate::device::types::{Device, DeviceBinding, DeviceTrustLevel, FingerprintHash};
 use crate::health::{HealthCheck, HealthStatus};
 use crate::locked::lock;
-use chrono::{DateTime, Utc};
+use axess_clock::Timestamp;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -176,6 +176,15 @@ impl MemoryDeviceStore {
 }
 
 impl DeviceStore for MemoryDeviceStore {
+    async fn load_fresh(
+        &self,
+        tenant_id: &TenantId,
+        id: &DeviceId,
+    ) -> Result<Option<Device>, Self::Error> {
+        // No cache of its own: the table is the authoritative store.
+        self.load(tenant_id, id).await
+    }
+
     type Error = MemoryDeviceStoreError;
 
     async fn load(
@@ -268,16 +277,12 @@ impl DeviceStore for MemoryDeviceStore {
         Ok(hits)
     }
 
-    async fn save(&self, device: &Device, now: DateTime<Utc>) -> Result<(), Self::Error> {
+    async fn save(&self, device: &Device, now: Timestamp) -> Result<(), Self::Error> {
         self.write(for_save(device, now));
         Ok(())
     }
 
-    async fn create_or_find(
-        &self,
-        device: &Device,
-        now: DateTime<Utc>,
-    ) -> Result<Device, Self::Error> {
+    async fn create_or_find(&self, device: &Device, now: Timestamp) -> Result<Device, Self::Error> {
         let device = for_save(device, now);
         // The table lock is held across the scan and the write and across no
         // await, so two creates run one after the other and the second finds
@@ -305,7 +310,7 @@ impl DeviceStore for MemoryDeviceStore {
         &self,
         tenant_id: &TenantId,
         id: &DeviceId,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Result<DeviceTrustLevel, Self::Error> {
         let key = Self::key(tenant_id, id);
         let now = whole_second(now);
@@ -338,7 +343,7 @@ impl DeviceStore for MemoryDeviceStore {
         tenant_id: &TenantId,
         id: &DeviceId,
         level: DeviceTrustLevel,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Result<(), Self::Error> {
         let key = Self::key(tenant_id, id);
         if let Some(entry) = lock(&self.table).devices.get_mut(&key) {
@@ -357,7 +362,7 @@ impl DeviceStore for MemoryDeviceStore {
         id: &DeviceId,
         expected: DeviceTrustLevel,
         level: DeviceTrustLevel,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Result<TrustTransition, Self::Error> {
         // The table lock makes the check and the write one step with respect
         // to every other writer of this row.
@@ -380,7 +385,7 @@ impl DeviceStore for MemoryDeviceStore {
         id: &DeviceId,
         expected: &[DeviceBinding],
         bindings: &[DeviceBinding],
-        _now: DateTime<Utc>,
+        _: Timestamp,
     ) -> Result<BindingsUpdate, Self::Error> {
         // The table lock makes the comparison and the write one step with
         // respect to every other writer of this row.
@@ -403,7 +408,7 @@ impl DeviceStore for MemoryDeviceStore {
         tenant_id: &TenantId,
         id: &DeviceId,
         user: &UserId,
-        _now: DateTime<Utc>,
+        _: Timestamp,
     ) -> Result<OwnerClaim, Self::Error> {
         let mut table = lock(&self.table);
         let Some(entry) = table.devices.get_mut(&Self::key(tenant_id, id)) else {
@@ -431,7 +436,7 @@ impl DeviceStore for MemoryDeviceStore {
     async fn sweep(
         &self,
         tenant_id: &TenantId,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Result<SweepCounts, Self::Error> {
         let cfg = self.sweep_config;
         let now = whole_second(now);
@@ -508,7 +513,7 @@ impl DeviceStore for MemoryDeviceStore {
 /// backend, and `revoked_at` stamped on a move into `Revoked` but kept on a
 /// row that already is, so repeating a revocation does not restart the purge
 /// grace clock; a move out of `Revoked` clears it.
-fn apply_trust_level(row: &mut Device, level: DeviceTrustLevel, now: DateTime<Utc>) {
+fn apply_trust_level(row: &mut Device, level: DeviceTrustLevel, now: Timestamp) {
     let now = whole_second(now);
     let was_revoked = row.trust_level == DeviceTrustLevel::Revoked;
     row.demoted_at = demotion_stamp(row.trust_level, level, row.demoted_at, now);

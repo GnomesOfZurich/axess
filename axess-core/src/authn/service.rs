@@ -42,6 +42,7 @@ mod factor_pipeline;
 mod factor_secrets;
 #[cfg(feature = "device")]
 mod known_device;
+pub(crate) mod log_text;
 mod login;
 #[cfg(feature = "oauth")]
 mod logout_audit;
@@ -51,6 +52,8 @@ pub mod provider_reload;
 mod refresh_tokens;
 mod reset_cooldown;
 mod revocation;
+mod rotation;
+mod session_end_audit;
 #[cfg(feature = "device")]
 pub mod step_up;
 mod verification;
@@ -66,16 +69,19 @@ pub(crate) mod oauth_service;
 
 pub mod session_validator;
 
+pub use account::SIGNUP_SESSION_NOT_REGISTERED_REASON;
 pub use builder::{
-    AuthnServiceBuilder, DEFAULT_CANDIDATE_TTL, DEFAULT_FLOW_TTL, DEFAULT_MAX_LIVE_RESET_TOKENS,
-    DEFAULT_MAX_PASSWORD_RESET_TTL, DEFAULT_PASSWORD_RESET_COOLDOWN,
-    DEFAULT_SIGNUP_VERIFICATION_TTL, RESET_COOLDOWN_CAPACITY,
+    AuthnBuildError, AuthnServiceBuilder, DEFAULT_CANDIDATE_TTL, DEFAULT_FLOW_TTL,
+    DEFAULT_MAX_LIVE_RESET_TOKENS, DEFAULT_MAX_PASSWORD_RESET_TTL, DEFAULT_PASSWORD_RESET_COOLDOWN,
+    DEFAULT_SIGNUP_VERIFICATION_TTL, ProfileSetting, RESET_COOLDOWN_CAPACITY,
 };
 #[cfg(feature = "oauth")]
 pub use builder::{DEFAULT_JWKS_REFRESH_INTERVAL, DEFAULT_SID_MAP_CAPACITY};
 pub use chosen_password::ChosenPasswordError;
+#[cfg(feature = "fido2")]
+pub use fido2_service::DiscoverableLogin;
 #[cfg(feature = "oauth")]
-pub use oauth_service::ScopedOAuth;
+pub use oauth_service::{OAUTH_REVOCATION_REQUESTED_REASON, OAuthCallbackRoute, ScopedOAuth};
 pub use outcomes::{
     FactorOutcome, LoginOutcome, PrepareOutcome, SignupOutcome, SignupVerification,
 };
@@ -83,13 +89,20 @@ pub use outcomes::{
 pub use provider_reload::BuiltProvider;
 #[cfg(feature = "fido2")]
 pub use provider_reload::ReloadFido2;
+#[cfg(feature = "oauth")]
+pub use provider_reload::{
+    CLIENT_OWNERSHIP_ATTESTED_REASON, CLIENT_PAIR_HAND_OVER_REQUESTED_REASON,
+    CLIENT_PAIR_HANDED_OVER_REASON,
+};
 #[cfg(any(feature = "oauth", feature = "fido2", feature = "ldap"))]
 pub use provider_reload::{
-    DEFAULT_PROVIDER_VALIDATION_TIMEOUT, ProviderChange, ProviderChangeKind, ProviderEntry,
-    ProviderFollower, ProviderKey, ProviderReloadError, ProviderSource, ProviderSourceError,
-    ReadCause,
+    DEFAULT_PROVIDER_VALIDATION_TIMEOUT, PROVIDER_SOURCE_REASON, ProviderChange,
+    ProviderChangeError, ProviderChangeKind, ProviderEntry, ProviderFollower, ProviderKey,
+    ProviderReloadError, ProviderSource, ProviderSourceError, ReadCause,
 };
-pub use revocation::Actor;
+pub use revocation::{
+    Actor, OTHER_SESSIONS_NOT_ENDED_REASON, OtherSessionsError, REFRESH_TOKENS_NOT_REVOKED_REASON,
+};
 pub use session_validator::{
     ActiveSessionsError, NoSessionRegistryError, SessionValidator, require_valid_session,
 };
@@ -264,8 +277,8 @@ where
     ///
     /// Both calls go through `svc` because there is no other way to make
     /// them: `begin_login` and `verify_factor` are on
-    /// [`RequestAuthnService`], not on this type. Before 0.7.0 they were on both
-    /// and reaching back to `state.authn` for the second call wrote that
+    /// [`RequestAuthnService`], not on this type. Were they on both,
+    /// reaching back to `state.authn` for the second call would write that
     /// row with no address, which in a login handler is the failed-password
     /// row: the one a brute-force query counts.
     ///
@@ -279,6 +292,27 @@ where
             service: self.clone(),
             audit: Arc::new(ctx),
         }
+    }
+
+    /// The security profile the service was built under, if its builder
+    /// was put under one by
+    /// [`ProfileValues::authn_service_builder`](crate::profile::ProfileValues::authn_service_builder).
+    /// A service built under a profile holds every setting the profile
+    /// governs at the profile's value or tighter, except the ones
+    /// [`profile_deviations`](Self::profile_deviations) lists.
+    #[must_use]
+    pub fn security_profile(&self) -> Option<crate::profile::SecurityProfile> {
+        self.inner.security_profile()
+    }
+
+    /// The settings the service holds below its security profile: each was
+    /// waived by name on the builder
+    /// ([`waive_profile_floor`](AuthnServiceBuilder::waive_profile_floor))
+    /// and is looser than the profile's value. Empty for a service that
+    /// holds its profile, and for one built under none.
+    #[must_use]
+    pub fn profile_deviations(&self) -> &[ProfileSetting] {
+        self.inner.profile_deviations()
     }
 
     /// Return the OAuth provider registry as of this call, for introspection.
@@ -313,7 +347,7 @@ where
     ///
     /// With a shared store set by
     /// [`with_sid_store`](AuthnServiceBuilder::with_sid_store) this is the
-    /// in-process map, which the login path no longer fills: point the
+    /// in-process map, which the login path does not fill: point the
     /// handlers at [`sid_store`](Self::sid_store) with their `with_sid_store`.
     #[cfg(feature = "oauth")]
     pub fn sid_map(&self) -> crate::federation::sid_map::SidMap {
@@ -364,7 +398,9 @@ where
         self.inner.registry.is_some()
     }
 
-    /// Enumerate active sessions for a user. Used by admin session lists,
+    /// Enumerate the active sessions of a user, by their keys
+    /// ([`AuthSession::session_key`](crate::session::AuthSession::session_key)
+    /// names the caller's own among them). Used by admin session lists,
     /// concurrent-session-limit enforcement, and by "kill every other
     /// session" flows that need to read the active set before filtering
     /// out the current session.
@@ -377,7 +413,7 @@ where
     pub async fn active_sessions(
         &self,
         user_id: &crate::authn::ids::UserId,
-    ) -> Result<Vec<crate::session::id::SessionId>, ActiveSessionsError> {
+    ) -> Result<Vec<crate::session::id::SessionKey>, ActiveSessionsError> {
         match &self.inner.registry {
             Some(reg) => reg
                 .active_sessions(user_id)
@@ -396,6 +432,7 @@ where
         SessionValidator {
             registry: self.inner.registry.clone(),
             identity: None,
+            audit: self.session_end_audit(),
         }
     }
 
@@ -415,6 +452,7 @@ where
             identity: Some(Arc::new(session_validator::IdentityWrapper(
                 self.inner.identity.clone(),
             ))),
+            audit: self.session_end_audit(),
         }
     }
 }
@@ -485,16 +523,14 @@ where
     pub(crate) async fn emit_audit_at(
         &self,
         builder: crate::authn::event::AuthEventBuilder,
-        event_time: chrono::DateTime<chrono::Utc>,
+        event_time: axess_clock::Timestamp,
     ) -> Result<(), crate::authn::error::AuthnError<I::Error>> {
         // The single point every emit site funnels through, and so the one
         // place the per-request context is applied. It is not optional
         // here: reaching this method at all means a caller held a
         // `RequestAuthnService`, and the only way to hold one is to have supplied
-        // a context. Before 0.6.0 nothing applied it anywhere and every row
-        // carried a null client IP; 0.6.0 applied it when present and
-        // offered a runtime policy for when it was not; 0.7.0 removed the
-        // state the policy was checking for.
+        // a context, so no row is written without the request's context and
+        // no runtime policy has a missing context to check for.
         let event = builder.with_audit_context(&self.audit).build_at(event_time);
 
         // Kept for the failure log only; formatting them is deferred to
@@ -531,10 +567,10 @@ mod audit_context_wiring_tests {
     //! documentation offered the catalogue as compliance evidence. Nothing
     //! failed, which is why nothing caught it.
     //!
-    //! The case that needed a test most is the one that no longer compiles.
+    //! The case most worth a test is one that does not compile.
     //! `AuthnService` has no `emit_audit`, so "a route that forgot to wire a
-    //! context" is not a state a test can construct, and the policy that
-    //! used to catch it at runtime is gone with it.
+    //! context" is not a state a test can construct, and no runtime policy
+    //! has to catch it.
 
     use super::AuthnService;
     use crate::authn::event::{AuditContext, AuthEventBuilder, AuthEventType};
@@ -553,7 +589,9 @@ mod audit_context_wiring_tests {
     #[tokio::test]
     async fn context_reaches_the_stored_event() {
         let identity = MockIdentityStore::new();
-        let service = AuthnService::new(identity.clone(), MockFactorStore::new());
+        let service = AuthnService::builder(identity.clone(), MockFactorStore::new())
+            .with_clock(axess_clock::testing::MockClock::at_reference())
+            .build();
 
         service
             .with_audit_context(ctx_with_ip("203.0.113.7"))
@@ -581,7 +619,9 @@ mod audit_context_wiring_tests {
     #[tokio::test]
     async fn an_honestly_empty_context_still_records() {
         let identity = MockIdentityStore::new();
-        let service = AuthnService::new(identity.clone(), MockFactorStore::new());
+        let service = AuthnService::builder(identity.clone(), MockFactorStore::new())
+            .with_clock(axess_clock::testing::MockClock::at_reference())
+            .build();
 
         let empty = AuditContext::default();
         assert!(empty.ip_address.is_none());
@@ -608,7 +648,9 @@ mod audit_context_wiring_tests {
     #[tokio::test]
     async fn request_handles_share_the_same_collaborators() {
         let identity = MockIdentityStore::new();
-        let service = AuthnService::new(identity.clone(), MockFactorStore::new());
+        let service = AuthnService::builder(identity.clone(), MockFactorStore::new())
+            .with_clock(axess_clock::testing::MockClock::at_reference())
+            .build();
 
         service
             .with_audit_context(ctx_with_ip("203.0.113.7"))
@@ -635,7 +677,9 @@ mod audit_context_wiring_tests {
     /// shape that wrote the address onto one call and not the other.
     #[tokio::test]
     async fn the_request_handle_derefs_to_the_service() {
-        let service = AuthnService::new(MockIdentityStore::new(), MockFactorStore::new());
+        let service = AuthnService::builder(MockIdentityStore::new(), MockFactorStore::new())
+            .with_clock(axess_clock::testing::MockClock::at_reference())
+            .build();
         let request = service.with_audit_context(AuditContext::default());
 
         assert!(!request.has_session_registry());
@@ -660,7 +704,9 @@ mod audit_shed_tests {
     #[tokio::test]
     async fn shedding_continues_the_flow_where_an_outage_fails_it() {
         let identity = MockIdentityStore::new();
-        let service = AuthnService::new(identity.clone(), MockFactorStore::new())
+        let service = AuthnService::builder(identity.clone(), MockFactorStore::new())
+            .with_clock(axess_clock::testing::MockClock::at_reference())
+            .build()
             .with_audit_context(AuditContext::default());
 
         identity.arm_record_event_shedding();

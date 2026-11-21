@@ -225,7 +225,7 @@ pub trait OAuthProvider: Send + Sync + 'static {
     /// were a refresh of this one. This is the method providers implement;
     /// call it only where the subject is checked by other means, and use
     /// [`refresh_token`](Self::refresh_token) or
-    /// `AuthnService::refresh_oauth_token` everywhere else.
+    /// `ScopedOAuth::refresh_oauth_token` everywhere else.
     fn refresh_token_unchecked<'a>(
         &'a self,
         refresh_token: &'a str,
@@ -287,7 +287,7 @@ pub trait OAuthProvider: Send + Sync + 'static {
     /// a caller that merges or links on it would take as this user's. This is
     /// the method providers implement; call it only where the subject is
     /// checked by other means, and use [`fetch_userinfo`](Self::fetch_userinfo)
-    /// or `AuthnService::fetch_userinfo` everywhere else.
+    /// or `ScopedOAuth::fetch_userinfo` everywhere else.
     fn fetch_userinfo_unchecked<'a>(
         &'a self,
         access_token: &'a str,
@@ -436,10 +436,11 @@ pub trait OAuthProvider: Send + Sync + 'static {
     /// `end_session_endpoint`.
     fn build_end_session_url(
         &self,
-        _id_token_hint: Option<&str>,
-        _post_logout_redirect_uri: Option<&str>,
-        _state: Option<&str>,
+        id_token_hint: Option<&str>,
+        post_logout_redirect_uri: Option<&str>,
+        state: Option<&str>,
     ) -> Option<url::Url> {
+        let _ = (id_token_hint, post_logout_redirect_uri, state);
         None
     }
 
@@ -457,10 +458,11 @@ pub trait OAuthProvider: Send + Sync + 'static {
     /// proof signed by it, for an authorization server that wants one.
     fn revoke_token<'a>(
         &'a self,
-        _token: &'a str,
-        _token_type_hint: Option<&'a str>,
-        _dpop: Option<DpopSigner<'a>>,
+        token: &'a str,
+        token_type_hint: Option<&'a str>,
+        dpop: Option<DpopSigner<'a>>,
     ) -> Pin<Box<dyn Future<Output = Result<(), OAuthError>> + Send + 'a>> {
+        let _ = (token, token_type_hint, dpop);
         Box::pin(async move {
             Err(OAuthError::Config(
                 "token revocation not supported by this provider".to_string(),
@@ -486,10 +488,11 @@ pub trait OAuthProvider: Send + Sync + 'static {
     /// ([`AuthUrlResult`]).
     fn build_auth_url_par<'a>(
         &'a self,
-        _options: &'a OAuthLoginOptions,
-        _rng: &'a dyn axess_rng::SecureRng,
-        _dpop: Option<DpopSigner<'a>>,
+        options: &'a OAuthLoginOptions,
+        rng: &'a dyn axess_rng::SecureRng,
+        dpop: Option<DpopSigner<'a>>,
     ) -> Pin<Box<dyn Future<Output = Result<AuthUrlResult, OAuthError>> + Send + 'a>> {
+        let _ = (options, rng, dpop);
         Box::pin(async move {
             Err(OAuthError::Config(
                 "PAR not supported by this provider".to_string(),
@@ -509,9 +512,10 @@ pub trait OAuthProvider: Send + Sync + 'static {
     /// `params`.
     fn push_authorization_request<'a>(
         &'a self,
-        _params: &'a [(&'a str, &'a str)],
-        _dpop: Option<DpopSigner<'a>>,
+        params: &'a [(&'a str, &'a str)],
+        dpop: Option<DpopSigner<'a>>,
     ) -> Pin<Box<dyn Future<Output = Result<ParResponse, OAuthError>> + Send + 'a>> {
+        let _ = (params, dpop);
         Box::pin(async move {
             Err(OAuthError::Config(
                 "PAR not supported by this provider".to_string(),
@@ -536,13 +540,14 @@ pub trait OAuthProvider: Send + Sync + 'static {
     /// arguments give the same proof.
     fn generate_dpop_proof(
         &self,
-        _key: &DpopKey,
-        _http_method: &str,
-        _http_url: &str,
-        _access_token: Option<&str>,
-        _iat: i64,
-        _jti_bytes: [u8; 16],
+        key: &DpopKey,
+        http_method: &str,
+        http_url: &str,
+        access_token: Option<&str>,
+        iat: i64,
+        jti_bytes: [u8; 16],
     ) -> Result<DpopProof, OAuthError> {
+        let _ = (key, http_method, http_url, access_token, iat, jti_bytes);
         Err(OAuthError::Config(
             "DPoP not supported by this provider".to_string(),
         ))
@@ -585,9 +590,10 @@ pub trait OAuthProvider: Send + Sync + 'static {
     /// bearer token where a bound one was asked for.
     fn client_credentials<'a>(
         &'a self,
-        _scopes: &'a [&'a str],
-        _dpop: Option<DpopSigner<'a>>,
+        scopes: &'a [&'a str],
+        dpop: Option<DpopSigner<'a>>,
     ) -> Pin<Box<dyn Future<Output = Result<ClientCredentialsToken, OAuthError>> + Send + 'a>> {
+        let _ = (scopes, dpop);
         Box::pin(async move {
             Err(OAuthError::Config(
                 "client_credentials not supported by this provider".to_string(),
@@ -624,25 +630,25 @@ mod provider_default_methods_tests {
         }
         fn refresh_token_unchecked<'a>(
             &'a self,
-            _refresh_token: &'a str,
-            _original_nonce: Option<&'a str>,
-            _dpop: Option<DpopSigner<'a>>,
+            _: &'a str,
+            _: Option<&'a str>,
+            _: Option<DpopSigner<'a>>,
         ) -> Pin<Box<dyn Future<Output = Result<RefreshOutcome, OAuthError>> + Send + 'a>> {
             Box::pin(async move { Err(OAuthError::Config("stub".into())) })
         }
         fn exchange_code<'a>(
             &'a self,
-            _code: &'a str,
-            _pkce_verifier: String,
-            _nonce: String,
-            _dpop: Option<DpopSigner<'a>>,
+            _: &'a str,
+            _: String,
+            _: String,
+            _: Option<DpopSigner<'a>>,
         ) -> Pin<Box<dyn Future<Output = Result<OAuthClaims, OAuthError>> + Send + 'a>> {
             Box::pin(async move { Err(OAuthError::Config("stub".into())) })
         }
         fn fetch_userinfo_unchecked<'a>(
             &'a self,
-            _access_token: &'a str,
-            _dpop: Option<DpopSigner<'a>>,
+            _: &'a str,
+            _: Option<DpopSigner<'a>>,
         ) -> Pin<Box<dyn Future<Output = Result<UserInfoClaims, OAuthError>> + Send + 'a>> {
             Box::pin(async move { Err(OAuthError::Config("stub".into())) })
         }
@@ -719,10 +725,10 @@ mod provider_default_methods_tests {
         }
         fn exchange_code<'a>(
             &'a self,
-            _code: &'a str,
-            _pkce_verifier: String,
-            _nonce: String,
-            _dpop: Option<DpopSigner<'a>>,
+            _: &'a str,
+            _: String,
+            _: String,
+            _: Option<DpopSigner<'a>>,
         ) -> Pin<Box<dyn Future<Output = Result<OAuthClaims, OAuthError>> + Send + 'a>> {
             Box::pin(async { Err(OAuthError::TokenExchange("reached the exchange".into())) })
         }

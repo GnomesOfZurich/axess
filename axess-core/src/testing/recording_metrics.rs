@@ -1,6 +1,6 @@
 //! A metrics recorder for tests: every concern, one call log.
 //!
-//! [`RecordingMetrics`] implements all eight metric traits and appends the
+//! [`RecordingMetrics`] implements all nine metric traits and appends the
 //! name of each call to a shared log, so a test attaches it to the one
 //! concern under test and asserts on the names that arrived:
 //!
@@ -17,8 +17,9 @@
 //! ```
 
 use crate::metrics::{
-    AuditMetrics, AuthFlowMetrics, AuthzCacheMetrics, CsrfRefusal, FactorMetrics, ProviderCategory,
-    ProviderRegistryMetrics, RequestGuardMetrics, RotationMetrics, SessionMetrics,
+    AuditMetrics, AuthFlowMetrics, AuthzCacheMetrics, CsrfRefusal, DeviceKeyMetrics, FactorMetrics,
+    ProviderCategory, ProviderRegistryMetrics, RequestGuardMetrics, RotationMetrics,
+    SessionMetrics, WorkloadCredentialKind,
 };
 use std::sync::Mutex;
 
@@ -102,6 +103,9 @@ impl SessionMetrics for RecordingMetrics {
     fn session_fingerprint_backfilled(&self) {
         self.record("session_fingerprint_backfilled", 1);
     }
+    fn session_row_refused(&self) {
+        self.record("session_row_refused", 1);
+    }
     fn sid_map_evicted(&self, count: u64) {
         self.record("sid_map_evicted", count);
     }
@@ -116,6 +120,78 @@ impl RotationMetrics for RecordingMetrics {
     }
     fn fingerprint_key_fallback(&self) {
         self.record("fingerprint_key_fallback", 1);
+    }
+    fn workload_credential_rotated(&self, kind: WorkloadCredentialKind) {
+        self.record(
+            match kind {
+                WorkloadCredentialKind::X509Svid => "workload_credential_rotated:x509_svid",
+                WorkloadCredentialKind::JwtSvid => "workload_credential_rotated:jwt_svid",
+                WorkloadCredentialKind::X509Bundles => "workload_credential_rotated:x509_bundles",
+                WorkloadCredentialKind::JwtBundles => "workload_credential_rotated:jwt_bundles",
+            },
+            1,
+        );
+        self.record("workload_credential_rotated", 1);
+    }
+    fn workload_credential_refresh_failed(&self, kind: WorkloadCredentialKind) {
+        self.record(
+            match kind {
+                WorkloadCredentialKind::X509Svid => "workload_credential_refresh_failed:x509_svid",
+                WorkloadCredentialKind::JwtSvid => "workload_credential_refresh_failed:jwt_svid",
+                WorkloadCredentialKind::X509Bundles => {
+                    "workload_credential_refresh_failed:x509_bundles"
+                }
+                WorkloadCredentialKind::JwtBundles => {
+                    "workload_credential_refresh_failed:jwt_bundles"
+                }
+            },
+            1,
+        );
+        self.record("workload_credential_refresh_failed", 1);
+    }
+    fn workload_credential_expired(&self, kind: WorkloadCredentialKind) {
+        self.record(
+            match kind {
+                WorkloadCredentialKind::X509Svid => "workload_credential_expired:x509_svid",
+                WorkloadCredentialKind::JwtSvid => "workload_credential_expired:jwt_svid",
+                WorkloadCredentialKind::X509Bundles => "workload_credential_expired:x509_bundles",
+                WorkloadCredentialKind::JwtBundles => "workload_credential_expired:jwt_bundles",
+            },
+            1,
+        );
+        self.record("workload_credential_expired", 1);
+    }
+    fn workload_credential_withdrawal_deferred(&self, kind: WorkloadCredentialKind) {
+        self.record(
+            match kind {
+                WorkloadCredentialKind::X509Svid => {
+                    "workload_credential_withdrawal_deferred:x509_svid"
+                }
+                WorkloadCredentialKind::JwtSvid => {
+                    "workload_credential_withdrawal_deferred:jwt_svid"
+                }
+                WorkloadCredentialKind::X509Bundles => {
+                    "workload_credential_withdrawal_deferred:x509_bundles"
+                }
+                WorkloadCredentialKind::JwtBundles => {
+                    "workload_credential_withdrawal_deferred:jwt_bundles"
+                }
+            },
+            1,
+        );
+        self.record("workload_credential_withdrawal_deferred", 1);
+    }
+    fn workload_bundle_skipped(&self, kind: WorkloadCredentialKind) {
+        self.record(
+            match kind {
+                WorkloadCredentialKind::X509Svid => "workload_bundle_skipped:x509_svid",
+                WorkloadCredentialKind::JwtSvid => "workload_bundle_skipped:jwt_svid",
+                WorkloadCredentialKind::X509Bundles => "workload_bundle_skipped:x509_bundles",
+                WorkloadCredentialKind::JwtBundles => "workload_bundle_skipped:jwt_bundles",
+            },
+            1,
+        );
+        self.record("workload_bundle_skipped", 1);
     }
 }
 
@@ -210,5 +286,44 @@ impl AuditMetrics for RecordingMetrics {
     }
     fn audit_event_shed(&self) {
         self.record("audit_event_shed", 1);
+    }
+}
+
+impl DeviceKeyMetrics for RecordingMetrics {
+    fn key_offered(&self) {
+        self.record("key_offered", 1);
+    }
+    fn key_registered(&self) {
+        self.record("key_registered", 1);
+    }
+    fn key_registration_refused(&self) {
+        self.record("key_registration_refused", 1);
+    }
+    fn key_proof_accepted(&self) {
+        self.record("key_proof_accepted", 1);
+    }
+    fn key_proof_challenged(&self) {
+        self.record("key_proof_challenged", 1);
+    }
+    fn key_proof_refused(&self) {
+        self.record("key_proof_refused", 1);
+    }
+    fn request_proof_accepted(&self) {
+        self.record("request_proof_accepted", 1);
+    }
+    fn request_proof_refused(&self) {
+        self.record("request_proof_refused", 1);
+    }
+    fn unbound_request_proof_refused(&self) {
+        self.record("unbound_request_proof_refused", 1);
+    }
+    fn request_proof_unanswered(&self) {
+        self.record("request_proof_unanswered", 1);
+    }
+    fn bound_session_unproven(&self) {
+        self.record("bound_session_unproven", 1);
+    }
+    fn unbound_session_ended(&self) {
+        self.record("unbound_session_ended", 1);
     }
 }

@@ -12,7 +12,13 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 mod audit_query;
-pub use audit_query::{AuditQuery, EventQueryFilter};
+
+/// Doctests: a `FactorStore` that leaves out a passkey credential-id method
+/// does not compile.
+#[cfg(doctest)]
+#[doc = include_str!("store/required_methods.md")]
+struct RequiredMethods;
+pub use audit_query::{AuditQuery, AuditTrail, EventQueryFilter, UnreadableReason, UnreadableRows};
 
 // ── Identity trait tier ──────────────────────────────────────────────────────
 //
@@ -292,7 +298,7 @@ pub trait IdentityAdmin: IdentityAuthnLog {
     /// that cannot list by age and state does not compile.
     fn delete_candidates_created_before(
         &self,
-        before: chrono::DateTime<chrono::Utc>,
+        before: axess_clock::Timestamp,
         limit: usize,
     ) -> impl std::future::Future<Output = Result<Vec<User>, Self::Error>> + Send;
 }
@@ -341,8 +347,8 @@ pub trait IdentityPasswordReset: IdentityLookup {
         &self,
         user_id: &UserId,
         token_hash: &str,
-        expires_at: chrono::DateTime<chrono::Utc>,
-        now: chrono::DateTime<chrono::Utc>,
+        expires_at: axess_clock::Timestamp,
+        now: axess_clock::Timestamp,
         max_live: usize,
     ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send;
 
@@ -357,7 +363,7 @@ pub trait IdentityPasswordReset: IdentityLookup {
         &self,
         user_id: &UserId,
         token_hash: &str,
-        now: chrono::DateTime<chrono::Utc>,
+        now: axess_clock::Timestamp,
     ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send;
 
     /// [`verify_reset_token`](Self::verify_reset_token)'s constant-time
@@ -367,7 +373,7 @@ pub trait IdentityPasswordReset: IdentityLookup {
         &self,
         user_id: &UserId,
         token_hash: &str,
-        now: chrono::DateTime<chrono::Utc>,
+        now: axess_clock::Timestamp,
     ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send;
 }
 
@@ -418,6 +424,8 @@ pub trait IdentityPasswordHistory: IdentityLookup {
 
 mod noop;
 pub use noop::NoopAuthnLog;
+mod fido2_claim;
+pub use fido2_claim::Fido2CredentialClaim;
 
 // ── ResolvedFactor ────────────────────────────────────────────────────────────
 
@@ -517,30 +525,7 @@ pub trait FactorStore: Send + Sync + 'static {
         config: FactorConfig,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Atomically replace the stored factor config with `updated` only if the
-    /// currently stored config matches `prior`. Returns `Ok(true)` on
-    /// successful swap and `Ok(false)` if the stored value has changed since
-    /// it was loaded (indicating a concurrent update; for TOTP/HOTP this
-    /// means the credential has already been spent in another request).
-    ///
-    /// This method is **required**: implementations MUST make the conditional
-    /// update atomic with respect to other writes; typically a single
-    /// `UPDATE ... WHERE` statement using the prior values as a guard, or
-    /// an equivalent single-transaction primitive on the backend. A
-    /// non-atomic load-compare-save would re-open the TOTP/HOTP replay
-    /// window the trait exists to close.
-    ///
-    /// **Comparison semantic is backend-defined**, not byte-equality on the
-    /// serialized blob. SQL backends SHOULD compare on a monotonic
-    /// generation/version column, or on the specific mutable columns the
-    /// factor advances (`last_step` for TOTP, `counter`+`attempt_count` for
-    /// HOTP, etc.), not on the full serialized `FactorConfig`. Byte-equality
-    /// on the serialized form couples in-flight CAS attempts to the
-    /// serialized shape of every `FactorConfig` variant; a serde-compatible
-    /// change to an unrelated field would invalidate a concurrent
-    /// verification's CAS, masquerading as replay. The `prior` argument is
-    /// the value the caller loaded earlier; the backend decides what
-    /// "matches" means in its storage model.
+    #[doc = include_str!("store/compare_and_save_factor.md")]
     fn compare_and_save_factor(
         &self,
         scope: &AuthnScope,
@@ -617,56 +602,38 @@ pub trait FactorStore: Send + Sync + 'static {
         enabled: bool,
     ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send;
 
-    /// The user of `tenant_id` who holds a passkey with `credential_id`
-    /// (the raw credential id bytes), or `Ok(None)` when no user of that
-    /// tenant does.
-    ///
-    /// `finish_fido2_registration` calls this before it stores a passkey
-    /// and refuses a credential id that another user of the tenant already
-    /// holds, so one authenticator credential cannot be registered to two
-    /// accounts. The lookup is by exact credential id within the tenant;
-    /// the user's own holding is returned like any other and the caller
-    /// compares.
-    ///
-    /// The default answers `Ok(None)`: a store that does not implement the
-    /// lookup admits every credential id, and the cross-user check does not
-    /// run. This keeps stores written against an earlier release building.
-    /// The in-tree stores (the mock store and the SQLite example) answer. A
-    /// store that keeps passkeys inside an opaque or sealed config row
-    /// should keep an index of `(tenant_id, credential_id, user_id)` written
-    /// together with the config, or it should leave the default in place and
-    /// keep that check in the application.
-    ///
-    /// An `Err` is not read as "no holder": the registration fails.
-    fn fido2_credential_holder(
-        &self,
-        tenant_id: &TenantId,
-        credential_id: &[u8],
-    ) -> impl std::future::Future<Output = Result<Option<UserId>, Self::Error>> + Send {
-        let _ = (tenant_id, credential_id);
-        async { Ok(None) }
-    }
-
-    /// Claim the passkey credential id `credential_id` for `user_id` within
-    /// `tenant_id`, and say whether the claim holds: `Ok(true)` when the id
-    /// is now (or already was) claimed by this user, `Ok(false)` when
-    /// another user of the tenant holds it.
+    /// Claim the passkey credential id `credential_id` (the raw id bytes) for
+    /// `user_id` within `tenant_id`, and say how the claim stands:
+    /// [`Fido2CredentialClaim::Claimed`] when the id is now (or already was)
+    /// claimed by this user, and [`Fido2CredentialClaim::HeldBy`] naming the
+    /// user who holds it when another user of the tenant does.
     ///
     /// `finish_fido2_registration` claims before it stores the passkey, so
-    /// two accounts racing to register one credential id cannot both pass:
-    /// the holder lookup and the per-user compare-and-swap write touch
-    /// different rows, and only a claim the store makes atomically (a unique
-    /// index on `(tenant_id, credential_id)`, written with a single
-    /// conditional insert) closes the window between them. Claiming for the
-    /// same user twice is `Ok(true)`.
+    /// two accounts racing to register one credential id cannot both pass,
+    /// and it writes the audit row of a refused claim from this answer and
+    /// from no second read. The store therefore takes the id and reads its
+    /// holder in one step: a unique index on `(tenant_id, credential_id)` and
+    /// one insert that, on a conflict, returns the row already there (or one
+    /// set-if-absent that returns the present value, or one transaction). A
+    /// holder read after the refusal could be nobody, or another user, when
+    /// a claim was released or made in between. A passkey stored without a
+    /// claim (before claims existed, or seeded directly) holds its id too,
+    /// for the user it is stored for. Claiming for the same user twice is
+    /// `Claimed`.
     ///
-    /// **The default is not atomic.** It answers from
-    /// [`fido2_credential_holder`](Self::fido2_credential_holder) and writes
-    /// nothing, so two registrations that both look before either stores
-    /// still both succeed. Implement this method, with
-    /// [`release_fido2_credential`](Self::release_fido2_credential), to get
-    /// the guarantee. The in-tree stores (the mock store and the SQLite
-    /// example) do.
+    /// Required: a claim that the store does not make atomically cannot
+    /// keep two accounts from holding one id, so there is no default to
+    /// fall back on and a store without the method does not compile. A
+    /// store implements it together with
+    /// [`release_fido2_credential`](Self::release_fido2_credential). A store
+    /// that keeps no passkeys answers [`Fido2CredentialClaim::Refused`] to
+    /// every claim and says so in its own documentation. A registration
+    /// whose credential write fails keeps its claim: a concurrent
+    /// registration by the same user may store the credential after any
+    /// check, and it depends on the claim. The in-tree stores (the mock
+    /// store, `InMemoryBackend` through it, and the SQLite example)
+    /// implement both, and `assert_fido2_claim_contract` in
+    /// `testing::store_contract` checks a store of your own.
     ///
     /// An `Err` is not read as a claim: the registration fails.
     fn claim_fido2_credential(
@@ -674,31 +641,23 @@ pub trait FactorStore: Send + Sync + 'static {
         tenant_id: &TenantId,
         user_id: &UserId,
         credential_id: &[u8],
-    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
-        async move {
-            let holder = self
-                .fido2_credential_holder(tenant_id, credential_id)
-                .await?;
-            Ok(holder.is_none_or(|holder| &holder == user_id))
-        }
-    }
+    ) -> impl std::future::Future<Output = Result<Fido2CredentialClaim, Self::Error>> + Send;
 
     /// Release the claim `user_id` holds on `credential_id` in `tenant_id`,
     /// taken by [`claim_fido2_credential`](Self::claim_fido2_credential).
     ///
-    /// Called when the passkey is deleted and when a registration that
-    /// claimed the id did not store it, so the id can be registered again.
-    /// Releasing a claim the user does not hold changes nothing. The default
-    /// does nothing, matching the default claim, which writes nothing.
+    /// Called when the passkey is deleted, so the id can be registered
+    /// again. Releasing a claim the user does not hold changes nothing. Required,
+    /// as the claim is: a release that did nothing would leave every deleted
+    /// passkey's id held. A store that deletes a user releases that user's
+    /// claims with the user, so an orphaned claim does not block the id for
+    /// the rest of the tenant.
     fn release_fido2_credential(
         &self,
         tenant_id: &TenantId,
         user_id: &UserId,
         credential_id: &[u8],
-    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
-        let _ = (tenant_id, user_id, credential_id);
-        async { Ok(()) }
-    }
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send;
 }
 
 // ── AuthMethod ────────────────────────────────────────────────────────────────
@@ -775,7 +734,7 @@ impl AuthMethod {
     /// `steps` directly for full fidelity.
     pub fn factors(&self) -> Vec<FactorKind> {
         // A step with no factor to offer (an empty `AnyOf`) contributes
-        // nothing. It used to be reported as `Password`, a factor the method
+        // nothing: reported as `Password`, it would name a factor the method
         // never listed.
         self.steps
             .iter()

@@ -37,10 +37,10 @@ impl RefreshTokenStore for OurBackend {
         .bind(token.family_id.as_ref().map(|f| f.to_string()))
         .bind(token.device_id.as_ref().map(|d| d.to_string()))
         .bind(token.device_info.as_deref())
-        .bind(token.issued_at.to_rfc3339())
-        .bind(token.expires_at.to_rfc3339())
+        .bind(token.issued_at.to_rfc3339_numeric_offset())
+        .bind(token.expires_at.to_timestamp().to_rfc3339_numeric_offset())
         .bind(i64::from(token.revoked))
-        .bind(token.authn_time.map(|t| t.to_rfc3339()))
+        .bind(token.authn_time.map(|t| t.to_rfc3339_numeric_offset()))
         .execute(self.pool())
         .await?;
         Ok(())
@@ -68,7 +68,7 @@ impl RefreshTokenStore for OurBackend {
         )
         .bind(token_id.to_string())
         .bind(RevocationReason::Explicit.as_str())
-        .bind(self.clock().now().to_rfc3339())
+        .bind(self.clock().now().to_rfc3339_numeric_offset())
         .execute(self.pool())
         .await?;
         Ok(())
@@ -82,7 +82,7 @@ impl RefreshTokenStore for OurBackend {
         )
         .bind(user_id.to_string())
         .bind(RevocationReason::Explicit.as_str())
-        .bind(self.clock().now().to_rfc3339())
+        .bind(self.clock().now().to_rfc3339_numeric_offset())
         .execute(self.pool())
         .await?;
         Ok(())
@@ -104,7 +104,7 @@ impl RefreshTokenStore for OurBackend {
         .bind(user_id.to_string())
         .bind(family_id.to_string())
         .bind(RevocationReason::Compromise.as_str())
-        .bind(self.clock().now().to_rfc3339())
+        .bind(self.clock().now().to_rfc3339_numeric_offset())
         .execute(self.pool())
         .await?;
         Ok(())
@@ -128,7 +128,7 @@ impl RefreshTokenStore for OurBackend {
         .bind(tenant_id.to_string())
         .bind(device_id.to_string())
         .bind(RevocationReason::Device.as_str())
-        .bind(self.clock().now().to_rfc3339())
+        .bind(self.clock().now().to_rfc3339_numeric_offset())
         .execute(self.pool())
         .await?;
         Ok(DeviceTokenRevocation::Revoked {
@@ -175,7 +175,7 @@ impl RefreshTokenStore for OurBackend {
         .bind(new_token.user_id.to_string())
         .bind(i64::try_from(max_per_user).unwrap_or(i64::MAX))
         .bind(RevocationReason::Evicted.as_str())
-        .bind(self.clock().now().to_rfc3339())
+        .bind(self.clock().now().to_rfc3339_numeric_offset())
         .execute(&mut *tx)
         .await?;
 
@@ -192,10 +192,15 @@ impl RefreshTokenStore for OurBackend {
         .bind(new_token.family_id.as_ref().map(|f| f.to_string()))
         .bind(new_token.device_id.as_ref().map(|d| d.to_string()))
         .bind(new_token.device_info.as_deref())
-        .bind(new_token.issued_at.to_rfc3339())
-        .bind(new_token.expires_at.to_rfc3339())
+        .bind(new_token.issued_at.to_rfc3339_numeric_offset())
+        .bind(
+            new_token
+                .expires_at
+                .to_timestamp()
+                .to_rfc3339_numeric_offset(),
+        )
         .bind(i64::from(new_token.revoked))
-        .bind(new_token.authn_time.map(|t| t.to_rfc3339()))
+        .bind(new_token.authn_time.map(|t| t.to_rfc3339_numeric_offset()))
         .execute(&mut *tx)
         .await?;
 
@@ -221,7 +226,7 @@ impl RefreshTokenStore for OurBackend {
         )
         .bind(parent_id.to_string())
         .bind(RevocationReason::Rotated.as_str())
-        .bind(new_token.issued_at.to_rfc3339())
+        .bind(new_token.issued_at.to_rfc3339_numeric_offset())
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -242,10 +247,15 @@ impl RefreshTokenStore for OurBackend {
         .bind(new_token.family_id.as_ref().map(|f| f.to_string()))
         .bind(new_token.device_id.as_ref().map(|d| d.to_string()))
         .bind(new_token.device_info.as_deref())
-        .bind(new_token.issued_at.to_rfc3339())
-        .bind(new_token.expires_at.to_rfc3339())
+        .bind(new_token.issued_at.to_rfc3339_numeric_offset())
+        .bind(
+            new_token
+                .expires_at
+                .to_timestamp()
+                .to_rfc3339_numeric_offset(),
+        )
         .bind(i64::from(new_token.revoked))
-        .bind(new_token.authn_time.map(|t| t.to_rfc3339()))
+        .bind(new_token.authn_time.map(|t| t.to_rfc3339_numeric_offset()))
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -294,16 +304,12 @@ fn refresh_token_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<RefreshToken,
 /// `issued_at` cannot be read is an integrity failure, not "now": falling
 /// back to the current time would hand back a token that is neither expired
 /// nor ageing, and the caller would honour it.
-fn strict_datetime(
-    column: &str,
-    value: &str,
-) -> Result<chrono::DateTime<chrono::Utc>, BackendError> {
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(value) {
-        return Ok(dt.into());
+fn strict_datetime(column: &str, value: &str) -> Result<axess::Timestamp, BackendError> {
+    if let Ok(dt) = axess::Timestamp::parse_rfc3339(value) {
+        return Ok(dt);
     }
-    chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
-        .map(|dt| dt.and_utc())
-        .map_err(|_| BackendError::Backend(format!("refresh_tokens.{column} is not a timestamp")))
+    super::sqlite_default_datetime(value)
+        .ok_or_else(|| BackendError::Backend(format!("refresh_tokens.{column} is not a timestamp")))
 }
 
 impl RawRefreshRow {
@@ -320,7 +326,12 @@ impl RawRefreshRow {
             tenant_id: TenantId::try_new(&self.tenant_id).map_err(|_| bad("tenant_id"))?,
             token_hash: self.token_hash,
             issued_at: strict_datetime("issued_at", &self.issued_at)?,
-            expires_at: strict_datetime("expires_at", &self.expires_at)?,
+            // The column holds the reading the end is stored as: the latest
+            // reading is a token that never expires.
+            expires_at: axess::Until::from_timestamp(strict_datetime(
+                "expires_at",
+                &self.expires_at,
+            )?),
             revoked: self.revoked != 0,
             device_info: self.device_info,
             family_id: self

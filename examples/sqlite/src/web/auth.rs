@@ -487,7 +487,9 @@ async fn store_signup_credentials(
         return Err("Signup failed; could not save credentials.");
     }
 
-    // Store auth method (password-only for now; user can enroll TOTP later).
+    // Store the user's auth method: the password alone. Enrolling TOTP
+    // (`/setup-totp`) replaces it with the password followed by a TOTP or
+    // recovery code.
     let method_json = serde_json::json!([{"Required": "Password"}]).to_string();
     if let Err(e) = sqlx::query(
         "INSERT INTO auth_methods (id, name, steps_json, user_id, tenant_id, enabled)
@@ -597,8 +599,14 @@ async fn totp_setup_page(
         .await
         .map(|id| id.to_string())
         .unwrap_or_else(|| "user".to_string());
-    let uri = axess::build_totp_uri(&username, "axess-example", secret, 6, 30)
-        .expect("6 digits and a 30 second period are a valid configuration");
+    let uri = axess::build_totp_uri(
+        &username,
+        "axess-example",
+        secret,
+        6,
+        std::time::Duration::from_secs(30),
+    )
+    .expect("6 digits and a 30 second period are a valid configuration");
     let qr_svg = totp_qr_svg(&uri);
     let csrf_input = csrf_hidden_input(csrf);
     let error = error

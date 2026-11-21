@@ -4,13 +4,13 @@
 //! converge from their source.
 
 use axess_core::authz::{
-    AuthzEntityProvider, AuthzError, AuthzStore, PolicyStore,
+    AuthzDecision, AuthzEntityProvider, AuthzError, AuthzStore, PolicyEvaluator, PolicyStore,
     cache::CacheInvalidator,
     make_entity_uid,
     reload::{InProcessCoordinator, PolicyBundle, PolicySource, ReloadCoordinator, ReloadFuture},
 };
 use axess_core::metrics::{AuthzCacheMetrics, MetricSinks};
-use cedar_policy::{Entities, EntityUid, Schema};
+use cedar_policy::{Context, Entities, EntityUid, Schema};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -301,7 +301,7 @@ async fn a_notice_makes_a_second_store_re_read_its_source() {
     let source = FixedSource::new("doc1");
     let a = Arc::new(store_with(&permit("doc1")).with_coordinator(bus.clone()));
     let b = Arc::new(store_with(&permit("doc1")).with_coordinator(bus.clone()));
-    let _follower = b
+    let follower = b
         .follow_reloads(source.clone(), Duration::from_secs(3600))
         .await
         .expect("follow");
@@ -314,6 +314,7 @@ async fn a_notice_makes_a_second_store_re_read_its_source() {
     eventually("B follows A", async || allowed(&b, "doc2").await).await;
     assert!(!allowed(&b, "doc1").await);
     assert_eq!(b.policy_digest(), a.policy_digest());
+    drop(follower);
 }
 
 #[tokio::test]
@@ -321,7 +322,7 @@ async fn a_notice_cannot_inject_policy_the_source_does_not_hold() {
     let bus = coordinator();
     let source = FixedSource::new("doc1");
     let b = Arc::new(store_with(&permit("doc1")).with_coordinator(bus.clone()));
-    let _follower = b
+    let follower = b
         .follow_reloads(source.clone(), Duration::from_secs(3600))
         .await
         .unwrap();
@@ -332,6 +333,7 @@ async fn a_notice_cannot_inject_policy_the_source_does_not_hold() {
 
     assert!(allowed(&b, "doc1").await);
     assert!(!allowed(&b, "doc2").await);
+    drop(follower);
 }
 
 #[tokio::test]
@@ -344,7 +346,7 @@ async fn a_follower_refuses_a_bad_bundle_from_its_source_and_keeps_its_set() {
             .with_coordinator(bus.clone())
             .with_metrics(MetricSinks::noop().with_authz_cache(metrics.clone())),
     );
-    let _follower = b
+    let follower = b
         .follow_reloads(source.clone(), Duration::from_secs(3600))
         .await
         .unwrap();
@@ -357,6 +359,7 @@ async fn a_follower_refuses_a_bad_bundle_from_its_source_and_keeps_its_set() {
     })
     .await;
     assert!(allowed(&b, "doc1").await);
+    drop(follower);
 }
 
 /// A source that counts how often it was read.
@@ -384,7 +387,7 @@ async fn a_follower_whose_receiver_lagged_converges_on_the_source() {
     });
     let b = Arc::new(store_with(&permit("doc1")).with_coordinator(bus.clone()));
     // The poll is an hour away: only a notice can make the follower read again.
-    let _follower = b
+    let follower = b
         .follow_reloads(source.clone(), Duration::from_secs(3600))
         .await
         .unwrap();
@@ -415,6 +418,7 @@ async fn a_follower_whose_receiver_lagged_converges_on_the_source() {
     assert!(!allowed(&b, "doc1").await);
     assert!(source.loads.load(Ordering::SeqCst) > loads_before);
     assert_eq!(b.policy_digest(), Some(bundle(&permit("doc2")).digest()));
+    drop(follower);
 }
 
 #[tokio::test]
@@ -422,7 +426,7 @@ async fn a_follower_that_missed_the_notice_catches_up_by_its_poll() {
     let bus = coordinator();
     let source = FixedSource::new("doc1");
     let b = Arc::new(store_with(&permit("doc1")).with_coordinator(bus.clone()));
-    let _follower = b
+    let follower = b
         .follow_reloads(source.clone(), Duration::from_millis(50))
         .await
         .unwrap();
@@ -434,6 +438,7 @@ async fn a_follower_that_missed_the_notice_catches_up_by_its_poll() {
         allowed(&b, "doc2").await
     })
     .await;
+    drop(follower);
 }
 
 #[tokio::test]
@@ -506,4 +511,61 @@ async fn reloads_racing_decisions_never_expose_a_missing_or_bad_set() {
     }
     assert!(total > 0);
     assert!(allowed(&store, "shared").await);
+}
+
+/// An evaluator of an adopter's own: it decides with a policy set but is not
+/// a `PolicyStore`, and keeps the trait's `adopt` as it comes.
+struct OwnEvaluator(PolicyStore);
+
+impl PolicyEvaluator for OwnEvaluator {
+    fn is_authorized(
+        &self,
+        entities: &Entities,
+        principal: EntityUid,
+        action: EntityUid,
+        resource: EntityUid,
+        context: Context,
+    ) -> AuthzDecision {
+        self.0
+            .is_authorized(entities, principal, action, resource, context)
+    }
+
+    fn mentions_context(&self) -> bool {
+        self.0.mentions_context()
+    }
+
+    fn schema(&self) -> Option<Schema> {
+        PolicyEvaluator::schema(&self.0)
+    }
+}
+
+/// An evaluator that is not a `PolicyStore` has nothing shared to update: it
+/// hands the new set back, and the reload replaces it in the store, which
+/// decides on the new set from then on.
+#[tokio::test]
+async fn a_reload_replaces_an_evaluator_that_cannot_take_the_new_set() {
+    let policy = |doc: &str| PolicyStore::from_text(&permit(doc), SCHEMA).expect("policy");
+    let offered = Arc::new(policy("doc2"));
+    let handed_back = OwnEvaluator(policy("doc1"))
+        .adopt(offered.clone())
+        .expect_err("an evaluator of one's own does not adopt");
+    assert!(Arc::ptr_eq(&handed_back, &offered));
+
+    let store = Arc::new(
+        AuthzStore::try_new(
+            Arc::new(OwnEvaluator(policy("doc1"))),
+            Arc::new(Provider),
+            "App",
+        )
+        .expect("store"),
+    );
+    assert!(allowed(&store, "doc1").await);
+
+    store
+        .reload_policies(&permit("doc2"), SCHEMA)
+        .await
+        .expect("valid set");
+
+    assert!(allowed(&store, "doc2").await, "the new set decides");
+    assert!(!allowed(&store, "doc1").await, "the retired grant is gone");
 }

@@ -15,8 +15,10 @@
 //! SDK that axess does not depend on; the document shows it and this file
 //! stops at the credentials the SDK would be given.
 
-mod common;
+mod signing;
+mod verifier;
 
+use axess_clock::testing::MockClock;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -62,7 +64,7 @@ const GITHUB_HOST: &str = "token.actions.githubusercontent.com";
 const EKS_HOST: &str = "oidc.eks.eu-central-1.amazonaws.com/id/EXAMPLED539D4633E53DE1B71EXAMPLE";
 const DEPLOY_ROLE: &str = "arn:aws:iam::123456789012:role/ledger-ci-deploy";
 const READER_ROLE: &str = "arn:aws:iam::123456789012:role/ledger-secret-reader";
-const JOB_SUBJECT: &str = "repo:gnomes/axess:ref:refs/heads/main";
+const JOB_SUBJECT: &str = "repo:example-org/example-repo:ref:refs/heads/main";
 const POD_SUBJECT: &str = "system:serviceaccount:payments:ledger";
 
 // ANCHOR: service
@@ -114,7 +116,7 @@ async fn ready(
         svc.trust.clone(),
         {
             let tenant = svc.tenant;
-            move |_slug: &str| Some(tenant)
+            move |_: &str| Some(tenant)
         },
         Issuer::custom("pipeline").expect("issuer name"),
         bearer.to_string(),
@@ -142,7 +144,7 @@ async fn secret_reader_credentials(
         .await
         .map_err(|e| AwsStsError::Transport(format!("web identity token file: {e}")))?;
     let request = AssumeRoleWithWebIdentityRequest::new(&svc.role_arn, "ledger", token.trim())
-        .with_duration_seconds(900);
+        .with_duration(std::time::Duration::from_secs(900))?;
     svc.sts.assume_role_with_web_identity(&request).await
 }
 
@@ -161,7 +163,7 @@ async fn job_assumes_deploy_role(
     id_token: &str,
 ) -> Result<AssumeRoleWithWebIdentityResponse, AwsStsError> {
     let request = AssumeRoleWithWebIdentityRequest::new(DEPLOY_ROLE, "ci-deploy", id_token)
-        .with_duration_seconds(900);
+        .with_duration(std::time::Duration::from_secs(900))?;
     sts.assume_role_with_web_identity(&request).await
 }
 // ANCHOR_END: job
@@ -376,7 +378,7 @@ fn expect_sts(err: AwsStsError, status: u16, code: &str, message: &str) {
 
 #[tokio::test]
 async fn job_assumes_the_deploy_role() {
-    let (_server, sts) = sts_server(good_account()).await;
+    let (server, sts) = sts_server(good_account()).await;
     let token = github_id_token(JOB_SUBJECT, STS_AUDIENCE);
     let out = job_assumes_deploy_role(&sts, &token).await.unwrap();
     assert_eq!(
@@ -385,29 +387,39 @@ async fn job_assumes_the_deploy_role() {
     );
     assert_eq!(out.subject_from_web_identity_token, JOB_SUBJECT);
     assert_eq!(&*out.credentials.access_key_id, "ASIAEXAMPLEKEY");
+    drop(server);
 }
 
 struct Fixture {
     app: Router,
     pipeline_token: String,
-    _server: MockServer,
+    // Held so the mock STS outlives the test, and ended by the fixture's
+    // `Drop`.
+    server: Option<MockServer>,
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        drop(self.server.take());
+    }
 }
 
 async fn fixture(account: MockSts, pod_token: &str, pipeline_audience: &str) -> Fixture {
+    let clock = MockClock::at_reference();
     let (server, sts) = sts_server(account).await;
-    let (der, jwks) = common::rsa_keypair("pipe-1");
-    let (now, exp) = common::now_and_exp();
-    let pipeline_token = common::sign(
+    let (der, jwks) = signing::rsa_keypair("pipe-1");
+    let (now, exp) = signing::now_and_exp();
+    let pipeline_token = signing::sign(
         &serde_json::json!({
             "iss": CALLER_ISSUER,
-            "sub": "project_path:gnomes/ledger:ref_type:branch:ref:main",
+            "sub": "project_path:example-group/ledger:ref_type:branch:ref:main",
             "aud": pipeline_audience,
             "exp": exp,
             "iat": now,
             "namespace_id": "1204",
-            "namespace_path": "gnomes",
+            "namespace_path": "example-group",
             "project_id": "4711",
-            "project_path": "gnomes/ledger",
+            "project_path": "example-group/ledger",
             "ref": "main",
             "ref_type": "branch",
             "ref_protected": "true",
@@ -417,7 +429,7 @@ async fn fixture(account: MockSts, pod_token: &str, pipeline_audience: &str) -> 
         &der,
     );
     let svc = Service {
-        verifier: common::build_verifier(jwks, CALLER_ISSUER, CALLER_AUDIENCE),
+        verifier: verifier::build_verifier(&clock, jwks, CALLER_ISSUER, CALLER_AUDIENCE),
         trust: TrustDomain::new("pipelines").unwrap(),
         tenant: TenantId::from_bytes([7u8; 16]),
         sts,
@@ -427,7 +439,7 @@ async fn fixture(account: MockSts, pod_token: &str, pipeline_audience: &str) -> 
     Fixture {
         app: router(svc),
         pipeline_token,
-        _server: server,
+        server: Some(server),
     }
 }
 
@@ -481,8 +493,11 @@ async fn trust_policy_sub_not_matching_the_job_is_access_denied() {
     // A job on a feature branch asks for the role whose trust policy names
     // `main`. The token is valid and its audience is right; the condition on
     // `:sub` refuses it.
-    let (_server, sts) = sts_server(good_account()).await;
-    let token = github_id_token("repo:gnomes/axess:ref:refs/heads/feature-x", STS_AUDIENCE);
+    let (server, sts) = sts_server(good_account()).await;
+    let token = github_id_token(
+        "repo:example-org/example-repo:ref:refs/heads/feature-x",
+        STS_AUDIENCE,
+    );
     let err = job_assumes_deploy_role(&sts, &token).await.unwrap_err();
     expect_sts(
         err,
@@ -490,16 +505,18 @@ async fn trust_policy_sub_not_matching_the_job_is_access_denied() {
         "AccessDenied",
         "Not authorized to perform sts:AssumeRoleWithWebIdentity",
     );
+    drop(server);
 }
 
 #[tokio::test]
 async fn token_audience_missing_from_the_provider_client_ids_is_invalid_identity_token() {
     // The workflow asked GitHub for an ID token with a custom `aud`; the IAM
     // provider only lists `sts.amazonaws.com` as a client ID.
-    let (_server, sts) = sts_server(good_account()).await;
+    let (server, sts) = sts_server(good_account()).await;
     let token = github_id_token(JOB_SUBJECT, "axess-platform");
     let err = job_assumes_deploy_role(&sts, &token).await.unwrap_err();
     expect_sts(err, 400, "InvalidIdentityToken", "Incorrect token audience");
+    drop(server);
 }
 
 #[tokio::test]
@@ -520,7 +537,7 @@ async fn issuer_without_an_iam_oidc_provider_is_invalid_identity_token() {
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert_eq!(body, "upstream identity exchange failed");
 
-    let (_server, sts) = sts_server(MockSts {
+    let (server, sts) = sts_server(MockSts {
         providers: vec![],
         roles: vec![],
     })
@@ -539,6 +556,7 @@ async fn issuer_without_an_iam_oidc_provider_is_invalid_identity_token() {
         "InvalidIdentityToken",
         &format!("No OpenIDConnect provider found in your account for https://{EKS_HOST}"),
     );
+    drop(server);
 }
 
 // ── Startup ─────────────────────────────────────────────────────────────────

@@ -26,8 +26,8 @@ where
     /// [`oauth_for_session`](crate::authn::service::RequestAuthnService::oauth_for_session)
     /// or
     /// [`oauth_in_tenant`](crate::authn::service::RequestAuthnService::oauth_in_tenant),
-    /// which resolve through this method; the by-name methods on the service
-    /// read the global registrations only.
+    /// which resolve through this method; no helper takes a provider by its
+    /// name alone.
     ///
     /// # Errors
     ///
@@ -63,13 +63,25 @@ where
     /// and the JARM form) resolves the provider for that stored tenant, so
     /// the callback request chooses neither the tenant nor the provider.
     ///
+    /// The callback names the route it arrived on,
+    /// [`OAuthCallbackRoute::of_tenant`](crate::authn::service::OAuthCallbackRoute::of_tenant),
+    /// and is refused on any route but this tenant's for this provider.
+    /// Give each tenant's provider a redirect URI of its own, with the
+    /// tenant in the path (`/callback/{tenant}/{provider}`), and register
+    /// that URI at the tenant's identity provider: two tenants' providers of
+    /// one name are then two routes, and a code one authorization server
+    /// issued cannot be finished at another's.
+    ///
     /// # Errors
     ///
     /// [`OAuthError::UnknownProvider`] when no per-tenant source is
     /// configured or the tenant has no provider by that name; the source's
     /// own error when it fails; everything
     /// [`begin_oauth_login`](Self::begin_oauth_login) reports.
-    #[tracing::instrument(skip(self, options, session))]
+    #[tracing::instrument(
+        skip(self, provider_name, options, session),
+        fields(provider_name = %super::super::logged_provider_name(provider_name))
+    )]
     pub async fn begin_oauth_login_with_tenant_provider(
         &self,
         provider_name: &str,

@@ -89,7 +89,7 @@
 //!
 //! The tax lands only on the inline form. `Static` and `Shared` already
 //! hold a `&str` and measure level with the alternatives. Equality,
-//! ordering and hashing were moved off this path onto the bytes, so what
+//! ordering and hashing work on the bytes, off this path, so what
 //! still pays is `Deref`, `Display`, and handing the value to a `&str`
 //! API.
 //!
@@ -120,28 +120,26 @@
 //!
 //! # Why this is not an Umbra string
 //!
-//! It was one: a 16-byte union with a tag bit in the length field, a
-//! hand-rolled heap allocation carrying its own `AtomicU32` refcount,
-//! and an `unsafe impl Sync`. It was the only `unsafe` in the axess
-//! workspace.
+//! An Umbra layout is a 16-byte union with a tag bit in the length field, a
+//! hand-rolled heap allocation carrying its own `AtomicU32` refcount, and an
+//! `unsafe impl Sync`: it would be the only `unsafe` in the axess workspace.
 //!
-//! It was replaced by the enum above because the measured cost of doing
-//! so, on the workload that actually runs, is nil. Those 42-byte ids
-//! exceed every inline buffer in play, so the union and the enum both
-//! allocate and both bump a refcount, and they land in the same band:
-//! construct 31.2 ns against 37.2 ns for a bare `Arc<str>`, clone
-//! 4.74 ns against 4.96 ns.
+//! The enum above costs nothing measurable beside it on the workload that
+//! actually runs. Those 42-byte ids exceed every inline buffer in play, so
+//! the union and the enum both allocate and both bump a refcount, and they
+//! land in the same band: construct 31.2 ns against 37.2 ns for a bare
+//! `Arc<str>`, clone 4.74 ns against 4.96 ns.
 //!
-//! Where the buffer does engage, between 13 and 22 bytes, the wider one
-//! is a clear gain over the old 12-byte limit: constructing a 22-byte id
-//! fell from ~24 ns to ~4 ns and cloning one from ~7.7 ns to ~3.0 ns,
-//! because it stopped allocating. The old layout won only on cloning ids
-//! of twelve bytes or fewer, by about 1.4 ns.
+//! Where the buffer does engage, between 13 and 22 bytes, the wider one is a
+//! clear gain over a union's 12-byte limit: a 22-byte id is constructed in
+//! ~4 ns against ~24 ns and cloned in ~3.0 ns against ~7.7 ns, because it
+//! does not allocate. The union wins only on cloning ids of twelve bytes or
+//! fewer, by about 1.4 ns.
 //!
-//! What the union really bought was eight bytes of struct footprint and
-//! a twelve-byte-leaner allocation header for long strings. Those are
-//! real, and they are memory rather than time. They were judged not to
-//! be worth twenty `unsafe` blocks in an authentication library.
+//! What a union buys is eight bytes of struct footprint and a
+//! twelve-byte-leaner allocation header for long strings. Those are real,
+//! and they are memory rather than time; they are not worth twenty `unsafe`
+//! blocks in an authentication library.
 //!
 //! # Quick start
 //!
@@ -258,12 +256,12 @@ impl ShortString {
     ///
     /// // A 42-byte SPIFFE-derived subject id does allocate; a clone of
     /// // it is then a refcount bump rather than a copy.
-    /// let id = ShortString::new("spiffe://gnomes.local/compute-worker/gnomes");
+    /// let id = ShortString::new("spiffe://example.org/reporting-worker/acme");
     /// assert!(id.is_allocated());
     ///
     /// // A compile-time-known one of the same length does not.
     /// const ID: ShortString =
-    ///     ShortString::from_static("spiffe://gnomes.local/compute-worker/gnomes");
+    ///     ShortString::from_static("spiffe://example.org/reporting-worker/acme");
     /// assert!(!ID.is_allocated());
     /// assert!(!ID.is_inline());
     /// ```

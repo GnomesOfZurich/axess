@@ -11,6 +11,56 @@ use crate::authn::{
 };
 use crate::session::extractor::AuthSession;
 
+/// What a discoverable (passwordless) login is begun with: the tenant it
+/// may finish in, and how the browser presents it.
+///
+/// The default is a login bound to no tenant and presented in the browser's
+/// autofill. [`begin_discoverable_login`](crate::authn::service::AuthnService::begin_discoverable_login)
+/// differs in one thing: it sends the challenge as the provider issued it,
+/// where the default prompt writes conditional mediation into it.
+///
+/// ```rust
+/// use axess_core::authn::factor::DiscoverablePrompt;
+/// use axess_core::authn::ids::TenantId;
+/// use axess_core::authn::service::DiscoverableLogin;
+///
+/// // A "use a passkey on your phone" button on one tenant's login page.
+/// let tenant = TenantId::try_new("7f1c4c0e-3f5b-4a51-9a0f-2f1d5c8b9e10")?;
+/// let login = DiscoverableLogin::default()
+///     .in_tenant(tenant)
+///     .with_prompt(DiscoverablePrompt::CrossDevice);
+/// assert_eq!(login.tenant, Some(tenant));
+/// assert_eq!(login.prompt, DiscoverablePrompt::CrossDevice);
+/// # Ok::<(), axess_core::authn::ids::IdError>(())
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiscoverableLogin {
+    /// The tenant the login may finish in: a user of any other tenant is
+    /// refused with [`AuthnError::CrossTenant`]. `None` binds the ceremony
+    /// to no tenant. Name one on any login page that belongs to a tenant,
+    /// since a discoverable credential names a user and says nothing of
+    /// tenants.
+    pub tenant: Option<crate::authn::ids::TenantId>,
+    /// How the browser presents the login.
+    pub prompt: crate::authn::factor::DiscoverablePrompt,
+}
+
+impl DiscoverableLogin {
+    /// The same login, bound to `tenant_id`.
+    #[must_use]
+    pub fn in_tenant(mut self, tenant_id: crate::authn::ids::TenantId) -> Self {
+        self.tenant = Some(tenant_id);
+        self
+    }
+
+    /// The same login, presented as `prompt` says.
+    #[must_use]
+    pub fn with_prompt(mut self, prompt: crate::authn::factor::DiscoverablePrompt) -> Self {
+        self.prompt = prompt;
+        self
+    }
+}
+
 impl<I, F> RequestAuthnService<I, F>
 where
     I: IdentityStore,
@@ -53,7 +103,7 @@ where
         let builder = AuthEventBuilder::failure(AuthEventType::FactorVerified)
             .maybe_attributed_to(known.map(|(u, _)| u), known.map(|(_, t)| t))
             .with_factor(FactorKind::Fido2)
-            .with_session(session.session_id().await)
+            .with_session(session.session_key().await)
             .with_error(AuthFailureReason::CrossTenant);
         match self.emit_audit(builder).await {
             Ok(()) => AuthnError::CrossTenant,
@@ -90,6 +140,16 @@ where
     /// `FactorVerified` row (`cross_tenant`) against the user's tenant of
     /// record, never against the tenant the caller supplied.
     ///
+    /// The assertion's user handle (`response.userHandle`) must be present
+    /// and equal [`User::webauthn_id`](crate::authn::types::User::webauthn_id)
+    /// of `user`: an assertion with no handle, one whose handle names another
+    /// account, and a `user` with no handle on record are refused as a failed
+    /// assertion ([`AuthnError::InvalidAssertion`], counted and audited),
+    /// with the ceremony consumed. The handle is not signed, so it adds no
+    /// proof of its own; it is the check WebAuthn asks for when the request
+    /// named no credential, and it catches a lookup that resolved the
+    /// credential id to the wrong account.
+    ///
     /// `credentials` is the list the caller verifies the assertion against,
     /// and only the entries the store holds for `user`, with the same
     /// credential id and the same public key, are used. A passkey that
@@ -123,24 +183,18 @@ where
         result
     }
 
-    /// The body of [`finish_discoverable_login`](Self::finish_discoverable_login):
-    /// the gates, then the assertion.
-    async fn finish_discoverable_login_gated(
+    /// The gates a passwordless login passes before its ceremony is looked
+    /// at: the tenant of record, the account's status, the tenant's own
+    /// gates and the lockout. Each refusal retires the ceremony.
+    async fn admit_discoverable_login(
         &self,
-        assertion: &webauthn_rs::prelude::PublicKeyCredential,
         user: &crate::authn::types::User,
-        credentials: &[crate::authn::factor::Fido2Credential],
         session: &AuthSession,
-    ) -> Result<FactorOutcome, AuthnError<I::Error>> {
-        let fido2 = self.inner.fido2.load_full();
-        let webauthn = match &fido2 {
-            Some(w) => w,
-            None => return Err(AuthnError::NoFlow),
-        };
-
+    ) -> Result<(), AuthnError<I::Error>> {
         // The tenant rail first. The caller resolved `user` from the
-        // credential's user handle, which names a user and carries no
-        // tenant; the tenant of record is the store's, and every gate below
+        // assertion's credential id or its user handle, neither of which
+        // carries a tenant; the tenant of record is the store's, and every
+        // gate below
         // (the tenant's status and IP policy, the lockout policy, the audit
         // rows) must run against it rather than against whatever the caller
         // put on the record. A mismatch ends the ceremony here.
@@ -166,8 +220,8 @@ where
                 .await);
         }
         // The tenant's own gates, as `begin_login` runs them: its status
-        // and its IP policy. The passkey path used to skip both, so a
-        // suspended tenant, or an allowlisted one, still logged in here.
+        // and its IP policy. Without them a suspended tenant, or one with
+        // an allowlist, would still log in through a passkey.
         if let std::ops::ControlFlow::Break(_) = self
             .admit_tenant_by_id(&user.identifier, &user.tenant_id)
             .await?
@@ -185,11 +239,30 @@ where
                 AuthEventBuilder::locked(AuthEventType::FactorVerified)
                     .attributed_to(&user.id, &user.tenant_id)
                     .with_factor(FactorKind::Fido2)
-                    .with_session(session.session_id().await),
+                    .with_session(session.session_key().await),
             )
             .await?;
             return Err(AuthnError::Locked { until: lock.until });
         }
+        Ok(())
+    }
+
+    /// The body of [`finish_discoverable_login`](Self::finish_discoverable_login):
+    /// the gates, then the assertion.
+    async fn finish_discoverable_login_gated(
+        &self,
+        assertion: &webauthn_rs::prelude::PublicKeyCredential,
+        user: &crate::authn::types::User,
+        credentials: &[crate::authn::factor::Fido2Credential],
+        session: &AuthSession,
+    ) -> Result<FactorOutcome, AuthnError<I::Error>> {
+        let fido2 = self.inner.fido2.load_full();
+        let webauthn = match &fido2 {
+            Some(w) => w,
+            None => return Err(AuthnError::NoFlow),
+        };
+
+        self.admit_discoverable_login(user, session).await?;
 
         if self
             .is_ceremony_expired(session, fido2_keys::DISC_STATE)
@@ -234,6 +307,20 @@ where
             return Err(self
                 .refuse_cross_tenant(Some((&user.id, &user.tenant_id)), session)
                 .await);
+        }
+
+        // The assertion names its user by the handle the authenticator
+        // stored with the credential. A ceremony that named no credential
+        // must carry one, and it must be the handle of the user the caller
+        // resolved: the credential id says which credential signed, the
+        // handle says whose the authenticator holds it to be, and the two
+        // have to agree before any key is tried.
+        if !names_user(assertion, user) {
+            tracing::warn!(
+                user_id = %user.id,
+                "discoverable login refused: the assertion's user handle is absent or names another user"
+            );
+            return Err(self.discoverable_failure(user, session).await);
         }
 
         let user_scope = AuthnScope::User {
@@ -344,7 +431,7 @@ where
                 AuthEventBuilder::failure(AuthEventType::FactorVerified)
                     .attributed_to(&user.id, &user.tenant_id)
                     .with_factor(FactorKind::Fido2)
-                    .with_session(session.session_id().await)
+                    .with_session(session.session_key().await)
                     .with_error(AuthFailureReason::from("method_not_passkey_first")),
             )
             .await?;
@@ -386,9 +473,19 @@ where
 
         // Device-binding hook for the credential that just satisfied this
         // assertion, after the step completed: see `verify_fido2_factor`.
-        if let Some(device_id) = session.device_id().await {
-            webauthn.on_credential_used(auth_result.cred_id(), &device_id);
-        }
+        super::credential_used(webauthn, auth_result.cred_id(), session).await;
         Ok(outcome)
+    }
+}
+
+/// Whether `assertion` carries the WebAuthn user handle of `user`: present,
+/// and the sixteen bytes of the handle on the user's record.
+fn names_user(
+    assertion: &webauthn_rs::prelude::PublicKeyCredential,
+    user: &crate::authn::types::User,
+) -> bool {
+    match (assertion.get_user_unique_id(), user.webauthn_id) {
+        (Some(handle), Some(recorded)) => handle == recorded.as_bytes().as_slice(),
+        _ => false,
     }
 }

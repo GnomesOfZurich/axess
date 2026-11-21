@@ -9,7 +9,7 @@
 //! disagrees with the original).
 use super::*;
 use crate::session::data::SessionData;
-use crate::session::id::SessionId;
+use crate::session::id::{SessionId, SessionKey};
 use axess_rng::SystemRng;
 use sqlx::sqlite::SqlitePoolOptions;
 
@@ -28,8 +28,8 @@ async fn store() -> SqliteSessionStore {
     store
 }
 
-fn sample_id() -> SessionId {
-    SessionId::new(&SystemRng)
+fn sample_id() -> SessionKey {
+    SessionKey::of(&SessionId::new(&SystemRng))
 }
 
 fn payload_with_custom() -> SessionData {
@@ -45,7 +45,7 @@ fn payload_with_custom() -> SessionData {
 /// the load must see the same second: a fixed clock, not the wall.
 #[tokio::test]
 async fn zero_ttl_update_reports_false_and_sub_second_ttl_stays_loadable() {
-    let clock = Arc::new(axess_clock::testing::MockClock::now());
+    let clock = Arc::new(axess_clock::testing::MockClock::at_reference());
     let pool = memory_pool().await;
     let store = SqliteSessionStore::plaintext_insecure(pool).with_clock(clock);
     store.init_schema().await.expect("init_schema");
@@ -75,7 +75,7 @@ async fn zero_ttl_update_reports_false_and_sub_second_ttl_stays_loadable() {
     );
 }
 
-async fn rows_under(store: &SqliteSessionStore, id: &SessionId) -> i64 {
+async fn rows_under(store: &SqliteSessionStore, id: &SessionKey) -> i64 {
     sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sessions WHERE id = ?1")
         .bind(id.to_string())
         .fetch_one(&store.pool)
@@ -197,7 +197,7 @@ async fn zero_ttl_cycle_removes_both_rows_and_reports_the_session_gone() {
 
 #[tokio::test]
 async fn init_schema_creates_sessions_table() {
-    // Pins line 90 body against `Ok(())`. After init_schema, an
+    // Pins the body against `Ok(())`. After init_schema, an
     // INSERT into `sessions` succeeds; if the body was replaced
     // by `Ok(())`, the table would not exist and the save below
     // would fail.
@@ -217,7 +217,7 @@ async fn init_schema_creates_sessions_table() {
 
 #[tokio::test]
 async fn save_then_load_returns_persisted_payload() {
-    // Pins lines 165 (load body), 187 (save body) against
+    // Pins the bodies of `load` and `save` against
     // `Ok(None)`, `Ok(Some(Default::default()))`, and `Ok(())`.
     // The mutations would either drop the persisted row or
     // return a default; the round-trip catches both.
@@ -253,7 +253,7 @@ async fn load_of_absent_key_returns_none() {
 
 #[tokio::test]
 async fn delete_actually_removes_row() {
-    // Pins line 208 body against `Ok(())`. With the mutation,
+    // Pins the body against `Ok(())`. With the mutation,
     // delete still returns Ok(()), but the row remains;
     // load() afterwards would still find it.
     let store = store().await;
@@ -275,7 +275,7 @@ async fn delete_actually_removes_row() {
 
 #[tokio::test]
 async fn cycle_atomically_swaps_session_ids() {
-    // Pins line 223 body against `Ok(())`. Real cycle replaces
+    // Pins the body against `Ok(())`. Real cycle replaces
     // old_id row with new_id row; mutated cycle returns Ok(())
     // without doing the swap; so old row stays and new row
     // never appears.
@@ -308,7 +308,7 @@ async fn cycle_atomically_swaps_session_ids() {
 
 #[tokio::test]
 async fn cleanup_expired_returns_real_row_count() {
-    // Pins line 111 against `Ok(0)` and `Ok(1)` mutations.
+    // Pins `cleanup_expired` against `Ok(0)` and `Ok(1)` mutations.
     // Save two sessions with negative TTL (already expired);
     // cleanup_expired must return 2, not 0 or 1.
     let store = store().await;
@@ -335,13 +335,13 @@ async fn cleanup_expired_returns_real_row_count() {
 
 #[tokio::test]
 async fn prune_expired_trait_surface_matches_inherent() {
-    // Pins line 252 body against `Ok(0)` and `Ok(1)`. After
+    // Pins the body against `Ok(0)` and `Ok(1)`. After
     // inserting three expired rows, prune_expired must
     // delegate to cleanup_expired and return 3.
     let store = store().await;
     for _ in 0..3 {
         sqlx::query("INSERT INTO sessions (id, data, expires_at) VALUES (?1, '{}', 0)")
-            .bind(SessionId::new(&SystemRng).to_string())
+            .bind(SessionKey::of(&SessionId::new(&SystemRng)).to_string())
             .execute(&store.pool)
             .await
             .expect("manual insert");
@@ -359,7 +359,7 @@ async fn prune_expired_trait_surface_matches_inherent() {
 /// it at that same second rather than one sweep later.
 #[tokio::test]
 async fn the_sweep_removes_a_row_at_the_second_it_expires() {
-    let clock = Arc::new(axess_clock::testing::MockClock::now());
+    let clock = Arc::new(axess_clock::testing::MockClock::at_reference());
     let pool = memory_pool().await;
     let store = SqliteSessionStore::plaintext_insecure(pool).with_clock(clock.clone());
     store.init_schema().await.expect("init_schema");

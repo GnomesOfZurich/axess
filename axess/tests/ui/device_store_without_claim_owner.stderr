@@ -1,0 +1,7 @@
+error[E0046]: not all trait items implemented, missing: `claim_owner`
+  --> tests/ui/device_store_without_claim_owner.rs:17:1
+   |
+17 | impl DeviceStore for Wrapped {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `claim_owner` in implementation
+   |
+   = help: implement the missing item: `fn claim_owner(&self, _: &axess_core::TenantId, _: &DeviceId, _: &axess_core::UserId, _: Timestamp) -> impl Future<Output = Result<OwnerClaim, <Self as axess_core::DeviceStore>::Error>> + Send { todo!() }`

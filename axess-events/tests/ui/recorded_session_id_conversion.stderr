@@ -1,0 +1,11 @@
+error[E0277]: the trait bound `RecordedSessionId: From<SessionId>` is not satisfied
+  --> tests/ui/recorded_session_id_conversion.rs:10:32
+   |
+10 |     let _: RecordedSessionId = converted(SessionId::NIL);
+   |                                ^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `From<SessionId>` is not implemented for `RecordedSessionId`
+   |
+note: required by a bound in `converted`
+  --> tests/ui/recorded_session_id_conversion.rs:5:17
+   |
+ 5 | fn converted<T: From<SessionId>>(id: SessionId) -> T {
+   |                 ^^^^^^^^^^^^^^^ required by this bound in `converted`

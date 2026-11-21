@@ -1,6 +1,8 @@
+use axess_clock::testing::Shift;
 use std::sync::{Arc, Mutex};
 
 use super::*;
+use crate::testing::MockClock;
 use axess_factors::jwt::verifier::JwtVerifier;
 use serde::Deserialize;
 
@@ -11,17 +13,20 @@ struct CustomClaims {}
 
 #[tokio::test]
 async fn issuance_listener_fires_per_mint() {
+    let clock = MockClock::at_reference();
     let recorder = Arc::new(MockIssuanceListener::new());
-    let idp = LocalIdpFixture::new("https://idp").with_issuance_listener(recorder.clone());
+    let idp = LocalIdpFixture::new("https://idp")
+        .with_clock(clock.clone())
+        .with_issuance_listener(recorder.clone());
 
-    let now = Utc::now();
+    let now = axess_clock::testing::MockClock::reference_time();
     idp.mint(
-        &MintClaims::new("alice", now + Duration::hours(1))
+        &MintClaims::new("alice", now.plus(SignedDuration::hours(1)))
             .with_audience("https://api")
             .with_issued_at(now),
     );
     idp.mint(
-        &MintClaims::new("bob", now + Duration::hours(1))
+        &MintClaims::new("bob", now.plus(SignedDuration::hours(1)))
             .with_audience("https://api")
             .with_issued_at(now),
     );
@@ -38,12 +43,15 @@ async fn issuance_listener_fires_per_mint() {
 
 #[tokio::test]
 async fn issuance_listener_captures_optional_claims() {
+    let clock = MockClock::at_reference();
     let recorder = Arc::new(MockIssuanceListener::new());
-    let idp = LocalIdpFixture::new("https://idp").with_issuance_listener(recorder.clone());
+    let idp = LocalIdpFixture::new("https://idp")
+        .with_clock(clock.clone())
+        .with_issuance_listener(recorder.clone());
 
-    let now = Utc::now();
+    let now = axess_clock::testing::MockClock::reference_time();
     idp.mint(
-        &MintClaims::new("alice", now + Duration::hours(1))
+        &MintClaims::new("alice", now.plus(SignedDuration::hours(1)))
             .with_audience("https://api")
             .with_issued_at(now)
             .with_not_before(now)
@@ -58,12 +66,15 @@ async fn issuance_listener_captures_optional_claims() {
 
 #[tokio::test]
 async fn issuance_listener_captures_multi_audience() {
+    let clock = MockClock::at_reference();
     let recorder = Arc::new(MockIssuanceListener::new());
-    let idp = LocalIdpFixture::new("https://idp").with_issuance_listener(recorder.clone());
+    let idp = LocalIdpFixture::new("https://idp")
+        .with_clock(clock.clone())
+        .with_issuance_listener(recorder.clone());
 
-    let now = Utc::now();
+    let now = axess_clock::testing::MockClock::reference_time();
     idp.mint(
-        &MintClaims::new("alice", now + Duration::hours(1))
+        &MintClaims::new("alice", now.plus(SignedDuration::hours(1)))
             .with_audiences(["https://api", "https://other"])
             .with_issued_at(now),
     );
@@ -77,14 +88,16 @@ async fn issuance_listener_captures_multi_audience() {
 
 #[tokio::test]
 async fn issuance_listener_records_kid_after_rotation() {
+    let clock = MockClock::at_reference();
     let recorder = Arc::new(MockIssuanceListener::new());
-    let k1 = LocalIdpSigningKey::generate_rsa().with_key_id("k1");
-    let k2 = LocalIdpSigningKey::generate_rsa().with_key_id("k2");
+    let k1 = LocalIdpSigningKey::generate_es256().with_key_id("k1");
+    let k2 = LocalIdpSigningKey::generate_es256().with_key_id("k2");
     let idp = LocalIdpFixture::with_signing_key("https://idp", k1)
+        .with_clock(clock.clone())
         .with_issuance_listener(recorder.clone());
 
-    let now = Utc::now();
-    let claims = MintClaims::new("alice", now + Duration::hours(1))
+    let now = axess_clock::testing::MockClock::reference_time();
+    let claims = MintClaims::new("alice", now.plus(SignedDuration::hours(1)))
         .with_audience("https://api")
         .with_issued_at(now);
     idp.mint(&claims);
@@ -101,24 +114,29 @@ async fn issuance_listener_records_kid_after_rotation() {
 #[tokio::test]
 #[should_panic(expected = "max_ttl")]
 async fn issuance_listener_does_not_fire_when_max_ttl_violated() {
+    let clock = MockClock::at_reference();
     let recorder = Arc::new(MockIssuanceListener::new());
     let idp = LocalIdpFixture::new("https://idp")
-        .with_max_ttl(Duration::minutes(5))
+        .with_clock(clock.clone())
+        .with_max_ttl(std::time::Duration::from_mins(5))
         .with_issuance_listener(recorder.clone());
-    let now = Utc::now();
-    let _ = idp.mint(&MintClaims::new("alice", now + Duration::hours(2)).with_issued_at(now));
+    let now = axess_clock::testing::MockClock::reference_time();
+    let _ =
+        idp.mint(&MintClaims::new("alice", now.plus(SignedDuration::hours(2))).with_issued_at(now));
 }
 
 #[tokio::test]
 async fn issuance_listener_replaced_on_second_call() {
+    let clock = MockClock::at_reference();
     let first = Arc::new(MockIssuanceListener::new());
     let second = Arc::new(MockIssuanceListener::new());
     let idp = LocalIdpFixture::new("https://idp")
+        .with_clock(clock.clone())
         .with_issuance_listener(first.clone())
         .with_issuance_listener(second.clone());
 
-    let now = Utc::now();
-    idp.mint(&MintClaims::new("alice", now + Duration::hours(1)).with_issued_at(now));
+    let now = axess_clock::testing::MockClock::reference_time();
+    idp.mint(&MintClaims::new("alice", now.plus(SignedDuration::hours(1))).with_issued_at(now));
 
     assert_eq!(first.count(), 0, "replaced listener must not be invoked");
     assert_eq!(second.count(), 1, "current listener captures the mint");
@@ -126,10 +144,13 @@ async fn issuance_listener_replaced_on_second_call() {
 
 #[tokio::test]
 async fn recording_issuance_listener_clear_resets_count() {
+    let clock = MockClock::at_reference();
     let recorder = Arc::new(MockIssuanceListener::new());
-    let idp = LocalIdpFixture::new("https://idp").with_issuance_listener(recorder.clone());
-    let now = Utc::now();
-    let claims = MintClaims::new("alice", now + Duration::hours(1)).with_issued_at(now);
+    let idp = LocalIdpFixture::new("https://idp")
+        .with_clock(clock.clone())
+        .with_issuance_listener(recorder.clone());
+    let now = axess_clock::testing::MockClock::reference_time();
+    let claims = MintClaims::new("alice", now.plus(SignedDuration::hours(1))).with_issued_at(now);
     idp.mint(&claims);
     idp.mint(&claims);
     assert_eq!(recorder.count(), 2);
@@ -151,47 +172,55 @@ async fn issuance_listener_accessor_returns_installed() {
 
 #[tokio::test]
 async fn issuance_listener_survives_with_historical_signing_key() {
+    let clock = MockClock::at_reference();
     let recorder = Arc::new(MockIssuanceListener::new());
-    let key = LocalIdpSigningKey::generate_rsa();
+    let key = LocalIdpSigningKey::generate_es256();
     let idp = LocalIdpFixture::new("https://idp")
+        .with_clock(clock.clone())
         .with_issuance_listener(recorder.clone())
         .with_historical_signing_key(key);
-    let now = Utc::now();
-    idp.mint(&MintClaims::new("alice", now + Duration::hours(1)).with_issued_at(now));
+    let now = axess_clock::testing::MockClock::reference_time();
+    idp.mint(&MintClaims::new("alice", now.plus(SignedDuration::hours(1))).with_issued_at(now));
     assert_eq!(recorder.count(), 1);
 }
 
 #[tokio::test]
 async fn issuance_listener_survives_with_extra_public_jwk() {
+    let clock = MockClock::at_reference();
     let recorder = Arc::new(MockIssuanceListener::new());
-    let foreign = LocalIdpSigningKey::generate_rsa().with_key_id("foreign");
+    let foreign = LocalIdpSigningKey::generate_es256().with_key_id("foreign");
     let idp = LocalIdpFixture::new("https://idp")
+        .with_clock(clock.clone())
         .with_issuance_listener(recorder.clone())
         .with_extra_public_jwk(foreign.jwk().clone());
-    let now = Utc::now();
-    idp.mint(&MintClaims::new("alice", now + Duration::hours(1)).with_issued_at(now));
+    let now = axess_clock::testing::MockClock::reference_time();
+    idp.mint(&MintClaims::new("alice", now.plus(SignedDuration::hours(1))).with_issued_at(now));
     assert_eq!(recorder.count(), 1);
 }
 
 #[tokio::test]
 async fn issuance_listener_survives_with_max_ttl() {
+    let clock = MockClock::at_reference();
     let recorder = Arc::new(MockIssuanceListener::new());
     let idp = LocalIdpFixture::new("https://idp")
+        .with_clock(clock.clone())
         .with_issuance_listener(recorder.clone())
-        .with_max_ttl(Duration::hours(2));
-    let now = Utc::now();
-    idp.mint(&MintClaims::new("alice", now + Duration::hours(1)).with_issued_at(now));
+        .with_max_ttl(std::time::Duration::from_hours(2));
+    let now = axess_clock::testing::MockClock::reference_time();
+    idp.mint(&MintClaims::new("alice", now.plus(SignedDuration::hours(1))).with_issued_at(now));
     assert_eq!(recorder.count(), 1);
 }
 
 #[tokio::test]
 async fn issuance_listener_survives_with_key_id() {
+    let clock = MockClock::at_reference();
     let recorder = Arc::new(MockIssuanceListener::new());
     let idp = LocalIdpFixture::new("https://idp")
+        .with_clock(clock.clone())
         .with_issuance_listener(recorder.clone())
         .with_key_id("custom");
-    let now = Utc::now();
-    idp.mint(&MintClaims::new("alice", now + Duration::hours(1)).with_issued_at(now));
+    let now = axess_clock::testing::MockClock::reference_time();
+    idp.mint(&MintClaims::new("alice", now.plus(SignedDuration::hours(1))).with_issued_at(now));
     assert_eq!(recorder.count(), 1);
     assert_eq!(recorder.events()[0].key_id, "custom");
 }
@@ -201,23 +230,26 @@ async fn issuance_listener_fires_for_mint_jwt_svid() {
     let recorder = Arc::new(MockIssuanceListener::new());
     let idp = LocalIdpFixture::new("https://idp").with_issuance_listener(recorder.clone());
     let _ = idp.mint_jwt_svid(
-        "test.gnomes",
+        "test.example.org",
         "worker",
         "acme",
         "https://api",
-        Duration::minutes(5),
+        SignedDuration::minutes(5),
     );
     let event = recorder.events().pop().expect("one event recorded");
-    assert_eq!(event.subject, "spiffe://test.gnomes/worker/acme");
+    assert_eq!(event.subject, "spiffe://test.example.org/worker/acme");
     assert_eq!(event.audience, vec!["https://api".to_string()]);
 }
 
 #[tokio::test]
 async fn issuance_listener_fires_for_mint_with_header() {
+    let clock = MockClock::at_reference();
     let recorder = Arc::new(MockIssuanceListener::new());
-    let idp = LocalIdpFixture::new("https://idp").with_issuance_listener(recorder.clone());
-    let now = Utc::now();
-    let claims = MintClaims::new("alice", now + Duration::hours(1))
+    let idp = LocalIdpFixture::new("https://idp")
+        .with_clock(clock.clone())
+        .with_issuance_listener(recorder.clone());
+    let now = axess_clock::testing::MockClock::reference_time();
+    let claims = MintClaims::new("alice", now.plus(SignedDuration::hours(1)))
         .with_audience("https://api")
         .with_issued_at(now);
     let mut header = jsonwebtoken::Header::new(idp.algorithm());
@@ -249,10 +281,13 @@ impl IssuanceListener for CountingListener {
 
 #[tokio::test]
 async fn custom_issuance_listener_implementation_works() {
+    let clock = MockClock::at_reference();
     let counter = Arc::new(CountingListener::default());
-    let idp = LocalIdpFixture::new("https://idp").with_issuance_listener(counter.clone());
-    let now = Utc::now();
-    let claims = MintClaims::new("alice", now + Duration::hours(1)).with_issued_at(now);
+    let idp = LocalIdpFixture::new("https://idp")
+        .with_clock(clock.clone())
+        .with_issuance_listener(counter.clone());
+    let now = axess_clock::testing::MockClock::reference_time();
+    let claims = MintClaims::new("alice", now.plus(SignedDuration::hours(1))).with_issued_at(now);
     idp.mint(&claims);
     idp.mint(&claims);
     idp.mint(&claims);
@@ -263,10 +298,10 @@ async fn custom_issuance_listener_implementation_works() {
 
 #[tokio::test]
 async fn from_ec_pem_accepts_sec1_pem() {
+    let clock = MockClock::at_reference();
     use p256::SecretKey;
-    use p256::elliptic_curve::rand_core::OsRng;
 
-    let secret = SecretKey::random(&mut OsRng);
+    let secret = SecretKey::from_slice(&[0x22; 32]).expect("a scalar below the curve order");
     let sec1_pem = secret
         .to_sec1_pem(p256::pkcs8::LineEnding::LF)
         .expect("SEC1 PEM encode")
@@ -278,14 +313,15 @@ async fn from_ec_pem_accepts_sec1_pem() {
     assert_eq!(key.key_id(), "sec1-pem-kid");
     assert_eq!(key.algorithm(), Algorithm::ES256);
 
-    let idp = LocalIdpFixture::with_signing_key("https://idp", key);
-    let now = Utc::now();
+    let idp = LocalIdpFixture::with_signing_key("https://idp", key).with_clock(clock.clone());
+    let now = axess_clock::testing::MockClock::reference_time();
     let token = idp.mint(
-        &MintClaims::new("alice", now + Duration::hours(1))
+        &MintClaims::new("alice", now.plus(SignedDuration::hours(1)))
             .with_audience("https://api")
             .with_issued_at(now),
     );
     let verifier = JwtVerifier::new(idp.jwks_handle())
+        .with_clock(Arc::new(clock.clone()))
         .with_audience("https://api")
         .allow_any_issuer()
         .with_algorithms(idp.verifier_algorithms());
@@ -297,11 +333,14 @@ async fn from_ec_pem_accepts_sec1_pem() {
 
 #[tokio::test]
 async fn mint_with_header_fires_issuance_listener() {
+    let clock = MockClock::at_reference();
     let recorder = Arc::new(MockIssuanceListener::new());
-    let idp = LocalIdpFixture::new("https://idp").with_issuance_listener(recorder.clone());
+    let idp = LocalIdpFixture::new("https://idp")
+        .with_clock(clock.clone())
+        .with_issuance_listener(recorder.clone());
 
-    let now = Utc::now();
-    let claims = MintClaims::new("alice", now + Duration::hours(1))
+    let now = axess_clock::testing::MockClock::reference_time();
+    let claims = MintClaims::new("alice", now.plus(SignedDuration::hours(1)))
         .with_audience("https://api")
         .with_issued_at(now);
 
@@ -322,11 +361,11 @@ async fn mint_with_header_fires_issuance_listener() {
 async fn max_ttl_survives_with_issuance_listener() {
     let recorder = Arc::new(MockIssuanceListener::new());
     let idp = LocalIdpFixture::new("https://idp")
-        .with_max_ttl(Duration::minutes(5))
+        .with_max_ttl(std::time::Duration::from_mins(5))
         .with_issuance_listener(recorder.clone());
     assert_eq!(
         idp.max_ttl(),
-        Some(Duration::minutes(5)),
+        Some(std::time::Duration::from_mins(5)),
         "with_issuance_listener must preserve max_ttl"
     );
 }

@@ -22,10 +22,9 @@
 //! - the calling pipelines read top-to-bottom, with orthogonal
 //!   concerns delegated rather than nested in `if let` ladders.
 //!
-//! Before this split, `verify_factor` was 345 lines in one
-//! method; afterwards it is a ~50-line pipeline. `prepare_factor`'s
-//! account-status block was a copy-paste of `verify_factor`'s; both
-//! now share [`RequestAuthnService::enforce_account_status`].
+//! `verify_factor` is a short pipeline of these steps, and
+//! `prepare_factor` and `verify_factor` share one account-status block,
+//! [`RequestAuthnService::enforce_account_status`].
 //!
 //! [`AuthnError::NoFlow`]: crate::authn::error::AuthnError::NoFlow
 
@@ -62,10 +61,15 @@ use crate::session::extractor::AuthSession;
 pub(super) enum AccountStatusEnforcement {
     /// Account is in good standing: proceed.
     Ok,
-    /// Account is `Suspended`. Audit row already emitted.
+    /// Account is `Suspended`, or the failure counter locks it. Audit row
+    /// already emitted.
     Locked {
-        /// Suspension expiry, when set; `None` means indefinite.
-        until: Option<chrono::DateTime<chrono::Utc>>,
+        /// When the lockout ends, for a lockout derived from the counter or
+        /// kept by a store as a `Suspended` state with
+        /// [`StatusCause::Lockout`](crate::authn::types::StatusCause::Lockout);
+        /// `None` for an indefinite one and for every other suspension,
+        /// whose cause and end are not the caller's to learn here.
+        until: Option<axess_clock::Until>,
     },
     /// Account is in some other non-login-allowing state
     /// (`Pending`, `Terminated`, `Archived`, `Candidate`, `Guest`).
@@ -79,6 +83,27 @@ pub(super) enum AccountStatusEnforcement {
         /// How long until a guess under the key runs again.
         retry_after: std::time::Duration,
     },
+}
+
+/// The end of a suspension that an answer to the caller may carry.
+///
+/// The end is shown for a lockout a store keeps as a state, and for nothing
+/// else: an administrative hold, a pending verification or a closure answers
+/// as an indefinite lockout does, so a step after a passed factor does not
+/// say that an operator holds the account or until when. Every place that
+/// answers [`FactorOutcome::Locked`] or [`AuthnError::Locked`] from a stored
+/// account status reads the end here: the status read before a factor step,
+/// the one read after a session is registered, the refusal of a passkey
+/// ceremony and the status gate of an OAuth completion cannot differ.
+pub(super) fn shown_suspension_end(status: &EntityState) -> Option<axess_clock::Until> {
+    match status {
+        EntityState::Suspended(detail)
+            if detail.cause == crate::authn::types::StatusCause::Lockout =>
+        {
+            detail.until
+        }
+        _ => None,
+    }
 }
 
 impl<I, F> RequestAuthnService<I, F>
@@ -109,16 +134,26 @@ where
         let status = self.current_account_status(user_id).await?;
 
         if status.is_suspended() {
-            let until = if let EntityState::Suspended(detail) = &status {
-                detail.until
-            } else {
-                None
-            };
-            self.record_locked_attempt_audit(user_id, tenant_id, next_kind, session)
-                .await?;
+            // The audit row is the same for every suspension; the end shown
+            // to the caller is not.
+            let until = shown_suspension_end(&status);
+            self.record_locked_attempt_audit(
+                user_id,
+                tenant_id,
+                next_kind,
+                session.session_key().await,
+            )
+            .await?;
             return Ok(AccountStatusEnforcement::Locked { until });
         }
         if !status.allows_login() {
+            self.record_not_active_attempt_audit(
+                user_id,
+                tenant_id,
+                next_kind,
+                session.session_key().await,
+            )
+            .await?;
             return Ok(AccountStatusEnforcement::NotActive(status));
         }
         // The counter is the lockout, whatever the store did with the
@@ -129,8 +164,13 @@ where
             .await?
         {
             self.inner.metrics.auth_flow.account_locked();
-            self.record_locked_attempt_audit(user_id, tenant_id, next_kind, session)
-                .await?;
+            self.record_locked_attempt_audit(
+                user_id,
+                tenant_id,
+                next_kind,
+                session.session_key().await,
+            )
+            .await?;
             return Ok(AccountStatusEnforcement::Locked { until: lock.until });
         }
         // The throttle, after the lock: a guess inside its delay is refused
@@ -143,6 +183,36 @@ where
             return Ok(AccountStatusEnforcement::Throttled { retry_after });
         }
         Ok(AccountStatusEnforcement::Ok)
+    }
+
+    /// The tenant's lockout policy as the pipeline applies it: the store's
+    /// policy clamped into its bounds by
+    /// [`LockoutPolicy::bounded`](crate::authn::types::LockoutPolicy::bounded).
+    ///
+    /// The policy's fields are public and a store builds one from its rows,
+    /// so a value past a bound reaches here; the request is served under
+    /// the clamped policy, which is at least as closed as the one asked
+    /// for, and the fault is reported once per service at error level with
+    /// the field and the bound, so the operator sees what the store holds.
+    pub(super) fn lockout_policy(
+        &self,
+        tenant_id: &TenantId,
+    ) -> crate::authn::types::LockoutPolicy {
+        let policy = self.inner.identity.lockout_policy_for_tenant(tenant_id);
+        if let Err(fault) = policy.validate()
+            && !self
+                .inner
+                .lockout_policy_fault_reported
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::error!(
+                tenant = %tenant_id,
+                %fault,
+                "the tenant's lockout policy is past a bound; the bound is applied \
+                 (reported once per service)"
+            );
+        }
+        policy.bounded()
     }
 
     /// The lockout the failure counter and the tenant's policy impose now,
@@ -162,7 +232,7 @@ where
         user_id: &UserId,
         tenant_id: &TenantId,
     ) -> Result<Option<crate::authn::types::DerivedLockout>, AuthnError<I::Error>> {
-        let policy = self.inner.identity.lockout_policy_for_tenant(tenant_id);
+        let policy = self.lockout_policy(tenant_id);
         let now = self.inner.clock.now();
         match self.inner.identity.failed_attempts(user_id).await {
             Ok((count, last)) => Ok(policy.derived_lockout(count, last, now)),
@@ -177,9 +247,7 @@ where
                 );
                 Ok(match policy.on_counter_unavailable {
                     CounterUnavailable::Lock => Some(crate::authn::types::DerivedLockout {
-                        until: policy
-                            .duration
-                            .and_then(|d| chrono::Duration::from_std(d).ok().map(|d| now + d)),
+                        until: policy.lockout_until(now),
                     }),
                     CounterUnavailable::Allow => None,
                 })
@@ -232,16 +300,40 @@ where
 
     /// Emit the `FactorVerified Failure` audit row for an
     /// attempt against a locked account.
-    async fn record_locked_attempt_audit(
+    pub(super) async fn record_locked_attempt_audit(
         &self,
         user_id: &UserId,
         tenant_id: &TenantId,
         next_kind: Option<FactorKind>,
-        session: &AuthSession,
+        session: crate::session::id::SessionKey,
     ) -> Result<(), AuthnError<I::Error>> {
         let mut builder = AuthEventBuilder::locked(AuthEventType::FactorVerified)
             .attributed_to(user_id, tenant_id)
-            .with_session(session.session_id().await);
+            .with_session(session);
+        if let Some(k) = next_kind {
+            builder = builder.with_factor(k);
+        }
+        self.emit_audit(builder).await
+    }
+
+    /// Write the `FactorVerified Failure` row naming `not_active` for an
+    /// attempt refused because the account is in a state that may not log in
+    /// and is not suspended (a suspension writes the locked row).
+    ///
+    /// The check before the factor step and the status read after a session
+    /// is registered both write this row, so the same state leaves the same
+    /// row on either path.
+    pub(super) async fn record_not_active_attempt_audit(
+        &self,
+        user_id: &UserId,
+        tenant_id: &TenantId,
+        next_kind: Option<FactorKind>,
+        session: crate::session::id::SessionKey,
+    ) -> Result<(), AuthnError<I::Error>> {
+        let mut builder = AuthEventBuilder::failure(AuthEventType::FactorVerified)
+            .attributed_to(user_id, tenant_id)
+            .with_error(crate::authn::event::AuthFailureReason::NotActive)
+            .with_session(session);
         if let Some(k) = next_kind {
             builder = builder.with_factor(k);
         }
@@ -268,7 +360,7 @@ where
                 AuthEventBuilder::failure(AuthEventType::FactorVerified)
                     .attributed_to(user_id, tenant_id)
                     .with_factor(current_kind.clone())
-                    .with_session(session.session_id().await)
+                    .with_session(session.session_key().await)
                     .build_at(self.inner.clock.now()),
             )
             .await
@@ -290,8 +382,8 @@ where
     ///
     /// The counter moves BEFORE the audit row is written. The audit write
     /// is an await, and a request cancelled there (a client disconnect, a
-    /// timeout) used to drop the future before the increment, so a guess
-    /// the client abandoned was never counted and an attacker could probe
+    /// timeout) drops the future: were the increment after it, a guess the
+    /// client abandoned would never be counted and an attacker could probe
     /// without limit by hanging up. A lost audit row is logged; a lost
     /// count is a brute-force window.
     ///
@@ -334,7 +426,7 @@ where
     ) -> Result<FactorOutcome, AuthnError<I::Error>> {
         self.inner.metrics.factors.factor_failure();
 
-        let policy = self.inner.identity.lockout_policy_for_tenant(tenant_id);
+        let policy = self.lockout_policy(tenant_id);
 
         let counted = match reserved {
             Some(n) => Ok(n),
@@ -358,12 +450,9 @@ where
                     // `begin_login` with timing equalization.
                     CounterUnavailable::Lock => {
                         self.inner.metrics.auth_flow.account_locked();
-                        let until = policy.duration.and_then(|d| {
-                            chrono::Duration::from_std(d)
-                                .ok()
-                                .map(|d| self.inner.clock.now() + d)
-                        });
-                        FactorOutcome::Locked { until }
+                        FactorOutcome::Locked {
+                            until: policy.lockout_until(self.inner.clock.now()),
+                        }
                     }
                     // Fail open. Logins keep working and lockout is disabled
                     // until the counter comes back.
@@ -407,12 +496,9 @@ where
             // the suspension row at the same moment). UIs avoid a
             // follow-up `enforce_account_status` round-trip to learn
             // the expiry.
-            let until = policy.duration.and_then(|d| {
-                chrono::Duration::from_std(d)
-                    .ok()
-                    .map(|d| self.inner.clock.now() + d)
+            return Ok(FactorOutcome::Locked {
+                until: policy.lockout_until(self.inner.clock.now()),
             });
-            return Ok(FactorOutcome::Locked { until });
         }
         Ok(FactorOutcome::InvalidCredential)
     }
@@ -430,10 +516,7 @@ mod tests;
 /// Email OTP and HOTP rows carry a failure counter and return the row with
 /// one more failure recorded at `now`; every other kind has none and gives
 /// `None`, so the caller falls back to the config it computed or stops.
-fn recount_failure(
-    existing: &FactorConfig,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Option<FactorConfig> {
+fn recount_failure(existing: &FactorConfig, now: axess_clock::Timestamp) -> Option<FactorConfig> {
     match existing {
         FactorConfig::EmailOtp(otp) => Some(FactorConfig::EmailOtp(apply_email_otp_failure(otp))),
         FactorConfig::Hotp(otp) => Some(FactorConfig::Hotp(apply_hotp_failure(otp, now))),

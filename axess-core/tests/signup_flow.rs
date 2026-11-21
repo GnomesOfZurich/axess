@@ -2,7 +2,8 @@
 
 #![cfg(feature = "testing")]
 
-mod common;
+use axess_clock::testing::Shift;
+use axess_core::testing::fixtures as common;
 
 use axess_core::authn::Actor;
 use axess_core::authn::{AuditContext, RequestAuthnService};
@@ -21,13 +22,12 @@ use axess_core::{
         test_session,
     },
 };
-use chrono::Utc;
 use common::{test_tenant, tid, uid};
 
 /// Candidate-status variant of [`common::test_user`]; signup flow tests need
 /// a user in `EntityState::Candidate` before activation.
 fn candidate_user(id: &str, identifier: &str) -> User {
-    let now = Utc::now();
+    let now = common::start();
     User {
         id: uid(id),
         tenant_id: tid("t1"),
@@ -43,9 +43,15 @@ fn candidate_user(id: &str, identifier: &str) -> User {
 }
 
 fn make_service() -> RequestAuthnService<MockIdentityStore, MockFactorStore> {
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
+    let clock = common::test_clock();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
     let factors = MockFactorStore::new();
-    AuthnService::new(identity, factors).with_audit_context(AuditContext::default())
+    AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
+        .build()
+        .with_audit_context(AuditContext::default())
 }
 
 /// Begin a signup and return the verification secret it minted.
@@ -72,7 +78,7 @@ async fn begin(
 async fn begin_signup_moves_the_session_to_a_fresh_id() {
     let service = make_service();
     let session = test_session();
-    let before = session.session_id().await;
+    let before = session.session_key().await;
 
     let user = candidate_user("u1", "alice@example.com");
     let outcome = service
@@ -81,7 +87,7 @@ async fn begin_signup_moves_the_session_to_a_fresh_id() {
         .unwrap();
 
     assert!(matches!(outcome, SignupOutcome::Started(_)));
-    assert_ne!(session.session_id().await, before);
+    assert_ne!(session.session_key().await, before);
 }
 
 #[tokio::test]
@@ -114,8 +120,13 @@ async fn begin_signup_creates_user_and_sets_pending_workflow() {
 
 #[tokio::test]
 async fn begin_signup_stores_the_user_in_the_tenant_it_validated() {
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let service = AuthnService::new(identity.clone(), MockFactorStore::new())
+    let clock = common::test_clock();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
+    let service = AuthnService::builder(identity.clone(), MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build()
         .with_audit_context(AuditContext::default());
     let session = test_session();
 
@@ -138,15 +149,18 @@ async fn begin_signup_stores_the_user_in_the_tenant_it_validated() {
 
 #[tokio::test]
 async fn begin_signup_active_user_returns_already_exists() {
+    let clock = common::test_clock();
     // An *active* user cannot be overwritten by a fresh signup.
     // Only orphan Candidates resume; Active accounts must reject.
     let mut active_user = candidate_user("u1", "alice@example.com");
     active_user.status = EntityState::Active;
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(active_user);
     let factors = MockFactorStore::new();
     let service = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
         .with_signup_conflicts_revealed()
         .build()
         .with_audit_context(AuditContext::default());
@@ -169,11 +183,14 @@ async fn begin_signup_active_user_returns_already_exists() {
 /// again (an idempotent resubmit).
 #[tokio::test]
 async fn begin_signup_orphan_candidate_is_not_handed_to_a_stranger() {
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(candidate_user("u1", "alice@example.com"));
     let factors = MockFactorStore::new();
     let service = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
         .with_signup_conflicts_revealed()
         .build()
         .with_audit_context(AuditContext::default());
@@ -200,8 +217,13 @@ async fn begin_signup_orphan_candidate_is_not_handed_to_a_stranger() {
 /// session, already bound to the user, and gets `Started` once more.
 #[tokio::test]
 async fn begin_signup_resubmit_from_the_pending_session_is_idempotent() {
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let service = AuthnService::new(identity, MockFactorStore::new())
+    let clock = common::test_clock();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
+    let service = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build()
         .with_audit_context(AuditContext::default());
     let session = test_session();
     let user = candidate_user("u1", "alice@example.com");
@@ -219,10 +241,14 @@ async fn begin_signup_resubmit_from_the_pending_session_is_idempotent() {
 
 #[tokio::test]
 async fn begin_signup_bad_tenant_returns_tenant_not_active() {
+    let clock = common::test_clock();
     // No tenants registered.
-    let identity = MockIdentityStore::new();
+    let identity = MockIdentityStore::new().with_clock(clock.clone());
     let factors = MockFactorStore::new();
-    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
+    let service = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
+        .build()
+        .with_audit_context(AuditContext::default());
     let session = test_session();
 
     let user = candidate_user("u1", "alice@example.com");
@@ -265,10 +291,15 @@ async fn complete_signup_without_pending_workflow_returns_no_flow() {
 
 #[tokio::test]
 async fn signup_records_audit_events() {
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
+    let clock = common::test_clock();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
     let factors = MockFactorStore::new();
-    let service =
-        AuthnService::new(identity.clone(), factors).with_audit_context(AuditContext::default());
+    let service = AuthnService::builder(identity.clone(), factors)
+        .with_clock(clock.clone())
+        .build()
+        .with_audit_context(AuditContext::default());
     let session = test_session();
 
     let user = candidate_user("u1", "alice@example.com");
@@ -285,10 +316,12 @@ async fn signup_records_audit_events() {
 
 #[tokio::test]
 async fn suspend_user_changes_status() {
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user({
-            let now = Utc::now();
+            let now = common::start();
             User {
                 id: uid("u1"),
                 tenant_id: tid("t1"),
@@ -303,10 +336,12 @@ async fn suspend_user_changes_status() {
             }
         });
     let factors = MockFactorStore::new();
-    let service =
-        AuthnService::new(identity.clone(), factors).with_audit_context(AuditContext::default());
+    let service = AuthnService::builder(identity.clone(), factors)
+        .with_clock(clock.clone())
+        .build()
+        .with_audit_context(AuditContext::default());
 
-    let detail = StatusDetail::administrative("policy violation", Utc::now());
+    let detail = StatusDetail::administrative("policy violation", common::start());
     service
         .suspend_user_across_tenants(Actor::System, &uid("u1"), detail)
         .await
@@ -324,10 +359,12 @@ async fn suspend_user_changes_status() {
 
 #[tokio::test]
 async fn activate_user_changes_status() {
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user({
-            let now = Utc::now();
+            let now = common::start();
             User {
                 id: uid("u1"),
                 tenant_id: tid("t1"),
@@ -342,8 +379,10 @@ async fn activate_user_changes_status() {
             }
         });
     let factors = MockFactorStore::new();
-    let service =
-        AuthnService::new(identity.clone(), factors).with_audit_context(AuditContext::default());
+    let service = AuthnService::builder(identity.clone(), factors)
+        .with_clock(clock.clone())
+        .build()
+        .with_audit_context(AuditContext::default());
 
     service
         .activate_user_across_tenants(Actor::System, &uid("u1"))
@@ -360,10 +399,12 @@ async fn activate_user_changes_status() {
 
 #[tokio::test]
 async fn suspend_then_reactivate() {
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user({
-            let now = Utc::now();
+            let now = common::start();
             User {
                 id: uid("u1"),
                 tenant_id: tid("t1"),
@@ -378,11 +419,13 @@ async fn suspend_then_reactivate() {
             }
         });
     let factors = MockFactorStore::new();
-    let service =
-        AuthnService::new(identity.clone(), factors).with_audit_context(AuditContext::default());
+    let service = AuthnService::builder(identity.clone(), factors)
+        .with_clock(clock.clone())
+        .build()
+        .with_audit_context(AuditContext::default());
 
     // Suspend.
-    let detail = StatusDetail::administrative("investigation", Utc::now());
+    let detail = StatusDetail::administrative("investigation", common::start());
     service
         .suspend_user_across_tenants(Actor::System, &uid("u1"), detail)
         .await
@@ -409,6 +452,143 @@ async fn suspend_then_reactivate() {
     );
 }
 
+// ── Suspend / activate by a named administrator ─────────────────────────────
+
+/// A service over one user of tenant `t1` in the given state, and its store.
+fn service_over_user(
+    status: EntityState,
+) -> (
+    RequestAuthnService<MockIdentityStore, MockFactorStore>,
+    MockIdentityStore,
+) {
+    let clock = common::test_clock();
+    let mut user = common::test_user("u1", "alice");
+    user.status = status;
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant())
+        .with_user(user);
+    let service = AuthnService::builder(identity.clone(), MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build()
+        .with_audit_context(AuditContext::default());
+    (service, identity)
+}
+
+/// The one audit row the store holds: its type, its subject and its actor.
+fn only_event(identity: &MockIdentityStore) -> (AuthEventType, Option<UserId>, Option<UserId>) {
+    let events = identity.events();
+    assert_eq!(events.len(), 1, "{events:?}");
+    (
+        events[0].event_type.clone(),
+        events[0].user_id,
+        events[0].actor_id,
+    )
+}
+
+/// A tenant's administrator suspends a user of that tenant: the account is
+/// suspended and the row names the administrator beside the user.
+#[tokio::test]
+async fn a_suspension_by_a_tenant_administrator_names_them() {
+    let (service, identity) = service_over_user(EntityState::Active);
+    let admin = uid("admin");
+
+    service
+        .suspend_user(
+            Actor::Admin(&admin),
+            &uid("u1"),
+            &tid("t1"),
+            StatusDetail::administrative("policy violation", common::start()),
+        )
+        .await
+        .unwrap();
+
+    let status = identity.account_status(&uid("u1")).await.unwrap();
+    assert!(status.is_suspended(), "{status:?}");
+    assert_eq!(
+        only_event(&identity),
+        (
+            AuthEventType::AccountSuspended,
+            Some(uid("u1")),
+            Some(admin)
+        )
+    );
+}
+
+/// The form without the tenant rail records the operator the same way.
+#[tokio::test]
+async fn a_suspension_across_tenants_names_the_operator() {
+    let (service, identity) = service_over_user(EntityState::Active);
+    let operator = uid("operator");
+
+    service
+        .suspend_user_across_tenants(
+            Actor::Admin(&operator),
+            &uid("u1"),
+            StatusDetail::administrative("policy violation", common::start()),
+        )
+        .await
+        .unwrap();
+
+    let status = identity.account_status(&uid("u1")).await.unwrap();
+    assert!(status.is_suspended(), "{status:?}");
+    assert_eq!(
+        only_event(&identity),
+        (
+            AuthEventType::AccountSuspended,
+            Some(uid("u1")),
+            Some(operator)
+        )
+    );
+}
+
+/// A tenant's administrator activates a user of that tenant: the account is
+/// active and the row names the administrator beside the user.
+#[tokio::test]
+async fn an_activation_by_a_tenant_administrator_names_them() {
+    let (service, identity) = service_over_user(EntityState::Candidate);
+    let admin = uid("admin");
+
+    service
+        .activate_user(Actor::Admin(&admin), &uid("u1"), &tid("t1"))
+        .await
+        .unwrap();
+
+    let status = identity.account_status(&uid("u1")).await.unwrap();
+    assert!(status.is_active(), "{status:?}");
+    assert_eq!(
+        only_event(&identity),
+        (
+            AuthEventType::AccountActivated,
+            Some(uid("u1")),
+            Some(admin)
+        )
+    );
+}
+
+/// The form without the tenant rail records the operator the same way.
+#[tokio::test]
+async fn an_activation_across_tenants_names_the_operator() {
+    let (service, identity) = service_over_user(EntityState::Candidate);
+    let operator = uid("operator");
+
+    service
+        .activate_user_across_tenants(Actor::Admin(&operator), &uid("u1"))
+        .await
+        .unwrap();
+
+    let status = identity.account_status(&uid("u1")).await.unwrap();
+    assert!(status.is_active(), "{status:?}");
+    assert_eq!(
+        only_event(&identity),
+        (
+            AuthEventType::AccountActivated,
+            Some(uid("u1")),
+            Some(operator)
+        )
+    );
+}
+
 // ── Input validation tests ───────────────────────────────────────────────────
 
 #[tokio::test]
@@ -416,7 +596,7 @@ async fn signup_rejects_oversized_identifier() {
     let service = make_service();
     let session = test_session();
 
-    let now = Utc::now();
+    let now = common::start();
     let user = User {
         id: uid("u1"),
         tenant_id: tid("t1"),
@@ -438,7 +618,7 @@ async fn signup_rejects_control_chars_in_display_name() {
     let service = make_service();
     let session = test_session();
 
-    let now = Utc::now();
+    let now = common::start();
     let user = User {
         id: uid("u1"),
         tenant_id: tid("t1"),
@@ -460,8 +640,13 @@ async fn signup_rejects_control_chars_in_display_name() {
 /// login reads it.
 #[tokio::test]
 async fn complete_signup_admits_a_tenant_whose_timed_suspension_has_lapsed() {
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let service = AuthnService::new(identity.clone(), MockFactorStore::new())
+    let clock = common::test_clock();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
+    let service = AuthnService::builder(identity.clone(), MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build()
         .with_audit_context(AuditContext::default());
     let session = test_session();
     let secret = begin(
@@ -473,8 +658,13 @@ async fn complete_signup_admits_a_tenant_whose_timed_suspension_has_lapsed() {
 
     let mut lapsed = test_tenant();
     lapsed.status = EntityState::Suspended(
-        StatusDetail::administrative("hold", Utc::now() - chrono::Duration::hours(2))
-            .with_until(Some(Utc::now() - chrono::Duration::hours(1))),
+        StatusDetail::administrative(
+            "hold",
+            common::start().minus(axess_clock::SignedDuration::hours(2)),
+        )
+        .with_until(Some(axess_clock::Until::At(
+            common::start().minus(axess_clock::SignedDuration::hours(1)),
+        ))),
     );
     let _ = identity.clone().with_tenant(lapsed);
 
@@ -488,8 +678,13 @@ async fn complete_signup_admits_a_tenant_whose_timed_suspension_has_lapsed() {
 /// activation: the tenant's status is read again, not taken from the begin.
 #[tokio::test]
 async fn complete_signup_refuses_a_tenant_suspended_since_the_begin() {
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let service = AuthnService::new(identity.clone(), MockFactorStore::new())
+    let clock = common::test_clock();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
+    let service = AuthnService::builder(identity.clone(), MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build()
         .with_audit_context(AuditContext::default());
     let session = test_session();
     let secret = begin(
@@ -500,7 +695,8 @@ async fn complete_signup_refuses_a_tenant_suspended_since_the_begin() {
     .await;
 
     let mut suspended = test_tenant();
-    suspended.status = EntityState::Suspended(StatusDetail::administrative("hold", Utc::now()));
+    suspended.status =
+        EntityState::Suspended(StatusDetail::administrative("hold", common::start()));
     let _ = identity.clone().with_tenant(suspended);
 
     let result = service.complete_signup(&session, &secret).await;
@@ -555,9 +751,10 @@ async fn the_pending_signup_holds_a_digest_not_the_secret() {
 /// stops working.
 #[tokio::test]
 async fn an_expired_or_replaced_secret_completes_nothing() {
-    use axess_clock::testing::MockClock;
-    let clock = MockClock::at(Utc::now());
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
+    let clock = common::test_clock();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
     let service = AuthnService::builder(identity, MockFactorStore::new())
         .with_clock(clock.clone())
         .with_signup_verification_ttl(std::time::Duration::from_secs(3600))
@@ -567,7 +764,7 @@ async fn an_expired_or_replaced_secret_completes_nothing() {
     let user = candidate_user("u1", "a@example.com");
     let first = begin(&service, &session, user.clone()).await;
 
-    clock.advance(chrono::Duration::minutes(61));
+    clock.advance(axess_clock::SignedDuration::minutes(61));
     let result = service.complete_signup(&session, &first).await;
     assert!(
         matches!(result, Err(AuthnError::InvalidAssertion)),

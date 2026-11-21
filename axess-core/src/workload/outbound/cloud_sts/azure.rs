@@ -31,7 +31,7 @@
 //! As with the other [`crate::workload::outbound::cloud_sts`] adapters,
 //! axess does not mint Azure-bound OIDC tokens directly; the
 //! federated token comes from K8s SA, GitHub Actions OIDC, axess's
-//! own `LocalIdP` (forthcoming), or any other JWT the configured
+//! own `LocalIdP` (feature `local-idp`), or any other JWT the configured
 //! Azure FIC trusts.
 //!
 //! # Example
@@ -56,10 +56,10 @@ use std::time::Duration;
 use reqwest::header::CONTENT_TYPE;
 use serde::Deserialize;
 use url::Url;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
-use super::log_safe;
 use crate::authn::factor::ZeroizedString;
+use axess_factors::http_body::log_safe;
 
 /// Time allowed for one token request from send to last response byte,
 /// unless [`AzureFicClient::with_timeout`] says otherwise.
@@ -89,11 +89,16 @@ fn token_endpoint_for_tenant(tenant: &str) -> Url {
 // ── Request ──────────────────────────────────────────────────────────────────
 
 /// Inputs to an Azure FIC token request.
+///
+/// The federated token is held in a [`ZeroizedString`], whose buffer is
+/// zeroed when the request is dropped. Copies made by `Clone` are each zeroed
+/// when they drop; the form body reqwest builds from the token is beyond this
+/// type's reach.
 #[derive(Clone)]
 pub struct AzureFicRequest {
     /// The federated token: passed as `client_assertion` in the
-    /// `client_credentials` form body.
-    pub federated_token: String,
+    /// `client_credentials` form body. Zeroed on drop.
+    pub federated_token: ZeroizedString,
     /// Requested scopes. Azure's v2.0 endpoint expects one
     /// resource-scoped value, typically `{resource}/.default`
     /// (e.g. `https://graph.microsoft.com/.default`).
@@ -111,22 +116,13 @@ impl std::fmt::Debug for AzureFicRequest {
     }
 }
 
-impl Drop for AzureFicRequest {
-    /// Zeroes the federated token's buffer. Copies made by `Clone` are
-    /// each zeroed when they drop; the form body reqwest builds from the
-    /// token is beyond this type's reach.
-    fn drop(&mut self) {
-        self.federated_token.zeroize();
-    }
-}
-
 impl AzureFicRequest {
     /// Build with just the federated token. Add scopes via
     /// [`with_scope`](Self::with_scope) or
     /// [`with_scopes`](Self::with_scopes).
     pub fn new(federated_token: impl Into<String>) -> Self {
         Self {
-            federated_token: federated_token.into(),
+            federated_token: ZeroizedString::new(federated_token),
             scopes: Vec::new(),
         }
     }
@@ -230,16 +226,7 @@ impl AzureFicClient {
         tenant: impl AsRef<str>,
         client_id: impl Into<String>,
     ) -> Result<Self, AzureFicError> {
-        Self::from_builder(tenant, client_id, reqwest::Client::builder())
-    }
-
-    /// [`new`](Self::new) on a builder the caller started.
-    fn from_builder(
-        tenant: impl AsRef<str>,
-        client_id: impl Into<String>,
-        builder: reqwest::ClientBuilder,
-    ) -> Result<Self, AzureFicError> {
-        let http = crate::outbound_http::harden(builder)?;
+        let http = crate::outbound_http::hardened_client(|settings| settings)?;
         Ok(Self {
             token_endpoint: Arc::new(token_endpoint_for_tenant(tenant.as_ref())),
             client_id: client_id.into(),
@@ -266,17 +253,31 @@ impl AzureFicClient {
         self
     }
 
-    /// Override the HTTP client: useful for proxy or outbound mTLS
-    /// configuration. The request timeout applies whichever client is used.
+    /// Add settings to the HTTP client of the token request: a `User-Agent`, a
+    /// trusted root certificate, a client certificate for outbound mTLS,
+    /// timeouts.
     ///
-    /// A replacement client drops the default client's protections: it must
-    /// be built with `redirect(reqwest::redirect::Policy::none())` and a
-    /// connect timeout, or a redirect carries the credential-bearing request
-    /// to wherever it points. The endpoint check (HTTPS, or HTTP to a
-    /// loopback host) still applies.
-    pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
-        self.http = http;
-        self
+    /// The client is built again with `configure`'s settings before the
+    /// library's own, so it still follows no redirect: a
+    /// [`ClientSettings`](axess_factors::egress::ClientSettings) offers
+    /// nothing that could change that, and a whole client of the caller's
+    /// own is not taken, since a redirect it followed would carry the
+    /// credentials to wherever it points. A proxy named in the environment
+    /// (`HTTPS_PROXY`) is followed, as before. The endpoint check (HTTPS, or
+    /// HTTP to a loopback host) still applies.
+    ///
+    /// # Errors
+    ///
+    /// [`AzureFicError::ClientBuild`] when the client cannot be built with the
+    /// settings.
+    pub fn with_client_settings(
+        mut self,
+        configure: impl FnOnce(
+            axess_factors::egress::ClientSettings,
+        ) -> axess_factors::egress::ClientSettings,
+    ) -> Result<Self, AzureFicError> {
+        self.http = crate::outbound_http::hardened_client(configure)?;
+        Ok(self)
     }
 
     /// Borrow the token endpoint URL.
@@ -297,12 +298,13 @@ impl AzureFicClient {
         crate::outbound_http::require_https_or_loopback(&self.token_endpoint)
             .map_err(|reason| AzureFicError::Transport(reason.to_string()))?;
         let scope = request.scopes.join(" ");
+        let assertion: &str = &request.federated_token;
         let form: Vec<(&str, &str)> = vec![
             ("grant_type", "client_credentials"),
             ("client_id", &self.client_id),
             ("scope", scope.as_str()),
             ("client_assertion_type", CLIENT_ASSERTION_TYPE_JWT_BEARER),
-            ("client_assertion", &request.federated_token),
+            ("client_assertion", assertion),
         ];
 
         let mut response = self
@@ -316,23 +318,26 @@ impl AzureFicClient {
             .map_err(|e| AzureFicError::Transport(e.to_string()))?;
 
         let status = response.status();
-        // The success body carries the access token, so it is zeroed on drop.
-        let body = Zeroizing::new(
-            axess_factors::http_body::read_for_status(
-                &mut response,
-                axess_factors::http_body::MAX_TOKEN_BODY_BYTES,
-            )
-            .await
-            .map_err(|e| AzureFicError::Transport(e.to_string()))?,
-        );
-        let body = Zeroizing::new(String::from_utf8_lossy(&body).into_owned());
-
         if !status.is_success() {
+            // Read to 64 KiB, so a long description does not cost the code.
+            let body = axess_factors::http_body::ErrorBody::read(&mut response).await;
             return Err(parse_azure_error(status.as_u16(), &body));
         }
+        // The success body carries the access token, so it is zeroed on drop.
+        let body = axess_factors::http_body::read_limited(
+            &mut response,
+            axess_factors::http_body::MAX_TOKEN_BODY_BYTES,
+        )
+        .await
+        .map_err(|e| AzureFicError::Transport(e.to_string()))?;
+        let body = Zeroizing::new(String::from_utf8_lossy(&body).into_owned());
 
-        let parsed: AzureSuccessBody = serde_json::from_str(&body)
-            .map_err(|e| AzureFicError::MalformedResponse(format!("success JSON: {e}")))?;
+        let parsed: AzureSuccessBody = serde_json::from_str(&body).map_err(|e| {
+            AzureFicError::MalformedResponse(format!(
+                "success JSON: {}",
+                axess_factors::http_body::log_safe_parse_error(&e)
+            ))
+        })?;
         if parsed.access_token.is_empty() {
             return Err(AzureFicError::MalformedResponse(
                 "access_token field is empty".to_string(),
@@ -377,8 +382,11 @@ const MAX_DESCRIPTION_BYTES: usize = 512;
 /// The longest `error` code or correlation id kept in an error.
 const MAX_CODE_BYTES: usize = 128;
 
-fn parse_azure_error(http_status: u16, body: &str) -> AzureFicError {
-    match serde_json::from_str::<AzureErrorBody>(body) {
+fn parse_azure_error(
+    http_status: u16,
+    body: &axess_factors::http_body::ErrorBody,
+) -> AzureFicError {
+    match serde_json::from_slice::<AzureErrorBody>(body.as_bytes()) {
         Ok(parsed) => AzureFicError::AzureError {
             http_status,
             error: log_safe(&parsed.error, MAX_CODE_BYTES),
@@ -391,15 +399,29 @@ fn parse_azure_error(http_status: u16, body: &str) -> AzureFicError {
                 .correlation_id
                 .map(|id| log_safe(&id, MAX_CODE_BYTES)),
         },
-        Err(_) => AzureFicError::AzureError {
-            http_status,
-            error: "unknown".to_string(),
-            error_description: log_safe(
-                &format!("non-JSON error body: {body}"),
-                MAX_DESCRIPTION_BYTES,
-            ),
-            error_codes: Vec::new(),
-            correlation_id: None,
+        // A body cut at the read bound still names its code when the code
+        // came before the cut.
+        Err(_) => match body.string_member("error") {
+            Some(code) => AzureFicError::AzureError {
+                http_status,
+                error: log_safe(&code, MAX_CODE_BYTES),
+                error_description: log_safe(
+                    &body.string_member("error_description").unwrap_or_default(),
+                    MAX_DESCRIPTION_BYTES,
+                ),
+                error_codes: Vec::new(),
+                correlation_id: None,
+            },
+            None => AzureFicError::AzureError {
+                http_status,
+                error: "unknown".to_string(),
+                error_description: log_safe(
+                    &format!("non-JSON error body: {}", body.snippet()),
+                    MAX_DESCRIPTION_BYTES,
+                ),
+                error_codes: Vec::new(),
+                correlation_id: None,
+            },
         },
     }
 }

@@ -1,4 +1,5 @@
 use super::*;
+use axess_clock::Timestamp;
 use axess_clock::testing::MockClock;
 use axess_rng::testing::MockRng;
 use base64::Engine as _;
@@ -29,7 +30,7 @@ fn rsa_pems() -> (String, String) {
 
 fn clock_and_rng() -> (MockClock, MockRng) {
     (
-        MockClock::at(chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap()),
+        MockClock::at(Timestamp::from_unix_seconds(1_700_000_000).unwrap()),
         MockRng::new(7),
     )
 }
@@ -44,9 +45,9 @@ fn header(jwt: &str) -> serde_json::Value {
     serde_json::from_slice(&URL_SAFE_NO_PAD.decode(part).expect("base64url")).expect("json")
 }
 
+#[cfg(any(feature = "jwt-aws-lc", feature = "client-assertion-rsa"))]
 #[test]
 fn pkcs1_and_pkcs8_rsa_pems_both_sign() {
-    axess_factors_crypto();
     let (pkcs1, pkcs8) = rsa_pems();
     let (clock, rng) = clock_and_rng();
     for pem in [pkcs1, pkcs8] {
@@ -61,7 +62,6 @@ fn pkcs1_and_pkcs8_rsa_pems_both_sign() {
 
 #[test]
 fn an_ec_pkcs8_pem_signs_es256() {
-    axess_factors_crypto();
     let (clock, rng) = clock_and_rng();
     let signer =
         ClientAssertionSigner::from_pem("c", EC_PKCS8, Algorithm::ES256).expect("an EC PEM");
@@ -85,13 +85,13 @@ fn a_label_that_does_not_suit_the_algorithm_is_refused() {
 
 #[test]
 fn the_assertion_follows_the_injected_clock_and_rng() {
-    axess_factors_crypto();
     let (clock, rng) = clock_and_rng();
     let signer = ClientAssertionSigner::from_pem("axess-client", EC_PKCS8, Algorithm::ES256)
         .expect("an EC PEM")
         .with_key_id("k1")
         .with_x5t_s256("thumb256")
-        .with_assertion_ttl(Duration::from_secs(30));
+        .with_assertion_ttl(Duration::from_secs(30))
+        .expect("a whole number of seconds");
     let jwt = signer
         .mint("https://idp/token", &clock, &rng)
         .expect("signs");
@@ -117,7 +117,6 @@ fn the_assertion_follows_the_injected_clock_and_rng() {
 
 #[test]
 fn a_fixed_audience_wins_over_the_endpoint() {
-    axess_factors_crypto();
     let (clock, rng) = clock_and_rng();
     let signer = ClientAssertionSigner::from_pem("c", EC_PKCS8, Algorithm::ES256)
         .expect("an EC PEM")
@@ -128,16 +127,11 @@ fn a_fixed_audience_wins_over_the_endpoint() {
     assert_eq!(payload(&jwt)["aud"], "https://issuer");
 }
 
-fn axess_factors_crypto() {
-    crate::jwt::ensure_crypto_provider();
-}
-
 /// A symmetric algorithm is refused when the signer is built: an `HS256`
 /// assertion is `client_secret_jwt`, never `private_key_jwt`, and it would
 /// otherwise have been minted at the first request.
 #[test]
 fn a_symmetric_algorithm_is_refused_at_construction() {
-    axess_factors_crypto();
     for alg in [Algorithm::HS256, Algorithm::HS384, Algorithm::HS512] {
         let built = ClientAssertionSigner::new("c", EncodingKey::from_secret(b"shared"), alg);
         assert_eq!(built.err(), Some(ClientAssertionError::Symmetric(alg)));
@@ -151,9 +145,9 @@ fn a_symmetric_algorithm_is_refused_at_construction() {
 /// A key that does not sign under the algorithm fails when the signer is
 /// built, not at the first request; the same key under its own algorithm
 /// builds.
+#[cfg(any(feature = "jwt-aws-lc", feature = "client-assertion-rsa"))]
 #[test]
 fn a_key_that_does_not_suit_the_algorithm_fails_at_construction() {
-    axess_factors_crypto();
     let (_, pkcs8) = rsa_pems();
     let ec_der = {
         let (_, der) = decode_pem(EC_PKCS8).expect("pem");
@@ -179,6 +173,7 @@ fn a_key_that_does_not_suit_the_algorithm_fails_at_construction() {
 }
 
 /// The typed refusals of `from_pem` name what was wrong.
+#[cfg(any(feature = "jwt-aws-lc", feature = "client-assertion-rsa"))]
 #[test]
 fn from_pem_refusals_are_typed() {
     let (pkcs1, _) = rsa_pems();
@@ -209,7 +204,6 @@ fn from_pem_refusals_are_typed() {
 /// reads back from the JSON shape a record has always had.
 #[test]
 fn a_spec_shapes_the_signer_and_keeps_the_stored_json() {
-    axess_factors_crypto();
     let (clock, rng) = clock_and_rng();
     let spec: SignerSpec = serde_json::from_value(serde_json::json!({
         "algorithm": "ES256",
@@ -219,7 +213,7 @@ fn a_spec_shapes_the_signer_and_keeps_the_stored_json() {
         "audience": "https://issuer",
     }))
     .expect("the stored shape reads");
-    assert_eq!(spec.assertion_ttl_secs, None);
+    assert_eq!(spec.assertion_ttl, None);
     let jwt = ClientAssertionSigner::from_spec("c", EC_PKCS8, &spec)
         .expect("builds")
         .mint("https://idp/token", &clock, &rng)
@@ -232,7 +226,7 @@ fn a_spec_shapes_the_signer_and_keeps_the_stored_json() {
     assert_eq!(payload(&jwt)["exp"], 1_700_000_060);
 
     let short = SignerSpec {
-        assertion_ttl_secs: Some(20),
+        assertion_ttl: Some(Duration::from_secs(20)),
         ..SignerSpec::new(Algorithm::ES256)
     };
     let jwt = ClientAssertionSigner::from_spec("c", EC_PKCS8, &short)
@@ -243,4 +237,147 @@ fn a_spec_shapes_the_signer_and_keeps_the_stored_json() {
     assert_eq!(payload(&jwt)["aud"], "https://idp/token");
     let stored = serde_json::to_value(SignerSpec::new(Algorithm::ES256)).unwrap();
     assert!(stored.get("assertion_ttl_secs").is_none(), "{stored}");
+    let stored = serde_json::to_value(&short).unwrap();
+    assert_eq!(stored["assertion_ttl_secs"], 20, "{stored}");
+    let read: SignerSpec = serde_json::from_value(stored).unwrap();
+    assert_eq!(read, short);
+}
+
+/// An assertion lifetime is a whole, non-zero number of seconds, since `exp`
+/// is whole seconds after `iat`: no time, or a fraction of a second, is
+/// refused by name, from a stored spec and from the builder, and is not
+/// stored.
+#[test]
+fn an_assertion_lifetime_that_is_no_time_or_not_whole_seconds_is_refused() {
+    for ttl in [
+        Duration::ZERO,
+        Duration::from_millis(20_500),
+        Duration::from_nanos(1),
+    ] {
+        let spec = SignerSpec {
+            assertion_ttl: Some(ttl),
+            ..SignerSpec::new(Algorithm::ES256)
+        };
+        let refused = ClientAssertionSigner::from_spec("c", EC_PKCS8, &spec).err();
+        assert_eq!(
+            refused,
+            Some(ClientAssertionError::AssertionTtl(ttl)),
+            "{ttl:?}"
+        );
+        let refused = ClientAssertionSigner::from_pem("c", EC_PKCS8, Algorithm::ES256)
+            .expect("an EC PEM")
+            .with_assertion_ttl(ttl)
+            .err();
+        assert_eq!(
+            refused,
+            Some(ClientAssertionError::AssertionTtl(ttl)),
+            "{ttl:?}"
+        );
+        assert!(
+            refused.unwrap().to_string().contains("assertion_ttl"),
+            "the refusal names the setting"
+        );
+        if !ttl.is_zero() {
+            assert!(
+                serde_json::to_value(&spec).is_err(),
+                "{ttl:?} is not stored"
+            );
+        }
+    }
+}
+
+/// The choice is made per algorithm: every RSA one is refused where the
+/// build does not sign with RSA, and passes where it does; the EC and
+/// Edwards algorithms pass either way.
+#[test]
+fn an_rsa_algorithm_is_refused_where_the_build_did_not_choose_it() {
+    for algorithm in RSA_ALGORITHMS {
+        assert_eq!(
+            check_rsa_choice(algorithm, false),
+            Err(ClientAssertionError::RsaNotChosen(algorithm))
+        );
+        assert_eq!(check_rsa_choice(algorithm, true), Ok(()));
+    }
+    for algorithm in [Algorithm::ES256, Algorithm::ES384, Algorithm::EdDSA] {
+        assert_eq!(check_rsa_choice(algorithm, false), Ok(()));
+    }
+}
+
+/// Every RSA algorithm `private_key_jwt` takes.
+const RSA_ALGORITHMS: [Algorithm; 6] = [
+    Algorithm::RS256,
+    Algorithm::RS384,
+    Algorithm::RS512,
+    Algorithm::PS256,
+    Algorithm::PS384,
+    Algorithm::PS512,
+];
+
+/// On `jwt-rust-crypto` without the choice, a signer for every RSA
+/// algorithm is refused by name before its key is read, through each of
+/// the three constructors: text that is no PEM at all is refused as an RSA
+/// algorithm, not as text, and so is a key handed in already built. An EC
+/// key still signs.
+#[cfg(not(any(feature = "jwt-aws-lc", feature = "client-assertion-rsa")))]
+#[test]
+fn an_rsa_signer_is_refused_before_its_key_is_read_on_the_pure_rust_backend() {
+    let (pkcs1, pkcs8) = rsa_pems();
+    for algorithm in RSA_ALGORITHMS {
+        let refused = Some(ClientAssertionError::RsaNotChosen(algorithm));
+        assert_eq!(
+            ClientAssertionSigner::from_pem("c", "not pem", algorithm).err(),
+            refused,
+            "{algorithm:?} from text that is no PEM"
+        );
+        for pem in [&pkcs1, &pkcs8] {
+            assert_eq!(
+                ClientAssertionSigner::from_pem("c", pem, algorithm).err(),
+                refused,
+                "{algorithm:?} from an RSA PEM"
+            );
+        }
+        assert_eq!(
+            ClientAssertionSigner::new("c", EncodingKey::from_rsa_der(&[]), algorithm).err(),
+            refused,
+            "{algorithm:?} from a built key"
+        );
+        let spec = SignerSpec::new(algorithm);
+        assert_eq!(
+            ClientAssertionSigner::from_spec("c", &pkcs1, &spec).err(),
+            refused,
+            "{algorithm:?} from a spec"
+        );
+        assert_eq!(
+            ClientAssertionSigner::from_spec("c", "not pem", &spec).err(),
+            refused,
+            "{algorithm:?} from a spec with text that is no PEM"
+        );
+    }
+    let message = ClientAssertionError::RsaNotChosen(Algorithm::RS256).to_string();
+    assert!(message.contains("client-assertion-rsa"), "{message}");
+    assert!(message.contains("RUSTSEC-2023-0071"), "{message}");
+    let (clock, rng) = clock_and_rng();
+    let signer =
+        ClientAssertionSigner::from_pem("c", EC_PKCS8, Algorithm::ES256).expect("EC signs");
+    assert!(signer.mint("https://idp/token", &clock, &rng).is_ok());
+}
+
+/// Where the build chose RSA (the aws-lc backend, or `client-assertion-rsa`
+/// on the pure-Rust one), an RSA key signs assertions under every RSA
+/// algorithm, each carrying its algorithm.
+#[cfg(any(feature = "jwt-aws-lc", feature = "client-assertion-rsa"))]
+#[test]
+fn an_rsa_signer_signs_where_the_build_chose_it() {
+    let (pkcs1, pkcs8) = rsa_pems();
+    let (clock, rng) = clock_and_rng();
+    for algorithm in RSA_ALGORITHMS {
+        for pem in [&pkcs1, &pkcs8] {
+            let signer =
+                ClientAssertionSigner::from_pem("c", pem, algorithm).expect("an RSA signer");
+            let jwt = signer
+                .mint("https://idp/token", &clock, &rng)
+                .expect("signs");
+            assert_eq!(header(&jwt)["alg"], format!("{algorithm:?}"));
+        }
+    }
 }

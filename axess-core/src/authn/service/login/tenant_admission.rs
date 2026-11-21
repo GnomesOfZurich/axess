@@ -51,9 +51,9 @@ where
                 // Emitting anyway is what keeps the audit failure mode from
                 // becoming an enumeration oracle, because an audit-store
                 // outage must fail this path exactly as it fails a known
-                // user's wrong password. It also closes a SOC blind spot: a
-                // credential-stuffing run against identifiers that do not
-                // exist used to leave no audit row at all.
+                // user's wrong password. It also gives a SOC the row it
+                // needs: a credential-stuffing run against identifiers that
+                // do not exist would otherwise leave no audit row at all.
                 return self
                     .reject_pre_user(identifier, None, AuthFailureReason::UnknownTenant, false)
                     .await
@@ -158,13 +158,10 @@ where
         tenant: &Tenant,
     ) -> Result<ControlFlow<LoginOutcome>, AuthnError<I::Error>> {
         // 1b. Enforce the tenant IP policy against the address this handle
-        // was derived with. Until 0.7.0 the address was a parameter and the
-        // check ran only `if let Some(ip)`, so a caller passing `None`
-        // skipped the policy entirely: an allowlist a caller could switch
-        // off by omitting an argument, and 51 of the 52 call sites in this
-        // repository omitted it. The address now comes from the client-IP
-        // layer by way of the audit context, which the caller does not
-        // choose.
+        // was derived with. The address comes from the client-IP layer by
+        // way of the audit context, which the caller does not choose: as a
+        // parameter checked only `if let Some(ip)`, it would make the
+        // allowlist one a caller could switch off by omitting an argument.
         let policy = self
             .inner
             .identity

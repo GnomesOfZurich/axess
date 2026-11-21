@@ -4,55 +4,39 @@
 
 # LF in the repository and LF in the working tree, on every platform.
 #
-# Linux and macOS are where this is written and where it is deployed; Windows is
-# an exception endured to keep the code portable. So the line ending is LF
-# everywhere, and a Windows checkout gets LF too rather than each machine's
-# `core.autocrlf` deciding, a per-machine setting nothing here records.
+# A checkout on any platform, Windows included, gets LF, rather than each
+# machine's `core.autocrlf` deciding, a per-machine setting nothing here
+# records.
 #
-# `eol=lf` rather than bare `text=auto` is the difference between normalising
-# what is *stored* and normalising what is *on disk*. The gap between the two is
-# where the damage lives: in one session it produced `sed -i` silently rewriting
-# a file whose CRLF was load-bearing, a shell script committed with a `bash\r`
-# shebang that would have failed on a runner with "bad interpreter", and a
-# warning on nearly every `git add`.
+# `eol=lf` rather than bare `text=auto` normalises what is on disk as well as
+# what is stored. Without it a Windows checkout can hold a shell script with a
+# `bash\r` shebang, which fails with "bad interpreter".
 #
 # This marks nothing as modified. Git compares normalised content, so a CRLF
 # working tree still matches an LF index; files convert as git next touches
 # them.
 * text=auto eol=lf
 
-# The exceptions that genuinely need CRLF on disk, because their interpreter is
-# a Windows one and they are Windows artefacts by definition.
+# The files whose interpreter is a Windows one keep CRLF on disk.
 *.[cC][mM][dD] text eol=crlf
 *.[bB][aA][tT] text eol=crlf
 *.ps1 text eol=crlf
 
-# Redundant under the rule above, and kept because it is the one that bit.
+# Shell scripts are LF on disk. The rule above already says so; this line
+# holds it for them if that rule changes.
 *.sh text eol=lf
 
 ###############################
 # Binaries                    #
 ###############################
 
-# Declared binary so git neither diffs them nor touches their bytes. Without a
-# rule git guesses per file from its contents, and a guess that happens to be
-# right is not a rule.
+# Declared binary so git neither diffs them nor changes their bytes. Without a
+# rule git guesses per file from its contents.
 #
-# Deliberately NOT `filter=lfs`. Only `fixconnector` actually uses LFS in this
-# workspace: 19 objects, which is why it keeps the filters. Everywhere else the
-# filters were declared and never fired, which is worse than not having them: the
-# first binary somebody adds is converted silently, and from then on the
-# repository needs `git-lfs` to yield its own contents. `scxml` is already
-# half-way into that state, carrying a PNG as an ordinary object under a
-# declaration that says it should be LFS.
-#
-# That matters most where these repositories are going. An escrow recipient
-# without `git-lfs` gets pointer files: the right names, the right count, and
-# none of the bytes.
-#
-# Adopting LFS is a decision with a migration and a quota attached. It should be
-# taken deliberately, for a repository that has a reason, and not inherited by
-# copying this file.
+# Not `filter=lfs`: binaries are ordinary git objects here, so a clone yields
+# every file's bytes without `git-lfs`. With the filter declared, the first
+# binary added would be stored as an LFS pointer, and a clone without
+# `git-lfs` would hold pointer files in place of the contents.
 *.pdf binary
 *.png binary
 *.jpg binary

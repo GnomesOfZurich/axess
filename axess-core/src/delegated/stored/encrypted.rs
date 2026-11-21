@@ -6,9 +6,10 @@
 //! On load, decryption is performed before the credential is handed
 //! back to the runtime. The inner store sees only opaque ciphertext
 //! envelopes in those string fields; the non-secret metadata
-//! (`provider`, `expires_at`, `scopes`, `token_type`) passes through
-//! in clear so adopters can still run operational queries over it, and
-//! is authenticated by the envelopes so a rewrite of it is noticed.
+//! (`provider`, `registration`, `expires_at`, `scopes`, `token_type`)
+//! passes through in clear so adopters can still run operational queries
+//! over it, and is authenticated by the envelopes so a rewrite of it is
+//! noticed.
 //!
 //! # Threat model
 //!
@@ -32,24 +33,28 @@
 //! Each encrypted string is encoded as
 //!
 //! ```text
-//! v3.{key_id}.{base64url-no-pad(nonce ‖ ciphertext‖tag)}
+//! v4.{key_id}.{base64url-no-pad(nonce ‖ ciphertext‖tag)}
 //! ```
 //!
-//! - `v3`: format version. New versions get a new tag and explicit
+//! - `v4`: format version. New versions get a new tag and explicit
 //!   decode dispatch; the decoder rejects unknown versions. Every save
-//!   writes `v3`, whose AAD covers the row's `scopes`, `token_type` and
-//!   `expires_at` (eight big-endian bytes of Unix seconds, or an empty
-//!   value for `None`) as well as the identity fields, so a store that
-//!   rewrites any of that metadata (widening the granted scopes, or
-//!   moving the expiry so a stale token looks fresh and is never
-//!   refreshed) fails authentication on load instead of changing what
-//!   the runtime believes it holds. `v2` (whose AAD lacks `expires_at`)
-//!   is still read, but its stored expiry is unauthenticated, so the row
-//!   loads as expired and is not re-sealed: the refresh that follows saves a
-//!   `v3` row from the provider's answer (a `v2` row with no refresh token
-//!   asks the user to reconnect). `v1` (whose AAD also lacks `scopes` and
-//!   `token_type`) is read only under the legacy policy below and is
-//!   treated the same way.
+//!   writes `v4`, whose AAD covers the row's registration (the
+//!   [`GrantRegistration`](super::grant::GrantRegistration) it was granted
+//!   through, or none), `scopes`, `token_type` and `expires_at` (eight
+//!   big-endian bytes of Unix seconds, or an empty value for `None`) as
+//!   well as the identity fields, so a store that rewrites any of that
+//!   metadata (moving a row under another registration of the same name,
+//!   widening the granted scopes, or moving the expiry so a stale token
+//!   looks fresh and is never refreshed) fails authentication on load
+//!   instead of changing what the runtime believes it holds. `v3` (whose
+//!   AAD lacks the registration) is still read, with its expiry, but it
+//!   reads as granted through no registration, which
+//!   [`StoredDelegationSession`](super::session::StoredDelegationSession)
+//!   never uses: the user grants again. `v2` (whose AAD also lacks
+//!   `expires_at`) reads the same way and, its stored expiry being
+//!   unauthenticated, as expired, and is not re-sealed. `v1` (whose AAD
+//!   also lacks `scopes` and `token_type`) is read only under the legacy
+//!   policy below and is treated the same way.
 //! - `key_id`: opaque adopter-chosen identifier (e.g. `"2026-05"`,
 //!   a KMS key ARN, an HSM label). Must not contain `.`; the
 //!   [`KeyProvider`] is responsible for storing and resolving the
@@ -62,9 +67,11 @@
 //! [`KeyProvider::resolve`] returns the key for a historical
 //! `key_id` (read during decrypt). Rotation is therefore lazy: rows
 //! re-encrypt under the new key whenever they're saved (each refresh
-//! cycle, every `complete_grant`), and a `v3` row read under a retired key is
-//! re-sealed by the read that found it. A `v2` row, or a `v1` row inside the
-//! legacy window, is read as expired and replaced by the refresh instead. That rewrite is a
+//! cycle, every `complete_grant`), and a `v4` row read under a retired key is
+//! re-sealed by the read that found it, as is every `v3` row (as one granted
+//! through no registration, which it then is in the current format). A `v2`
+//! row, or a `v1` row inside the legacy window, is left as it is. That
+//! rewrite is a
 //! compare-and-swap ([`DelegatedCredentialStore::save_if_unchanged`]), so it
 //! cannot overwrite a refresh token another request rotated in between; a
 //! store that does not implement the swap is left as it is.
@@ -110,6 +117,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use axess_identity::{TenantId, UserId};
 
+use crate::aead::TAG_LEN;
 use crate::delegated::stored::credential::{
     CredentialSwap, DelegatedCredentialStore, StoredDelegation,
 };
@@ -124,14 +132,17 @@ mod keys;
 pub use keys::{CurrentKey, EncryptionKey, KeyProvider, KeyProviderError, MemoryKeyProvider};
 
 use envelope::{
-    EnvelopeError, Opened, build_aad, build_aad_v2, build_aad_v3, encrypt_envelope, open_envelope,
+    EnvelopeError, Opened, build_aad, build_aad_v2, build_aad_v3, build_aad_v4, encrypt_envelope,
+    open_envelope,
 };
 
-/// Version written by this release. `v3` binds the row's `expires_at` into
-/// the AAD as well as its `scopes` and `token_type`; `v2` rows (no expiry
-/// bound) are read as expired and left as they are, `v1` rows follow
-/// [`LegacyBlobs`].
-const ENVELOPE_VERSION: &str = "v3";
+/// Version written by this release. `v4` binds the row's registration into
+/// the AAD as well as its `expires_at`, `scopes` and `token_type`; `v3` rows
+/// (no registration bound) are read with no registration, `v2` rows (no
+/// expiry bound either) are read as expired and left as they are, `v1` rows
+/// follow [`LegacyBlobs`].
+const ENVELOPE_VERSION: &str = "v4";
+const EXPIRY_ENVELOPE_VERSION: &str = "v3";
 const SCOPED_ENVELOPE_VERSION: &str = "v2";
 const LEGACY_ENVELOPE_VERSION: &str = "v1";
 const NONCE_LEN: usize = 12;
@@ -278,15 +289,6 @@ where
         user: &UserId,
         credential: StoredDelegation,
     ) -> Result<StoredDelegation, String> {
-        let StoredDelegation {
-            provider,
-            access_token,
-            refresh_token,
-            expires_at,
-            scopes,
-            token_type,
-        } = credential;
-
         let current = self.keys.current().map_err(|e| e.to_string())?;
         // A provider of its own can name any id or hand over any key; the
         // envelope would then be written and never read back.
@@ -294,32 +296,20 @@ where
         if current.key.is_constant() {
             return Err(KeyProviderError::from(crate::session::WeakKeyError).to_string());
         }
-        self.seals
-            .fetch_add(1 + u64::from(refresh_token.is_some()), Ordering::Relaxed);
-
-        let aad_access = build_aad_v3(
-            &provider,
-            tenant,
-            user,
-            FIELD_ACCESS,
-            &scopes,
-            &token_type,
-            expires_at,
+        self.seals.fetch_add(
+            1 + u64::from(credential.refresh_token.is_some()),
+            Ordering::Relaxed,
         );
-        let access_env = encrypt_envelope(&current, &*self.rng, &access_token, &aad_access)
-            .map_err(|e| format!("encrypt access_token: {e}"))?;
 
-        let refresh_env = match refresh_token.as_deref() {
+        let provider = credential.provider.as_str();
+        let aad_access = build_aad_v4(provider, tenant, user, FIELD_ACCESS, &credential);
+        let access_env =
+            encrypt_envelope(&current, &*self.rng, &credential.access_token, &aad_access)
+                .map_err(|e| format!("encrypt access_token: {e}"))?;
+
+        let refresh_env = match credential.refresh_token.as_deref() {
             Some(rt) => {
-                let aad_refresh = build_aad_v3(
-                    &provider,
-                    tenant,
-                    user,
-                    FIELD_REFRESH,
-                    &scopes,
-                    &token_type,
-                    expires_at,
-                );
+                let aad_refresh = build_aad_v4(provider, tenant, user, FIELD_REFRESH, &credential);
                 Some(ZeroizedString::from(
                     encrypt_envelope(&current, &*self.rng, rt, &aad_refresh)
                         .map_err(|e| format!("encrypt refresh_token: {e}"))?,
@@ -329,12 +319,9 @@ where
         };
 
         Ok(StoredDelegation {
-            provider,
             access_token: ZeroizedString::from(access_env),
             refresh_token: refresh_env,
-            expires_at,
-            scopes,
-            token_type,
+            ..credential
         })
     }
 
@@ -349,6 +336,7 @@ where
     ) -> Result<OpenedRow, String> {
         let mut stale = false;
         let mut expiry_bound = true;
+        let mut registration_bound = true;
 
         let access = self
             .open_field(
@@ -362,6 +350,7 @@ where
             .map_err(|e| format!("decrypt access_token: {e}"))?;
         stale |= access.is_stale(current_id);
         expiry_bound &= access.binds_expiry();
+        registration_bound &= access.binds_registration();
         let access_plain = access.plain;
 
         let refresh_plain = match cred.refresh_token.as_deref() {
@@ -371,6 +360,7 @@ where
                     .map_err(|e| format!("decrypt refresh_token: {e}"))?;
                 stale |= opened.is_stale(current_id);
                 expiry_bound &= opened.binds_expiry();
+                registration_bound &= opened.binds_registration();
                 Some(ZeroizedString::from(opened.plain))
             }
             None => None,
@@ -378,6 +368,15 @@ where
 
         let plain = StoredDelegation {
             provider: cred.provider.clone(),
+            // A registration beside an envelope older than the current
+            // version is not authenticated: the row reads as granted through
+            // none, which a session never uses. Read with none, it is safe to
+            // re-seal.
+            registration: if registration_bound {
+                cred.registration.clone()
+            } else {
+                None
+            },
             access_token: ZeroizedString::from(access_plain),
             refresh_token: refresh_plain,
             // An envelope older than the current version does not cover the
@@ -388,7 +387,7 @@ where
             expires_at: if expiry_bound {
                 cred.expires_at
             } else {
-                Some(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH)
+                Some(axess_clock::Timestamp::UNIX_EPOCH)
             },
             scopes: cred.scopes.clone(),
             token_type: cred.token_type.clone(),
@@ -535,7 +534,8 @@ where
             return Err(EnvelopeError::LegacyRefused);
         }
         let aad_for = |version: &str| match version {
-            ENVELOPE_VERSION => Some(build_aad_v3(
+            ENVELOPE_VERSION => Some(build_aad_v4(provider, tenant, user, field, row)),
+            EXPIRY_ENVELOPE_VERSION => Some(build_aad_v3(
                 provider,
                 tenant,
                 user,
@@ -571,6 +571,8 @@ fn test_key(seed: u8) -> [u8; 32] {
 mod key_id_tests;
 #[cfg(test)]
 mod legacy_tests;
+#[cfg(test)]
+mod registration_tests;
 #[cfg(test)]
 mod rng_tests;
 #[cfg(test)]

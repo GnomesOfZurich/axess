@@ -61,7 +61,7 @@ impl MemoryRefreshTokenStore {
         &self,
         id: &RefreshTokenId,
         reason: RevocationReason,
-        at: Option<chrono::DateTime<chrono::Utc>>,
+        at: Option<axess_clock::Timestamp>,
     ) {
         let now = at.unwrap_or_else(|| self.inner.clock().now());
         self.inner.update(id, |t| {
@@ -81,10 +81,14 @@ impl RefreshTokenStore for MemoryRefreshTokenStore {
         // TTL = expires_at - the store's now, saturating at zero. An
         // expired-on-arrival token is stored with TTL=0 → invisible to
         // every subsequent `get`. The store is infallible so the
-        // `unwrap_or` is hit on negative chrono durations only.
-        let ttl = (token.expires_at - self.inner.clock().now())
-            .to_std()
-            .unwrap_or(Duration::ZERO);
+        // `unwrap_or` is hit on a negative span only. A token that never
+        // expires is kept for the longest TTL, which the store never ends.
+        let ttl = match token.expires_at {
+            axess_clock::Until::At(end) => {
+                Duration::try_from(end.since(self.inner.clock().now())).unwrap_or(Duration::ZERO)
+            }
+            axess_clock::Until::Forever => Duration::MAX,
+        };
         self.inner.put(&token.id, token, ttl).await
     }
 
@@ -171,13 +175,15 @@ impl RefreshTokenStore for MemoryRefreshTokenStore {
     ) -> Result<(), Self::Error> {
         // One issue at a time per store: the count, the evictions and the
         // insert below are a single step to every other issuer.
-        let _serial = self.issue_lock.lock().await;
+        let serial = self.issue_lock.lock().await;
         let active = self.active_tokens(&new_token.user_id).await?;
         let surplus = (active.len() + 1).saturating_sub(max_per_user);
         for token in active.iter().take(surplus) {
             self.revoke_as(&token.id, RevocationReason::Evicted, None);
         }
-        self.store_token(new_token).await
+        let stored = self.store_token(new_token).await;
+        drop(serial);
+        stored
     }
 
     async fn rotate_token(
@@ -210,19 +216,19 @@ impl RefreshTokenStore for MemoryRefreshTokenStore {
 mod tests {
     use super::*;
     use crate::session::refresh::RefreshTokenId;
+    use axess_clock::testing::Shift;
     use axess_rng::testing::MockRng;
-    use chrono::Utc;
     use std::sync::Arc;
 
     fn token(rng: &MockRng, user: UserId, hash: &str) -> RefreshToken {
-        let now = Utc::now();
+        let now = axess_clock::testing::MockClock::reference_time();
         RefreshToken {
             id: RefreshTokenId::new(rng),
             user_id: user,
             tenant_id: axess_identity::testing::tenant("t1"),
             token_hash: hash.to_string(),
             issued_at: now,
-            expires_at: now + chrono::Duration::days(1),
+            expires_at: axess_clock::Until::At(now.plus(axess_clock::SignedDuration::days(1))),
             revoked: false,
             device_info: None,
             family_id: None,
@@ -237,18 +243,18 @@ mod tests {
     /// mock clock passes its `expires_at`, whatever the real date is.
     #[tokio::test]
     async fn rows_expire_on_the_injected_clock() {
-        use chrono::TimeZone;
-        let origin = Utc.with_ymd_and_hms(2031, 3, 1, 12, 0, 0).unwrap();
+        use axess_clock::Timestamp;
+        let origin = Timestamp::from_utc(2031, 3, 1, 12, 0, 0).unwrap();
         let clock = axess_clock::testing::MockClock::at(origin);
         let store = MemoryRefreshTokenStore::new().with_clock(Arc::new(clock.clone()));
         let mut t = token(&MockRng::new(3), axess_identity::testing::user("u1"), "h");
         t.issued_at = origin;
-        t.expires_at = origin + chrono::Duration::days(1);
+        t.expires_at = axess_clock::Until::At(origin.plus(axess_clock::SignedDuration::days(1)));
         store.store_token(&t).await.unwrap();
 
-        clock.advance(chrono::Duration::hours(23));
+        clock.advance(axess_clock::SignedDuration::hours(23));
         assert!(store.find_token("h").await.unwrap().is_some());
-        clock.advance(chrono::Duration::hours(2));
+        clock.advance(axess_clock::SignedDuration::hours(2));
         assert!(store.find_token("h").await.unwrap().is_none());
     }
 
@@ -258,7 +264,10 @@ mod tests {
         let rng = MockRng::new(1);
         let user = axess_identity::testing::user("u1");
         for round in 0..200 {
-            let store = Arc::new(MemoryRefreshTokenStore::new());
+            let store = Arc::new(
+                MemoryRefreshTokenStore::new()
+                    .with_clock(Arc::new(axess_clock::testing::MockClock::at_reference())),
+            );
             let parent = token(&rng, user, &format!("parent-{round}"));
             store.store_token(&parent).await.unwrap();
             let tasks: Vec<_> = (0..8)

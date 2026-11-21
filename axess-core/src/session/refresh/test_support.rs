@@ -7,7 +7,7 @@ use super::*;
 
 pub(super) fn test_config() -> RefreshTokenConfig {
     RefreshTokenConfig {
-        ttl: Duration::days(30),
+        ttl: std::time::Duration::from_hours(30 * 24),
         max_per_user: 3,
         rotation: true,
         hash_pepper: None,
@@ -18,9 +18,9 @@ pub(super) fn test_config() -> RefreshTokenConfig {
 }
 
 /// The fixed instant the refresh tests run at.
-pub(super) fn now() -> DateTime<Utc> {
-    use chrono::TimeZone;
-    Utc.with_ymd_and_hms(2031, 3, 1, 12, 0, 0).unwrap()
+pub(super) fn now() -> Timestamp {
+    use axess_clock::Timestamp;
+    Timestamp::from_utc(2031, 3, 1, 12, 0, 0).unwrap()
 }
 
 /// A store whose clock is [`now`], so row expiry does not depend on when the

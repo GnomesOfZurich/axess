@@ -2,9 +2,10 @@
 
 use super::*;
 use crate::delegated::error::DelegatedError;
+use axess_clock::Timestamp;
 use axess_clock::testing::MockClock;
+use axess_clock::testing::Shift;
 use axess_identity::{TenantId, UserId};
-use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -12,8 +13,8 @@ use tokio::net::TcpListener;
 use tokio::sync::Notify;
 use url::Url;
 
-fn t0() -> DateTime<Utc> {
-    DateTime::from_timestamp(1_700_000_000, 0).expect("fixed t0")
+fn t0() -> Timestamp {
+    Timestamp::from_unix_seconds(1_700_000_000).expect("fixed t0")
 }
 
 /// A token endpoint that reads the request, tells the test it arrived, and
@@ -51,7 +52,7 @@ async fn a_refresh_in_flight_does_not_revive_a_revoked_credential() {
         Url::parse(&token_url).unwrap(),
         "client",
         "secret",
-        Url::parse("https://gnomes.local/callback").unwrap(),
+        Url::parse("https://example.org/callback").unwrap(),
     ));
     let store = Arc::new(MemoryDelegatedCredentialStore::new());
     let (tenant, user) = (TenantId::from_bytes([1; 16]), UserId::from_bytes([2; 16]));
@@ -61,9 +62,10 @@ async fn a_refresh_in_flight_does_not_revive_a_revoked_credential() {
             &user,
             StoredDelegation {
                 provider: provider.name.clone(),
+                registration: Some(GrantRegistration::of(&provider)),
                 access_token: "stale".into(),
                 refresh_token: Some("old-refresh".into()),
-                expires_at: Some(t0() - chrono::Duration::seconds(60)),
+                expires_at: Some(t0().minus(axess_clock::SignedDuration::seconds(60))),
                 scopes: vec![],
                 token_type: "Bearer".to_string(),
             },
@@ -124,7 +126,7 @@ async fn a_revoke_from_another_process_survives_a_refresh_over_the_encrypted_sto
         Url::parse(&token_url).unwrap(),
         "client",
         "secret",
-        Url::parse("https://gnomes.local/callback").unwrap(),
+        Url::parse("https://example.org/callback").unwrap(),
     ));
     let keys = MemoryKeyProvider::new("k1", std::array::from_fn(|i| 7u8.wrapping_add(i as u8)))
         .expect("key");
@@ -139,9 +141,10 @@ async fn a_revoke_from_another_process_survives_a_refresh_over_the_encrypted_sto
             &user,
             StoredDelegation {
                 provider: provider.name.clone(),
+                registration: Some(GrantRegistration::of(&provider)),
                 access_token: "stale".into(),
                 refresh_token: Some("old-refresh".into()),
-                expires_at: Some(t0() - chrono::Duration::seconds(60)),
+                expires_at: Some(t0().minus(axess_clock::SignedDuration::seconds(60))),
                 scopes: vec![],
                 token_type: "Bearer".to_string(),
             },
@@ -180,7 +183,7 @@ async fn a_revoke_from_another_process_survives_a_refresh_over_the_encrypted_sto
 }
 
 /// A store that answers `Unsupported` explicitly still has its refresh
-/// written, by the unconditional save.
+/// written, by the unconditional save, and the fallback is said aloud.
 struct NoSwap(MemoryDelegatedCredentialStore);
 
 impl DelegatedCredentialStore for NoSwap {
@@ -211,6 +214,7 @@ impl DelegatedCredentialStore for NoSwap {
 
 #[tokio::test]
 async fn a_store_that_answers_unsupported_still_has_its_refresh_saved() {
+    let printed = axess_testing::mock_tracing::LineCapture::install();
     let (token_url, arrived, release) = held_token_endpoint().await;
     let provider = Arc::new(DelegatedProvider::new(
         "p",
@@ -218,7 +222,7 @@ async fn a_store_that_answers_unsupported_still_has_its_refresh_saved() {
         Url::parse(&token_url).unwrap(),
         "client",
         "secret",
-        Url::parse("https://gnomes.local/callback").unwrap(),
+        Url::parse("https://example.org/callback").unwrap(),
     ));
     let store = Arc::new(NoSwap(MemoryDelegatedCredentialStore::new()));
     let (tenant, user) = (TenantId::from_bytes([1; 16]), UserId::from_bytes([2; 16]));
@@ -228,9 +232,10 @@ async fn a_store_that_answers_unsupported_still_has_its_refresh_saved() {
             &user,
             StoredDelegation {
                 provider: provider.name.clone(),
+                registration: Some(GrantRegistration::of(&provider)),
                 access_token: "stale".into(),
                 refresh_token: Some("old-refresh".into()),
-                expires_at: Some(t0() - chrono::Duration::seconds(60)),
+                expires_at: Some(t0().minus(axess_clock::SignedDuration::seconds(60))),
                 scopes: vec![],
                 token_type: "Bearer".to_string(),
             },
@@ -258,4 +263,15 @@ async fn a_store_that_answers_unsupported_still_has_its_refresh_saved() {
         .expect("load")
         .expect("present");
     assert_eq!(stored.refresh_token.as_deref(), Some("rotated"));
+    let warned = printed
+        .lines()
+        .into_iter()
+        .filter(|line| line.contains("WARN") && line.contains("save_if_unchanged"))
+        .count();
+    assert_eq!(
+        warned,
+        1,
+        "the unconditional save is warned of: {}",
+        printed.text()
+    );
 }

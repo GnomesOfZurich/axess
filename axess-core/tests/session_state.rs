@@ -3,12 +3,11 @@
 //! rotation on auth-state changes, atomic `take_custom`, and `AuthSession`
 //! extractor surface.
 
-mod common;
+use axess_core::testing::fixtures as common;
 
 use axess_core::authn::factor::{FactorKind, FactorStep};
 use axess_core::session::data::{AuthState, SessionData, WorkflowKind, WorkflowState};
 use axess_core::testing::{AuthSessionTestExt, test_session};
-use chrono::Utc;
 use common::{tid, uid};
 
 // ── SessionData / AuthState shape ────────────────────────────────────────────
@@ -32,7 +31,8 @@ fn auth_state_authenticated_has_user_and_tenant() {
     let state = AuthState::Authenticated {
         user_id: uid("u1"),
         tenant_id: tid("t1"),
-        authn_time: Utc::now(),
+        authn_time: common::start(),
+        signed_in_at: common::start(),
         factors_completed: vec![],
         impersonator: None,
         ldap_groups: None,
@@ -56,6 +56,7 @@ fn auth_state_authenticating_is_not_authenticated() {
         ldap_groups: None,
         assurance: Vec::new(),
         impersonator: None,
+        flow: axess_core::AuthFlow::Login,
     };
     assert!(state.is_authenticating());
     assert!(!state.is_authenticated());
@@ -64,25 +65,25 @@ fn auth_state_authenticating_is_not_authenticated() {
 
 // ── Eager session-id rotation ────────────────────────────────────────────────
 
-/// Regression: handler-side `session.session_id().await` after
-/// `set_authenticated` must return the **post-rotation** id so callers
+/// Handler-side `session.session_key().await` after
+/// `set_authenticated` must return the **post-rotation** key so callers
 /// that register the session against `SessionRegistry` key against the
-/// id the cookie will actually carry on the next request.
+/// key of the id the cookie will actually carry on the next request.
 #[tokio::test]
 async fn set_authenticated_rotates_session_id_eagerly() {
     let session = test_session();
-    let pre = session.session_id().await;
+    let pre = session.session_key().await;
     session
-        .set_authenticated(uid("u1"), tid("t1"), Utc::now())
+        .set_authenticated(uid("u1"), tid("t1"), common::start())
         .await;
-    let post = session.session_id().await;
+    let post = session.session_key().await;
     assert_ne!(
         pre, post,
         "set_authenticated must rotate session id eagerly"
     );
 }
 
-/// Regression: `advance_factor` to the final factor must rotate the id
+/// `advance_factor` to the final factor must rotate the id
 /// (the transition that flips state to Authenticated).
 #[tokio::test]
 async fn advance_factor_to_authenticated_rotates_session_id() {
@@ -95,11 +96,11 @@ async fn advance_factor_to_authenticated_rotates_session_id() {
             vec![FactorKind::Password],
         )
         .await;
-    let pre = session.session_id().await;
+    let pre = session.session_key().await;
     session
-        .advance_factor(&FactorKind::Password, Utc::now())
+        .advance_factor(&FactorKind::Password, common::start())
         .await;
-    let post = session.session_id().await;
+    let post = session.session_key().await;
     assert!(session.is_authenticated().await);
     assert_ne!(
         pre, post,
@@ -107,19 +108,41 @@ async fn advance_factor_to_authenticated_rotates_session_id() {
     );
 }
 
-/// Regression: explicit `regenerate()` rotates immediately.
+/// `advance_factor_with` records the proof it is handed, as it is: a test
+/// that sets up a session with a chosen proof reads that proof back.
+#[tokio::test]
+async fn advance_factor_with_records_the_proof_it_is_given() {
+    use axess_core::authn::assurance::FactorAssurance;
+    let session = test_session();
+    session
+        .begin_authenticating(
+            uid("u1"),
+            tid("t1"),
+            "passkey".into(),
+            vec![FactorKind::Fido2],
+        )
+        .await;
+    let proof = FactorAssurance::fido2(true, false, false, None, common::start());
+
+    session.advance_factor_with(proof.clone()).await;
+
+    assert!(session.is_authenticated().await);
+    assert_eq!(session.assurance().await, vec![proof]);
+}
+
+/// Explicit `regenerate()` rotates immediately.
 #[tokio::test]
 async fn regenerate_rotates_session_id_eagerly() {
     let session = test_session();
-    let pre = session.session_id().await;
+    let pre = session.session_key().await;
     session.regenerate().await;
-    let post = session.session_id().await;
+    let post = session.session_key().await;
     assert_ne!(pre, post, "regenerate() must rotate session id");
 }
 
 // ── take_custom atomicity ────────────────────────────────────────────────────
 
-/// Regression: `take_custom` reads and removes atomically. A second take
+/// `take_custom` reads and removes atomically. A second take
 /// must return None even if interleaved with a slow caller.
 #[tokio::test]
 async fn take_custom_consumes_value_atomically() {
@@ -142,7 +165,7 @@ async fn take_custom_consumes_value_atomically() {
     assert_eq!(session.get_custom("ceremony").await, None);
 }
 
-/// Regression: parallel `take_custom` racers: only one observes the
+/// Parallel `take_custom` racers: only one observes the
 /// value. This is the actual replay-protection contract.
 #[tokio::test]
 async fn take_custom_only_one_racer_wins() {
@@ -176,7 +199,8 @@ fn session_data_json_roundtrip() {
         auth_state: AuthState::Authenticated {
             user_id: uid("u1"),
             tenant_id: tid("t1"),
-            authn_time: Utc::now(),
+            authn_time: common::start(),
+            signed_in_at: common::start(),
             factors_completed: vec![],
             impersonator: None,
             ldap_groups: None,
@@ -185,9 +209,13 @@ fn session_data_json_roundtrip() {
         fingerprint: Some("abc123".to_string()),
         device_id: None,
         device_proven: false,
+        device_key: None,
+        key_proven: false,
+        key_binding: None,
         custom: serde_json::json!({"key": "value"}),
         revision: 0,
         touched_at: None,
+        ending: None,
     };
     let json = serde_json::to_string(&data).unwrap();
     let restored: SessionData = serde_json::from_str(&json).unwrap();
@@ -198,7 +226,7 @@ fn session_data_json_roundtrip() {
 
 #[test]
 fn workflow_state_new_sets_step_zero() {
-    let ws = WorkflowState::new(WorkflowKind::Signup, 3, Utc::now());
+    let ws = WorkflowState::new(WorkflowKind::Signup, 3, common::start());
     assert_eq!(ws.current_step, 0);
     assert_eq!(ws.total_steps, 3);
 }
@@ -209,7 +237,7 @@ fn workflow_state_new_sets_step_zero() {
 async fn set_authenticated_marks_regenerate() {
     let session = test_session();
     session
-        .set_authenticated(uid("u1"), tid("t1"), Utc::now())
+        .set_authenticated(uid("u1"), tid("t1"), common::start())
         .await;
     assert!(session.is_authenticated().await);
     assert_eq!(session.user_id().await, Some(uid("u1")));
@@ -238,7 +266,7 @@ async fn authenticated_ids_returns_both() {
     assert!(session.authenticated_ids().await.is_none());
 
     session
-        .set_authenticated(uid("u1"), tid("t1"), Utc::now())
+        .set_authenticated(uid("u1"), tid("t1"), common::start())
         .await;
     let (uid_got, tid_got) = session.authenticated_ids().await.unwrap();
     assert_eq!(uid_got, uid("u1"));
@@ -258,7 +286,7 @@ async fn advance_factor_removes_first_match_only() {
         .await;
 
     session
-        .advance_factor(&FactorKind::Password, Utc::now())
+        .advance_factor(&FactorKind::Password, common::start())
         .await;
 
     // Should have removed only the FIRST Password, leaving [Totp, Password].
@@ -285,7 +313,7 @@ async fn advance_factor_transitions_to_authenticated_when_empty() {
         .await;
 
     session
-        .advance_factor(&FactorKind::Password, Utc::now())
+        .advance_factor(&FactorKind::Password, common::start())
         .await;
     assert!(session.is_authenticated().await);
 }
@@ -294,7 +322,7 @@ async fn advance_factor_transitions_to_authenticated_when_empty() {
 async fn clear_resets_to_guest() {
     let session = test_session();
     session
-        .set_authenticated(uid("u1"), tid("t1"), Utc::now())
+        .set_authenticated(uid("u1"), tid("t1"), common::start())
         .await;
     assert!(session.is_authenticated().await);
 
@@ -313,7 +341,7 @@ async fn custom_data_round_trip() {
 #[tokio::test]
 async fn set_pending_workflow() {
     let session = test_session();
-    let ws = WorkflowState::new(WorkflowKind::Signup, 3, Utc::now());
+    let ws = WorkflowState::new(WorkflowKind::Signup, 3, common::start());
     session.set_pending_workflow(uid("u1"), tid("t1"), ws).await;
 
     let state = session.auth_state().await;

@@ -5,6 +5,13 @@
 //! - `is_permitted()`; boolean check (typical for UI capability hints)
 //! - `batch_check()`; multiple checks in one call (typical for list views)
 //!
+//! Every handler begins its authorization session with a request context
+//! (`AuthzStore::for_user_id_with_context`). The example's policies read
+//! `context` (the delete rule), and a policy set that reads `context` is
+//! never decided for a session without one: `AuthzStore::for_user_id` would
+//! answer `AuthzError::ContextRequired` here, on every route and not on the
+//! delete route alone, because the question is asked of the policy set.
+//!
 //! The user id in each path and the `mfa` query flag are demo inputs chosen
 //! by the caller. A real handler builds its authorization session from the
 //! authenticated session (`AuthzStore::for_session`, which refuses a session
@@ -99,6 +106,26 @@ curl -X DELETE "http://localhost:3000/users/alice/documents/doc-1?mfa=true"    #
     )
 }
 
+// ── The request context ─────────────────────────────────────────────────────
+
+/// The facts of a request that the policies read as `context`.
+///
+/// The `mfa` query parameter simulates MFA status for this example, which
+/// makes it caller-controlled: do not copy it. In a real app MFA status comes
+/// from the authenticated session, never from the request.
+#[derive(Deserialize)]
+pub struct RequestFacts {
+    pub mfa: Option<bool>,
+}
+
+impl RequestFacts {
+    /// The Cedar context of this request: MFA not verified unless the
+    /// request says so.
+    fn context(&self) -> StandardRequestContext {
+        StandardRequestContext::new(self.mfa.unwrap_or(false), None)
+    }
+}
+
 // ── GET /users/:user_id/documents/:doc_id; require ViewDocument ─────────────
 
 /// View a single document. Returns 403 if the user lacks permission.
@@ -107,8 +134,11 @@ curl -X DELETE "http://localhost:3000/users/alice/documents/doc-1?mfa=true"    #
 pub async fn view_document(
     State(state): State<AppState>,
     Path((user_id, doc_id)): Path<(String, String)>,
+    Query(facts): Query<RequestFacts>,
 ) -> Result<Json<DocumentResponse>, AppError> {
-    let authz = state.authz.for_user_id(&user_id)?;
+    let authz = state
+        .authz
+        .for_user_id_with_context(&user_id, facts.context())?;
     authz.require("ViewDocument", &doc_id).await?;
 
     let doc = state
@@ -130,8 +160,11 @@ pub async fn view_document(
 pub async fn edit_document(
     State(state): State<AppState>,
     Path((user_id, doc_id)): Path<(String, String)>,
+    Query(facts): Query<RequestFacts>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let authz = state.authz.for_user_id(&user_id)?;
+    let authz = state
+        .authz
+        .for_user_id_with_context(&user_id, facts.context())?;
     authz.require("EditDocument", &doc_id).await?;
 
     Ok(Json(serde_json::json!({
@@ -142,29 +175,22 @@ pub async fn edit_document(
 
 // ── DELETE /users/:user_id/documents/:doc_id; require DeleteDocument + MFA ──
 
-/// Delete a document. Requires MFA verification (ABAC policy).
-///
-/// The `mfa` query parameter simulates MFA status for this example, which
-/// makes it caller-controlled: do not copy it. In a real app MFA status comes
-/// from the authenticated session, never from the request.
+/// Delete a document. Requires MFA verification (ABAC policy), which the
+/// rule reads from the request context ([`RequestFacts`]).
 pub async fn delete_document(
     State(state): State<AppState>,
     Path((user_id, doc_id)): Path<(String, String)>,
-    Query(params): Query<DeleteParams>,
+    Query(facts): Query<RequestFacts>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let ctx = StandardRequestContext::new(params.mfa.unwrap_or(false), None);
-    let authz = state.authz.for_user_id_with_context(&user_id, ctx)?;
+    let authz = state
+        .authz
+        .for_user_id_with_context(&user_id, facts.context())?;
     authz.require("DeleteDocument", &doc_id).await?;
 
     Ok(Json(serde_json::json!({
         "status": "ok",
         "message": format!("Document {doc_id} deleted by {user_id}")
     })))
-}
-
-#[derive(Deserialize)]
-pub struct DeleteParams {
-    pub mfa: Option<bool>,
 }
 
 // ── GET /users/:user_id/documents/:doc_id/permissions; capability hints ─────
@@ -175,8 +201,11 @@ pub struct DeleteParams {
 pub async fn document_permissions(
     State(state): State<AppState>,
     Path((user_id, doc_id)): Path<(String, String)>,
+    Query(facts): Query<RequestFacts>,
 ) -> Result<Json<PermissionsResponse>, AppError> {
-    let authz = state.authz.for_user_id(&user_id)?;
+    let authz = state
+        .authz
+        .for_user_id_with_context(&user_id, facts.context())?;
 
     Ok(Json(PermissionsResponse {
         document_id: doc_id.clone(),
@@ -194,8 +223,11 @@ pub async fn document_permissions(
 pub async fn user_capabilities(
     State(state): State<AppState>,
     Path(user_id): Path<String>,
+    Query(facts): Query<RequestFacts>,
 ) -> Result<Json<Vec<CapabilityEntry>>, AppError> {
-    let authz = state.authz.for_user_id(&user_id)?;
+    let authz = state
+        .authz
+        .for_user_id_with_context(&user_id, facts.context())?;
 
     let mut results = Vec::new();
     for doc in state.data.documents.values() {

@@ -4,11 +4,13 @@
 //! 360+ lines of `OkService` / fixture scaffolding.
 
 use super::*;
+use axess_clock::Timestamp;
 use axess_clock::testing::MockClock;
+use axess_clock::testing::Shift;
 use axum::http::HeaderValue;
-use chrono::TimeZone;
 use tower::ServiceExt;
 
+mod carried_client;
 mod hardening;
 mod key_bounds;
 mod login_injector;
@@ -21,12 +23,12 @@ use std::sync::atomic::Ordering;
 use store::HARD_BUCKET_CAP;
 
 /// A fixed origin well away from the real clock.
-fn t_zero() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2031, 3, 1, 12, 0, 0).unwrap()
+fn t_zero() -> Timestamp {
+    Timestamp::from_utc(2031, 3, 1, 12, 0, 0).unwrap()
 }
 
-fn secs(t: DateTime<Utc>, n: i64) -> DateTime<Utc> {
-    t + chrono::Duration::seconds(n)
+fn secs(t: Timestamp, n: i64) -> Timestamp {
+    t.plus(axess_clock::SignedDuration::seconds(n))
 }
 
 fn test_store(max: u32, window: Duration) -> BucketStore {
@@ -59,11 +61,10 @@ impl Service<Request<Body>> for OkService {
 
 /// A request that the client-IP layer has already resolved to `ip`.
 ///
-/// This used to set `X-Forwarded-For` and let the extractor believe it,
-/// which is precisely the bypass `KeyExtractor::ClientIp` exists to close:
-/// the header is no longer read, so a header-based fixture would put every
-/// request in the same bucket. The resolved value goes in the extensions,
-/// where the layer puts it.
+/// The resolved value goes in the extensions, where the layer puts it.
+/// A fixture that set `X-Forwarded-For` would lean on the bypass
+/// `KeyExtractor::ClientIp` exists to close: the header is not read, so
+/// every such request would land in the same bucket.
 fn make_request_with_ip(ip: &str) -> Request<Body> {
     let mut req = Request::new(Body::empty());
     req.extensions_mut()
@@ -438,7 +439,7 @@ fn login_identifier_rejects_empty_input() {
     assert!(RateLimitLoginIdentifier::new("alice").is_some());
 }
 
-// ── Mutation-coverage tests ────────────────────────────────────────────────
+// ── Eviction, boundaries and single branches ───────────────────────────────
 
 /// The `evict_expired` wrapper reads the store's clock: advancing the mock
 /// clock past the window is what ages the bucket out.
@@ -524,8 +525,8 @@ fn warn_threshold_helpers_have_strict_bounds() {
 }
 
 /// The bypass this variant exists to close: rotating a forwarded header
-/// must not buy a fresh bucket. Before 0.7.0 each of these landed in its
-/// own bucket and the limiter was ornamental behind a proxy that appends.
+/// must not buy a fresh bucket. Without it each of these lands in its own
+/// bucket and the limiter is ornamental behind a proxy that appends.
 #[tokio::test]
 async fn forged_forwarded_headers_share_one_bucket() {
     let svc = make_service(1, Duration::from_secs(60));

@@ -3,8 +3,9 @@
 //! These must live in the `axess` crate (not `axess-core`) because the macros
 //! are defined in `axess-macros` and re-exported via `axess`.
 
-#![cfg(feature = "memory")]
+#![cfg(all(feature = "memory", feature = "testing"))]
 
+#[cfg(feature = "authz")]
 use axess::testing::AuthSessionTestExt;
 use axess::{MemorySessionStore, SessionLayer, require_authn, require_partial_authn};
 use axum::{
@@ -16,20 +17,26 @@ use axum::{
 use std::time::Duration;
 use tower::ServiceExt;
 
-fn session_layer() -> SessionLayer<MemorySessionStore> {
-    SessionLayer::without_registry_insecure(MemorySessionStore::new(), axess::testing::test_key(42))
-        .with_ttl(Duration::from_secs(3600))
-        .with_secure(false)
+fn session_layer(clock: &axess::testing::MockClock) -> SessionLayer<MemorySessionStore> {
+    SessionLayer::without_registry_insecure(
+        MemorySessionStore::new().with_clock(std::sync::Arc::new(clock.clone())),
+        axess::testing::test_key(42),
+        std::sync::Arc::new(axess::session::UnrecordedSessionEnds),
+    )
+    .with_clock(clock.clone())
+    .with_ttl(Duration::from_secs(3600))
+    .with_secure(false)
 }
 
 // ── require_authn!() ────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn require_authn_returns_401_for_unauthenticated() {
+    let clock = axess::testing::MockClock::at_reference();
     let app = Router::new()
         .route("/protected", get(|| async { "secret" }))
         .layer(require_authn!())
-        .layer(session_layer());
+        .layer(session_layer(&clock));
 
     let response = app
         .oneshot(Request::get("/protected").body(Body::empty()).unwrap())
@@ -41,10 +48,11 @@ async fn require_authn_returns_401_for_unauthenticated() {
 
 #[tokio::test]
 async fn require_authn_with_redirect_returns_307() {
+    let clock = axess::testing::MockClock::at_reference();
     let app = Router::new()
         .route("/protected", get(|| async { "secret" }))
         .layer(require_authn!("/login"))
-        .layer(session_layer());
+        .layer(session_layer(&clock));
 
     let response = app
         .oneshot(Request::get("/protected").body(Body::empty()).unwrap())
@@ -67,10 +75,11 @@ async fn require_authn_with_redirect_returns_307() {
 
 #[tokio::test]
 async fn require_authn_with_redirect_and_custom_field() {
+    let clock = axess::testing::MockClock::at_reference();
     let app = Router::new()
         .route("/protected", get(|| async { "secret" }))
         .layer(require_authn!("/auth/login", "return_to"))
-        .layer(session_layer());
+        .layer(session_layer(&clock));
 
     let response = app
         .oneshot(Request::get("/protected").body(Body::empty()).unwrap())
@@ -94,10 +103,11 @@ async fn require_authn_with_redirect_and_custom_field() {
 
 #[tokio::test]
 async fn require_partial_authn_returns_401_for_guest() {
+    let clock = axess::testing::MockClock::at_reference();
     let app = Router::new()
         .route("/mfa", get(|| async { "mfa page" }))
         .layer(require_partial_authn!())
-        .layer(session_layer());
+        .layer(session_layer(&clock));
 
     let response = app
         .oneshot(Request::get("/mfa").body(Body::empty()).unwrap())
@@ -112,7 +122,7 @@ async fn require_partial_authn_returns_401_for_guest() {
 #[cfg(feature = "authz")]
 mod authz_tests {
     use super::*;
-    use axess::authz::{PolicyStore, RequestEntityProvider};
+    use axess::authz::{AuthzInstallation, PolicyStore, RequestEntityProvider};
 
     use axess::require_authz;
     use axess_core::authz::AuthzError;
@@ -123,11 +133,12 @@ mod authz_tests {
 
     /// A validator without a registry: the session record decides, which is
     /// all these tests exercise.
-    fn session_validator() -> axess::authn::SessionValidator {
+    fn session_validator(clock: &axess::testing::MockClock) -> axess::authn::SessionValidator {
         axess::authn::AuthnService::builder(
-            axess::testing::MockIdentityStore::new(),
+            axess::testing::MockIdentityStore::new().with_clock(clock.clone()),
             axess::testing::MockFactorStore::new(),
         )
+        .with_clock(clock.clone())
         .build()
         .session_validator()
     }
@@ -221,6 +232,13 @@ mod authz_tests {
         Arc::new(TestProvider)
     }
 
+    /// What the gates decide with. The policies never read `context`, so no
+    /// context provider is given.
+    fn installation() -> AuthzInstallation {
+        AuthzInstallation::new(policy_store(), provider(), None)
+            .expect("the policies do not read `context`")
+    }
+
     /// One-step helper: log in via `/login`, then call the protected
     /// route reusing the session cookie.
     async fn call_protected(app: Router, path: &str) -> (StatusCode, Vec<u8>) {
@@ -267,7 +285,7 @@ mod authz_tests {
         (status, body)
     }
 
-    fn build_app(user_id: &'static str) -> Router {
+    fn build_app(clock: &axess::testing::MockClock, user_id: &'static str) -> Router {
         let app = Router::new()
             .route(
                 "/docs/{id}",
@@ -275,7 +293,7 @@ mod authz_tests {
                     "App",
                     "View",
                     "Doc:{id}",
-                    validator = session_validator()
+                    validator = session_validator(clock)
                 )),
             )
             .route(
@@ -284,14 +302,14 @@ mod authz_tests {
                     "App",
                     "Manage",
                     "Platform:global",
-                    validator = session_validator()
+                    validator = session_validator(clock)
                 )),
             )
             .fallback(get(|| async { "fallback body" }).layer(require_authz!(
                 "App",
                 "Manage",
                 "Platform:global",
-                validator = session_validator()
+                validator = session_validator(clock)
             )))
             .route(
                 "/login",
@@ -300,22 +318,22 @@ mod authz_tests {
                         .set_authenticated(
                             axess::testing::user(user_id),
                             axess::testing::tenant("t1"),
-                            chrono::Utc::now(),
+                            axess::testing::MockClock::reference_time(),
                         )
                         .await;
                     StatusCode::NO_CONTENT
                 }),
             )
-            .layer(Extension(policy_store()))
-            .layer(Extension(provider()))
-            .layer(session_layer());
+            .layer(installation())
+            .layer(session_layer(clock));
         let _ = user_id; // used only inside the login closure capture
         app
     }
 
     #[tokio::test]
     async fn require_authz_allows_when_cedar_permits() {
-        let app = build_app("alice");
+        let clock = axess::testing::MockClock::at_reference();
+        let app = build_app(&clock, "alice");
         let (status, _) = call_protected(app, "/docs/doc-1").await;
         assert_eq!(
             status,
@@ -326,7 +344,8 @@ mod authz_tests {
 
     #[tokio::test]
     async fn require_authz_denies_with_403_when_cedar_forbids() {
-        let app = build_app("alice");
+        let clock = axess::testing::MockClock::at_reference();
+        let app = build_app(&clock, "alice");
         // Policy only permits doc-1; doc-2 should deny.
         let (status, _) = call_protected(app, "/docs/doc-2").await;
         assert_eq!(
@@ -338,7 +357,8 @@ mod authz_tests {
 
     #[tokio::test]
     async fn require_authz_denies_with_403_for_other_user() {
-        let app = build_app("bob");
+        let clock = axess::testing::MockClock::at_reference();
+        let app = build_app(&clock, "bob");
         // Bob is not in the policy's permit; should deny even on doc-1.
         let (status, _) = call_protected(app, "/docs/doc-1").await;
         assert_eq!(
@@ -350,7 +370,8 @@ mod authz_tests {
 
     #[tokio::test]
     async fn require_authz_path_param_escape_does_not_decode_into_another_resource() {
-        let app = build_app("alice");
+        let clock = axess::testing::MockClock::at_reference();
+        let app = build_app(&clock, "alice");
         // `doc-\u{31}` would parse as `doc-1` if the id were spliced into
         // UID text; as an opaque id it is a different, unpermitted resource.
         let (status, _) = call_protected(app, "/docs/doc-%5Cu%7B31%7D").await;
@@ -359,14 +380,16 @@ mod authz_tests {
 
     #[tokio::test]
     async fn require_authz_quote_in_path_param_is_denied_not_an_error() {
-        let app = build_app("alice");
+        let clock = axess::testing::MockClock::at_reference();
+        let app = build_app(&clock, "alice");
         let (status, _) = call_protected(app, "/docs/x%22%20or%20%22").await;
         assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
     async fn require_authz_returns_401_for_unauthenticated() {
-        let app = build_app("alice");
+        let clock = axess::testing::MockClock::at_reference();
+        let app = build_app(&clock, "alice");
         // Skip the /login step → no session cookie → should 401.
         let resp = app
             .oneshot(
@@ -385,7 +408,8 @@ mod authz_tests {
     /// than a well-formed one: not authenticated is 401 either way.
     #[tokio::test]
     async fn require_authz_answers_an_anonymous_caller_401_for_a_malformed_path_parameter() {
-        let resp = build_app("alice")
+        let clock = axess::testing::MockClock::at_reference();
+        let resp = build_app(&clock, "alice")
             .oneshot(
                 Request::builder()
                     .method(Method::GET)
@@ -400,22 +424,22 @@ mod authz_tests {
 
     #[tokio::test]
     async fn require_authz_answers_an_authenticated_caller_400_for_a_malformed_path_parameter() {
-        let (status, _) = call_protected(build_app("alice"), "/docs/%FF").await;
+        let clock = axess::testing::MockClock::at_reference();
+        let (status, _) = call_protected(build_app(&clock, "alice"), "/docs/%FF").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
-    #[tokio::test]
-    async fn require_authz_returns_500_when_policy_store_extension_missing() {
-        // Build the app WITHOUT the PolicyStore extension to exercise the
-        // misconfiguration path.
-        let app = Router::new()
+    /// A router with the gated route and the login route, and nothing a
+    /// gate decides with: the caller adds what it wants to try.
+    fn bare_router(clock: &axess::testing::MockClock) -> Router {
+        Router::new()
             .route(
                 "/docs/{id}",
                 get(|| async { "doc body" }).layer(require_authz!(
                     "App",
                     "View",
                     "Doc:{id}",
-                    validator = session_validator()
+                    validator = session_validator(clock)
                 )),
             )
             .route(
@@ -425,21 +449,77 @@ mod authz_tests {
                         .set_authenticated(
                             axess::testing::user("alice"),
                             axess::testing::tenant("t1"),
-                            chrono::Utc::now(),
+                            axess::testing::MockClock::reference_time(),
                         )
                         .await;
                     StatusCode::NO_CONTENT
                 }),
             )
-            // No PolicyStore extension, no Entities extension.
-            .layer(session_layer());
+    }
 
+    #[tokio::test]
+    async fn require_authz_returns_500_when_no_installation_is_in_the_request() {
+        let clock = axess::testing::MockClock::at_reference();
+        let app = bare_router(&clock).layer(session_layer(&clock));
+
+        let capture = axess_testing::mock_tracing::TracingCapture::install();
         let (status, _) = call_protected(app, "/docs/doc-1").await;
         assert_eq!(
             status,
             StatusCode::INTERNAL_SERVER_ERROR,
-            "missing extensions should yield 500, not silently allow"
+            "a gate with nothing to decide with answers 500, it does not allow"
         );
+        assert!(
+            capture.contains_at_level(
+                axess_core::tracing::Level::ERROR,
+                "no AuthzInstallation in the request"
+            ),
+            "the error names what is missing: {:?}",
+            capture.events()
+        );
+    }
+
+    /// The gate reads the installation and nothing else. A policy store and
+    /// an entity provider put into the request extensions on their own, the
+    /// way a gate once read them, do not reach it: the request the
+    /// installation allows (the test above this group) is answered 500.
+    #[tokio::test]
+    async fn require_authz_does_not_read_a_store_and_a_provider_installed_on_their_own() {
+        let clock = axess::testing::MockClock::at_reference();
+        let app = bare_router(&clock)
+            .layer(Extension(policy_store()))
+            .layer(Extension(provider()))
+            .layer(session_layer(&clock));
+
+        let (status, _) = call_protected(app, "/docs/doc-1").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// The same route with the same store and provider, handed over as the
+    /// installation, is allowed: the 500 above is the missing installation
+    /// and nothing about the policies.
+    #[tokio::test]
+    async fn require_authz_decides_with_the_installation() {
+        let clock = axess::testing::MockClock::at_reference();
+        let app = bare_router(&clock)
+            .layer(installation())
+            .layer(session_layer(&clock));
+
+        let (status, _) = call_protected(app, "/docs/doc-1").await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// An `Extension` holding the installation is the installation's own
+    /// layer written out: both put the one value into the request.
+    #[tokio::test]
+    async fn require_authz_reads_the_installation_from_an_extension_layer_too() {
+        let clock = axess::testing::MockClock::at_reference();
+        let app = bare_router(&clock)
+            .layer(Extension(installation()))
+            .layer(session_layer(&clock));
+
+        let (status, _) = call_protected(app, "/docs/doc-1").await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     /// A resource template that names a path parameter the route does not
@@ -448,6 +528,7 @@ mod authz_tests {
     /// still records the denial, with the principal and action as strings.
     #[tokio::test]
     async fn require_authz_audits_the_denial_when_the_resource_uid_cannot_be_built() {
+        let clock = axess::testing::MockClock::at_reference();
         let app = Router::new()
             .route(
                 "/docs/{id}",
@@ -455,7 +536,7 @@ mod authz_tests {
                     "App",
                     "View",
                     "Doc:{slug}",
-                    validator = session_validator()
+                    validator = session_validator(&clock)
                 )),
             )
             .route(
@@ -465,15 +546,14 @@ mod authz_tests {
                         .set_authenticated(
                             axess::testing::user("alice"),
                             axess::testing::tenant("t1"),
-                            chrono::Utc::now(),
+                            axess::testing::MockClock::reference_time(),
                         )
                         .await;
                     StatusCode::NO_CONTENT
                 }),
             )
-            .layer(Extension(policy_store()))
-            .layer(Extension(provider()))
-            .layer(session_layer());
+            .layer(installation())
+            .layer(session_layer(&clock));
         let capture = axess_testing::mock_tracing::TracingCapture::install();
         let (status, _) = call_protected(app, "/docs/doc-1").await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -496,45 +576,71 @@ mod authz_tests {
 
     #[tokio::test]
     async fn require_authz_route_without_path_params_authorizes() {
-        let (status, body) = call_protected(build_app("alice"), "/admin").await;
+        let clock = axess::testing::MockClock::at_reference();
+        let (status, body) = call_protected(build_app(&clock, "alice"), "/admin").await;
         assert_eq!(status, StatusCode::OK, "body: {body:?}");
-        let (status, _) = call_protected(build_app("bob"), "/admin").await;
+        let (status, _) = call_protected(build_app(&clock, "bob"), "/admin").await;
         assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
+    /// The type comes from the attribute (`App::Doc`); a path value naming
+    /// another type never reaches the policy. It holds `:`, which a value
+    /// under a template's only placeholder may not, so the id is refused
+    /// as one that could be read as other values, and the gate answers as
+    /// it does for every id it cannot build: 500 and a recorded denial.
     #[tokio::test]
     async fn require_authz_path_value_cannot_choose_the_entity_type() {
-        // The type comes from the attribute (`App::Doc`); a path value
-        // naming another type stays part of the id and is simply a
-        // different, unpermitted `App::Doc`.
+        let clock = axess::testing::MockClock::at_reference();
         for path in [
             "/docs/Platform::global",
             "/docs/App::Platform::%22global%22",
         ] {
-            let (status, _) = call_protected(build_app("alice"), path).await;
-            assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+            let capture = axess_testing::mock_tracing::TracingCapture::install();
+            let (status, _) = call_protected(build_app(&clock, "alice"), path).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{path}");
+            let decisions: Vec<_> = capture
+                .events()
+                .into_iter()
+                .filter(|e| e.target == "axess::authz::decision")
+                .collect();
+            assert_eq!(
+                decisions.len(),
+                1,
+                "one decision event for {path}: {decisions:?}"
+            );
+            let event = &decisions[0].message;
+            for needle in ["decision=deny", "reason=invalid_resource"] {
+                assert!(event.contains(needle), "{needle} not in {event}");
+            }
         }
     }
 
     #[tokio::test]
     async fn require_authz_service_without_matched_route_params_authorizes() {
+        let clock = axess::testing::MockClock::at_reference();
         // A fallback service is reached without any matched-route
         // parameters at all; the gate must still evaluate, not 500.
-        let (status, body) = call_protected(build_app("alice"), "/nowhere").await;
+        let (status, body) = call_protected(build_app(&clock, "alice"), "/nowhere").await;
         assert_eq!(status, StatusCode::OK, "body: {body:?}");
-        let (status, _) = call_protected(build_app("bob"), "/nowhere").await;
+        let (status, _) = call_protected(build_app(&clock, "bob"), "/nowhere").await;
         assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
     async fn require_authz_service_called_outside_a_router_authorizes() {
+        let clock = axess::testing::MockClock::at_reference();
         // No router means no path-parameter extension on the request. The
         // gate must evaluate from the attribute alone rather than 500.
-        let store = MemorySessionStore::new();
+        let store = MemorySessionStore::new().with_clock(std::sync::Arc::new(clock.clone()));
         let layer = || {
-            SessionLayer::without_registry_insecure(store.clone(), axess::testing::test_key(42))
-                .with_ttl(Duration::from_secs(3600))
-                .with_secure(false)
+            SessionLayer::without_registry_insecure(
+                store.clone(),
+                axess::testing::test_key(42),
+                std::sync::Arc::new(axess::session::UnrecordedSessionEnds),
+            )
+            .with_clock(clock.clone())
+            .with_ttl(Duration::from_secs(3600))
+            .with_secure(false)
         };
         let login = Router::new()
             .route(
@@ -544,7 +650,7 @@ mod authz_tests {
                         .set_authenticated(
                             axess::testing::user("alice"),
                             axess::testing::tenant("t1"),
-                            chrono::Utc::now(),
+                            axess::testing::MockClock::reference_time(),
                         )
                         .await;
                     StatusCode::NO_CONTENT
@@ -573,10 +679,9 @@ mod authz_tests {
                 "App",
                 "Manage",
                 "Platform:global",
-                validator = session_validator()
+                validator = session_validator(&clock)
             ))
-            .layer::<_, std::convert::Infallible>(Extension(policy_store()))
-            .layer::<_, std::convert::Infallible>(Extension(provider()))
+            .layer::<_, std::convert::Infallible>(installation())
             .layer::<_, std::convert::Infallible>(layer());
         let resp = bare
             .oneshot(

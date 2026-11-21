@@ -115,7 +115,7 @@ impl BackChannelLogoutHandler {
         }
 
         // 3. Check `iat` is recent.
-        match check_iat(payload, self.clock.now().timestamp()) {
+        match check_iat(payload, self.clock.now().unix_seconds()) {
             IatCheck::Ok => {}
             IatCheck::Missing => {
                 tracing::warn!("back-channel logout: missing or invalid iat claim");

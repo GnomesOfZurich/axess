@@ -5,7 +5,8 @@
 //! backends. Implements the proposal in
 //! [`docs/identity/device.md`](../../../docs/identity/device.md). All
 //! types are gated on the `device` feature; storage backends are
-//! double-gated (`device,sqlite`, `device,postgres`, `device,valkey`).
+//! double-gated (`device,sqlite`, `device,postgres`, `device,mysql`,
+//! `device,valkey`).
 //!
 //! # Composition recipe
 //!
@@ -38,7 +39,7 @@
 //! let resolver  = LifecycleDeviceResolver::new(extractor, lifecycle, clock);
 //!
 //! // 6. hand the resolver to the session layer
-//! let layer = SessionLayer::new(sessions, signing_key, registry)
+//! let layer = SessionLayer::new(sessions, signing_key, registry, authn.session_end_audit())
 //!     .with_device_resolver(resolver);
 //! router.layer(layer);
 //! ```
@@ -59,8 +60,7 @@ pub mod types;
 
 pub use cache::CachedDeviceStore;
 pub use cascade::{
-    RevokeDeviceError, cascade_revoke_by_refresh_family,
-    cascade_revoke_by_refresh_family_and_tokens, cascade_revoke_devices,
+    RevokeDeviceError, cascade_revoke_by_refresh_family_and_tokens, cascade_revoke_devices,
     cascade_revoke_devices_and_tokens, revoke_device,
 };
 pub use cascade_store::CascadingRefreshStore;
@@ -70,14 +70,16 @@ pub use fingerprint::{
 };
 pub use lifecycle::{
     DEFAULT_MAX_UNKNOWN_DEVICES_PER_USER, DeviceLifecycleService, DeviceRequest, ResolvedDevice,
+    ResolvedOrKept,
 };
-pub use lifecycle_resolver::LifecycleDeviceResolver;
+pub use lifecycle_resolver::{LifecycleDeviceResolver, LifecycleResolveError};
 pub use pii::{
     DevicePiiCategory, DevicePiiMapping, DevicePiiResolver, DevicePiiStore, MemoryDevicePiiStore,
     MemoryDevicePiiStoreError, PiiToken, REDACTED_PLACEHOLDER, RedactedResolver,
 };
 pub use proof::{
-    DeviceCookieConfig, DeviceCookieSlot, DeviceToken, PresentedDevice, ProvenDevice, cookie_value,
+    DeviceCookieConfig, DeviceCookieSlot, DeviceToken, MAX_DEVICE_COOKIE_ENTRIES, PresentedDevice,
+    ProvenDevice, UserDevice, cookie_value,
 };
 pub use resolver::{
     BoundDevice, DeviceResolver, NoopDeviceResolver, SessionDevice, SessionTenant, SessionUser,
@@ -97,7 +99,7 @@ pub use crate::authn::ids::DeviceId;
 /// A fixed instant for tests that write device rows and do not depend on
 /// when the write happens.
 #[cfg(test)]
-pub(crate) fn test_now() -> chrono::DateTime<chrono::Utc> {
-    use chrono::TimeZone;
-    chrono::Utc.with_ymd_and_hms(2031, 3, 1, 12, 0, 0).unwrap()
+pub(crate) fn test_now() -> axess_clock::Timestamp {
+    use axess_clock::Timestamp;
+    Timestamp::from_utc(2031, 3, 1, 12, 0, 0).unwrap()
 }

@@ -1,14 +1,12 @@
 # OAuth 2.0 and OIDC
 
 Federated login through an Identity Provider you do not control is
-the most common reason adopters reach for OAuth. The user has a
-Google account, an Okta account, a corporate Azure AD account, and
-you accept a login from any of them rather than asking
-the user to invent and remember another password. The mechanism is
-OAuth 2.0 for the authorisation flow and OpenID Connect for the
-identity assertion layered on top. The division of labour is the thing
-to hold on to: what axess wires up, and what your integration code still
-owns.
+the most common reason to use OAuth. The user has a Google, Okta or
+corporate Microsoft Entra ID account, and you accept a login from any of
+them instead of asking for another password. OAuth 2.0 carries the
+authorization flow and OpenID Connect the identity assertion on top of
+it. This page separates what axess wires up from what your integration
+code still owns.
 
 The feature flag is `oauth` (off by default), enabled with
 `features = ["oauth", "jwt-rust-crypto"]` on the `axess` facade. `oauth`
@@ -17,15 +15,15 @@ transitively enables `oidc` (the discovery and JWKS-cache machinery) and `jwt`
 `jwt-rust-crypto` (pure Rust) or `jwt-aws-lc` (FIPS-capable, needs a C
 toolchain).
 
-Axess supports generic OIDC-based external login and SSO, including standard providers such as Google and Microsoft Entra ID when configured with the appropriate issuer metadata and client credentials. SAML / Shibboleth federation is not currently supported out of the box.
+Axess supports OIDC external login and SSO, including standard providers such as Google and Microsoft Entra ID configured with their issuer metadata and client credentials. SAML and Shibboleth federation are not supported out of the box.
 
 ## The shape of the flow
 
 A federated login involves the user, the application (the OAuth
-client, in OAuth language, which is axess), and the Identity Provider
-(the OAuth server, which is the third-party IdP). The flow is the
-authorisation code grant with PKCE, which is what every modern OIDC
-deployment uses.
+client, which axess implements) and the Identity Provider (the
+authorization server, run by a third party). The flow is the
+authorization code grant with PKCE, which every modern OIDC deployment
+uses.
 
 ```mermaid
 sequenceDiagram
@@ -65,18 +63,16 @@ Your integration owns three:
 
 ## Configuring a provider
 
-You do not implement the trait; `discover` reads the IdP's own document into a
+You do not implement the provider trait; `discover` reads the IdP's own document into a
 builder, and `build` checks its settings and returns the provider.
 
 ### The provider
 
-`OAuthProvider` is the trait that represents an IdP. The trait is
-asynchronous because every method may need to fetch JWKS, perform
-discovery, or hit the token endpoint. Adopters do not implement this
-trait themselves under normal circumstances; the
-`OAuthProviderConfig` constructor in `axess-factors` produces a
-provider from a discovery URL plus client credentials, and the
-returned provider implements the trait.
+`OAuthProvider` is the trait that represents an IdP. It is
+asynchronous because any method may fetch JWKS, run discovery or call
+the token endpoint. Adopters do not normally implement it: the
+`OAuthProviderConfig` constructor in `axess-factors` builds a provider
+that implements it from a discovery URL and client credentials.
 
 ```rust,ignore
 let provider = OAuthProviderConfig::discover(
@@ -90,18 +86,29 @@ let provider = OAuthProviderConfig::discover(
 .build()?;
 ```
 
-`discover` returns an `OAuthProviderBuilder`. Its `with_*` methods record a
-setting and return the builder, in any order; `build` is the one place the
-settings meet. It checks the transport of every endpoint a setter named, the
-FAPI profile's demands, the DPoP setting against the profile and the IdP,
-and the ID-token algorithm list, so a provider that cannot work fails at
-startup with a `Config` error naming the rule, and the order of the calls
-never changes the verdict.
+Discovery runs under `EgressPolicy::screened()`: the issuer URL, every
+endpoint the document names and the addresses each request connects to must
+be HTTPS to a public address. To discover an identity provider on your own network, or a mock on
+loopback in development, call `discover_screened` with the policy named:
+`EgressPolicy::unscreened()` or
+`EgressPolicy::screened_allowing_loopback_http()`.
 
-`discover` fetches the IdP's discovery document, validates it
-contains the endpoints axess needs (authorization, token, JWKS,
-userinfo, sometimes end-session), constructs a `Discovery` value, and
-sets up the JWKS cache against the IdP's signing-key endpoint. The
+`discover` returns an `OAuthProviderBuilder`. Its `with_*` methods each
+record a setting and return the builder, and may be called in any order;
+`build` is the one place the settings meet. It checks the transport of every
+endpoint a setter named, the FAPI profile's demands, the DPoP setting
+against the profile and the IdP, and the ID-token algorithm list. A
+provider that cannot work fails at startup with a `Config` error naming
+the rule. The order of the calls does not change the result, except that a
+later call to the same setting replaces an earlier one (`with_dpop()` and
+`without_dpop()` are one setting).
+
+`discover` fetches the IdP's discovery document, which must name the
+authorization endpoint and the JWKS URI. It reads the token, userinfo,
+end-session, revocation and PAR endpoints when the document names them,
+checks the transport of every endpoint it read, and fetches the IdP's
+signing keys into the JWKS cache. A call that needs an endpoint the
+document did not name fails when it is made. The
 cache is single-flight (concurrent JWKS misses dedupe to one request)
 and debounced (the cache refuses to refresh more often than once
 every few seconds, defeating a denial-of-service that triggers
@@ -113,10 +120,9 @@ The configuration record carries four things:
 - The redirect URI, where the IdP sends the user after authentication.
 - The ceremony timeout: how long the intermediate state on the session
   may live before the flow has to restart.
-- The scopes to request. `openid` and `profile` at minimum; `email` if
-  you need the user's email address; `offline_access` if
-  it needs a refresh token to keep acting as the user after the
-  initial session expires.
+- The scopes to request. `openid` and `profile` at minimum; `email` for
+  the user's email address; `offline_access` for a refresh token, to
+  keep acting as the user after the initial session expires.
 
 ### Authenticating the client
 
@@ -156,8 +162,8 @@ let provider = OAuthProviderConfig::discover_with_private_key_jwt(
 .build()?;
 ```
 
-`with_private_key_jwt` on the builder of `discover` switches the provider
-the same way, and drops its secret: while a signer is set, no request carries
+`with_private_key_jwt` on the builder that `discover` returns switches the
+provider the same way and drops its secret: while a signer is set, no request carries
 a `client_secret` or a Basic header. `ClientAssertionSigner::from_pem`
 reads a PKCS#1 or PKCS#8 RSA key and a PKCS#8 EC or Ed25519 key;
 `ClientAssertionSigner::new` takes a `jsonwebtoken::EncodingKey` you
@@ -167,6 +173,19 @@ assertion, so a key that does not suit its algorithm fails with a
 outbound client (`ClientAuthMethod::PrivateKeyJwt`) and, through a stored
 `SignerSpec`, a tenant's provider.
 
+An RSA key (`RS*`, `PS*`) signs on the `jwt-aws-lc` backend, where axess
+installs `jsonwebtoken`'s aws-lc crypto provider. Elsewhere its
+signature may run in `rsa` 0.9, whose private-key operations leak timing
+(RUSTSEC-2023-0071). That happens on `jwt-rust-crypto` alone, and in a
+build that compiles both backends when the application or another crate
+installed a provider before axess did: that provider may then be
+RustCrypto's, and `jsonwebtoken` cannot report which one is in place.
+In those builds `from_pem`, `from_spec` and `new` refuse an RSA algorithm with
+`ClientAssertionError::RsaNotChosen` before the key is read, unless the
+`client-assertion-rsa` feature names that choice. To sign RSA in aws-lc-rs,
+build with `jwt-aws-lc` and leave installing the provider to axess. An
+ES256, ES384 or EdDSA key needs neither.
+
 The assertion's `iat` and `exp` come from the provider's clock
 (`with_clock`) and its `jti` from the provider's RNG (`with_rng`), so a
 test under a `MockClock` and a seeded `MockRng` reproduces it exactly.
@@ -174,7 +193,7 @@ Its `aud` is the endpoint being called, which is what Entra and Keycloak
 accept; under [`with_fapi`](fapi.md) it is the issuer, as FAPI 2.0
 requires, and `ClientAssertionSigner::with_audience` fixes one value for
 an IdP that wants something else. FAPI composes with the method: DPoP or
-mTLS constrain the tokens, the assertion authenticates the client. DPoP
+mTLS constrain the tokens; the assertion authenticates the client. DPoP
 does not need FAPI: see [Binding tokens to a key](#binding-tokens-to-a-key-dpop),
 which works with a client secret too. `build` refuses a FAPI provider that
 would authenticate by a secret, whatever order the settings came in.
@@ -186,7 +205,7 @@ assertion lives 60 seconds); the `aud` is the value the IdP expects.
 
 ### Multiple providers
 
-A common shape is to offer login with several IdPs side by side
+Many applications offer login with several IdPs side by side
 (Google, GitHub, Microsoft). Each provider is its own
 `OAuthProvider` instance constructed at startup; your code
 registers them under a `provider_name` key. The login URL carries
@@ -195,9 +214,9 @@ carries the name (`GET /auth/callback/google`). Axess dispatches to
 the right provider per request.
 
 A per-tenant variation is also common: each tenant's users federate
-against the tenant's own IdP (an Okta workspace, an Azure AD
-directory). Registering one provider per tenant at startup does not
-survive a tenant being added or edited while the service runs; the
+against the tenant's own IdP (an Okta workspace, a Microsoft Entra ID
+directory). Registering one provider per tenant at startup breaks when a
+tenant is added or edited while the service runs; the
 [Bring your own IdP](#bring-your-own-idp-per-tenant) section below
 resolves the provider by `(tenant, name)` from a store at request time
 instead.
@@ -215,43 +234,199 @@ The pieces:
   id, redirect URL, scopes, a `TenantClientCredential`, either a
   secret or a `private_key_jwt` key (the PEM, and a `SignerSpec`: algorithm,
   `kid`, certificate thumbprints, audience, assertion lifetime), and `dpop`, a `TenantDpop` with the three behaviours of
-  [DPoP](#binding-tokens-to-a-key-dpop): `Advertised` (the default, and
-  what a stored record without the field reads as: on where the tenant's
-  IdP advertises DPoP), `Off` (as `without_dpop()`, for a tenant whose
+  [DPoP](#binding-tokens-to-a-key-dpop): `Advertised` (DPoP on where the
+  tenant's IdP advertises it; the default, and what a stored record
+  without the field reads as), `Off` (as `without_dpop()`, for a tenant whose
   resource servers accept only Bearer tokens) and `Required` (as
   `with_dpop()`: the provider is not built, and the login is refused,
-  when the IdP does not advertise DPoP).
+  when the IdP does not advertise DPoP), and `kind`, the
+  `FederatedProvider` every login through the provider records (`None`,
+  the default, records `Custom(name)`; a record without the field reads as
+  `None` and is written without it).
 - `TenantOAuthProviderStore` keeps records.
   `MemoryTenantOAuthProviderStore` is for tests and fixed tenant lists;
   `SqliteTenantOAuthProviderStore` (the `sqlite` feature) keeps them in a
   `tenant_oauth_providers` table. The store assigns each record a
-  `revision`: 1, then one more per update.
+  `revision`: 1, then one more per update. The store also limits each
+  `(issuer, client_id)` pair to one record, whichever tenant owns the
+  records (a tenant's own second record of a pair under another name is
+  refused too). It enforces this atomically (the SQLite store with a unique
+  index) and answers `TenantOAuthProviderStoreError::pair_held()` for a
+  write that would take a held pair. A store of your own must do the same:
+  two records of one pair make that client's back-channel logout ambiguous,
+  and the directory's own check holds within one process only. (The
+  directory applies the same rule first, so that its refusal says which
+  kind of registration holds the pair and nothing is sealed or written.)
 - `StoredTenantOAuthProviders` is the `TenantOAuthProviders` over a
   store. It discovers and builds a provider on first use and keeps it.
   Each resolution reads the record and compares revisions, so an update
   written by any process is used by the next login with no restart and no
   call to make; `invalidate` drops a provider early, and `remove` deletes
   a record and stops it resolving.
-- `StoredTenantOAuthProviders::new(store, cipher)` takes the
+- `StoredTenantOAuthProviders::new(store, cipher, ownership)` takes the
   `FactorSecretCipher` you already use for OTP secrets, and `upsert` seals
   the credential with it, bound to the tenant and the name, so the client
   secret or private key is never in the table in clear text and a row
-  copied to another tenant does not open. `new_unencrypted(store)` is for
-  tests and development only.
+  copied to another tenant does not open. The credential is also bound to
+  the issuer, client id, redirect URL, scopes, DPoP mode, credential kind
+  and signer spec, so a row rewritten in the store does not open either. A
+  record sealed by 0.15 to 0.19, bound to the issuer and client id only,
+  is moved to the current binding when the directory starts: `started()`
+  runs `reseal_earlier_bindings()`, which lists every record
+  (`TenantOAuthProviderStore::list_all`) and re-seals each credential due a
+  re-seal with one `put_if_revision`. It logs its counts and returns them as
+  a `ResealReport` (`moved`, `not_moved`). When a credential opens under no
+  binding the cipher knows, it refuses to start and names the record. A
+  second pass moves nothing. A directory that was not started runs the
+  same pass before its first resolution and resolves nothing until the
+  pass succeeds. A store whose `put_if_revision` returns
+  `put_if_revision_unsupported()` writes nothing and loses nothing: the
+  pass counts each such record in `not_moved` and names it in a warning.
+  At use, the cipher's `with_earlier_tenant_binding` policy decides
+  whether a credential still under the earlier binding opens (one the
+  store could not move, or one a 0.19.0 node wrote during a rolling
+  upgrade). Under the default, `LegacyBlobs::Reject`, it is refused, and
+  the refusal is logged at `warn` with its tenant, its provider and the
+  earlier binding as the reason. Under `Accept` or `AcceptUntil(cutoff)`,
+  set explicitly, it opens and is re-sealed under every field on first use, or
+  serves with a warning on each use when the store cannot write the move.
+  `new_unencrypted(store, ownership)` is for tests and development only.
+- Whoever registers an `(issuer, client_id)` pair first holds it, so the
+  directory stores a record only once the tenant's ownership of the client
+  is proven. The constructors' `OwnershipProofs` names the proofs a
+  deployment accepts, for every tenant (`accept`, `or_accept`) or for one
+  (`for_tenant`), with no default; every write (`upsert`, `upsert_attested`
+  and an operator's hand-over) checks them before it stores, and refuses the
+  record with
+  `OAuthError::Config` naming only the kind of each proof's refusal (not
+  authenticated, unproven, public client, not attested). What the provider
+  answered (its error code and HTTP status, or a transport failure) is
+  traced as a warning and never shown to the tenant, since the tenant
+  chose the issuer.
+  `TokenEndpointProbe` makes a token request to the provider as the
+  client, with the record's credential (`client_secret_basic`, or
+  `with_client_secret_post()`, or the `private_key_jwt` assertion), for an
+  authorization code the provider never issued, through the directory's
+  egress policy. `invalid_grant`, `unauthorized_client`,
+  `unsupported_grant_type` or `invalid_scope` with HTTP 400 prove the
+  client (the provider authenticated it before refusing the grant, RFC 6749
+  section 5.2); `invalid_client` with HTTP 400 or 401 refuses it; any
+  other answer (a grant error under another status included), a token, a
+  redirect or a failure refuses it as unproven. A refusal of the grant
+  counts only when the same request with a credential known to be wrong
+  (the secret with its last letter or digit changed to another of its
+  class, so its length, characters and prefix match, or the assertion with
+  the lowest bit of its signature flipped), sent once before the client's
+  own request and once after, is refused as `invalid_client` both times. A
+  provider that skips client authentication for a client it holds as
+  public, checks the code first, or checks only a secret's length or
+  characters refuses a control as it refuses the client; one that
+  rate-limits or fails between the requests answers a control otherwise.
+  Either way the record is refused as unproven until an operator attests it. A
+  first control not refused as `invalid_client` ends the probe before the
+  client's credential is sent. The probe detects a provider that ignores
+  the secret's value, not one that validates a structured secret's format
+  (a checksum, a canonical base64 suffix) and then skips the value check:
+  one changed character cannot keep a checksum valid, so the control fails
+  the format while a guess formed correctly passes it and reads as proven.
+  For tenants of a provider that issues structured secrets and may check
+  only their format, accept the attestation alone:
+  `OwnershipProofs::accept(TokenEndpointProbe::new()).for_tenant(tenant,
+  OperatorAttestation)`.
+  `OperatorAttestation` holds when the write carries an
+  `OwnershipAttestation`, which only
+  `RequestAuthnService::attest_tenant_oauth_client_as(operator, &record,
+  purpose)` makes for the record's tenant, provider name and pair, after
+  writing a `MethodEnabled` row naming the operator, the tenant, the
+  provider (by the kind the record is configured with), the pair and the
+  write it is for (`CLIENT_OWNERSHIP_ATTESTED_REASON`, then
+  `purpose=register` or `purpose=hand_over`); it is the only route for a
+  public client, whose secret is empty. An attestation made for one
+  `OwnershipPurpose` is refused for the other. It is not `Clone` and a
+  write takes it by value, so each write needs an attestation, and an
+  audit row, of its own.
+  The attesting operator is a deployment operator who checks ownership out
+  of band (with the identity provider's administrator, in its console): an
+  active user the identity store places in `TenantId::SYSTEM`, the tenant
+  axess reserves for platform-operator principals and keeps self-service
+  signup out of. The service refuses the following, each with a failure row: a user of the tenant
+  it would attest for, an operator attesting `TenantId::SYSTEM` included
+  (`ProviderChangeError::OperatorActsForTenant`); a user of any other tenant
+  (`NotADeploymentOperator`), so a party that holds two tenants cannot have
+  one attest for the other; an operator whose
+  account is not `Active` as of the service's clock, suspended or pending
+  verification (`OperatorNotActive`); the reserved
+  `UserId::SYSTEM` (`OperatorIsSystemUser`), which automated paths such as
+  seeding and signup act as and which names nobody who checked ownership;
+  and a user it does not know (`OperatorUnknown`).
+  Create your operators in `TenantId::SYSTEM`.
+  A check of your own implements
+  `ClientOwnershipProof`. An `upsert` of a pair another record holds is
+  refused before any proof runs, with no request to the provider; for a
+  free pair the probe makes up to four requests (the discovery document,
+  the first control, the client's own token request and the second control)
+  from your deployment's address on each call, so rate-limit registrations
+  per tenant on the path that accepts them, with a setting of its own:
+
+  ```rust,ignore
+  /// Tenant OAuth registrations a tenant may make per hour; each may send
+  /// four requests to the identity provider it names.
+  pub const TENANT_OAUTH_REGISTRATIONS_PER_HOUR: u32 = 10;
+
+  let made = registrations.count_in_last_hour(&tenant_id).await?;
+  anyhow::ensure!(
+      made < TENANT_OAUTH_REGISTRATIONS_PER_HOUR,
+      "too many identity provider registrations this hour"
+  );
+  tenants.upsert(record).await?;
+  ```
+- `store()` returns the records read-only (`TenantOAuthRecords`: `get`,
+  `list`, `list_by_issuer`, `list_all`). Every write goes through the directory, so
+  none skips the proof, the egress check, the pair rule or the sealing; a
+  write that must bypass them, for a migration or a repair, uses the store
+  handle you built the directory from. Build the directory over an `Arc` of
+  the store (an `Arc` of a store is a store) and keep a clone; never hand
+  the clone to a path a tenant reaches.
+- `reprove(tenant, name)` runs the accepted proofs against a stored record
+  as a registration would and writes nothing: `Reproved::Proven`,
+  `Reproved::Refused` with the refusal, or `Reproved::NoRecord`. A record
+  stored before the directory asked for proof keeps serving; run `reprove`
+  over every stored pair (`list` per tenant), and hand each refused pair to
+  its owner or remove the record. An `OperatorAttestation` never holds
+  there, since no attestation is offered.
 
 ```rust,ignore
-use axess::federation::oauth::{StoredTenantOAuthProviders, SqliteTenantOAuthProviderStore};
+use axess::federation::oauth::{
+    OperatorAttestation, OwnershipProofs, OwnershipPurpose, SqliteTenantOAuthProviderStore,
+    StoredTenantOAuthProviders, TokenEndpointProbe,
+};
 
 let store = SqliteTenantOAuthProviderStore::new(pool);
 store.init_schema().await?;
-let tenants = Arc::new(StoredTenantOAuthProviders::new(store, cipher));
+// Confidential clients prove themselves to their IdP; an operator attests
+// a public one.
+let ownership = OwnershipProofs::accept(TokenEndpointProbe::new()).or_accept(OperatorAttestation);
+// `started` moves every earlier-binding credential, or names the one it
+// cannot open.
+let tenants = Arc::new(
+    StoredTenantOAuthProviders::new(store, cipher, ownership)
+        .started()
+        .await?,
+);
 
 let authn = AuthnService::builder(identity, factors)
     .with_tenant_oauth_providers(tenants.clone())
     .build();
 
-// An operator saves a tenant's IdP; the next login uses it.
+// An operator saves a tenant's IdP; the next login uses it. A confidential
+// client proves itself to its IdP; a public one carries an attestation,
+// made by an active operator of `TenantId::SYSTEM`.
 tenants.upsert(record).await?;
+let attestation = authn
+    .with_audit_context(audit)
+    .attest_tenant_oauth_client_as(&operator, &public_record, OwnershipPurpose::Register)
+    .await?;
+tenants.upsert_attested(public_record, attestation).await?;
 
 // Login: the tenant comes from the route or the host, never the body.
 let (url, _state) = authn
@@ -264,11 +439,54 @@ let (url, _state) = authn
 server-side session and binds the ceremony to it, as
 `begin_oauth_login_in_tenant` does:
 `complete_oauth_login` refuses a user of another tenant. The callback
-(`finish_oauth_login`, or the JARM form) is unchanged: it reads the
-tenant from the session, so the callback request chooses neither the
-tenant nor the provider. A ceremony begun before an update does not
+(`finish_oauth_login`, or the JARM form) reads the tenant from the session,
+so the callback request chooses neither the tenant nor the provider. The
+handler passes the route the callback arrived on, and that route must be
+this tenant's for this provider. A ceremony begun before an update does not
 finish against the new issuer; it fails the issuer check and the login
 restarts.
+
+**The redirect URI of a tenant's provider carries the tenant.** Two
+tenants' providers of one name are two authorization servers, and a
+provider name alone does not tell their callbacks apart. Give each record a
+`redirect_url` with the tenant in its path,
+`https://app.example.com/auth/callback/{tenant}/{provider}`, register that
+URI at the tenant's identity provider, and mount one route for the shape.
+The handler reads both segments from the path the server routed, never from
+a query parameter or a body, and passes them as the callback route:
+
+```rust,ignore
+async fn tenant_callback(
+    session: AuthSession,
+    State(authn): State<Arc<AuthnService<...>>>,
+    Path((tenant, provider)): Path<(TenantId, String)>,
+    Query(callback): Query<CallbackQuery>,
+    audit: AuditContext,
+) -> impl IntoResponse {
+    let claims = authn
+        .with_audit_context(audit)
+        .finish_oauth_login(
+            OAuthCallbackRoute::of_tenant(&tenant, &provider),
+            &callback.code,
+            &callback.state,
+            callback.iss.as_deref(),
+            &session,
+        )
+        .await?;
+    // resolve the local user, then complete_oauth_login
+}
+```
+
+`finish_oauth_login` refuses a callback on any route but the one of the
+registration the login began with, before the code is exchanged: another
+tenant's route for a provider of the same name, the global route
+(`OAuthCallbackRoute::global`) for a tenant's provider, and a tenant's route
+for a global one. Without the tenant in the comparison, a tenant whose
+identity provider is hostile could send a user on to another tenant's
+honest one and have the code that comes back posted to its own token
+endpoint. A login begun with `begin_oauth_login_in_tenant` uses the global
+registration's provider and returns on that provider's redirect URI, so its
+route is the global one.
 
 The global registration stays as the single-tenant form. A name
 registered with `with_oauth_provider` is reached by `begin_oauth_login`
@@ -279,14 +497,16 @@ The helpers that follow the login resolve the provider the way the login
 did. `oauth_for_session(&session)` reads the tenant that
 `complete_oauth_login` recorded for a login begun with
 `begin_oauth_login_with_tenant_provider` and returns a `ScopedOAuth`; its `refresh_oauth_token`,
-`fetch_userinfo`, `revoke_oauth_token`, `build_end_session_url` and
-`generate_dpop_proof` take the same arguments as the
-methods of that name on the service and reach that tenant's provider. A
-session that logged in through the global registration, or through no OAuth
-provider, gets the global registration, so a single-tenant product changes
-nothing. Where there is no session (a background refresh keyed by a stored
-tenant id) use `oauth_in_tenant(&tenant)`. A tenant with no provider by that
-name is `OAuthError::UnknownProvider`, never the global one.
+`fetch_userinfo`, `build_end_session_url`, `generate_dpop_proof` and
+`revoke_oauth_token` reach that tenant's provider. A session that logged in through the global registration, or through no
+OAuth provider, gets the global registration, so a single-tenant product
+changes nothing. Where there is no session (a background refresh keyed by a
+stored tenant id) use `oauth_in_tenant(&tenant)`. For a tenant with no provider
+by that name the call fails with `OAuthError::UnknownProvider`; it never
+falls back to the global one. Where
+there is neither a session nor a tenant (a job that revokes a stored token of
+a provider every tenant shares) use `oauth_global()`, which reads the global
+registration by name.
 
 ```rust,ignore
 let authn = authn.with_audit_context(audit);
@@ -305,9 +525,22 @@ let info = authn
     .await?;
 ```
 
-The by-name methods directly on the service (`authn.refresh_oauth_token`
-and the others) are the single-tenant form and read the global registration
-only, as `begin_oauth_login` does.
+A revocation writes two `LogoutAttempt` audit rows naming the provider and,
+where the scope has them, the session's user and the tenant, under one
+`request_id`: a
+request row before the provider is asked (a `Failure` with the reason
+`OAUTH_REVOCATION_REQUESTED_REASON`), and an outcome row after it answers
+(`Success`, its refusal, or unconfirmed when it did not answer). When the
+request row cannot be written nothing is sent and the call answers
+`OAuthError::AuditStore`; when the outcome row cannot be written the call
+answers `OAuthError::AuditStore` with what the provider answered, and the
+token may be revoked.
+
+No helper takes a provider by its name alone. A name is unique only inside
+one tenant's providers or the global registration, and a token sent to the
+wrong one of two providers of a name is disclosed to it, so every call
+names its scope. A single-tenant product writes `oauth_for_session(&session)`
+in a request and `oauth_global()` in a worker.
 
 An IdP-initiated logout arrives with no session and no tenant, only an issuer.
 Build the back-channel handler with the tenant source so it finds the
@@ -339,13 +572,38 @@ tenants' providers share both the issuer and the client id, the token cannot
 be attributed, and the handler refuses it with
 `LogoutProviderError::Ambiguous` and ends nothing; give each tenant its own
 client registration. `StoredTenantOAuthProviders::upsert` refuses to register
-the second one (`OAuthError::Config`, "already registered by another
-tenant"), so a tenant administrator cannot create the ambiguity for another
-tenant; name the pairs the global registration holds with
+the second one (`OAuthError::Config`, "its issuer and client id are already
+registered by another record"), whichever tenant holds the first, so a tenant
+administrator cannot create the ambiguity for another tenant. Name the pairs
+the global registration holds with
 `with_global_registration(issuer, client_id)` so a tenant cannot take those
-either. A tenant provider that matches a global one never shadows it: the
-global provider decides the token, and the tenant's is ignored and logged. A
-tenant source that fails answers 503, so the IdP retries.
+either. The first record to register a pair keeps it, so `upsert` stores a
+record only once the tenant's ownership of the client is proven (the
+`OwnershipProofs` above). When a tenant took another's client before the directory asked for proof,
+`reprove` refuses its record, `holder_of(issuer, client_id)` names the
+record that holds the pair, and
+`RequestAuthnService::reassign_tenant_oauth_pair_as(operator, &tenants,
+owner_record, attestation)` writes the owner's record and removes the one
+that held the pair in a single store write, so the tenant that took the
+pair cannot take it again in between. The owner's record proves itself as
+any write does, or carries an attestation made for
+`OwnershipPurpose::HandOver`, and the operator is a deployment operator
+in `TenantId::SYSTEM`, as for an attestation. The hand-over writes a request row
+before the store is asked (`CLIENT_PAIR_HAND_OVER_REQUESTED_REASON`), a
+`Failure` that means pending, as the revocation request row does, so a
+hand-over whose outcome was never recorded never reads as done; then,
+under the same `request_id`, a `Success` row for the record stored and a
+`MethodDisabled` row for each record removed, attributed to that record's
+tenant (`CLIENT_PAIR_HANDED_OVER_REASON`), or a `Failure` row with the
+refusal. Each row names a record's provider by the kind the record is
+configured with, and the hand-over returns each record it removed, as it
+was stored (`ReassignedPair::removed`). Count hand-overs by those outcome rows, not the request row. A store of your
+own implements `TenantOAuthProviderStore::reassign_pair`, a required
+method; one that cannot make the removal and the write one step returns
+`reassign_pair_unsupported()` and changes nothing. A tenant provider that
+matches a global one never shadows it: the global provider decides the
+token, and the tenant's is ignored and logged. When the tenant source fails, the handler answers 503, so the IdP
+retries.
 
 ## Back-channel logout across instances
 
@@ -374,30 +632,52 @@ let handler = BackChannelLogoutHandler::for_tenants(source, registry, authn.sid_
 ```
 
 `SidStore` and `LogoutReplayLog` are traits, so a store of your own (SQL, say)
-plugs in the same way. `ValkeySidStore` ages its keys out by time instead of
-by the in-process map's capacity and prune (`with_sid_ttl`, `with_subject_ttl`),
-so `with_sid_map_capacity` does not apply to it, and it gives every key one
-prefix; in a cluster put a hash tag in it (`with_prefix("{axess}:logout")`)
-because its scripts address the records of a session together. A login whose
-mapping the store could not write is still a login (the mapping is best
-effort, as at capacity); a logout whose store cannot be read is answered
-`503`, so the IdP sends the token again.
+plugs in the same way. A sid store names a session by its `SessionKey`, as
+the session store and the session registry do: no record it keeps holds a
+value a cookie could carry. `ValkeySidStore` ages its keys out by time
+instead of by the in-process map's capacity and prune (`with_sid_ttl`,
+`with_subject_ttl`), so `with_sid_map_capacity` does not apply to it. Its
+scripts address the records of a session together, so it puts its whole
+prefix in a hash tag: every key begins `{<prefix>}:v2:` and the store's keys
+share one slot on any cluster, with no hash tag of yours in the prefix. A
+prefix that is empty or begins with `}` would split them, so a store given
+such a prefix fails every call. The replay log's keys (`<prefix>:jti:...`)
+need no shared slot: each of its scripts takes one key.
+
+A login whose subject record or `sid` mapping the sid store cannot write is
+refused (`AuthnError::NoFlow`) and its session ended, just as a login the
+session registry cannot register is: no session exists that a logout from
+the provider cannot reach. An outage of the sid store is therefore an outage of
+federated sign-in; make the store as available as the session registry. A
+logout whose store cannot be read is answered `503`, so the IdP sends the
+token again.
 
 `with_metrics` counts the tokens that verified but ended no session
 (`back_channel_logout_unmatched`); the answer stays `200`. A rate that does not
-fall is instances that do not share a store, or logouts for sessions that
-already ended.
+fall points to instances that do not share a store, or to logouts for
+sessions that already ended.
 
 ## Changing a provider on a running service
 
-`reload_oauth_provider(name, candidate)` replaces or adds a global provider and
-`remove_oauth_provider(name)` takes one out; `reload_tenant_oauth_provider` and
-`remove_tenant_oauth_provider` do the same in a registry keyed by tenant and
-name (`LiveTenantOAuthProviders`). The candidate is the future of
+`reload_oauth_provider_as(actor, name, kind, candidate)` replaces or adds a
+global provider and `remove_oauth_provider_as(actor, name)` takes one out;
+`reload_tenant_oauth_provider_as` and `remove_tenant_oauth_provider_as` do the
+same in a registry keyed by tenant and name (`LiveTenantOAuthProviders`). Each
+is called on `authn.with_audit_context(audit)` and records the administrator
+it names. `kind` is the `FederatedProvider` every login through the new
+provider records, as `with_oauth_provider_of_kind` and a tenant record's
+`kind` configure it, and the change's audit row names it. The candidate is the future of
 `OAuthProviderConfig::discover(..)` finished with `.build()`, so discovery and
 the issuer check run before the swap, and a refusal leaves the previous
 provider serving. A login begun before the swap finishes only if the issuer is
-unchanged. See [live provider reload](../authentication/live-provider-reload.md).
+unchanged. The live registry keeps an `(issuer, client_id)` pair to one
+provider as the stored directory does: a tenant reload (by an administrator or
+a `ProviderSource` follower) whose pair another tenant provider or a global
+provider holds is refused as `ProviderReloadError::PairHeld`. It asks for no
+proof of ownership: the providers are the adopter's, installed by an operator
+through `reload_tenant_oauth_provider_as`, which records who did, so ownership
+is checked on that operator's path. See
+[live provider reload](../authentication/live-provider-reload.md).
 
 ## The login flow
 
@@ -411,7 +691,8 @@ nonce, and returns a redirect to the IdP's authorize URL with those
 values bound in.
 
 ```rust,ignore
-use axess::{AuthnService, AuthSession, OAuthLoginOptions};
+use axess::federation::oauth::OAuthLoginOptions;
+use axess::{AuthnService, AuthSession};
 use axum::response::{IntoResponse, Redirect};
 
 async fn begin_oauth_login(
@@ -420,10 +701,10 @@ async fn begin_oauth_login(
     Path(provider_name): Path<String>,
 ) -> impl IntoResponse {
     match service
-        .begin_oauth_login(&session, &provider_name, OAuthLoginOptions::default())
+        .begin_oauth_login(&provider_name, &OAuthLoginOptions::default(), &session)
         .await
     {
-        Ok(auth_url) => Redirect::to(auth_url.as_str()).into_response(),
+        Ok((auth_url, _state)) => Redirect::to(auth_url.as_str()).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
     }
 }
@@ -440,13 +721,13 @@ async fn begin_oauth_login(
 
 The redirect URI passed at this step must exactly match the one
 registered with the IdP at provisioning time. A mismatch is the
-single most common reason a federated login fails out of the box.
+most common reason a new federated login fails.
 
 ### Where the ceremony secrets live
 
 Between the begin and the callback the in-flight ceremony sits in the
 session's custom data: the PKCE verifier, the state, the nonce and, for a
-provider that binds tokens, the DPoP key's seed. axess does not seal those
+provider that binds tokens, the DPoP key's seed. Axess does not seal those
 fields one by one. They are as private as the session store: sealed whenever
 the store was built with a `SessionCrypto` key (the Valkey, SQLite, Postgres
 and MySQL stores seal the whole row), and plain text in the store only
@@ -457,24 +738,39 @@ session store as access to an in-flight ceremony. The ceremony lasts at most
 
 ### Handle the callback
 
-The IdP, on successful user authentication and consent, redirects the
+After the user authenticates and consents, the IdP redirects the
 user to the registered redirect URI with a `code` and a `state` query
-parameter. The application's callback handler picks these up,
-verifies the state matches what was stored on the session (defeating
-CSRF), and calls into axess to perform the token exchange.
+parameter, and an `iss` when it supports RFC 9207. The application's
+callback handler picks these up and calls `finish_oauth_login` with the
+route it is registered for (`OAuthCallbackRoute::global(name)` for a
+provider of the global registration, `OAuthCallbackRoute::of_tenant(tenant,
+name)` for one a tenant brought). Axess checks the state against what
+was stored on the session (defeating CSRF), the route and `iss` against
+the registration the login began with (defeating a mix-up), and performs the
+token exchange.
 
 ```rust,ignore
-async fn finish_oauth_login(
+async fn oauth_callback(
     session: AuthSession,
     State(service): State<Arc<AuthnService<...>>>,
     Path(provider_name): Path<String>,
     Query(callback): Query<CallbackQuery>,
+    audit: AuditContext,
 ) -> impl IntoResponse {
-    match service
-        .finish_oauth_login(&session, &provider_name, &callback.code, &callback.state)
+    let authn = service.with_audit_context(audit);
+    match authn
+        .finish_oauth_login(
+            OAuthCallbackRoute::global(&provider_name),
+            &callback.code,
+            &callback.state,
+            callback.iss.as_deref(),
+            &session,
+        )
         .await
     {
-        Ok(_authenticated) => Redirect::to("/dashboard").into_response(),
+        // Not signed in yet: resolve the local user from the claims,
+        // then `authn.complete_oauth_login(&user, &claims, &session)`.
+        Ok(claims) => todo!("resolve the user, complete the login, redirect"),
         Err(e) => (StatusCode::UNAUTHORIZED, format!("{e}")).into_response(),
     }
 }
@@ -483,49 +779,65 @@ async fn finish_oauth_login(
 struct CallbackQuery {
     code: String,
     state: String,
+    iss: Option<String>,
 }
 ```
 
-`finish_oauth_login` does seven things:
+`finish_oauth_login` does six things:
 
 1. Reads the PKCE verifier, CSRF state and nonce from the session's
    intermediate state.
-2. Cross-checks the supplied state against the stored one, returning
-   `OAuthError::CsrfMismatch` if they disagree.
-3. POSTs to the IdP's token endpoint with the code, verifier, client id
-   and client secret.
+2. Checks the callback's route against the registration the login began
+   with, refuses a ceremony older than the ceremony timeout
+   (`OAuthError::Expired`), cross-checks the supplied state against the
+   stored one, returning `OAuthError::CsrfMismatch` if they disagree, and
+   checks `iss` against the provider the login began with (the mix-up
+   defence described under ID token validation).
+3. POSTs to the IdP's token endpoint with the code, the PKCE verifier and
+   the redirect URI, authenticating the client with its secret (a Basic
+   header) or, under `private_key_jwt`, its client assertion.
 4. Extracts the ID token, access token and optional refresh token.
 5. Validates the ID token: signature against the cached JWKS, issuer,
    audience, nonce, expiry, and `azp` when the audience is multi-valued.
-6. Optionally fetches userinfo to supplement the ID token claims.
-7. Transitions the session to `Authenticated`, or to `PendingWorkflow`
-   if the federated flow is one step of a longer ceremony such as signup.
+6. Clears the ceremony from the session, leaves a claim lock bound to this
+   provider, subject and session, and returns the `OAuthClaims`.
 
-If any of the seven steps fails, the function returns an
-`OAuthError` variant naming what failed. The session does not
-transition; the intermediate state is cleared (to prevent replay);
-the callback handler can render an error.
+The session is not signed in yet. The application resolves the local user
+from the claims (find or create) and calls `complete_oauth_login(&user,
+&claims, &session)`, which checks the claim lock and the ceremony's tenant
+and transitions the session to `Authenticated`. Userinfo is a separate call,
+`fetch_userinfo`, for claims the ID token does not carry.
+
+If any of the six steps fails, `finish_oauth_login` returns an
+`OAuthError`. A failed token exchange or ID token check comes back as
+`OAuthError::TokenExchange`. The provider's own error, such as the
+`OAuthError::IdTokenValidation` described under ID token validation, goes
+to the server log, so that no provider detail reaches the caller. The
+session does not transition,
+the intermediate state is cleared to prevent replay, and the callback
+handler can render an error.
 
 ### ID token validation
 
-The ID token validation is where most of the security of an OIDC
-integration lives. Axess performs the full set of checks RFC 6749
-and OpenID Connect Core 1.0 require; the integration code does not
-have to write them. The checks are:
+Most of the security of an OIDC integration lies in ID token
+validation. Axess performs the full set of checks RFC 6749 and OpenID
+Connect Core 1.0 require, so integration code does not write them. The
+checks are:
 
 **Signature verification** against the IdP's JWKS. The
 cache holds the current signing keys; if the ID token's `kid` header
 does not match a cached key, the cache refreshes (subject to the
-single-flight and debounce protections). A signature that fails
-against the refreshed keys produces `OAuthError::IdTokenValidation`,
-carrying the underlying reason as a string; a `kid` the refreshed JWKS
-still does not contain produces `OAuthError::UnknownKid` instead, which
-is the one to alert on because it usually means the IdP rotated keys in
-a way the cache cannot follow.
+single-flight and debounce protections) and the check runs once more. A
+signature that fails produces `OAuthError::IdTokenValidation`, carrying
+the underlying reason as a string. A `kid` the refreshed JWKS still does
+not contain produces `OAuthError::IdTokenValidation` too, with a string
+saying that no key in the refreshed JWKS matches the ID token. That is
+the one to alert on, because it usually means the IdP rotated keys in a
+way the cache cannot follow.
 
 **The issuer check.** The ID token's `iss` claim must
 exactly match the discovery document's `issuer` field. A mismatch
-indicates either a misconfigured IdP, a discovery-document substitution
+indicates a misconfigured IdP, a discovery-document substitution
 attack, or an attempt to replay an ID token from a different issuer;
 all three produce `OAuthError::IdTokenValidation`. There is no
 per-check variant: the enum carries one validation error whose string
@@ -533,42 +845,50 @@ names which claim failed, so match on the variant and log the string
 rather than branching on the reason.
 
 **The audience check.** The ID token's `aud` claim must
-contain the client's registered client id. If `aud` is a single
-value, the check is straightforward. If `aud` is an array (which
-happens when the IdP issues tokens valid for multiple clients), the
-check ensures the client id is in the array, *and* additionally
-enforces the `azp` (authorized party) check: the `azp` claim must
-exist and equal the client id, regardless of the array's contents.
+contain the client's registered client id. If `aud` is an array (which
+happens when the IdP issues tokens valid for several clients), the
+client id must be in it *and* the `azp` (authorized party) claim must
+exist and equal the client id.
 The `azp` check defeats a class of attacks where an ID token issued
 for one client is replayed against a different client whose id is
 also in the audience array.
 
-The fourth is the nonce check. The ID token's `nonce` claim must
-exactly match the nonce that was generated at `begin_oauth_login`
-time and stored in the session. The nonce defeats ID token replay:
-an attacker who captures an ID token cannot reuse it against the
-same client because the session-bound nonce will not match on a
-later login.
+**The nonce check.** The ID token's `nonce` claim must exactly
+match the nonce `begin_oauth_login` generated and stored in the
+session. The nonce defeats ID token replay: an attacker who captures
+an ID token cannot reuse it against the same client, because a later
+login has a different nonce.
 
-The fifth is the expiry check. The ID token's `exp` claim must be
+**The expiry check.** The ID token's `exp` claim must be
 in the future at the moment of validation, with a small clock-skew
 allowance. The clock comes from the injected `Clock` trait, so DST
 tests can exercise expiry handling deterministically.
 
-`iat` (issued-at) is not given an age bound of its own for ID tokens.
+ID tokens get no age bound on `iat` (issued-at).
 The `openidconnect` verifier checks `exp` and the nonce but accepts any
 `iat`, and axess does not add a maximum age: how recent a login is comes
 from the single-use authorization code, the nonce bound to the session, the
 ceremony timeout, and `exp`. (Logout tokens are different: their `iat` must be
-within five minutes.) With `with_fapi` it caps `exp - iat`.
+within five minutes.) Under `with_fapi`, axess caps `exp - iat`.
 
-The seventh is the `iss` parameter of the authorization response (RFC 9207).
-`finish_oauth_login_with_iss` takes the callback's `iss` and compares it with
-the provider's issuer exactly; a different one is a mix-up and is refused. A
-missing `iss` is refused when the provider's metadata advertises
+**The mix-up defence** of RFC 9207, in two parts. First,
+`finish_oauth_login` takes the route the callback arrived on, an
+`OAuthCallbackRoute`: the `{provider}` of a `/callback/{provider}` route for
+the global registration, the `{tenant}` and `{provider}` of a
+`/callback/{tenant}/{provider}` route for a provider a tenant brought. It
+refuses a callback on any route but the one of the registration the login
+began with (another provider name, another tenant's provider of the same
+name, the global route for a tenant's provider or the reverse), before the
+code is exchanged: an authorization server that sent the browser on to
+another one cannot have the other's code redeemed at its own token endpoint.
+For this to hold, register one redirect URI per provider at each IdP,
+and one per tenant for a tenant's provider. Second, the
+method takes the callback's `iss` and compares it with the provider's
+issuer exactly; a different one is refused the same way. A missing `iss` is
+refused when the provider's metadata advertises
 `authorization_response_iss_parameter_supported`, and accepted when it does
-not. `finish_oauth_login` does not look at `iss`; prefer the former. Register
-one redirect URI per provider as well.
+not. Both refusals are recorded as a `provider_mismatch` login failure and
+clear the ceremony.
 
 ## Refreshing tokens
 
@@ -611,17 +931,18 @@ What a bound provider does:
   `token_type` is not `DPoP`, or whose access token names another key in
   `cnf.jkt`, is refused. The key comes back in `OAuthClaims::dpop_key`.
 - Every later call with the tokens takes the key: the `dpop_key` argument of
-  `refresh_oauth_token`, `fetch_userinfo` and `revoke_oauth_token`, the
-  `dpop` argument of the provider's client credentials and device grants. A
-  call given `None` is refused with `OAuthError::DpopKeyRequired` before
-  anything is sent, because a bound token presented as Bearer is refused by a
-  resource server that checks the binding, and accepted by one that does not.
-  Revocation is sent without a key too, and with a proof when given one.
+  `refresh_oauth_token` and `fetch_userinfo`, the `dpop` argument of the
+  provider's client credentials and device grants. A call given `None` is
+  refused with `OAuthError::DpopKeyRequired` before anything is sent, because
+  a bound token presented as Bearer is refused by a resource server that
+  checks the binding, and accepted by one that does not. Revocation is the
+  exception: a revocation issues no token, so `revoke_oauth_token` is sent
+  when its `dpop_key` is `None` too, and with a proof when given the key.
 - An authorization or resource server that wants a nonce answers
   `use_dpop_nonce` (RFC 9449 sections 8 and 9); the request is sent once more
   with a proof that echoes it. No other refusal is retried.
 
-**Keep the key for the tokens' life.** axess does not store it, and a key
+**Keep the key for the tokens' life.** Axess does not store it, and a key
 made afresh does not match tokens already issued. Store its seed beside the
 refresh token, as secret as the token itself, and restore it in whichever
 process refreshes, after a restart or on another node:
@@ -635,6 +956,7 @@ let seed = claims.dpop_key.as_ref().map(|key| key.to_seed_bytes());
 // Later, in any process: restore it and refresh with it.
 let key = stored_seed.map(DpopKey::from_seed);
 let outcome = authn
+    .oauth_global() // or `oauth_in_tenant(&tenant)` for a tenant's provider
     .refresh_oauth_token("idp", &refresh_token, &subject, nonce.as_deref(), key.as_ref())
     .await?;
 ```
@@ -643,8 +965,9 @@ The OAuth example keeps the seed in its session beside the refresh token
 (`examples/oauth/src/app.rs`). Sessions that were signed in before the
 provider bound its tokens hold Bearer tokens and no key. A confidential
 client's refresh token is not bound to a key (RFC 9449 section 5), so where
-the IdP accepts it they refresh with a key made then (`DpopKey::generate`)
-and kept from that refresh on; otherwise they sign in again.
+the IdP accepts it, those sessions refresh with a new key
+(`DpopKey::generate`) and keep it from then on; otherwise they sign in
+again.
 
 **`without_dpop()`** turns DPoP off for a provider whose IdP advertises it.
 It is the setting for deployments whose resource servers accept only Bearer
@@ -693,23 +1016,23 @@ Two mechanisms, driven from opposite ends.
 
 ### Back-channel logout
 
-When the IdP supports OIDC back-channel logout, the IdP sends a POST
+When the IdP supports OIDC back-channel logout, it sends a POST
 to a registered logout endpoint at your application with a
 `logout_token`. The application validates the token and, on success,
 revokes the user's session.
 
-The validation is similar to ID token validation but slightly
-different: the audience and issuer checks apply, the `azp` check
+The validation resembles ID token validation: the audience and issuer
+checks apply, the `azp` check
 applies when audience is multi-valued, and an additional check on
 the `events` claim verifies the token is a back-channel logout token
 (the URI `http://schemas.openid.net/event/backchannel-logout` must be
 present). Axess implements this through `OAuthProvider::verify_logout_jwt`,
 which returns the claims on success.
 
-The token's `typ` header is checked as well. By default `logout+jwt`, the
-plain `JWT` and `Logout` spellings IdPs in the field send, and no `typ` at
-all are taken, and the types of other tokens the same key signs (`dpop+jwt`,
-`at+jwt`) are refused. For an IdP that sends the explicit type, call
+The token's `typ` header is checked as well. By default axess accepts
+`logout+jwt`, the plain `JWT` and `Logout` spellings some IdPs send, and a
+missing `typ`; it refuses the types of other tokens the same key signs
+(`dpop+jwt`, `at+jwt`). For an IdP that sends the explicit type, call
 `OAuthProviderBuilder::with_required_logout_typ` and any token whose `typ` is
 not `logout+jwt` is refused too.
 
@@ -717,21 +1040,37 @@ A token with a `sid` ends the one session that `sid` maps to; the subject's
 other sessions are ended only when the token has no `sid` or the `sid` maps to
 nothing. Providers that share an issuer are told apart by the client id the
 token's `aud` names. The replay log of `jti` values is bounded per issuer;
-when an issuer's share is full of live entries that issuer's token is
-answered 503 (retry later), nothing is forgotten, and other issuers' logouts
-go on being served.
+when an issuer's share is full of live entries, that issuer's tokens are
+answered 503 (retry later), no entry is evicted, and other issuers'
+logouts are still served.
 Userinfo is bound to the login the same way: `fetch_userinfo` takes the
 expected subject and refuses a response for any other.
 
+The sid store keeps the key the session's login registered, and a logout
+finds the session by it for as long as the session lives, across rotations.
+A step-up, `rotate_session` or `regenerate` moves the session to a new key;
+given the key the login registered, the registry returns the key the
+session is under now (`SessionRevoker::current_key`) and ends that session.
+So a logout by `sid` or by `sub`, back-channel or front-channel, ends a
+session that rotated after its login. The front-channel route compares the
+caller's session with the key the session is under now, and the sweep of the
+subject records keeps a session that rotated. A logout for a session that
+has already ended ends nothing and reports nothing: no `SessionInvalidated`
+row is written, the session's records go, and the token is counted as
+unmatched (`back_channel_logout_unmatched`).
+
 The size cap on the logout token is eight kilobytes, the `iat` bound
-is five minutes, and the clock-skew tolerance is sixty seconds. The
-caps protect against denial-of-service through oversize tokens; the
-bounds defeat replay of a captured logout token after a meaningful
-delay.
+is five minutes, and the clock-skew tolerance is sixty seconds (the JWT
+verifier's tolerance may be at most `MAX_LEEWAY`, 300 s, in whole seconds; a
+configuration above it, or with a fraction of a second, is refused before any token is read, with an error naming the
+bound). The
+size cap protects against denial-of-service through oversize tokens;
+the time bounds defeat replay of a captured logout token after a
+meaningful delay.
 
 ### RP-Initiated Logout
 
-The opposite direction is RP-Initiated Logout: you
+The opposite direction is RP-Initiated Logout: the application
 initiates a logout that propagates to the IdP, so the user is logged
 out of the IdP session as well as your own. Axess
 constructs the end-session URL through
@@ -744,16 +1083,16 @@ The `post_logout_redirect_uri` must be on an allowlist that the
 application configures with `with_allowed_post_logout_redirect_uris`. The
 allowlist exists to defeat open-redirect attacks: an attacker who can
 manipulate the redirect URI could send the user to an arbitrary external site
-after logout, which is the shape of a phishing setup. The allowlist is a small
-explicit list of allowed URIs matched exactly. A redirect that is not on the
+after logout, a common phishing setup. The allowlist is a
+small explicit list of URIs, matched exactly. A redirect that is not on the
 list is dropped from the URL at `build_end_session_url` time, and so is every
 redirect when the list is empty (the default): a provider nobody configured
 forwards nothing.
 
 ## Threat model
 
-OAuth and OIDC together are robust against a handful of attacks
-when the implementation does the validations above correctly.
+With the validations above, OAuth and OIDC defend against the
+following attacks.
 
 Against CSRF on the callback: the state parameter binds the callback
 to the session that started the login. An attacker who tricks a user
@@ -773,7 +1112,7 @@ against another): the audience check plus the `azp` check on
 multi-element audiences catch this.
 
 Against authorization code interception: PKCE binds the code to the
-verifier you generated. An attacker who intercepts the
+verifier axess generated. An attacker who intercepts the
 code cannot exchange it without the verifier.
 
 Against open-redirect phishing on logout: the
@@ -792,23 +1131,27 @@ the registered client secret if the IdP suffers a breach.
 
 A few failure modes recur during initial integration.
 
-If the callback returns an error about state mismatch, the most
-likely cause is that the user took longer than the ceremony timeout
-to complete the IdP login. The intermediate state on the session has
-expired and the state value is no longer recoverable. Increasing
-the ceremony timeout (a generous fifteen minutes is reasonable) is
-the fix.
+If the callback returns `OAuthError::Expired`, the user took longer than
+the ceremony timeout to complete the IdP login, and has to start the login
+again. The timeout defaults to ten minutes and is capped there, at the
+authorization-code lifetime RFC 6749 section 4.1.2 recommends:
+`with_ceremony_timeout` can shorten it, and a longer setting has no effect.
+`OAuthError::NoFlow` means the session holds no ceremony: the callback
+arrived without the session the login began in, or the ceremony was already
+used. `OAuthError::CsrfMismatch` means the callback's `state`, route or `iss`
+does not match the ceremony: a forged callback, one that came back on
+another provider's redirect URI, or the callback of an earlier login after
+a second one began in the same session.
 
 If the token exchange returns an invalid-client error, the client id
 or secret in `OAuthProviderConfig` does not match what the IdP has
-registered. The most common variant is using a public-client id at
-the IdP while configuring axess with a confidential-client expectation
-(or vice versa). Check the IdP's client registration page.
+registered. The most common variant is a client registered as public at the IdP
+while axess is configured as a confidential client, or the reverse. Check the IdP's client registration page.
 
 If the ID token validation returns an audience mismatch on an IdP
 that supports multiple clients, the `aud` claim is probably an
 array and the `azp` claim is missing. Some IdPs do not emit `azp`
-when they should; configuring the IdP to issue `azp` is the fix.
+when they should; the fix is to configure the IdP to issue `azp`.
 Axess deliberately refuses to bypass the `azp` check because doing
 so would open the audience-confusion attack.
 
@@ -823,7 +1166,7 @@ By default an ID token is accepted when it verifies under a key the provider
 published and its algorithm is one the provider advertised; a logout token,
 when its algorithm is one of the asymmetric defaults. OpenID Connect Core
 3.1.3.7 asks for the algorithm the client registered
-(`id_token_signed_response_alg`, `RS256` unless said otherwise). Name it with
+(`id_token_signed_response_alg`, `RS256` unless registered otherwise). Name it with
 `OAuthProviderBuilder::with_id_token_signing_algs(["RS256"])` and every other
 algorithm is refused for both kinds of token. Under `with_fapi` the provider
 accepts the algorithms the pin and the profile both name: a pin narrows the
@@ -841,9 +1184,9 @@ profile's rules (the binding described above, required and with the
 code bound too),
 and JARM (JWT-secured authorization response mode, which signs the
 IdP's response back to the client).
-*Workload identity overview* covers the inbound resolver side of
-the same machinery, where your service is the OAuth server
-accepting tokens issued by federated workload-identity systems.
+*Workload identity overview* covers the inbound side, where your
+service is the resource server that accepts tokens issued by federated
+workload-identity systems and resolves them into a `Principal::Workload`.
 *Local IdP* covers the in-process IdP, both production `LocalIdp`
 for workload-identity issuance and the `LocalIdpFixture` that mints
 test tokens against a controllable JWKS for integration tests.

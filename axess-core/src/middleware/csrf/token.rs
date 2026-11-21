@@ -1,4 +1,4 @@
-//! Minting and checking of CSRF tokens: `nonce || HMAC(key, nonce || session_id)`.
+//! Minting and checking of CSRF tokens: `nonce || HMAC(key, nonce || session_key)`.
 
 use super::TOKEN_NONCE_BYTES;
 use axess_rng::SecureRng;
@@ -6,30 +6,34 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::Mac;
 use subtle::ConstantTimeEq;
 
-pub(super) fn mint_token(session_id: &[u8], signing_key: &[u8; 32], rng: &dyn SecureRng) -> String {
+pub(super) fn mint_token(
+    session_key: &[u8],
+    signing_key: &[u8; 32],
+    rng: &dyn SecureRng,
+) -> String {
     let mut nonce = [0u8; TOKEN_NONCE_BYTES];
     rng.fill_bytes(&mut nonce);
-    let tag = compute_tag(&nonce, session_id, signing_key);
+    let tag = compute_tag(&nonce, session_key, signing_key);
     let mut combined = Vec::with_capacity(TOKEN_NONCE_BYTES + tag.len());
     combined.extend_from_slice(&nonce);
     combined.extend_from_slice(&tag);
     URL_SAFE_NO_PAD.encode(&combined)
 }
 
-fn compute_tag(nonce: &[u8], session_id: &[u8], signing_key: &[u8; 32]) -> [u8; 32] {
-    // MAC over `nonce || session_id`. Binding the session id into the tag is
+fn compute_tag(nonce: &[u8], session_key: &[u8], signing_key: &[u8; 32]) -> [u8; 32] {
+    // MAC over `nonce || session_key`. Binding the session's key into the tag is
     // what makes a token minted under one session fail validation under
-    // another: the nonce is echoed in the token but the id is not, so an
+    // another: the nonce is echoed in the token but the key is not, so an
     // attacker cannot recompute the tag for a different session without the
     // key. The nonce has a fixed length (`TOKEN_NONCE_BYTES`), so the
     // concatenation is unambiguous and needs no separator.
     let mut mac = crate::hmac::new_signer(signing_key);
     mac.update(nonce);
-    mac.update(session_id);
+    mac.update(session_key);
     mac.finalize().into_bytes().into()
 }
 
-pub(super) fn validate_token(token: &str, session_id: &[u8], signing_key: &[u8; 32]) -> bool {
+pub(super) fn validate_token(token: &str, session_key: &[u8], signing_key: &[u8; 32]) -> bool {
     let bytes = match URL_SAFE_NO_PAD.decode(token) {
         Ok(b) => b,
         Err(_) => return false,
@@ -38,16 +42,16 @@ pub(super) fn validate_token(token: &str, session_id: &[u8], signing_key: &[u8; 
         return false;
     }
     let (nonce, tag) = bytes.split_at(TOKEN_NONCE_BYTES);
-    let expected = compute_tag(nonce, session_id, signing_key);
+    let expected = compute_tag(nonce, session_key, signing_key);
     expected.ct_eq(tag).into()
 }
 
 /// The double-submit check: the cookie and the presented token are equal and
-/// the token verifies against the signing key and `session_id`.
+/// the token verifies against the signing key and `session_key`.
 pub(super) fn validate_pair(
     cookie_token: Option<&str>,
     presented: Option<&str>,
-    session_id: &[u8],
+    session_key: &[u8],
     signing_key: &[u8; 32],
 ) -> bool {
     let (Some(c), Some(p)) = (cookie_token, presented) else {
@@ -57,8 +61,8 @@ pub(super) fn validate_pair(
         return false;
     }
     // Cookie and presented must match exactly (double-submit) AND the token
-    // must verify against the signing key *and* the current session id (so an
+    // must verify against the signing key *and* the current session key (so an
     // attacker who can set cookies cannot inject a self-chosen value, and a
     // token stolen from another session cannot be replayed here).
-    bool::from(c.as_bytes().ct_eq(p.as_bytes())) && validate_token(c, session_id, signing_key)
+    bool::from(c.as_bytes().ct_eq(p.as_bytes())) && validate_token(c, session_key, signing_key)
 }

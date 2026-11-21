@@ -3,6 +3,7 @@
 //! 1. All workspace crates must have the same version.
 //! 2. Critical ecosystem crates (axum, tower, http, hyper) must not have
 //!    multiple semver-incompatible versions in the dependency tree.
+//! 3. The `sqlite-unbundled` feature must not compile the bundled SQLite.
 
 /// All axess workspace crates (including examples) must share the same version.
 #[test]
@@ -144,5 +145,56 @@ fn no_duplicate_critical_crates() {
          This will cause trait-mismatch compile errors.\n\n{}\n\n\
          Fix: align versions in Cargo.toml or add workspace [patch] entries.\n",
         duplicates.join("\n\n")
+    );
+}
+
+/// The features of `libsqlite3-sys` that a build of `axess-core` with only
+/// `feature` on resolves, as `cargo tree` prints them. Dev-dependencies are
+/// left out: they are not part of an adopter's build.
+fn libsqlite3_sys_features(feature: &str) -> String {
+    let output = std::process::Command::new("cargo")
+        .args([
+            "tree",
+            "--package=axess-core",
+            "--no-default-features",
+            "--features",
+            feature,
+            "--edges=features,normal,build",
+            "--invert=libsqlite3-sys",
+            "--depth=1",
+        ])
+        .output()
+        .expect("failed to run `cargo tree`");
+    assert!(
+        output.status.success(),
+        "`cargo tree` failed for the feature {feature}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// `sqlite-unbundled` exists so that the SQLite source sqlx bundles is not
+/// compiled and the system's library is linked. A build with it alone must
+/// resolve `libsqlite3-sys` without its `bundled` feature, by whatever route
+/// a later change might switch that on; `sqlite` is the control that shows
+/// the feature would be seen.
+#[test]
+fn the_unbundled_sqlite_feature_does_not_compile_the_bundled_source() {
+    const BUNDLED: &str = r#"libsqlite3-sys feature "bundled""#;
+
+    let bundled = libsqlite3_sys_features("sqlite");
+    assert!(
+        bundled.contains(BUNDLED),
+        "`sqlite` should resolve the bundled source, the control of this test:\n{bundled}"
+    );
+
+    let unbundled = libsqlite3_sys_features("sqlite-unbundled");
+    assert!(
+        unbundled.contains(r#"libsqlite3-sys feature "buildtime_bindgen""#),
+        "`sqlite-unbundled` should generate bindings from the system header:\n{unbundled}"
+    );
+    assert!(
+        !unbundled.contains(BUNDLED),
+        "`sqlite-unbundled` must not compile the bundled SQLite source:\n{unbundled}"
     );
 }

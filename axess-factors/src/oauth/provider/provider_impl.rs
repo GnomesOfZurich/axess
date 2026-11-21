@@ -15,44 +15,56 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-/// A `typ` header as it is compared: lower case, without the optional
-/// `application/` prefix (RFC 7515 §4.1.9).
-fn normalised_typ(typ: &str) -> String {
-    let typ = typ.to_ascii_lowercase();
-    match typ.strip_prefix("application/") {
-        Some(bare) => bare.to_string(),
-        None => typ,
-    }
-}
-
 /// Whether a logout token's `typ` header is one a logout token may carry:
 /// `logout+jwt` (the explicit type), plain `JWT`, or `Logout`, which IdPs in
-/// the field send.
+/// the field send. Compared as every `typ` is (RFC 7515 section 4.1.9).
 fn logout_typ_acceptable(typ: &str) -> bool {
-    matches!(
-        normalised_typ(typ).as_str(),
-        "logout+jwt" | "jwt" | "logout"
-    )
+    ["logout+jwt", "jwt", "logout"]
+        .into_iter()
+        .any(|acceptable| crate::jwt::validation::typ_matches(Some(typ), acceptable))
 }
 
 /// Whether a logout token's `typ` is the explicit `logout+jwt`.
 fn logout_typ_is_explicit(typ: &str) -> bool {
-    normalised_typ(typ) == "logout+jwt"
+    crate::jwt::validation::typ_matches(Some(typ), "logout+jwt")
 }
+
+/// The refusal of a logout token for its `typ` header, if any: `None` for a
+/// token whose `typ` passes, and for one longer than
+/// [`MAX_JWT_BYTES`](crate::jwt::claims::MAX_JWT_BYTES), whose header is
+/// not read. Decoding the header costs in proportion to the token, so the
+/// size bound comes first, as in the shared verifier, which then refuses
+/// the long token for its length. A header that does not decode is left to
+/// the verifier too.
+fn logout_typ_refusal(token: &str, required: bool) -> Option<String> {
+    if token.len() > crate::jwt::claims::MAX_JWT_BYTES {
+        return None;
+    }
+    let header = jsonwebtoken::decode_header(token).ok()?;
+    check_logout_typ(header.typ.as_deref(), required).err()
+}
+
+/// The most bytes of a logout token's `typ` header a refusal quotes.
+const TYP_LOG_BYTES: usize = 64;
 
 /// The verdict on a logout token's `typ` header under the provider's
 /// setting: `typ` is `None` when the token has none. `Err` carries the
-/// reason.
+/// reason. The header is read before any signature is checked, so it is
+/// the sender's text: the reason quotes it escaped and cut at
+/// [`TYP_LOG_BYTES`].
 fn check_logout_typ(typ: Option<&str>, required: bool) -> Result<(), String> {
+    let quoted = |typ: &str| crate::log_text::log_safe(typ, TYP_LOG_BYTES);
     match (typ, required) {
         (Some(typ), true) if !logout_typ_is_explicit(typ) => Err(format!(
-            "logout token `typ` `{typ}` is not `logout+jwt`, which this provider requires"
+            "logout token `typ` `{}` is not `logout+jwt`, which this provider requires",
+            quoted(typ)
         )),
         (None, true) => Err(
             "logout token has no `typ` header, and this provider requires `logout+jwt`".to_string(),
         ),
         (Some(typ), false) if !logout_typ_acceptable(typ) => Err(format!(
-            "logout token `typ` `{typ}` is not a logout token type"
+            "logout token `typ` `{}` is not a logout token type",
+            quoted(typ)
         )),
         _ => Ok(()),
     }
@@ -94,9 +106,7 @@ impl OAuthProvider for OAuthProviderConfig {
         // type. A `dpop+jwt` or `at+jwt` signed by the same key is another
         // kind of token, and being valid as that kind is no reason to take
         // it for a logout.
-        if let Ok(header) = jsonwebtoken::decode_header(token)
-            && let Err(reason) = check_logout_typ(header.typ.as_deref(), self.require_logout_typ)
-        {
+        if let Some(reason) = logout_typ_refusal(token, self.require_logout_typ) {
             return Err(OAuthError::IdTokenValidation(reason));
         }
         // The shared verifier enforces the asymmetric algorithm allow-list
@@ -322,7 +332,33 @@ impl OAuthProvider for OAuthProviderConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_logout_typ, logout_typ_acceptable};
+    use super::{check_logout_typ, logout_typ_acceptable, logout_typ_refusal};
+
+    /// A token with `header` as its JOSE header and a payload and signature
+    /// that are not checked here.
+    fn token_with_header(header: &str) -> String {
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(header);
+        format!("{encoded}.e30.c2ln")
+    }
+
+    /// The `typ` is read only from a token within the size bound: one past
+    /// it, whose header would refuse it, is left whole to the verifier,
+    /// which refuses it for its length before reading anything.
+    #[test]
+    fn the_typ_of_an_oversized_logout_token_is_not_read() {
+        let refused = token_with_header(r#"{"alg":"RS256","typ":"dpop+jwt"}"#);
+        assert!(logout_typ_refusal(&refused, false).is_some());
+        let padding = " ".repeat(crate::jwt::claims::MAX_JWT_BYTES);
+        let oversized =
+            token_with_header(&format!(r#"{{"alg":"RS256","typ":"dpop+jwt"{padding}}}"#));
+        assert!(oversized.len() > crate::jwt::claims::MAX_JWT_BYTES);
+        assert_eq!(logout_typ_refusal(&oversized, false), None);
+        assert_eq!(
+            logout_typ_refusal(&token_with_header(r#"{"alg":"RS256","typ":"JWT"}"#), false),
+            None
+        );
+    }
 
     #[test]
     fn only_logout_typ_values_are_acceptable() {
@@ -360,5 +396,23 @@ mod tests {
         assert!(check_logout_typ(None, false).is_ok());
         assert!(check_logout_typ(Some("JWT"), false).is_ok());
         assert!(check_logout_typ(Some("dpop+jwt"), false).is_err());
+    }
+
+    /// The header is read before the signature, so its text is the
+    /// sender's: a refusal quotes it cut and with every class the one
+    /// log-text predicate names escaped, under either setting.
+    #[test]
+    fn a_refused_typ_is_quoted_cut_and_escaped() {
+        let forged = format!(
+            "dpop\nWARN forged line\u{2028}\u{202e}\u{200b}\u{feff}{}",
+            "A".repeat(3000)
+        );
+        for required in [true, false] {
+            let reason = check_logout_typ(Some(forged.as_str()), required).expect_err("refused");
+            assert!(reason.len() <= 256, "{} bytes", reason.len());
+            assert!(!reason.contains(&"A".repeat(64)), "{reason}");
+            assert!(!reason.chars().any(crate::log_text::escapes), "{reason:?}");
+            assert!(reason.contains("dpop\\nWARN forged line"), "{reason}");
+        }
     }
 }

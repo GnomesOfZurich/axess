@@ -4,8 +4,8 @@ use super::tests::{bid, make_event, tempdir};
 use super::*;
 use std::time::Duration;
 
-fn day(day: u32) -> chrono::NaiveDate {
-    chrono::NaiveDate::from_ymd_opt(2026, 5, day).unwrap()
+fn day(day: u32) -> axess_clock::UtcDate {
+    axess_clock::UtcDate::new(2026, 5, u8::try_from(day).unwrap()).unwrap()
 }
 
 fn line_count(path: &std::path::Path) -> usize {
@@ -61,8 +61,8 @@ async fn archiving_waits_for_the_root_lock() {
 
 /// A call that is aborted mid-write does not free the root for its retry:
 /// the blocking task still holds the lock, so the retry waits, sees the id
-/// and writes nothing. The lock used to live in the async future, and the
-/// retry then ran beside the first call's writes.
+/// and writes nothing. A lock held by the async future would be freed by the
+/// abort, and the retry would run beside the first call's writes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_aborted_call_does_not_let_its_retry_interleave() {
     let tmp = tempdir();

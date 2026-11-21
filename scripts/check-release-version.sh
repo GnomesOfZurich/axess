@@ -44,7 +44,7 @@ ALLOW_UNRELEASED=false
 TAG=""
 HAVE_TAG=false
 
-usage() { sed -n '/^# Usage:/,/^#   *checkout/p' "$0"; }
+usage() { sed -n -- '/^# Usage:/,/^#   *checkout/p' "$0"; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -80,8 +80,8 @@ refuse() {
   errors=$((errors + 1))
 }
 
-VERSION="$(sed -n '/^\[workspace.package\]/,/^\[/p' "$MANIFEST" \
-  | grep -m1 '^version[[:space:]]*=' | sed 's/.*"\(.*\)".*/\1/')"
+VERSION="$(sed -n -- '/^\[workspace.package\]/,/^\[/p' "$MANIFEST" \
+  | grep '^version[[:space:]]*=' | sed -n 1p | sed 's/.*"\(.*\)".*/\1/')"
 
 SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
 if [ -z "$VERSION" ]; then
@@ -100,7 +100,7 @@ VERSION_RE="$(printf '%s' "$VERSION" | sed 's/[.+-]/\\&/g')"
 # Internal crates are pinned with `=X.Y.Z` in [workspace.dependencies]; a
 # release bump that misses one publishes a crate that depends on the last
 # release of its sibling.
-stale_pins="$(sed -n '/^\[workspace.dependencies\]/,/^\[/p' "$MANIFEST" \
+stale_pins="$(sed -n -- '/^\[workspace.dependencies\]/,/^\[/p' "$MANIFEST" \
   | grep -E '^axess-[a-z-]+[[:space:]]*=' \
   | grep -vE "version[[:space:]]*=[[:space:]]*\"=${VERSION_RE}\"" || true)"
 if [ -n "$stale_pins" ]; then
@@ -115,8 +115,11 @@ if [ "$HAVE_TAG" = true ] && [ "$TAG" != "v$VERSION" ]; then
   refuse "tag '$TAG' is not v$VERSION, the workspace version in Cargo.toml"
 fi
 
+# expr reads the three values as decimal numbers, or fails: bash arithmetic
+# would evaluate them, and a value it evaluates may run a command.
 valid_date() {
-  local y=$((10#$1)) m=$((10#$2)) d=$((10#$3)) max
+  local y m d max
+  y=$(expr "$1" + 0) && m=$(expr "$2" + 0) && d=$(expr "$3" + 0) || return 1
   [ "$m" -ge 1 ] && [ "$m" -le 12 ] || return 1
   case "$m" in
     1|3|5|7|8|10|12) max=31 ;;
@@ -139,8 +142,8 @@ section_entries() {
 version_lines="$(grep -nE "^## \[${VERSION_RE}\]" "$CHANGELOG" || true)"
 version_count=0
 [ -n "$version_lines" ] && version_count="$(printf '%s\n' "$version_lines" | wc -l | tr -d ' ')"
-unreleased_line="$(grep -nE '^## \[Unreleased\]' "$CHANGELOG" | head -1 | cut -d: -f1)"
-newest_line="$(grep -nE '^## \[' "$CHANGELOG" | grep -vE '^[0-9]+:## \[Unreleased\]' | head -1)"
+unreleased_line="$(grep -nE '^## \[Unreleased\]' "$CHANGELOG" | sed -n 1p | cut -d: -f1)"
+newest_line="$(grep -nE '^## \[' "$CHANGELOG" | grep -vE '^[0-9]+:## \[Unreleased\]' | sed -n 1p)"
 
 if [ "$version_count" -eq 0 ]; then
   if [ "$ALLOW_UNRELEASED" = true ] && [ -n "$unreleased_line" ]; then
@@ -158,9 +161,9 @@ else
   DATED_RE="^## \[${VERSION_RE}\] - ([0-9]{4})-([0-9]{2})-([0-9]{2})$"
   PENDING_RE="^## \[${VERSION_RE}\] - unreleased$"
   if [[ "$heading" =~ $DATED_RE ]]; then
-    y="${BASH_REMATCH[1]}"; m="${BASH_REMATCH[2]}"; d="${BASH_REMATCH[3]}"
-    if ! valid_date "$y" "$m" "$d"; then
-      refuse "CHANGELOG.md line $line_no: $y-$m-$d is not a calendar date: $heading"
+    year="${BASH_REMATCH[1]}"; month="${BASH_REMATCH[2]}"; day="${BASH_REMATCH[3]}"
+    if ! valid_date "$year" "$month" "$day"; then
+      refuse "CHANGELOG.md line $line_no: $year-$month-$day is not a calendar date: $heading"
     fi
   elif [[ "$heading" =~ $PENDING_RE ]]; then
     if [ "$ALLOW_UNRELEASED" != true ]; then

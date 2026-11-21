@@ -58,7 +58,34 @@ where
         mut self,
         provider: impl axess_factors::oauth::OAuthProvider,
     ) -> Self {
-        if self.oauth_providers.add(provider) {
+        if self.oauth_providers.add(provider, None) {
+            self.duplicate_providers += 1;
+        }
+        self
+    }
+
+    /// Register an OAuth/OIDC provider under its own name, as
+    /// [`with_oauth_provider`](Self::with_oauth_provider) does, with the
+    /// kind every login through it records: `FederatedProvider::Google` for
+    /// a provider that is Google's, say. The kind is configured, never read
+    /// from the issuer URL; `with_oauth_provider` gives the name's
+    /// `FederatedProvider::Custom(name)`.
+    ///
+    /// A reload under the name
+    /// ([`reload_oauth_provider_as`](crate::authn::service::RequestAuthnService::reload_oauth_provider_as),
+    /// or a [`ProviderSource`](crate::authn::service::ProviderSource) a
+    /// follower reads) names the kind again with the provider it installs,
+    /// so every way a provider arrives configures its kind. It is written in the
+    /// session's assurance and on the login's audit rows, the refresh and
+    /// revocation rows included; a method step or a policy that names the
+    /// provider names this kind.
+    #[cfg(feature = "oauth")]
+    pub fn with_oauth_provider_of_kind(
+        mut self,
+        provider: impl axess_factors::oauth::OAuthProvider,
+        kind: crate::authn::factor::FederatedProvider,
+    ) -> Self {
+        if self.oauth_providers.add(provider, Some(kind)) {
             self.duplicate_providers += 1;
         }
         self

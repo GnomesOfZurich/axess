@@ -12,10 +12,10 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use axess_clock::Timestamp;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use cedar_policy::{Context, EvalResult, RestrictedExpression};
-use chrono::{DateTime, Utc};
 
 use super::context::RequestContextProvider;
 use super::error::AuthzError;
@@ -139,7 +139,7 @@ impl AssuranceContext {
     /// reading. A proof dated after `now` is left out (a clock that went
     /// backwards proves nothing fresh). An empty session record gives an
     /// empty record, which satisfies no policy that asks for a factor.
-    pub fn from_session(record: &[FactorAssurance], now: DateTime<Utc>) -> Self {
+    pub fn from_session(record: &[FactorAssurance], now: Timestamp) -> Self {
         let mut context = Self::default();
         for proof in record {
             context.insert(proof, now);
@@ -153,13 +153,13 @@ impl AssuranceContext {
     }
 
     /// The record with `proof` as the latest of its kind, as of `now`.
-    pub fn with_proof(mut self, proof: &FactorAssurance, now: DateTime<Utc>) -> Self {
+    pub fn with_proof(mut self, proof: &FactorAssurance, now: Timestamp) -> Self {
         self.insert(proof, now);
         self
     }
 
-    fn insert(&mut self, proof: &FactorAssurance, now: DateTime<Utc>) {
-        let age = now.signed_duration_since(proof.at).num_seconds();
+    fn insert(&mut self, proof: &FactorAssurance, now: Timestamp) {
+        let age = now.since(proof.at).whole_seconds();
         if proof.at > now {
             return;
         }
@@ -313,8 +313,10 @@ pub(crate) fn replace_assurance(
 /// A [`RequestContextProvider`] that puts the session's assurance, as of the
 /// injected clock, in the context as `assurance`, and nothing else.
 ///
-/// Install it as `Arc<dyn RequestContextProvider>` beside the policy store
-/// for gates whose policies read only `context.assurance`; a provider of
+/// Pass it to
+/// [`AuthzInstallation::new`](super::installation::AuthzInstallation::new)
+/// as the context provider of gates whose policies read only
+/// `context.assurance`; a provider of
 /// your own that also emits other attributes adds
 /// [`AssuranceContext::to_expression`] beside them, or builds
 /// [`StandardRequestContext::with_assurance`](super::context::StandardRequestContext::with_assurance).

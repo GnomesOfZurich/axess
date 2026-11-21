@@ -116,7 +116,7 @@ pub trait IdentityAuthnLog: IdentityLookup {
         &self,
         user_id: &UserId,
     ) -> impl std::future::Future<
-        Output = Result<(u32, Option<chrono::DateTime<chrono::Utc>>), Self::Error>,
+        Output = Result<(u32, Option<axess_clock::Timestamp>), Self::Error>,
     > + Send;
 
     /// Reserve one guess against the failure counter **before** the
@@ -228,6 +228,6 @@ pub trait IdentityAuthnLog: IdentityLookup {
     fn record_last_login(
         &self,
         user_id: &UserId,
-        at: chrono::DateTime<chrono::Utc>,
+        at: axess_clock::Timestamp,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send;
 }

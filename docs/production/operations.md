@@ -4,36 +4,37 @@ For whoever carries the pager. Read the pre-launch checklist before
 launch; the rest is reference for when something is wrong at three in
 the morning.
 
-The chapter has two halves. The first half is operational
-guidance specific to axess. The second half is the canonical
+The first half of this chapter is operational guidance specific to
+axess. The second half is the canonical
 [`OPERATIONS.md`](https://github.com/GnomesOfZurich/axess/blob/main/OPERATIONS.md)
-from the repo root, included so the deployment's runbook
-checklist is in one place.
+from the repo root, included so the runbook is in one place.
 
 ## Pre-launch checklist
 
-The list below is the minimum an axess-instrumented deployment
-should clear before serving real traffic. Each item is covered in
-detail in another chapter; the list here is the inventory.
+The list below is the minimum a deployment should clear before serving
+real traffic. Other chapters cover each item in detail; this list is the
+inventory.
 
 The session signing key is loaded from the deployment's secrets
 manager. The key is 32 bytes of cryptographic randomness, stable
-across process restarts. The per-start random key from
-*Getting started* is replaced.
+across process restarts. It replaces the per-start random key from
+*Getting started*.
 
 The session envelope key is loaded the same way. The two keys
-are independent; one is for HMAC signing the cookie, the other
-is for AES-256-GCM encrypting the session payload at rest.
+are independent: one HMAC-signs the cookie, the other encrypts the
+session payload at rest with AES-256-GCM.
 *Session lifecycle and crypto envelope* covers the distinction.
 
-The fingerprint pepper is loaded for the fingerprint binding.
-Each tenant has its own pepper, stored alongside the tenant
-record; *Multi-tenancy* and *Cookies, fingerprinting, hijack
-detection* cover the mechanism.
+The device fingerprint pepper is loaded for the device layer. Each
+tenant has its own, returned by the `TenantPepperResolver` the
+application supplies (axess stores none, and the tenant record has no
+field for it); *Device identity* covers the mechanism. The session's
+own fingerprint binding has no pepper: it is keyed from the signing
+key.
 
 The session cookie has `Secure=true` set. TLS terminates at the
-edge; your service sees only HTTPS traffic; the cookie is
-only sent on HTTPS. The CSRF cookie is `Secure` too (the default of
+edge, your service sees only HTTPS traffic, and the cookie is
+sent only over HTTPS. The CSRF cookie is `Secure` too (the default of
 `CsrfConfig`, which only local development turns off).
 
 The CSRF signing key is persistent and stable across restarts and
@@ -50,6 +51,13 @@ argument of `SessionLayer::new`, so the revocation reaches the stored row
 on every route. Without a registry those calls have nothing to revoke and
 sessions stay valid until they expire (`SessionLayer::without_registry_insecure`
 builds a layer that way and logs an error).
+
+The fourth argument of `SessionLayer::new` is the service's
+`session_end_audit()`, so each session the layer ends by itself (an age
+cap, a registry entry gone, a rotation that could not be kept) has its
+audit row, written before the session is removed. A layer built with
+`UnrecordedSessionEnds::insecure()` records none of them and logs an error
+saying so.
 
 The trusted-proxy list is configured. The application reads the
 forwarded header (`X-Forwarded-For` or `Forwarded`) only when
@@ -79,8 +87,7 @@ deployment chooses) queries the session store, the identity
 store, and the device store. The public answer is the aggregate
 (healthy or unhealthy) only; per-component detail and backend error
 text go to the log or to an internal-only listener, because they can
-carry connection strings and host names. *Operations runbook*
-in the canonical SECURITY/OPERATIONS section covers the
+carry connection strings and host names. The canonical `OPERATIONS.md` below covers the
 deployment expectations.
 
 The metrics are exported. The metric traits of the concerns you
@@ -88,46 +95,45 @@ export (see [Observability and metrics](observability.md)) are
 implemented and wired with `MetricSinks`; the metric values flow into Prometheus or
 OpenTelemetry; the dashboards cover the auth-attempt rate, the
 failure rate, the rate-limit rejection rate, and the lockout
-trigger rate. *Operations runbook* below covers the
+trigger rate. *Health checks and metrics* below covers the
 production-dashboard expectations.
 
 The Cedar policy set is loaded and validated against the
-schema. The startup path refuses if the validation fails; a
-production launch with a misconfigured policy set never gets to
-serve traffic. *Cedar policy fundamentals* covers the validation
+schema. Startup stops if the validation fails, so a misconfigured policy
+set never serves traffic. *Cedar policy fundamentals* covers the validation
 flow.
 
 The cleanup tasks are scheduled. The session cleanup, the device
-retention sweep, the audit retention loop, the OAuth JWKS cache
-refresh: all of these run on intervals; the scheduler is the
-application's responsibility. *Backends* §"SQLite" and similar
+retention sweep, the audit retention loop and the OAuth JWKS cache
+refresh run on intervals, and the application schedules them. *Backends* §"SQLite" and similar
 sections cover the per-backend cleanup patterns.
 
 ## Key rotation
 
 The deployment has four secrets to rotate on a schedule: the
 session signing key, the session envelope key, the CSRF key and the
-per-tenant fingerprint pepper. The mechanism is the same shape for all three:
-provide the new key alongside the old one for a transition window,
-let in-flight sessions and devices roll over, then remove the old
-key.
+per-tenant fingerprint pepper. The signing key and the envelope key rotate the same way: provide
+the new key alongside the old one for a transition window, let
+in-flight sessions and devices roll over, then remove the old key.
+The CSRF key and the pepper have no previous-key fallback; their
+sections below say what a rotation costs.
 
 ### Session signing key
 
-The signing key is what HMAC-protects the session cookie.
-Rotating it without invalidating sessions requires keeping the
-old key available for verification during the transition.
+The signing key HMAC-protects the session cookie. Rotating it
+without invalidating sessions means keeping the old key available
+for verification during the transition.
 
 ```rust,ignore
-let session_layer = SessionLayer::new(store, new_signing_key, registry)
+let session_layer = SessionLayer::new(store, new_signing_key, registry, authn.session_end_audit())
     .with_previous_signing_key(old_signing_key)
     .with_ttl(session_ttl);
 ```
 
 `with_previous_signing_key` accepts the old key. Cookies signed with the
 old key continue to validate; new cookies sign with the new key.
-After enough time for all old cookies to expire (one session TTL
-plus a safety margin), the previous key can be removed: drop the call,
+Once every old cookie has expired (one session TTL plus a safety
+margin), remove the previous key: drop the call,
 or call `remove_previous_signing_key` on the freshly built layer.
 
 The rotation sequence:
@@ -149,11 +155,10 @@ The rotation sequence:
 
 ### Session envelope key
 
-The envelope key is what AES-256-GCM protects the session payload
-at rest. Rotating it without invalidating sessions is similar to
-the signing-key rotation, with the additional consideration that
-sessions stored before the rotation continue to be readable but
-new writes use the new key.
+The envelope key protects the session payload at rest with
+AES-256-GCM. Its rotation works like the signing-key rotation:
+sessions stored before the rotation stay readable, and new writes
+use the new key.
 
 ```rust,ignore
 let crypto = SessionCrypto::new(new_envelope_key)
@@ -162,15 +167,14 @@ let store = SessionStore::new(pool, crypto);
 ```
 
 The rotation sequence is the same as the signing key. The
-transition window covers one session TTL; after that, every
-stored session has been rewritten with the new key.
+transition window covers one session TTL. A store re-seals a session
+under the new key when it reads it and on its next write, so after
+that window every stored session has been re-sealed or has expired.
 
-For deployments with long session TTLs (a week or a month),
-rotating the envelope key per the deployment's compliance cycle
-(quarterly, semiannually) requires the transition window to be
-at least the TTL. Alternative: a background scan that proactively
-rewrites stored sessions with the new key, finishing the
-rotation faster than the TTL would.
+With a long session TTL (a week or a month), a rotation on the
+compliance cycle (quarterly, semiannually) still needs a transition
+window of at least the TTL. To finish sooner, run a background scan
+that rewrites stored sessions with the new key.
 
 #### The envelope key has no write budget
 
@@ -183,12 +187,14 @@ the envelope key, a fresh 16-byte salt and the record's row identity
 and a blob costs 16 bytes more than before. Rotate the envelope key on your
 compliance cycle, not to stay inside a count.
 
-A blob written by an earlier release (the key used directly) is a legacy
-blob: it is read only while `LegacyBlobs` reads them (`AcceptUntil` or
-`Accept`; the default `Reject` refuses it, so the user signs in again) and is
+A device row or a device-bindings blob written by an earlier release (the
+key used directly) is a legacy blob: it is read only while the `LegacyBlobs` policy
+is `AcceptUntil` or `Accept` (the default `Reject` refuses it) and is
 re-sealed in the new layout by the read that finds it, as any stale blob is:
-after an upgrade each live row costs one extra write the first time it is
-read. Only a caller that
+after an upgrade each such row costs one extra write the first time it is
+read. A session blob is read in the current sealed form only, whatever the
+policy says: a session stored by an earlier release is not read, and its user
+signs in again. Only a caller that
 seals with `SessionCrypto::encrypt_with_aad` itself draws on the budget;
 `SessionCrypto::seals` counts those calls, per process, so sum it across
 replicas and alert well before 2^32.
@@ -219,7 +225,7 @@ let devices = ValkeyDeviceStore::with_crypto(client, crypto);
 Drop the previous key only after every row has been read or written since
 the rotation. A tenant sweep (`DeviceStore::sweep`) reads every row of the
 tenant on Valkey, so one full sweep of every tenant after the new key is
-deployed covers the rows still there; the SQL stores re-seal on the reads
+deployed covers the rows still there. The SQL stores re-seal on the reads
 that find them, so run a pass that lists each user's devices, or keep the
 previous key for the longest device retention you configured. Dropping it
 early makes the unread rows fail to decode: lookups return an error for
@@ -239,29 +245,30 @@ and accept one round of reloads.
 
 ### Per-tenant fingerprint pepper
 
-The fingerprint pepper rotates per-tenant rather than globally. axess
+The fingerprint pepper rotates per tenant rather than globally. axess
 holds no pepper: the application supplies a `TenantPepperResolver`, a
 function from a tenant id to 32 bytes, when it builds the device
 layer. To rotate one tenant, change what the resolver returns for that
 tenant (new secret in the secrets manager, then redeploy or reload).
 There is no rotation call to make.
 
-The rotation invalidates every device record under the tenant.
-Existing sessions remain valid (they do not depend on the device
-record), but the next request from each user re-registers their
-device from scratch (transitioning the device to `Unknown` and
-walking the assurance ladder again). Users see no break; the
-device store sees a churn.
+What the rotation does depends on how devices are found. Under the
+stock `LifecycleDeviceResolver` a device is found by the token on its
+cookie, so existing devices and sessions go on as before, and only the
+hash stored on devices created from then on differs. Under a resolver
+that looks devices up by fingerprint (`ensure_device`), the stored
+hashes no longer match and each client registers as a new `Unknown`
+device and walks the assurance ladder again. In either case a refresh
+token issued with the fingerprint as its `device_info` stops matching
+what its client presents.
 
-The pepper rotates on tenant suspension and on demand. The
-default cadence is annual; tighter cadences are appropriate for
-high-sensitivity deployments.
+Nothing in axess rotates the pepper on a schedule or on a tenant's
+suspension; the cadence is the deployment's to set.
 
 ## Multi-instance considerations
 
-A deployment that runs multiple application instances behind a
-load balancer has a handful of considerations the single-instance
-deployment does not.
+Running several application instances behind a load balancer adds
+the following considerations.
 
 Shared session store. The session backend must be cluster-safe:
 Postgres, MySQL, or Valkey. SQLite is single-writer and works
@@ -269,9 +276,8 @@ only for single-instance deployments. *Backends* covers the
 choices.
 
 Shared signing and envelope keys. Every instance must use the
-same keys; otherwise an instance that issued a cookie cannot
-have the cookie validated by a different instance that receives
-the next request. The secrets manager is the source of truth;
+same keys; otherwise a cookie issued by one instance fails
+validation on another instance that receives the next request. The secrets manager is the source of truth;
 each instance pulls the keys at startup.
 
 Rate-limit state is per instance. axess keeps the buckets in process
@@ -281,7 +287,7 @@ limit. Enforce the shared limit at the gateway or load balancer
 (*Rate limiting* covers the layering), or divide the per-instance
 limit by the instance count to keep the total near the target.
 
-Session affinity (sticky sessions). Optional, not required. The
+Session affinity (sticky sessions). Optional. The
 session is stored server-side; any instance can serve any
 session. Some deployments prefer sticky sessions to improve
 local cache hit rates; the trade-off is reduced resilience to
@@ -314,21 +320,25 @@ complete, with a timeout (typically 30 seconds; long enough for
 real requests, short enough that a stuck request does not block
 shutdown forever).
 
-The audit pipeline drains. The shutdown handler triggers the
-pipeline to flush its buffer to all sinks. The wait is bounded
-(typically 10 seconds); buffered events that do not flush in
-time are written to a local recovery log for the next process
-start to pick up.
+The audit trail needs no drain: axess awaits each
+`IdentityAuthnLog::record_event` call on the request path and buffers
+nothing, so a completed request leaves no audit row waiting to be
+written. The one buffer is the
+optional analytics stream. If you wrap the log in
+`AuditLogWithAnalytics`, call its `shutdown` and then await the
+handle `AnalyticsWorker::spawn` returned, so the sink sees every
+queued event. Bound that wait yourself. Axess keeps no recovery log:
+analytics events still queued when the process exits are lost.
 
 The session store closes. The connection pool drains; in-flight
 queries complete; the pool releases its connections.
 
 The process exits.
 
-The pattern is what Axum's `with_graceful_shutdown` enables; the
+Axum's `with_graceful_shutdown` provides the pattern; the
 application wires the shutdown signal through the standard
 shutdown handler. No axess-specific code is needed beyond the
-audit-pipeline drain.
+analytics drain, and none at all without the analytics stream.
 
 ## Health checks and metrics
 
@@ -401,8 +411,7 @@ with the audit-event volumes from the SIEM. *Audit events*
 
 ## Common failures and remedies
 
-The categories of failure that recur in production deployments,
-and the standard responses.
+Failures that recur in production, and the standard response to each.
 
 Spike in `auth_failures`: typically a credential-stuffing attack
 or a credential leak elsewhere. The rate limiter should be
@@ -428,11 +437,14 @@ signing key has changed without the previous-key transition. Add
 the previous key to the configuration; sessions will start
 validating again as soon as the deployment picks up the change.
 
-Spike in `DeviceFingerprintMismatch` events: typically the
-fingerprint tolerance is too tight. Calibrate against the warn
-rate; widen the IP-prefix tolerance or the user-agent matching.
-*Cookies, fingerprinting, hijack detection* covers the tolerance
-configuration.
+Spike in `session fingerprint mismatch` warnings (and in the
+binding-mismatch metric): the session binding's material changes
+under legitimate users. The comparison is exact and has no tolerance
+to widen; the stock `UserAgentBinding` diverges only on a browser
+update, so look at a `SessionBinding` of your own that reads an
+address or a header a proxy rewrites. *Cookies, fingerprinting,
+hijack detection* covers the binding. `DeviceFingerprintMismatch` is
+an event only a `DeviceResolver` of your own writes.
 
 Logins slowing with no change in traffic: look at the audit sink.
 `IdentityAuthnLog::record_event` is awaited on the login path, so
@@ -444,7 +456,7 @@ here, and where you take over.
 
 Logins failing in a burst with the store reachable: check
 `AuditMetrics::audit_store_outage` before `auth_failure`. A failed audit
-write fails the login since 0.6.0, so an audit problem presents as an
+write fails the login, so an audit problem presents as an
 authentication problem. `audit_event_shed` rising instead means the sink
 is deliberately dropping events to protect itself: nothing is failing,
 but the trail has gaps and something is driving volume at you.

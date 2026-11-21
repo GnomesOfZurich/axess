@@ -1,3 +1,4 @@
+use axess_clock::testing::Shift;
 use std::sync::Arc;
 
 use super::*;
@@ -13,13 +14,14 @@ struct CustomClaims {
     roles: Vec<String>,
 }
 
-fn one_hour_from_now() -> DateTime<Utc> {
-    Utc::now() + Duration::hours(1)
+fn one_hour_from_now() -> Timestamp {
+    axess_clock::testing::MockClock::reference_time().plus(SignedDuration::hours(1))
 }
 
 #[tokio::test]
 async fn mint_roundtrips_through_jwt_verifier() {
-    let idp = LocalIdpFixture::new("https://test.idp.local");
+    let clock = MockClock::at_reference();
+    let idp = LocalIdpFixture::new("https://test.idp.local").with_clock(clock.clone());
     // Pin the `issuer()` accessor against `-> ""` / `-> "xyzzy"`.
     assert_eq!(
         idp.issuer(),
@@ -28,10 +30,11 @@ async fn mint_roundtrips_through_jwt_verifier() {
     );
     let claims = MintClaims::new("alice", one_hour_from_now())
         .with_audience("https://api.example.com")
-        .with_issued_at(Utc::now());
+        .with_issued_at(axess_clock::testing::MockClock::reference_time());
 
     let token = idp.mint(&claims);
     let verifier = JwtVerifier::new(idp.jwks_handle())
+        .with_clock(Arc::new(clock.clone()))
         .with_issuer("https://test.idp.local")
         .with_audience("https://api.example.com");
     let verified = verifier
@@ -44,15 +47,17 @@ async fn mint_roundtrips_through_jwt_verifier() {
 
 #[tokio::test]
 async fn mint_propagates_custom_claims() {
-    let idp = LocalIdpFixture::new("https://test.idp.local");
+    let clock = MockClock::at_reference();
+    let idp = LocalIdpFixture::new("https://test.idp.local").with_clock(clock.clone());
     let claims = MintClaims::new("bob", one_hour_from_now())
         .with_audience("https://api.example.com")
-        .with_issued_at(Utc::now())
+        .with_issued_at(axess_clock::testing::MockClock::reference_time())
         .with_custom_claim("department", serde_json::json!("research"))
         .with_custom_claim("roles", serde_json::json!(["admin", "auditor"]));
 
     let token = idp.mint(&claims);
     let verifier = JwtVerifier::new(idp.jwks_handle())
+        .with_clock(Arc::new(clock.clone()))
         .with_audience("https://api.example.com")
         .allow_any_issuer();
     let verified = verifier
@@ -65,13 +70,15 @@ async fn mint_propagates_custom_claims() {
 
 #[tokio::test]
 async fn audience_mismatch_rejected_by_verifier() {
-    let idp = LocalIdpFixture::new("https://test.idp.local");
+    let clock = MockClock::at_reference();
+    let idp = LocalIdpFixture::new("https://test.idp.local").with_clock(clock.clone());
     let claims = MintClaims::new("alice", one_hour_from_now())
         .with_audience("https://other.example.com")
-        .with_issued_at(Utc::now());
+        .with_issued_at(axess_clock::testing::MockClock::reference_time());
     let token = idp.mint(&claims);
 
     let verifier = JwtVerifier::new(idp.jwks_handle())
+        .with_clock(Arc::new(clock.clone()))
         .with_audience("https://api.example.com")
         .allow_any_issuer();
     let result = verifier.verify::<CustomClaims>(&token).await;
@@ -83,19 +90,20 @@ async fn audience_mismatch_rejected_by_verifier() {
 
 #[tokio::test]
 async fn expired_token_rejected_against_advanced_clock() {
-    let idp = LocalIdpFixture::new("https://test.idp.local");
-    let now = Utc::now();
-    let claims = MintClaims::new("alice", now + Duration::seconds(60))
+    let clock = MockClock::at_reference();
+    let idp = LocalIdpFixture::new("https://test.idp.local").with_clock(clock.clone());
+    let now = clock.now();
+    let claims = MintClaims::new("alice", now.plus(SignedDuration::seconds(60)))
         .with_audience("https://api.example.com")
         .with_issued_at(now);
     let token = idp.mint(&claims);
 
-    // Mock clock past the token's exp + jsonwebtoken default leeway (60s).
-    let clock = Arc::new(MockClock::at(now + Duration::seconds(200)));
+    // Advance the clock past the token's exp + jsonwebtoken default leeway (60s).
+    clock.advance(SignedDuration::seconds(200));
     let verifier = JwtVerifier::new(idp.jwks_handle())
         .with_audience("https://api.example.com")
         .allow_any_issuer()
-        .with_clock(clock);
+        .with_clock(Arc::new(clock));
     let result = verifier.verify::<CustomClaims>(&token).await;
     assert!(
         result.is_err(),
@@ -105,20 +113,20 @@ async fn expired_token_rejected_against_advanced_clock() {
 
 #[tokio::test]
 async fn not_yet_valid_token_rejected_against_pre_nbf_clock() {
-    let idp = LocalIdpFixture::new("https://test.idp.local");
-    let now = Utc::now();
-    let nbf = now + Duration::seconds(600);
-    let claims = MintClaims::new("alice", now + Duration::hours(1))
+    let clock = MockClock::at_reference();
+    let idp = LocalIdpFixture::new("https://test.idp.local").with_clock(clock.clone());
+    let now = clock.now();
+    let nbf = now.plus(SignedDuration::seconds(600));
+    let claims = MintClaims::new("alice", now.plus(SignedDuration::hours(1)))
         .with_audience("https://api.example.com")
         .with_not_before(nbf)
         .with_issued_at(now);
     let token = idp.mint(&claims);
 
-    let clock = Arc::new(MockClock::at(now));
     let verifier = JwtVerifier::new(idp.jwks_handle())
         .with_audience("https://api.example.com")
         .allow_any_issuer()
-        .with_clock(clock);
+        .with_clock(Arc::new(clock));
     let result = verifier.verify::<CustomClaims>(&token).await;
     assert!(result.is_err(), "pre-nbf clock must reject token");
 }
@@ -127,14 +135,14 @@ async fn not_yet_valid_token_rejected_against_pre_nbf_clock() {
 async fn mint_jwt_svid_produces_spiffe_subject() {
     let idp = LocalIdpFixture::new("https://test.idp.local");
     let token = idp.mint_jwt_svid(
-        "test.gnomes",
+        "test.example.org",
         "compute-worker",
         "acme",
-        "https://api.gnomes",
-        Duration::minutes(5),
+        "https://api.example.org",
+        SignedDuration::minutes(5),
     );
     let verifier = JwtVerifier::new(idp.jwks_handle())
-        .with_audience("https://api.gnomes")
+        .with_audience("https://api.example.org")
         .allow_any_issuer();
     let verified = verifier
         .verify::<CustomClaims>(&token)
@@ -142,7 +150,7 @@ async fn mint_jwt_svid_produces_spiffe_subject() {
         .expect("SVID verify");
     assert_eq!(
         verified.sub.as_deref(),
-        Some("spiffe://test.gnomes/compute-worker/acme")
+        Some("spiffe://test.example.org/compute-worker/acme")
     );
 }
 
@@ -168,7 +176,10 @@ fn jwks_json_serializes_to_well_formed_jwks() {
 
 #[test]
 fn with_key_id_overrides_both_jwk_and_signing_header() {
-    let idp = LocalIdpFixture::new("https://test.idp.local").with_key_id("custom-kid");
+    let clock = MockClock::at_reference();
+    let idp = LocalIdpFixture::new("https://test.idp.local")
+        .with_clock(clock.clone())
+        .with_key_id("custom-kid");
     assert_eq!(idp.key_id(), "custom-kid");
     let token = idp.mint(&MintClaims::new("alice", one_hour_from_now()));
     let header = jsonwebtoken::decode_header(&token).expect("decode header");
@@ -180,14 +191,16 @@ fn with_key_id_overrides_both_jwk_and_signing_header() {
 
 #[tokio::test]
 async fn iss_claim_cannot_be_overridden_via_custom_claims() {
-    let idp = LocalIdpFixture::new("https://test.idp.local");
+    let clock = MockClock::at_reference();
+    let idp = LocalIdpFixture::new("https://test.idp.local").with_clock(clock.clone());
     let claims = MintClaims::new("alice", one_hour_from_now())
         .with_audience("https://api.example.com")
-        .with_issued_at(Utc::now())
+        .with_issued_at(axess_clock::testing::MockClock::reference_time())
         .with_custom_claim("iss", serde_json::json!("https://evil.idp"));
     let token = idp.mint(&claims);
 
     let verifier = JwtVerifier::new(idp.jwks_handle())
+        .with_clock(Arc::new(clock.clone()))
         .with_issuer("https://test.idp.local")
         .with_audience("https://api.example.com");
     let verified = verifier
@@ -203,16 +216,19 @@ async fn iss_claim_cannot_be_overridden_via_custom_claims() {
 
 #[tokio::test]
 async fn multi_audience_validates_against_either() {
-    let idp = LocalIdpFixture::new("https://test.idp.local");
+    let clock = MockClock::at_reference();
+    let idp = LocalIdpFixture::new("https://test.idp.local").with_clock(clock.clone());
     let claims = MintClaims::new("alice", one_hour_from_now())
         .with_audiences(["https://api.example.com", "https://other.example.com"])
-        .with_issued_at(Utc::now());
+        .with_issued_at(axess_clock::testing::MockClock::reference_time());
     let token = idp.mint(&claims);
 
     let v1 = JwtVerifier::new(idp.jwks_handle())
+        .with_clock(Arc::new(clock.clone()))
         .with_audience("https://api.example.com")
         .allow_any_issuer();
     let v2 = JwtVerifier::new(idp.jwks_handle())
+        .with_clock(Arc::new(clock.clone()))
         .with_audience("https://other.example.com")
         .allow_any_issuer();
     assert!(v1.verify::<CustomClaims>(&token).await.is_ok());
@@ -221,7 +237,8 @@ async fn multi_audience_validates_against_either() {
 
 #[test]
 fn clone_shares_keypair() {
-    let idp = LocalIdpFixture::new("https://test.idp.local");
+    let clock = MockClock::at_reference();
+    let idp = LocalIdpFixture::new("https://test.idp.local").with_clock(clock.clone());
     let clone = idp.clone();
     let token1 = idp.mint(&MintClaims::new("alice", one_hour_from_now()));
     let token2 = clone.mint(&MintClaims::new("alice", one_hour_from_now()));
@@ -232,6 +249,7 @@ fn clone_shares_keypair() {
     assert_eq!(idp.key_id(), clone.key_id());
 }
 
+#[cfg(feature = "local-idp-rsa")]
 #[test]
 fn algorithm_accessor_returns_configured_alg() {
     let idp = LocalIdpFixture::new("https://test.idp.local");
@@ -249,14 +267,16 @@ fn unsupported_algorithm_panics() {
 
 #[tokio::test]
 async fn jti_claim_propagates_to_verified_claims() {
-    let idp = LocalIdpFixture::new("https://test.idp.local");
+    let clock = MockClock::at_reference();
+    let idp = LocalIdpFixture::new("https://test.idp.local").with_clock(clock.clone());
     let claims = MintClaims::new("alice", one_hour_from_now())
         .with_audience("https://api.example.com")
-        .with_issued_at(Utc::now())
+        .with_issued_at(axess_clock::testing::MockClock::reference_time())
         .with_jwt_id("test-jti-1234");
     let token = idp.mint(&claims);
 
     let verifier = JwtVerifier::new(idp.jwks_handle())
+        .with_clock(Arc::new(clock.clone()))
         .with_audience("https://api.example.com")
         .allow_any_issuer();
     let verified = verifier
@@ -274,6 +294,7 @@ fn verifier_algorithms_default_es256_only() {
     assert_eq!(idp.verifier_algorithms(), vec![Algorithm::ES256]);
 }
 
+#[cfg(feature = "local-idp-rsa")]
 #[test]
 fn verifier_algorithms_rsa_fixture_rs256_only() {
     let idp = LocalIdpFixture::new_rsa("https://idp");
@@ -287,6 +308,7 @@ fn verifier_algorithms_es256_only() {
     assert_eq!(idp.verifier_algorithms(), vec![Algorithm::ES256]);
 }
 
+#[cfg(feature = "local-idp-rsa")]
 #[test]
 fn verifier_algorithms_rotation_carries_historical_alg() {
     let rsa = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-1");
@@ -298,6 +320,7 @@ fn verifier_algorithms_rotation_carries_historical_alg() {
     assert_eq!(algs.len(), 2, "no duplicates");
 }
 
+#[cfg(feature = "local-idp-rsa")]
 #[test]
 fn verifier_algorithms_extra_public_jwk_with_alg_included() {
     let foreign = LocalIdpSigningKey::generate_es256().with_key_id("foreign-ec");
@@ -317,6 +340,7 @@ fn verifier_algorithms_extra_public_jwk_without_alg_skipped() {
     assert_eq!(algs, vec![Algorithm::ES256], "alg-less extra JWK skipped");
 }
 
+#[cfg(feature = "local-idp-rsa")]
 #[test]
 fn verifier_algorithms_dedupes_when_historical_matches_current() {
     let k1 = LocalIdpSigningKey::generate_rsa().with_key_id("k1");
@@ -332,17 +356,20 @@ fn verifier_algorithms_dedupes_when_historical_matches_current() {
 
 #[tokio::test]
 async fn verifier_algorithms_drives_with_algorithms_for_es256() {
+    let clock = MockClock::at_reference();
     let idp =
-        LocalIdpFixture::with_signing_key("https://idp", LocalIdpSigningKey::generate_es256());
-    let now = Utc::now();
+        LocalIdpFixture::with_signing_key("https://idp", LocalIdpSigningKey::generate_es256())
+            .with_clock(clock.clone());
+    let now = axess_clock::testing::MockClock::reference_time();
     let token = idp.mint(
-        &MintClaims::new("alice", now + Duration::hours(1))
+        &MintClaims::new("alice", now.plus(SignedDuration::hours(1)))
             .with_audience("https://api")
             .with_issued_at(now),
     );
     // Wire the accessor straight into the verifier; no need for the
     // adopter to know which algorithms the fixture happens to use.
     let verifier = JwtVerifier::new(idp.jwks_handle())
+        .with_clock(Arc::new(clock.clone()))
         .with_audience("https://api")
         .allow_any_issuer()
         .with_algorithms(idp.verifier_algorithms());
@@ -356,7 +383,8 @@ async fn verifier_algorithms_drives_with_algorithms_for_es256() {
 /// caller's key-location headers never reach the token.
 #[test]
 fn mint_with_header_drops_key_location_headers() {
-    let idp = LocalIdpFixture::new("https://test.idp.local");
+    let clock = MockClock::at_reference();
+    let idp = LocalIdpFixture::new("https://test.idp.local").with_clock(clock.clone());
     let mut header = Header {
         jku: Some("https://evil.example/jwks".to_string()),
         x5u: Some("https://evil.example/cert".to_string()),

@@ -4,8 +4,9 @@
 
 #![cfg(all(feature = "testing", feature = "device"))]
 
-mod common;
+use axess_core::testing::fixtures as common;
 
+use axess_clock::testing::MockClock;
 use axess_core::authn::AuditContext;
 use axess_core::authn::ids::{DeviceId, TenantId};
 use axess_core::{
@@ -21,7 +22,6 @@ use axess_core::{
         test_session, test_session_on_device, test_session_on_unproven_device,
     },
 };
-use chrono::Utc;
 use common::{password_config, password_method, test_tenant, test_user, uid, user_scope};
 
 fn device_id(label: &str) -> DeviceId {
@@ -39,7 +39,7 @@ async fn put(
     level: DeviceTrustLevel,
     fp: u8,
 ) {
-    let now = Utc::now();
+    let now = common::start();
     let device = Device {
         id,
         tenant_id: tenant(),
@@ -75,8 +75,9 @@ fn attacker_address(n: u8) -> AuditContext {
 }
 
 /// An account locked by three wrong passwords from unknown browsers.
-async fn locked_world(with_device_store: bool) -> World {
+async fn locked_world(clock: &MockClock, with_device_store: bool) -> World {
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"))
         .with_lockout_policy(LockoutPolicy {
@@ -85,10 +86,10 @@ async fn locked_world(with_device_store: bool) -> World {
             ..LockoutPolicy::default()
         });
     let factors = MockFactorStore::new()
-        .with_factor(user_scope(), password_config("Gnomes2+"))
+        .with_factor(user_scope(), password_config("Sample2+"))
         .with_method(&uid("u1"), password_method());
     let devices = MemoryDeviceStore::new();
-    let mut builder = AuthnService::builder(identity.clone(), factors);
+    let mut builder = AuthnService::builder(identity.clone(), factors).with_clock(clock.clone());
     if with_device_store {
         builder = builder.with_device_store(devices.clone());
     }
@@ -131,7 +132,7 @@ async fn login_from(
     if !matches!(begun, LoginOutcome::FactorRequired(_)) {
         return (begun, None);
     }
-    let right = FactorCredential::Password(ZeroizedString::new("Gnomes2+"));
+    let right = FactorCredential::Password(ZeroizedString::new("Sample2+"));
     let verified = world.service.verify_factor(&right, session).await.unwrap();
     (begun, Some(verified))
 }
@@ -139,11 +140,12 @@ async fn login_from(
 /// The account's own `Seen` and `Trusted` devices log in during the lock.
 #[tokio::test]
 async fn a_known_device_still_logs_in_while_the_account_is_locked() {
+    let clock = common::test_clock();
     for (label, level) in [
         ("seen", DeviceTrustLevel::Seen),
         ("trusted", DeviceTrustLevel::Trusted),
     ] {
-        let world = locked_world(true).await;
+        let world = locked_world(&clock, true).await;
         let id = device_id(label);
         put(&world.devices, id, Some("u1"), level, 1).await;
 
@@ -171,7 +173,8 @@ async fn a_known_device_still_logs_in_while_the_account_is_locked() {
 /// client proved holds the exemption.
 #[tokio::test]
 async fn a_device_found_by_fingerprint_alone_does_not_lift_the_lock() {
-    let world = locked_world(true).await;
+    let clock = common::test_clock();
+    let world = locked_world(&clock, true).await;
     let id = device_id("seen");
     put(&world.devices, id, Some("u1"), DeviceTrustLevel::Seen, 1).await;
 
@@ -190,7 +193,8 @@ async fn a_device_found_by_fingerprint_alone_does_not_lift_the_lock() {
 /// no device store.
 #[tokio::test]
 async fn every_other_origin_is_kept_out_by_the_lock() {
-    let world = locked_world(true).await;
+    let clock = common::test_clock();
+    let world = locked_world(&clock, true).await;
     let strangers = [
         ("no device", test_session()),
         (
@@ -252,7 +256,7 @@ async fn every_other_origin_is_kept_out_by_the_lock() {
         assert!(!session.is_authenticated().await, "{label}");
     }
 
-    let plain = locked_world(false).await;
+    let plain = locked_world(&clock, false).await;
     let id = device_id("seen");
     put(&plain.devices, id, Some("u1"), DeviceTrustLevel::Seen, 1).await;
     let (begun, _) = login_from(&plain, &test_session_on_device(id)).await;

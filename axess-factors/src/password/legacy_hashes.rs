@@ -1,6 +1,8 @@
-//! Hashes written by 0.10.0 (`password_auth::generate_hash`, random salt)
-//! captured as literals, so verification is checked against bytes this crate
-//! did not produce.
+//! Hashes in the form 0.10.0 wrote (`password_auth::generate_hash`, random
+//! salt), held as literals computed outside this crate, so verification is
+//! checked against bytes this crate did not produce. The first fixture keeps
+//! that release's salt and parameters with a tag computed by OpenSSL's
+//! Argon2id for its password; the others are that release's own output.
 
 use super::*;
 
@@ -15,8 +17,8 @@ const LONG: &str = concat!(
 fn fixtures() -> [(String, &'static str); 5] {
     [
         (
-            "Gnomes2+".into(),
-            "$argon2id$v=19$m=19456,t=2,p=1$YT0eBJkc+fGx9d4XXuZw1Q$gQu/cRWKR8AUZnd2leNgYrLDl+P77Ytb6YNMWnNoRgM",
+            "Sample2+".into(),
+            "$argon2id$v=19$m=19456,t=2,p=1$YT0eBJkc+fGx9d4XXuZw1Q$zhPtXyr0rgGsz1rTpoT49+BZ0t/tYB03ib2ObbxICvI",
         ),
         (
             "correct horse battery staple".into(),
@@ -71,7 +73,7 @@ fn the_legacy_recovery_code_row_verifies() {
 #[test]
 fn a_hash_made_now_has_the_legacy_parameter_block() {
     let (_, legacy) = fixtures()[0].clone();
-    let fresh = generate_password_hash("Gnomes2+");
+    let fresh = generate_password_hash("Sample2+");
     let block = |h: &str| h.split('$').take(4).collect::<Vec<_>>().join("$");
     assert_eq!(block(&fresh), block(legacy));
     let fields = |h: &str| h.split('$').count();
@@ -89,7 +91,7 @@ fn the_error_says_whether_the_hash_or_the_password_was_wrong() {
     );
     for junk in ["", "not a hash", "$argon2id$v=19$m=19456,t=2,p=1$"] {
         assert_eq!(
-            verify_password("Gnomes2+", junk),
+            verify_password("Sample2+", junk),
             Err(PasswordVerifyError::Malformed),
             "{junk:?}"
         );

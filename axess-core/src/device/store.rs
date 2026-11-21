@@ -9,8 +9,9 @@
 
 use crate::authn::ids::{DeviceId, TenantId, UserId};
 use crate::device::types::{Device, DeviceBinding, DeviceTrustLevel, FingerprintHash};
-use chrono::{DateTime, Timelike, Utc};
+use axess_clock::Timestamp;
 use std::future::Future;
+use std::time::Duration;
 
 mod memory;
 
@@ -26,7 +27,7 @@ pub const OWN_DEVICE_SCAN_LIMIT: usize = 100;
 /// Typed, async device-identity backend.
 ///
 /// Implementors: [`MemoryDeviceStore`], `SqliteDeviceStore`,
-/// `PostgresDeviceStore`, `ValkeyDeviceStore`.
+/// `PostgresDeviceStore`, `MysqlDeviceStore`, `ValkeyDeviceStore`.
 ///
 /// All methods accept `&self`; implementations use interior mutability
 /// (`Arc<Mutex<HashMap<…>>>` for memory, connection pool for SQL/Valkey).
@@ -52,21 +53,22 @@ pub trait DeviceStore: Send + Sync + Clone + 'static {
     ///
     /// What a decision that a stale row would get wrong reads: the refresh
     /// device check, where a revocation another instance made must stop the
-    /// next refresh and not the one after the cache expires. The default is
-    /// [`load`](Self::load), right for a store that has no cache of its own;
-    /// [`CachedDeviceStore`](crate::device::CachedDeviceStore) overrides it
-    /// to read through.
+    /// next refresh and not the one after the cache expires. A store with no
+    /// cache of its own forwards to [`load`](Self::load);
+    /// [`CachedDeviceStore`](crate::device::CachedDeviceStore) reads through
+    /// to its backing store, and a store wrapped around it forwards to the
+    /// cache's `load_fresh`. The method has no default, so a wrapper cannot
+    /// fall back to a cached read without saying so.
     fn load_fresh(
         &self,
         tenant_id: &TenantId,
         id: &DeviceId,
-    ) -> impl Future<Output = Result<Option<Device>, Self::Error>> + Send {
-        self.load(tenant_id, id)
-    }
+    ) -> impl Future<Output = Result<Option<Device>, Self::Error>> + Send;
 
-    /// Look up a device by its keyed fingerprint within a tenant. Used as
-    /// the fast-path during request handling when no `device_id` cookie is
-    /// present yet. Collisions must be vanishingly rare given a
+    /// Look up a device by its keyed fingerprint within a tenant. Read by
+    /// a lookup by fingerprint (`DeviceLifecycleService::ensure_device`)
+    /// only: a resolution by the device token loads the row by its id and
+    /// never calls this. Collisions must be vanishingly rare given a
     /// per-tenant HMAC key, but implementations MUST scope the query by
     /// `tenant_id` to prevent cross-tenant correlation.
     fn find_by_fingerprint(
@@ -186,7 +188,7 @@ pub trait DeviceStore: Send + Sync + Clone + 'static {
     fn save(
         &self,
         device: &Device,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// Insert `device` as a new row unless a live device of its tenant,
@@ -212,7 +214,7 @@ pub trait DeviceStore: Send + Sync + Clone + 'static {
     fn create_or_find(
         &self,
         device: &Device,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<Device, Self::Error>> + Send;
 
     /// Touch the `last_seen_at` timestamp for the given device.
@@ -234,7 +236,7 @@ pub trait DeviceStore: Send + Sync + Clone + 'static {
         &self,
         tenant_id: &TenantId,
         id: &DeviceId,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<DeviceTrustLevel, Self::Error>> + Send;
 
     /// Set the trust level. Drives transitions across the
@@ -248,7 +250,7 @@ pub trait DeviceStore: Send + Sync + Clone + 'static {
         tenant_id: &TenantId,
         id: &DeviceId,
         level: DeviceTrustLevel,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// Set the trust level to `level` only if the row is currently at
@@ -263,32 +265,24 @@ pub trait DeviceStore: Send + Sync + Clone + 'static {
     /// it was not, and [`TrustTransition::Missing`] when no such device
     /// exists.
     ///
-    /// Backends MUST implement this as one conditional write in their own
-    /// storage engine. The provided body is a load followed by an
-    /// unconditional write and is NOT safe against a concurrent change; it
-    /// exists so that an out-of-tree backend keeps compiling, and a
-    /// backend that is used with concurrent writers must override it.
+    /// Required, with no provided body. The body the trait could offer is a
+    /// load followed by an unconditional
+    /// [`set_trust_level`](Self::set_trust_level): two steps, so a
+    /// revocation that lands between them is written over (the login-time
+    /// promotion of a device relies on this method for exactly that), and
+    /// two transitions decided from one read both report `Applied`.
+    /// Implement it as one conditional write in the storage engine (`UPDATE
+    /// ... SET trust_level = ? WHERE trust_level = ?`, a script, or a write
+    /// under the lock the comparison was made under). A store wrapped around
+    /// another forwards it.
     fn set_trust_level_if(
         &self,
         tenant_id: &TenantId,
         id: &DeviceId,
         expected: DeviceTrustLevel,
         level: DeviceTrustLevel,
-        now: DateTime<Utc>,
-    ) -> impl Future<Output = Result<TrustTransition, Self::Error>> + Send {
-        async move {
-            let Some(device) = self.load(tenant_id, id).await? else {
-                return Ok(TrustTransition::Missing);
-            };
-            if device.trust_level != expected {
-                return Ok(TrustTransition::Refused {
-                    current: device.trust_level,
-                });
-            }
-            self.set_trust_level(tenant_id, id, level, now).await?;
-            Ok(TrustTransition::Applied)
-        }
-    }
+        now: Timestamp,
+    ) -> impl Future<Output = Result<TrustTransition, Self::Error>> + Send;
 
     /// Replace the device's bindings with `bindings`, only if they are
     /// still exactly `expected`, and nothing else; never on a
@@ -305,33 +299,27 @@ pub trait DeviceStore: Send + Sync + Clone + 'static {
     /// and decide again), [`BindingsUpdate::Revoked`] (nothing written) or
     /// [`BindingsUpdate::Missing`].
     ///
-    /// The same rule as [`set_trust_level_if`](Self::set_trust_level_if)
-    /// applies to the provided body: it is a load and a [`save`](Self::save),
-    /// not safe against a concurrent writer, and a backend with concurrent
-    /// writers must override it with a conditional write.
+    /// **Required, and one conditional write.** There is no provided body.
+    /// The body the trait could offer is a load followed by a
+    /// [`save`](Self::save): two steps, so two editors that both read before
+    /// either wrote would both be answered `Written` and one change would be
+    /// lost, and the save would write every column of a row that may have
+    /// been revoked in between. Device keys rest on this write being atomic:
+    /// it is what makes a key challenge single-use (two refreshes with one
+    /// proof cannot both replace it), lets a device take exactly one key, and
+    /// keeps a revoked row from gaining anything. Implement it as one
+    /// conditional write in the storage engine (`UPDATE ... SET bindings = ?
+    /// WHERE bindings = ? AND trust_level <> 'revoked'`, a script, or a
+    /// write under the lock the comparison was made under). A store wrapped
+    /// around another forwards it.
     fn replace_bindings(
         &self,
         tenant_id: &TenantId,
         id: &DeviceId,
         expected: &[DeviceBinding],
         bindings: &[DeviceBinding],
-        now: DateTime<Utc>,
-    ) -> impl Future<Output = Result<BindingsUpdate, Self::Error>> + Send {
-        async move {
-            let Some(mut device) = self.load(tenant_id, id).await? else {
-                return Ok(BindingsUpdate::Missing);
-            };
-            if device.trust_level == DeviceTrustLevel::Revoked {
-                return Ok(BindingsUpdate::Revoked);
-            }
-            if device.bindings != expected {
-                return Ok(BindingsUpdate::Conflict);
-            }
-            device.bindings = bindings.to_vec();
-            self.save(&device, now).await?;
-            Ok(BindingsUpdate::Written)
-        }
-    }
+        now: Timestamp,
+    ) -> impl Future<Output = Result<BindingsUpdate, Self::Error>> + Send;
 
     /// Make `user` the owner of the device if it has none (`user_id IS
     /// NULL`), as one conditional write.
@@ -345,35 +333,20 @@ pub trait DeviceStore: Send + Sync + Clone + 'static {
     /// when no such device exists. Two users racing for one unowned device:
     /// exactly one is `Claimed`.
     ///
-    /// The provided body is a load and a [`save`](Self::save) and is NOT
-    /// safe against a concurrent claim; a backend with concurrent writers
-    /// must override it with a conditional write.
+    /// Required, with no provided body. The body the trait could offer is a
+    /// load followed by a [`save`](Self::save): two steps, so two users who
+    /// both read the device unowned would both be answered `Claimed`.
+    /// Implement it as one conditional write in the storage engine (`UPDATE
+    /// ... SET user_id = ? WHERE user_id IS NULL AND trust_level <>
+    /// 'revoked'`, a script, or a write under the lock the comparison was
+    /// made under). A store wrapped around another forwards it.
     fn claim_owner(
         &self,
         tenant_id: &TenantId,
         id: &DeviceId,
         user: &UserId,
-        now: DateTime<Utc>,
-    ) -> impl Future<Output = Result<OwnerClaim, Self::Error>> + Send {
-        async move {
-            let Some(mut device) = self.load(tenant_id, id).await? else {
-                return Ok(OwnerClaim::Missing);
-            };
-            if device.trust_level == DeviceTrustLevel::Revoked && device.user_id.is_none() {
-                // A save never un-revokes, so nothing would be written.
-                return Ok(OwnerClaim::OwnedByOther);
-            }
-            match device.user_id.as_ref() {
-                Some(owner) if owner == user => Ok(OwnerClaim::Claimed),
-                Some(_) => Ok(OwnerClaim::OwnedByOther),
-                None => {
-                    device.user_id = Some(*user);
-                    self.save(&device, now).await?;
-                    Ok(OwnerClaim::Claimed)
-                }
-            }
-        }
-    }
+        now: Timestamp,
+    ) -> impl Future<Output = Result<OwnerClaim, Self::Error>> + Send;
 
     /// Hard-delete the row. Idempotent. Used by the retention sweep once a
     /// `Revoked` device has aged out of the configured grace window, and
@@ -390,16 +363,24 @@ pub trait DeviceStore: Send + Sync + Clone + 'static {
     /// configured grace window). Returns the count of rows changed at
     /// each stage.
     ///
+    /// One call moves a row one level at most, each window is counted from
+    /// the stamp the step before wrote ([`SweepConfig::level_after`],
+    /// [`SweepConfig::purge_due`]), only rows of `tenant_id` are read, an
+    /// `Unknown` row is never moved, and the counts are the rows this call
+    /// wrote, with [`SweepCounts::skipped`] the rows it met and left
+    /// (unreadable, or due and contended): `Ok(SweepCounts::default())`,
+    /// every count zero, says that nothing was due.
+    ///
     /// Required, not defaulted: a default of `Ok(SweepCounts::default())`
     /// would be a silent no-op: a backend that forgot to override would
     /// fail to demote anything, and the caller would have no way to tell
     /// "no rows aged out this tick" from "sweep is unimplemented." Every
-    /// backend must answer the question, even if the answer is
-    /// `Err(_)` with a "not yet implemented" sentinel.
+    /// backend implements the sweep; an `Err` is a store failure, never a
+    /// stand-in for a sweep that was not written.
     fn sweep(
         &self,
         tenant_id: &TenantId,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<SweepCounts, Self::Error>> + Send;
 }
 
@@ -458,6 +439,13 @@ pub struct SweepCounts {
     pub seen_to_revoked: u64,
     /// `Revoked` rows hard-deleted because they aged past the grace window.
     pub revoked_purged: u64,
+    /// Rows this call met and could neither decide nor move: a row that
+    /// does not decode, or a row that was due and whose write another
+    /// writer kept winning. They stay as they were, and the next sweep
+    /// meets them again. Zero from a store that decides every row inside
+    /// one statement; a store that reads rows and then swaps them one by
+    /// one (the Valkey store) counts here what it left behind.
+    pub skipped: u64,
 }
 
 // ── SweepConfig ───────────────────────────────────────────────────────────────
@@ -482,7 +470,28 @@ pub struct SweepCounts {
 /// Defaults reflect a fintech-style retention posture suitable for
 /// PSD2 / DORA / MiFID II contexts: 90-day trusted idle, 30-day
 /// seen idle, 7-day revoked grace. Tighten or loosen via
-/// [`SweepConfig::builder`].
+/// [`SweepConfig::builder`], the one way to make any other, and read the
+/// windows through the methods of their names:
+///
+/// ```
+/// use axess_core::SweepConfig;
+/// let config = SweepConfig::builder()
+///     .trusted_idle(std::time::Duration::from_hours(30 * 24))
+///     .build()
+///     .expect("a whole number of seconds");
+/// assert_eq!(config.trusted_idle(), std::time::Duration::from_hours(30 * 24));
+/// ```
+///
+/// A value is not assembled field by field, which would skip the builder's
+/// check of the windows:
+///
+/// ```compile_fail,E0451
+/// use axess_core::SweepConfig;
+/// let _ = SweepConfig {
+///     trusted_idle: std::time::Duration::from_millis(1_500),
+///     ..SweepConfig::default()
+/// };
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SweepConfig {
     /// How long a `Trusted` device may go un-sighted before sweep
@@ -490,23 +499,23 @@ pub struct SweepConfig {
     /// 90-day default: a device that hasn't authenticated for a
     /// quarter shouldn't keep its possession-factor status without a
     /// fresh ceremony.
-    pub trusted_idle: chrono::Duration,
+    pub(crate) trusted_idle: Duration,
     /// How long a `Seen` device may go un-sighted before sweep revokes
     /// it, counted from the later of its last sighting and its demotion
     /// from `Trusted` ([`Device::demoted_at`]).
-    pub seen_idle: chrono::Duration,
+    pub(crate) seen_idle: Duration,
     /// How long a `Revoked` device row sticks around before hard
     /// deletion. Provides an audit-trail window for forensics on
     /// recently-compromised devices.
-    pub revoked_grace: chrono::Duration,
+    pub(crate) revoked_grace: Duration,
 }
 
 impl Default for SweepConfig {
     fn default() -> Self {
         Self {
-            trusted_idle: chrono::Duration::days(90),
-            seen_idle: chrono::Duration::days(30),
-            revoked_grace: chrono::Duration::days(7),
+            trusted_idle: Duration::from_hours(90 * 24),
+            seen_idle: Duration::from_hours(30 * 24),
+            revoked_grace: Duration::from_hours(7 * 24),
         }
     }
 }
@@ -532,20 +541,20 @@ impl SweepConfig {
     pub fn level_after(
         &self,
         level: DeviceTrustLevel,
-        last_seen_at: DateTime<Utc>,
-        demoted_at: Option<DateTime<Utc>>,
-        now: DateTime<Utc>,
+        last_seen_at: Timestamp,
+        demoted_at: Option<Timestamp>,
+        now: Timestamp,
     ) -> DeviceTrustLevel {
-        let idle_secs = |since: DateTime<Utc>| now.timestamp() - since.timestamp();
+        let idle_secs = |since: Timestamp| now.unix_seconds() - since.unix_seconds();
         match level {
             DeviceTrustLevel::Trusted
-                if idle_secs(last_seen_at) > self.trusted_idle.num_seconds() =>
+                if idle_secs(last_seen_at) > window_seconds(self.trusted_idle) =>
             {
                 DeviceTrustLevel::Seen
             }
             DeviceTrustLevel::Seen
                 if idle_secs(demoted_at.map_or(last_seen_at, |d| d.max(last_seen_at)))
-                    > self.seen_idle.num_seconds() =>
+                    > window_seconds(self.seen_idle) =>
             {
                 DeviceTrustLevel::Revoked
             }
@@ -556,8 +565,28 @@ impl SweepConfig {
     /// `true` when a `Revoked` row revoked at `revoked_at` has outlived the
     /// grace window at `now` and may be purged. Whole seconds, like
     /// [`level_after`](Self::level_after).
-    pub fn purge_due(&self, revoked_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
-        now.timestamp() - revoked_at.timestamp() > self.revoked_grace.num_seconds()
+    pub fn purge_due(&self, revoked_at: Timestamp, now: Timestamp) -> bool {
+        now.unix_seconds() - revoked_at.unix_seconds() > window_seconds(self.revoked_grace)
+    }
+
+    /// How long a `Trusted` device may go un-sighted before a sweep demotes
+    /// it to `Seen`.
+    #[must_use]
+    pub const fn trusted_idle(&self) -> Duration {
+        self.trusted_idle
+    }
+
+    /// How long a `Seen` device may go un-sighted, or stay demoted, before a
+    /// sweep revokes it.
+    #[must_use]
+    pub const fn seen_idle(&self) -> Duration {
+        self.seen_idle
+    }
+
+    /// How long a `Revoked` device row is kept before a sweep deletes it.
+    #[must_use]
+    pub const fn revoked_grace(&self) -> Duration {
+        self.revoked_grace
     }
 
     /// Construct via the builder.
@@ -566,28 +595,36 @@ impl SweepConfig {
     }
 }
 
+/// The whole seconds of a retention window, as the count the sweep compares
+/// an idle time with. A window past an `i64` of seconds reads as the largest
+/// count: no two readings are that far apart, so nothing is ever older than
+/// such a window, which is what a window that long means.
+pub(crate) fn window_seconds(window: Duration) -> i64 {
+    i64::try_from(window.as_secs()).unwrap_or(i64::MAX)
+}
+
 /// Builder for [`SweepConfig`]. Each setter overrides the default
 /// for one window; unset fields keep their default value.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SweepConfigBuilder {
-    trusted_idle: Option<chrono::Duration>,
-    seen_idle: Option<chrono::Duration>,
-    revoked_grace: Option<chrono::Duration>,
+    trusted_idle: Option<Duration>,
+    seen_idle: Option<Duration>,
+    revoked_grace: Option<Duration>,
 }
 
 impl SweepConfigBuilder {
     /// Set the Trusted-idle window.
-    pub fn trusted_idle(mut self, d: chrono::Duration) -> Self {
+    pub fn trusted_idle(mut self, d: Duration) -> Self {
         self.trusted_idle = Some(d);
         self
     }
     /// Set the Seen-idle window.
-    pub fn seen_idle(mut self, d: chrono::Duration) -> Self {
+    pub fn seen_idle(mut self, d: Duration) -> Self {
         self.seen_idle = Some(d);
         self
     }
     /// Set the Revoked-grace window.
-    pub fn revoked_grace(mut self, d: chrono::Duration) -> Self {
+    pub fn revoked_grace(mut self, d: Duration) -> Self {
         self.revoked_grace = Some(d);
         self
     }
@@ -646,8 +683,8 @@ pub(crate) fn shares_create_key(other: &Device, device: &Device) -> bool {
 /// second tie on every backend alike.
 pub(crate) fn order_newest_first(a: &Device, b: &Device) -> std::cmp::Ordering {
     b.last_seen_at
-        .timestamp()
-        .cmp(&a.last_seen_at.timestamp())
+        .unix_seconds()
+        .cmp(&a.last_seen_at.unix_seconds())
         .then_with(|| a.id.cmp(&b.id))
 }
 
@@ -656,14 +693,14 @@ pub(crate) fn order_newest_first(a: &Device, b: &Device) -> std::cmp::Ordering {
 /// and Valkey stores floor on write too, and a decision taken on a row (the
 /// newest sighting, whether a sighting moves the clock, a sweep window) comes
 /// out the same whatever the backend.
-pub(crate) fn whole_second(dt: DateTime<Utc>) -> DateTime<Utc> {
-    dt.with_nanosecond(0).unwrap_or(dt)
+pub(crate) fn whole_second(dt: Timestamp) -> Timestamp {
+    Timestamp::from_unix_seconds(dt.unix_seconds()).unwrap_or(dt)
 }
 
 /// The row a [`DeviceStore::save`] stores for `device`: a revoked row with no
 /// `revoked_at` gets `now`, so it has a grace clock and can be purged, and
 /// every timestamp is a [`whole_second`].
-pub(crate) fn for_save(device: &Device, now: DateTime<Utc>) -> Device {
+pub(crate) fn for_save(device: &Device, now: Timestamp) -> Device {
     let mut row = device.clone();
     if row.trust_level == DeviceTrustLevel::Revoked && row.revoked_at.is_none() {
         row.revoked_at = Some(now);
@@ -692,9 +729,9 @@ pub(crate) fn blocks_save(stored: DeviceTrustLevel) -> bool {
 pub(crate) fn demotion_stamp(
     from: DeviceTrustLevel,
     to: DeviceTrustLevel,
-    current: Option<DateTime<Utc>>,
-    now: DateTime<Utc>,
-) -> Option<DateTime<Utc>> {
+    current: Option<Timestamp>,
+    now: Timestamp,
+) -> Option<Timestamp> {
     match (from, to) {
         (DeviceTrustLevel::Trusted, DeviceTrustLevel::Seen) => Some(now),
         (_, DeviceTrustLevel::Seen) => current,
@@ -713,6 +750,12 @@ mod claims;
 
 #[cfg(test)]
 pub(crate) mod consistency;
+
+#[cfg(test)]
+pub(crate) mod interleaving;
+
+#[cfg(test)]
+pub(crate) mod key_contract;
 
 #[cfg(all(test, any(feature = "postgres", feature = "mysql")))]
 pub(crate) mod sql_contract;

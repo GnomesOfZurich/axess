@@ -1,4 +1,8 @@
+use axess_clock::testing::Shift;
+use std::sync::Arc;
+
 use super::*;
+use crate::testing::MockClock;
 use axess_factors::jwt::verifier::JwtVerifier;
 use serde::Deserialize;
 
@@ -15,19 +19,23 @@ fn max_ttl_accessor_returns_none_by_default() {
 
 #[test]
 fn with_max_ttl_records_cap() {
-    let idp = LocalIdpFixture::new("https://idp").with_max_ttl(Duration::minutes(15));
-    assert_eq!(idp.max_ttl(), Some(Duration::minutes(15)));
+    let idp = LocalIdpFixture::new("https://idp").with_max_ttl(std::time::Duration::from_mins(15));
+    assert_eq!(idp.max_ttl(), Some(std::time::Duration::from_mins(15)));
 }
 
 #[tokio::test]
 async fn mint_within_max_ttl_succeeds() {
-    let idp = LocalIdpFixture::new("https://idp").with_max_ttl(Duration::minutes(30));
-    let now = Utc::now();
-    let claims = MintClaims::new("alice", now + Duration::minutes(15))
+    let clock = MockClock::at_reference();
+    let idp = LocalIdpFixture::new("https://idp")
+        .with_clock(clock.clone())
+        .with_max_ttl(std::time::Duration::from_mins(30));
+    let now = axess_clock::testing::MockClock::reference_time();
+    let claims = MintClaims::new("alice", now.plus(SignedDuration::minutes(15)))
         .with_audience("https://api")
         .with_issued_at(now);
     let token = idp.mint(&claims);
     let verifier = JwtVerifier::new(idp.jwks_handle())
+        .with_clock(Arc::new(clock.clone()))
         .with_audience("https://api")
         .allow_any_issuer();
     verifier
@@ -39,9 +47,12 @@ async fn mint_within_max_ttl_succeeds() {
 #[test]
 #[should_panic(expected = "exceeding the fixture's max_ttl")]
 fn mint_exceeding_max_ttl_panics() {
-    let idp = LocalIdpFixture::new("https://idp").with_max_ttl(Duration::minutes(15));
-    let now = Utc::now();
-    let claims = MintClaims::new("alice", now + Duration::hours(2))
+    let clock = MockClock::at_reference();
+    let idp = LocalIdpFixture::new("https://idp")
+        .with_clock(clock.clone())
+        .with_max_ttl(std::time::Duration::from_mins(15));
+    let now = axess_clock::testing::MockClock::reference_time();
+    let claims = MintClaims::new("alice", now.plus(SignedDuration::hours(2)))
         .with_audience("https://api")
         .with_issued_at(now);
     let _ = idp.mint(&claims);
@@ -53,9 +64,15 @@ fn mint_exceeding_max_ttl_panics() {
 #[test]
 #[should_panic(expected = "exceeding the fixture's max_ttl")]
 fn mint_exceeding_max_ttl_without_iat_uses_now() {
-    let idp = LocalIdpFixture::new("https://idp").with_max_ttl(Duration::seconds(60));
-    let claims =
-        MintClaims::new("alice", Utc::now() + Duration::hours(2)).with_audience("https://api");
+    let clock = MockClock::at_reference();
+    let idp = LocalIdpFixture::new("https://idp")
+        .with_clock(clock.clone())
+        .with_max_ttl(std::time::Duration::from_secs(60));
+    let claims = MintClaims::new(
+        "alice",
+        axess_clock::testing::MockClock::reference_time().plus(SignedDuration::hours(2)),
+    )
+    .with_audience("https://api");
     let _ = idp.mint(&claims);
 }
 
@@ -64,25 +81,29 @@ fn mint_exceeding_max_ttl_without_iat_uses_now() {
 #[test]
 #[should_panic(expected = "exceeding the fixture's max_ttl")]
 fn mint_jwt_svid_exceeding_max_ttl_panics() {
-    let idp = LocalIdpFixture::new("https://idp").with_max_ttl(Duration::minutes(5));
+    let idp = LocalIdpFixture::new("https://idp").with_max_ttl(std::time::Duration::from_mins(5));
     let _ = idp.mint_jwt_svid(
-        "test.gnomes",
+        "test.example.org",
         "worker",
         "acme",
         "https://api",
-        Duration::hours(1),
+        SignedDuration::hours(1),
     );
 }
 
 #[tokio::test]
 async fn mint_at_exact_max_ttl_boundary_succeeds() {
-    let idp = LocalIdpFixture::new("https://idp").with_max_ttl(Duration::minutes(10));
-    let now = Utc::now();
-    let claims = MintClaims::new("alice", now + Duration::minutes(10))
+    let clock = MockClock::at_reference();
+    let idp = LocalIdpFixture::new("https://idp")
+        .with_clock(clock.clone())
+        .with_max_ttl(std::time::Duration::from_mins(10));
+    let now = axess_clock::testing::MockClock::reference_time();
+    let claims = MintClaims::new("alice", now.plus(SignedDuration::minutes(10)))
         .with_audience("https://api")
         .with_issued_at(now);
     let token = idp.mint(&claims);
     let verifier = JwtVerifier::new(idp.jwks_handle())
+        .with_clock(Arc::new(clock.clone()))
         .with_audience("https://api")
         .allow_any_issuer();
     verifier
@@ -93,33 +114,31 @@ async fn mint_at_exact_max_ttl_boundary_succeeds() {
 
 #[tokio::test]
 async fn max_ttl_survives_rotate_signing_key() {
-    let idp = LocalIdpFixture::new("https://idp").with_max_ttl(Duration::minutes(5));
-    let new_key = LocalIdpSigningKey::generate_rsa().with_key_id("rotated");
+    let idp = LocalIdpFixture::new("https://idp").with_max_ttl(std::time::Duration::from_mins(5));
+    let new_key = LocalIdpSigningKey::generate_es256().with_key_id("rotated");
     let rotated = idp.rotate_signing_key(new_key);
-    assert_eq!(rotated.max_ttl(), Some(Duration::minutes(5)));
+    assert_eq!(rotated.max_ttl(), Some(std::time::Duration::from_mins(5)));
 }
 
 #[tokio::test]
 async fn max_ttl_survives_with_historical_signing_key() {
-    let key = LocalIdpSigningKey::generate_rsa();
+    let key = LocalIdpSigningKey::generate_es256();
     let idp = LocalIdpFixture::new("https://idp")
-        .with_max_ttl(Duration::minutes(5))
+        .with_max_ttl(std::time::Duration::from_mins(5))
         .with_historical_signing_key(key);
-    assert_eq!(idp.max_ttl(), Some(Duration::minutes(5)));
+    assert_eq!(idp.max_ttl(), Some(std::time::Duration::from_mins(5)));
 }
 
 #[tokio::test]
 async fn max_ttl_survives_with_key_id() {
     let idp = LocalIdpFixture::new("https://idp")
-        .with_max_ttl(Duration::minutes(5))
+        .with_max_ttl(std::time::Duration::from_mins(5))
         .with_key_id("custom");
-    assert_eq!(idp.max_ttl(), Some(Duration::minutes(5)));
+    assert_eq!(idp.max_ttl(), Some(std::time::Duration::from_mins(5)));
 }
 
-fn far_future() -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339("2100-01-01T00:00:00Z")
-        .expect("literal parses")
-        .with_timezone(&Utc)
+fn far_future() -> Timestamp {
+    Timestamp::parse_rfc3339("2100-01-01T00:00:00Z").expect("literal parses")
 }
 
 /// The cap is measured from the supplied instant: a five-minute token
@@ -127,39 +146,43 @@ fn far_future() -> DateTime<Utc> {
 /// would call seventy-odd years long.
 #[test]
 fn mint_at_measures_the_cap_from_the_given_instant() {
-    let idp = LocalIdpFixture::new("https://idp").with_max_ttl(Duration::minutes(10));
+    let idp = LocalIdpFixture::new("https://idp").with_max_ttl(std::time::Duration::from_mins(10));
     let now = far_future();
-    let claims = MintClaims::new("alice", now + Duration::minutes(5)).with_audience("https://api");
+    let claims =
+        MintClaims::new("alice", now.plus(SignedDuration::minutes(5))).with_audience("https://api");
     let _ = idp.mint_at(&claims, now);
 }
 
 #[test]
 #[should_panic(expected = "exceeding the fixture's max_ttl")]
 fn mint_at_rejects_a_lifetime_over_the_cap_from_the_given_instant() {
-    let idp = LocalIdpFixture::new("https://idp").with_max_ttl(Duration::minutes(10));
+    let idp = LocalIdpFixture::new("https://idp").with_max_ttl(std::time::Duration::from_mins(10));
     let now = far_future();
-    let claims = MintClaims::new("alice", now + Duration::minutes(11)).with_audience("https://api");
+    let claims = MintClaims::new("alice", now.plus(SignedDuration::minutes(11)))
+        .with_audience("https://api");
     let _ = idp.mint_at(&claims, now);
 }
 
 /// `mint_jwt_svid_at` takes `iat`, `exp` and the cap from `now`.
 #[tokio::test]
 async fn mint_jwt_svid_at_uses_the_given_instant() {
-    let idp = LocalIdpFixture::new("https://idp").with_max_ttl(Duration::minutes(10));
     let now = far_future();
+    let clock = MockClock::at(now);
+    let idp = LocalIdpFixture::new("https://idp")
+        .with_clock(clock.clone())
+        .with_max_ttl(std::time::Duration::from_mins(10));
     let token = idp.mint_jwt_svid_at(
-        "test.gnomes",
+        "test.example.org",
         "worker",
         "acme",
         "https://api",
-        Duration::minutes(5),
+        SignedDuration::minutes(5),
         now,
     );
-    let clock = std::sync::Arc::new(crate::testing::MockClock::at(now));
     let verifier = JwtVerifier::new(idp.jwks_handle())
         .with_audience("https://api")
         .allow_any_issuer()
-        .with_clock(clock);
+        .with_clock(Arc::new(clock));
     verifier
         .verify::<CustomClaims>(&token)
         .await
@@ -168,6 +191,9 @@ async fn mint_jwt_svid_at_uses_the_given_instant() {
     let bytes = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, payload)
         .expect("payload decodes");
     let json: serde_json::Value = serde_json::from_slice(&bytes).expect("payload is JSON");
-    assert_eq!(json["iat"], now.timestamp());
-    assert_eq!(json["exp"], (now + Duration::minutes(5)).timestamp());
+    assert_eq!(json["iat"], now.unix_seconds());
+    assert_eq!(
+        json["exp"],
+        (now.plus(SignedDuration::minutes(5))).unix_seconds()
+    );
 }

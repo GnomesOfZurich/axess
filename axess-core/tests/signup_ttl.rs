@@ -2,7 +2,7 @@
 //! A signup verification TTL an operator set to an extreme value never
 //! panics the signup that reads it.
 
-mod common;
+use axess_core::testing::fixtures as common;
 
 use axess_core::authn::AuditContext;
 use axess_core::authn::service::{AuthnService, SignupOutcome};
@@ -16,9 +16,13 @@ use common::{test_tenant, test_user};
 
 #[tokio::test]
 async fn an_extreme_verification_ttl_never_panics_a_signup() {
+    let clock = common::test_clock();
     for extreme in extreme_durations() {
-        let identity = MockIdentityStore::new().with_tenant(test_tenant());
+        let identity = MockIdentityStore::new()
+            .with_clock(clock.clone())
+            .with_tenant(test_tenant());
         let svc = AuthnService::builder(identity, MockFactorStore::new())
+            .with_clock(clock.clone())
             .with_signup_verification_ttl(extreme.value)
             .build()
             .with_audit_context(AuditContext::default());

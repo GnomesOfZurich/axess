@@ -12,7 +12,7 @@
 //! attacker cycling addresses still meets it.
 
 use crate::authn::ids::{TenantId, UserId};
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::IpAddr;
 use std::time::Duration;
 
 /// How consecutive wrong guesses are slowed down before the account's lock
@@ -70,7 +70,7 @@ pub struct ThrottleState {
     /// Consecutive wrong guesses since the key was last cleared or forgotten.
     pub failures: u32,
     /// When the last of them was recorded, on the store's clock.
-    pub last_failure_at: chrono::DateTime<chrono::Utc>,
+    pub last_failure_at: axess_clock::Timestamp,
 }
 
 /// The key one throttle entry is read and recorded under: built by
@@ -83,9 +83,10 @@ pub struct ThrottleSubject {
     /// The account.
     pub user_id: UserId,
     /// The client address, under [`ThrottleKey::AccountAndAddress`] when
-    /// the request resolved one: an IPv6 address as its /64 prefix, an
-    /// IPv4-mapped one as its IPv4 address. `None` under [`ThrottleKey::Account`] and
-    /// for a request with no resolved address.
+    /// the request resolved one: an IPv6 address as its /64 prefix, one that
+    /// carries an IPv4 client (IPv4-mapped, NAT64, IPv4-translated or
+    /// -compatible, 6to4, Teredo) as that IPv4 address. `None` under
+    /// [`ThrottleKey::Account`] and for a request with no resolved address.
     pub address: Option<IpAddr>,
 }
 
@@ -117,9 +118,9 @@ impl Throttle {
 
     /// Whether `state` is older than [`forget_after`](Self::forget_after)
     /// at `now`.
-    pub fn is_stale(&self, state: &ThrottleState, now: chrono::DateTime<chrono::Utc>) -> bool {
-        match chrono::Duration::from_std(self.forget_after()) {
-            Ok(keep) => now - state.last_failure_at > keep,
+    pub fn is_stale(&self, state: &ThrottleState, now: axess_clock::Timestamp) -> bool {
+        match axess_clock::SignedDuration::try_from(self.forget_after()) {
+            Ok(keep) => now.since(state.last_failure_at) > keep,
             // A span too long to represent is never exceeded.
             Err(_) => false,
         }
@@ -134,7 +135,7 @@ impl Throttle {
     pub fn retry_after(
         &self,
         state: Option<&ThrottleState>,
-        now: chrono::DateTime<chrono::Utc>,
+        now: axess_clock::Timestamp,
     ) -> Option<Duration> {
         let state = state?;
         if self.is_stale(state, now) {
@@ -144,23 +145,25 @@ impl Throttle {
         // A delay or a retry time too large to represent is a guess that
         // waits for it, not one that runs: the throttle refuses and names
         // the delay it could not add up.
-        let Ok(delay) = chrono::Duration::from_std(wait) else {
+        let Ok(delay) = axess_clock::SignedDuration::try_from(wait) else {
             return Some(wait);
         };
-        let Some(retry_at) = state.last_failure_at.checked_add_signed(delay) else {
+        let Some(retry_at) = state.last_failure_at.checked_add(delay) else {
             return Some(wait);
         };
         if now >= retry_at {
             None
         } else {
-            Some((retry_at - now).to_std().unwrap_or(wait))
+            Some(Duration::try_from(retry_at.since(now)).unwrap_or(wait))
         }
     }
 
     /// The key a request for `user_id` of `tenant_id` from `address` is
     /// throttled under: the address is kept only under
     /// [`ThrottleKey::AccountAndAddress`], and then as its network (an IPv6
-    /// address as its /64 prefix), so rotating inside one /64 is one guesser.
+    /// address as its /64 prefix, one that carries an IPv4 client as that
+    /// client), so rotating inside one /64 is one guesser and the clients of
+    /// one NAT64 gateway are as many guessers as they are clients.
     pub fn subject(
         &self,
         tenant_id: &TenantId,
@@ -171,25 +174,12 @@ impl Throttle {
             tenant_id: *tenant_id,
             user_id: *user_id,
             address: match self.key {
-                ThrottleKey::AccountAndAddress => address.map(client_network),
+                ThrottleKey::AccountAndAddress => {
+                    address.map(|a| crate::client_ip::network::ClientNetwork::of(a).address())
+                }
                 ThrottleKey::Account => None,
             },
         }
-    }
-}
-
-/// The network a client address is throttled as: an IPv4 address as it is,
-/// an IPv4-mapped IPv6 address as the IPv4 address it carries, and any other
-/// IPv6 address as its /64 prefix.
-///
-/// One IPv6 subscriber is routinely handed a whole /64, so keying on the
-/// full address would give a guesser 2^64 keys and the throttle would never
-/// delay anything. This is the masking the request rate limiter applies to
-/// its bucket keys.
-fn client_network(address: IpAddr) -> IpAddr {
-    match address.to_canonical() {
-        IpAddr::V4(v4) => IpAddr::V4(v4),
-        IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & (u128::MAX << 64))),
     }
 }
 

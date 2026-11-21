@@ -55,10 +55,12 @@ use axess::authn::{
     AuditContext, AuthnService, EntityState, IdentityAdmin, IdentityLookup, Tenant, TenantId, User,
     UserId,
 };
+use axess::federation::oauth::OAuthCallbackRoute;
 use axess::federation::oauth::{
-    ClientAssertionSigner, DpopKey, FapiConfig, OAuthClaims, OAuthLoginOptions,
+    ClientAssertionSigner, DpopKey, EgressPolicy, FapiConfig, OAuthClaims, OAuthLoginOptions,
     OAuthProviderConfig, ResponseMode, SenderConstraint,
 };
+use axess::profile::SecurityProfile;
 use axess::testing::{MockFactorStore, MockIdentityStore};
 use axess::{
     AuthSession, Clock, KeyExtractor, MemorySessionRegistry, MemorySessionStore, RateLimitConfig,
@@ -115,6 +117,8 @@ struct AppState {
     allowed_email_domains: Vec<String>,
     provider_name: String,
     post_logout_redirect: String,
+    /// The clock a provisioned user is stamped with.
+    clock: Arc<dyn Clock>,
 }
 
 #[tokio::main]
@@ -134,6 +138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The tenant the IdP's users are created in. A real application reads it
     // from its tenant table; the in-memory store is seeded here.
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let tenant = TenantId::new(&SystemRng);
     let identity = MockIdentityStore::new().with_tenant(Tenant::new(
         tenant.to_string(),
@@ -141,17 +146,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "FAPI example tenant",
         EntityState::Active,
         UserId::system(),
-        SystemClock.now(),
+        clock.now(),
     )?);
     let registry = MemorySessionRegistry::new();
-    let builder = AuthnService::builder(identity.clone(), MockFactorStore::new())
+    // Financial-grade: the strict profile's values for the authentication
+    // service, applied before the example's own settings so those stay.
+    let builder = SecurityProfile::Strict
+        .values()
+        .authn_service_builder(AuthnService::builder(
+            identity.clone(),
+            MockFactorStore::new(),
+        ))
         .with_registry(registry.clone());
 
     let (authn, provider_name) = if is_live {
         let (provider, name) = build_live_provider().await?;
         (builder.with_oauth_provider(provider).build(), name)
     } else {
-        let (provider, name) = build_mock_provider();
+        let (provider, name) = build_mock_provider(clock.clone());
         (builder.with_oauth_provider(provider).build(), name)
     };
 
@@ -187,11 +199,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // switch also lets a cross-site page send the cookie with a forged `POST`;
     // refresh and logout stay safe only through `same_origin_only`, so keep it.
     // A session the registry no longer holds (a logout, a forced logout) is
-    // refused on its next request.
+    // refused on its next request, and the service's sink writes the audit
+    // row of each session the layer ends that way or at the age cap.
     let session_layer = SessionLayer::new(
         session_store,
         signing_key,
         Arc::new(SessionRegistryAdapter(registry)),
+        authn.session_end_audit(),
     )
     .with_ttl(STRICT_IDLE_TTL)
     .with_max_session_age(Some(STRICT_MAX_SESSION_AGE))
@@ -212,9 +226,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         allowed_email_domains,
         provider_name,
         post_logout_redirect: format!("{APP_ORIGIN}/"),
+        clock: clock.clone(),
     };
 
-    let app = routes().with_state(state).layer(session_layer);
+    let app = routes(clock).with_state(state).layer(session_layer);
 
     // Resolve the client address once, outside everything that reads one.
     // A FAPI deployment sits behind a TLS terminator, so name that
@@ -251,23 +266,26 @@ const LOGIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 /// `axess::client_ip::layer` resolves (installed outside everything in
 /// `main`); without that layer every request shares one bucket, which limits
 /// harder, not less. A deployment behind several replicas needs a limit at
-/// the edge as well, since this one counts per process.
-fn login_limiter() -> RateLimitLayer {
+/// the edge as well, since this one counts per process. Its window runs on
+/// `clock`.
+fn login_limiter(clock: Arc<dyn Clock>) -> RateLimitLayer {
     RateLimitLayer::new(
         RateLimitConfig::builder()
             .max_requests(LOGIN_LIMIT)
             .window(LOGIN_WINDOW)
             .key(KeyExtractor::ClientIp)
+            .clock(clock)
             .build(),
     )
 }
 
 /// The example's routes. The callback is `POST` only: the login asks for
 /// `form_post`, so a code in a URL query is never expected and never accepted.
-fn routes() -> Router<AppState> {
+/// The login limit counts its window on `clock`.
+fn routes(clock: Arc<dyn Clock>) -> Router<AppState> {
     Router::new()
         .route("/", get(home))
-        .route("/auth/login", get(login).route_layer(login_limiter()))
+        .route("/auth/login", get(login).route_layer(login_limiter(clock)))
         .route("/auth/callback", post(callback_post))
         .route("/profile", get(profile))
         .merge(
@@ -342,12 +360,13 @@ fn run_mode(issuer: Option<&str>, mock: Option<&str>) -> Result<Mode, String> {
     }
 }
 
-fn build_mock_provider() -> (axess::testing::MockOAuthProvider, String) {
+fn build_mock_provider(clock: Arc<dyn Clock>) -> (axess::testing::MockOAuthProvider, String) {
     use axess::testing::MockOAuthProvider;
 
     info!("Building mock FAPI service (no external IdP)");
 
     let mock = MockOAuthProvider::new("fapi-mock")
+        .with_clock(clock)
         .with_issuer("https://fapi-mock.example.com")
         .with_client_id("mock-fapi-client")
         .with_user(
@@ -475,11 +494,15 @@ async fn build_live_provider() -> Result<(OAuthProviderConfig, String), Box<dyn 
     // FAPI 2.0 authenticates the client by private_key_jwt or mTLS, never a
     // client secret, and `build` refuses a provider that would send one.
     // The assertion is signed for the issuer as audience.
-    let provider = OAuthProviderConfig::discover_with_private_key_jwt(
+    // The mock bank of the walkthrough is on loopback over plain HTTP, which
+    // the default policy refuses; this is the named opt-in for local
+    // development. A live issuer stays screened.
+    let provider = OAuthProviderConfig::discover_screened_with_private_key_jwt(
         &provider_name,
         &issuer,
         signer,
         &format!("{APP_ORIGIN}/auth/callback"),
+        EgressPolicy::screened_allowing_loopback_http(),
     )
     .await?
     // Without this list the logout redirect below is dropped: only an exact
@@ -537,7 +560,7 @@ async fn login(
         .begin_oauth_login(&state.provider_name, &options, &session)
         .await
     {
-        Ok((auth_url, _csrf)) => {
+        Ok((auth_url, _)) => {
             info!("Redirecting to IdP (PAR-backed authorization URL)");
             Redirect::temporary(auth_url.as_str()).into_response()
         }
@@ -586,14 +609,20 @@ async fn handle_callback(
     session: &AuthSession,
     audit: AuditContext,
 ) -> axum::response::Response {
-    let authn = state.authn.with_audit_context(audit);
+    let authn = state.authn.with_audit_context(audit.clone());
     let claims = match authn
-        .finish_oauth_login_with_iss(&params.code, &params.state, params.iss.as_deref(), session)
+        .finish_oauth_login(
+            OAuthCallbackRoute::global(&state.provider_name),
+            &params.code,
+            &params.state,
+            params.iss.as_deref(),
+            session,
+        )
         .await
     {
         Ok(claims) => claims,
         Err(e) => {
-            tracing::error!(error = %e, "finish_oauth_login_with_iss failed");
+            tracing::error!(error = %e, "finish_oauth_login failed");
             return failure_page(
                 "Login Failed",
                 "The provider's answer could not be accepted.",
@@ -625,7 +654,7 @@ async fn handle_callback(
     // every proof for the token with it.
     let dpop_demo = match claims.dpop_key.as_ref() {
         None => "<p><em>No DPoP key: this login was not sender-constrained.</em></p>".to_string(),
-        Some(key) => dpop_demo(state, key, claims.access_token.as_deref()),
+        Some(key) => dpop_demo(state, audit, key, claims.access_token.as_deref()).await,
     };
 
     Html(format!(
@@ -709,7 +738,7 @@ async fn local_user(state: &AppState, claims: &OAuthClaims) -> Result<User, Stri
         claims.email.as_deref().unwrap_or(&claims.subject),
         EntityState::Active,
         UserId::system(),
-        SystemClock.now(),
+        state.clock.now(),
     )?;
     match state.identity.create_user(user.clone()).await {
         Ok(()) => Ok(user),
@@ -765,14 +794,27 @@ fn dpop_key_from_json(value: serde_json::Value) -> Option<DpopKey> {
 
 /// A DPoP proof for a call to a resource server with `access_token`, signed
 /// by `key`, the key the token is bound to.
-fn dpop_demo(state: &AppState, key: &DpopKey, access_token: Option<&str>) -> String {
-    match state.authn.generate_dpop_proof(
-        &state.provider_name,
-        key,
-        "GET",
-        "https://api.bank.example.com/accounts",
-        access_token,
-    ) {
+async fn dpop_demo(
+    state: &AppState,
+    audit: AuditContext,
+    key: &DpopKey,
+    access_token: Option<&str>,
+) -> String {
+    // The helpers are called on a scope, which says whose provider the name
+    // is: this example registers its one provider globally.
+    match state
+        .authn
+        .with_audit_context(audit)
+        .oauth_global()
+        .generate_dpop_proof(
+            &state.provider_name,
+            key,
+            "GET",
+            "https://api.bank.example.com/accounts",
+            access_token,
+        )
+        .await
+    {
         Ok(proof) => format!(
             "<h2>DPoP Proof (for API calls)</h2>\
              <p><strong>Thumbprint (jkt):</strong> <code>{}</code></p>\
@@ -883,7 +925,9 @@ async fn refresh(
         .and_then(dpop_key_from_json);
     let outcome = match state
         .authn
-        .with_audit_context(audit)
+        .with_audit_context(audit.clone())
+        .oauth_for_session(&session)
+        .await
         .refresh_oauth_token(
             &state.provider_name,
             &token,
@@ -924,7 +968,7 @@ async fn refresh(
     }
     info!("tokens refreshed");
     let dpop = match key.as_ref() {
-        Some(key) => dpop_demo(&state, key, Some(&outcome.access_token)),
+        Some(key) => dpop_demo(&state, audit, key, Some(&outcome.access_token)).await,
         None => String::new(),
     };
     Html(format!(
@@ -971,9 +1015,12 @@ async fn logout(
 
     // Step 1: Revoke the refresh token, which also ends the access tokens
     // issued from it at the IdP. A failure is logged and the logout goes on.
+    let authn = state.authn.with_audit_context(audit);
+    // The provider the session logged in through, read before the session
+    // is cleared: the revocation and the logout URL both go to it.
+    let oauth = authn.oauth_for_session(&session).await;
     if let Some(token) = refresh_token {
-        match state
-            .authn
+        match oauth
             .revoke_oauth_token(provider, &token, Some("refresh_token"), None)
             .await
         {
@@ -986,7 +1033,7 @@ async fn logout(
     // records the logout, and clears the session and rotates its id whatever
     // the audit store does; a bare `session.clear()` would do the last two
     // only.
-    if let Err(e) = state.authn.with_audit_context(audit).logout(&session).await {
+    if let Err(e) = authn.logout(&session).await {
         tracing::error!(error = %e, "logout could not be recorded; the session is cleared regardless");
     }
     info!("Local session invalidated");
@@ -994,12 +1041,19 @@ async fn logout(
     // Step 3: Redirect to IdP's end_session_endpoint (RP-Initiated Logout).
     // The IdP hands `state` back on the post-logout redirect; the landing
     // page is static and acts on nothing, so the example sends none.
-    if let Some(end_session_url) = state.authn.build_end_session_url(
-        provider,
-        hint.as_deref(),
-        Some(&state.post_logout_redirect),
-        None,
-    ) {
+    let end_session_url = oauth
+        .build_end_session_url(
+            provider,
+            hint.as_deref(),
+            Some(&state.post_logout_redirect),
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "no logout URL for the provider");
+            None
+        });
+    if let Some(end_session_url) = end_session_url {
         info!("Redirecting to IdP end_session_endpoint");
         Redirect::to(end_session_url.as_str()).into_response()
     } else {

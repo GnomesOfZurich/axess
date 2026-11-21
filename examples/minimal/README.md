@@ -35,7 +35,7 @@ curl -s -i http://localhost:3000/dashboard
 # Log in, keeping the cookie.
 curl -s -c jar.txt -X POST http://localhost:3000/login \
   -H 'content-type: application/json' \
-  -d '{"username":"alice","password":"Gnomes2+"}'
+  -d '{"username":"alice","password":"Sample2+"}'
 
 # Protected route with the cookie: 200.
 curl -s -b jar.txt http://localhost:3000/dashboard

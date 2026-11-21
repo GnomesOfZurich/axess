@@ -6,8 +6,8 @@
 //! `crate::testing::local_idp`). The fixture generates a fresh keypair
 //! per `new()` (test-only; tokens become unverifiable across restarts),
 //! while production loads its current + historical signing keys from a
-//! [`LocalIdpKeyStore`](crate::local_idp::LocalIdpKeyStore) implementation (file, Vault, KMS, ...). Both
-//! variants share the primitives in [`primitives`](crate::local_idp::primitives), so tokens minted by
+//! [`LocalIdpKeyStore`] implementation (file, Vault, KMS, ...). Both
+//! variants share the primitives in [`primitives`], so tokens minted by
 //! either are byte-identical when the same key drives them.
 //!
 //! Scope: issuance only. No authorization-code flow, refresh tokens,
@@ -18,7 +18,8 @@
 //!
 //! ```rust,ignore
 //! use axess::local_idp::{LocalIdp, LocalIdpSigningKey, MemoryLocalIdpKeyStore, MintClaims};
-//! use chrono::{Duration, Utc};
+//! use axess::{Clock, SystemClock};
+//! use axess_clock::SignedDuration;
 //!
 //! let key = LocalIdpSigningKey::generate_es256().with_key_id("v1");
 //! let store = MemoryLocalIdpKeyStore::with_current(key);
@@ -26,11 +27,16 @@
 //!     .await
 //!     .expect("load keys");
 //!
+//! // The clock the deployment gives the IdP (`with_clock`) dates the claims.
+//! let now = SystemClock.now();
 //! let token = idp
 //!     .mint(
-//!         &MintClaims::new("worker-1", Utc::now() + Duration::minutes(5))
+//!         &MintClaims::new(
+//!             "worker-1",
+//!             now.checked_add(SignedDuration::minutes(5)).expect("inside the range"),
+//!         )
 //!             .with_audience("https://api")
-//!             .with_issued_at(Utc::now()),
+//!             .with_issued_at(now),
 //!     )
 //!     .await
 //!     .expect("mint");
@@ -39,9 +45,9 @@
 use std::sync::{Arc, RwLock};
 
 use axess_clock::{Clock, SystemClock};
-use chrono::Duration;
 use jsonwebtoken::jwk::{Jwk, JwkSet};
-use jsonwebtoken::{Algorithm, Header, encode};
+use jsonwebtoken::{Algorithm, Header};
+use std::time::Duration;
 use tokio::sync::RwLock as AsyncRwLock;
 
 use self::primitives::{
@@ -64,10 +70,6 @@ pub use crate::testing::local_idp::{MockIssuanceListener, RecordedIssuance};
 /// from a test module.
 pub mod primitives;
 
-/// RFC 8414 minimal discovery document + axum handlers for serving
-/// it (`/.well-known/openid-configuration` + `/jwks.json`). Promoted
-/// out of the parent module so the metadata struct and the handler
-/// functions live near each other and can be re-exported together.
 pub mod discovery;
 
 pub use discovery::LocalIdpMetadata;
@@ -175,7 +177,7 @@ pub struct LocalIdp<K: LocalIdpKeyStore> {
 /// Lifetime cap a new [`LocalIdp`] applies until
 /// [`with_max_ttl`](LocalIdp::with_max_ttl) or
 /// [`without_max_ttl`](LocalIdp::without_max_ttl) says otherwise.
-pub const DEFAULT_MAX_TTL: Duration = Duration::hours(1);
+pub const DEFAULT_MAX_TTL: Duration = Duration::from_hours(1);
 
 impl<K: LocalIdpKeyStore> Clone for LocalIdp<K> {
     fn clone(&self) -> Self {
@@ -313,7 +315,7 @@ impl<K: LocalIdpKeyStore> LocalIdp<K> {
     /// claim sets; the lifetime is `exp` less the IdP clock's now. Contrast with
     /// [`crate::testing::local_idp::LocalIdpFixture::with_max_ttl`],
     /// which panics at the misuse site (fixture mints have no error
-    /// channel because they're test-time). A cap of zero or less admits no
+    /// channel because they're test-time). A cap of no time admits no
     /// token: every mint is refused with [`IssuanceError::InvalidLifetime`].
     pub fn with_max_ttl(mut self, ttl: Duration) -> Self {
         self.max_ttl = Some(ttl);
@@ -406,13 +408,7 @@ impl<K: LocalIdpKeyStore> LocalIdp<K> {
         header.x5c = None;
         let claims_json = build_claims_json(&self.issuer, claims);
         let key = state.signing_key.encoding_key();
-        // This is the one place axess signs rather than verifies, and
-        // `jsonwebtoken` needs a crypto provider for both. With one backend
-        // compiled in it derives its own; with two (`--all-features`, or an
-        // adopter and a dependency that chose differently) it cannot, and
-        // would panic here.
-        axess_factors::jwt::ensure_crypto_provider();
-        let token = encode(&header, &claims_json, key)
+        let token = axess_factors::jwt::encode(&header, &claims_json, key)
             .map_err(|e| IssuanceError::Encoding(e.to_string()))?;
 
         if let Some(listener) = &self.issuance_listener {

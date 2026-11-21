@@ -6,12 +6,12 @@ use std::{fmt, str::FromStr};
 /// Why a failed [`AuthEvent`](super::AuthEvent) failed.
 ///
 /// This is the field a SOC dashboard groups by, so it is an enum rather
-/// than free text. It used to be a `String`, which is the same defect
+/// than free text. A `String` here would be the defect
 /// [`AuthEventBuilder::locked`](crate::authn::event::AuthEventBuilder::locked)
-/// was introduced to fix for the *outcome*: querying meant matching a
-/// string, and a string nothing enforced. One call site wrote
-/// `"cross-tenant impersonation refused"`, with spaces, so it did not
-/// even sort alongside the snake_case tags it sat beside.
+/// removes for the *outcome*: querying would mean matching a string, and
+/// a string nothing enforces. A call site could write
+/// `"cross-tenant impersonation refused"`, with spaces, and it would not
+/// even sort alongside the snake_case tags beside it.
 ///
 /// [`Other`](Self::Other) carries anything axess has no tag for,
 /// including an adopter's own detail. Parsing never fails: an

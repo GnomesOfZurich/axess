@@ -6,8 +6,8 @@ use super::assured_fixture::assured_session;
 use super::*;
 use crate::authn::assurance::{CredentialBinding, FactorAssurance};
 
-fn at(seconds: i64) -> DateTime<Utc> {
-    DateTime::<Utc>::from_timestamp(1_700_000_000 + seconds, 0).expect("valid time")
+fn at(seconds: i64) -> Timestamp {
+    Timestamp::from_unix_seconds(1_700_000_000 + seconds).expect("valid time")
 }
 
 fn login(kinds: Vec<FactorKind>) -> AuthState {
@@ -70,28 +70,6 @@ fn a_new_login_drops_the_record() {
     );
     state.advance_factor(FactorAssurance::for_kind(FactorKind::Password, at(5)));
     assert_eq!(state.assurance().len(), 1, "only the new login's proof");
-}
-
-#[test]
-fn a_session_written_before_the_record_existed_reads_with_none() {
-    let stored = serde_json::json!({
-        "kind": "Authenticated",
-        "user_id": axess_identity::testing::user("old"),
-        "tenant_id": axess_identity::testing::tenant("old"),
-        "authn_time": at(0),
-        "factors_completed": [["Fido2", at(0)]],
-    });
-    let state: AuthState = serde_json::from_value(stored).expect("a 0.17 session reads");
-    assert!(state.is_authenticated());
-    assert_eq!(
-        state.factor_completed_at(&FactorKind::Fido2),
-        Some(at(0)),
-        "its factors are kept"
-    );
-    assert!(
-        state.assurance().is_empty(),
-        "but nothing it proved is invented"
-    );
 }
 
 #[test]

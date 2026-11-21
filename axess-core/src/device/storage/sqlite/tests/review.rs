@@ -4,10 +4,20 @@
 use super::*;
 use crate::device::store::consistency as shared;
 use crate::device::types::DeviceBinding;
+use axess_clock::testing::Shift;
+
+#[tokio::test]
+async fn device_key_contract() {
+    use crate::device::store::key_contract;
+    key_contract::a_key_binding_round_trips(fresh_store().await).await;
+    key_contract::a_challenge_is_replaced_by_one_compare_and_swap(fresh_store().await).await;
+    key_contract::a_registration_beside_a_sighting_loses_neither(fresh_store().await).await;
+}
 
 #[tokio::test]
 async fn shared_contract() {
     shared::ties_are_broken_by_the_smaller_id(fresh_store().await).await;
+    shared::the_family_lookup_is_by_family_and_by_tenant(fresh_store().await).await;
     shared::a_shared_fingerprint_stays_findable_while_any_device_carries_it(fresh_store().await)
         .await;
     shared::a_sighting_never_rewinds_and_skips_a_revoked_row(fresh_store().await).await;
@@ -18,10 +28,19 @@ async fn shared_contract() {
     shared::a_revoked_row_keeps_its_revocation_time(fresh_store().await).await;
     shared::a_sighting_reports_the_level_it_found(fresh_store().await).await;
     shared::a_revoked_save_without_a_time_is_stamped_and_purged(fresh_store().await).await;
+    shared::two_swaps_from_one_read_have_one_winner(fresh_store().await).await;
+    shared::two_trust_changes_from_one_level_have_one_winner(fresh_store().await).await;
+    shared::two_claims_of_one_unowned_device_have_one_winner(fresh_store().await).await;
     shared::sweep_decisions_agree_to_the_second(
         fresh_store()
             .await
             .with_sweep_config(shared::tight_config()),
+    )
+    .await;
+    shared::a_sweep_walks_the_ladder_and_counts_what_it_wrote(
+        fresh_store()
+            .await
+            .with_sweep_config(shared::ladder_config()),
     )
     .await;
 }
@@ -88,9 +107,17 @@ async fn a_legacy_revoked_row_without_a_time_ages_out() {
     store.sweep(&t, now).await.unwrap();
     let stamped = store.load(&t, &d).await.unwrap().unwrap();
     assert_eq!(stamped.revoked_at, Some(now));
-    let grace = SweepConfig::default().revoked_grace;
+    let grace =
+        axess_clock::SignedDuration::try_from(SweepConfig::default().revoked_grace).unwrap();
     let counts = store
-        .sweep(&t, now + grace + chrono::Duration::seconds(1))
+        .sweep(
+            &t,
+            now.plus(
+                grace
+                    .checked_add(axess_clock::SignedDuration::seconds(1))
+                    .unwrap(),
+            ),
+        )
         .await
         .unwrap();
     assert_eq!(counts.revoked_purged, 1);

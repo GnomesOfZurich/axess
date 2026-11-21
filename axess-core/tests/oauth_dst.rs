@@ -10,12 +10,14 @@
 
 #![cfg(all(feature = "testing", feature = "oauth"))]
 
+use axess_core::testing::fixtures as common;
+
+use axess_clock::Timestamp;
 use axess_clock::testing::MockClock;
-use axess_core::testing::oauth_provider::{oauth_discover_provider, oauth_setup_provider};
+use axess_core::testing::oauth_provider::{oauth_discover_provider, oauth_setup_provider_on};
 use axess_factors::oauth::{OAuthError, OAuthProvider};
 use axess_rng::{SecureRng, testing::MockRng};
 use axess_testing::oauth_wiremock::{oauth_generate_rsa_keypair, oauth_mount_oidc_endpoints};
-use chrono::TimeZone;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde_json::json;
 use std::sync::Arc;
@@ -29,15 +31,14 @@ const MOCK_EPOCH: i64 = 1_600_000_000;
 
 fn mock_clock() -> Arc<MockClock> {
     Arc::new(MockClock::at(
-        chrono::Utc.timestamp_opt(MOCK_EPOCH, 0).unwrap(),
+        Timestamp::from_unix_seconds(MOCK_EPOCH).unwrap(),
     ))
 }
 
 fn sign(private_der: &[u8], kid: &str, claims: &serde_json::Value) -> String {
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some(kid.to_string());
-    axess_factors::jwt::ensure_crypto_provider();
-    jsonwebtoken::encode(&header, claims, &EncodingKey::from_rsa_der(private_der))
+    axess_factors::jwt::encode(&header, claims, &EncodingKey::from_rsa_der(private_der))
         .expect("JWT encode")
 }
 
@@ -82,16 +83,16 @@ async fn logout_jwt_exp_follows_the_injected_clock() {
     );
 }
 
-async fn exchange_with(clock: Option<Arc<MockClock>>) -> Result<(), OAuthError> {
+async fn exchange_with(clock: Arc<MockClock>) -> Result<(), OAuthError> {
     let server = MockServer::start().await;
     let issuer = server.uri();
     let (private_der, jwk, kid) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &jwk).await;
-    let mut provider = oauth_discover_provider(&server.uri()).await;
-    if let Some(clock) = clock {
-        provider = provider.with_clock(clock);
-    }
-    let provider = provider.build().expect("build");
+    let provider = oauth_discover_provider(&server.uri())
+        .await
+        .with_clock(clock)
+        .build()
+        .expect("build");
 
     let id_token = sign(
         &private_der,
@@ -124,13 +125,15 @@ async fn exchange_with(clock: Option<Arc<MockClock>>) -> Result<(), OAuthError> 
 
 #[tokio::test]
 async fn id_token_exp_follows_the_injected_clock() {
-    exchange_with(Some(mock_clock()))
+    let clock = mock_clock();
+    exchange_with(clock.clone())
         .await
         .expect("an ID token inside its life on the injected clock is accepted");
 
-    let err = exchange_with(None)
+    clock.advance_secs(2 * 3600);
+    let err = exchange_with(clock)
         .await
-        .expect_err("the same token is long expired on the system clock");
+        .expect_err("the same token is expired once the injected clock passes its exp");
     assert!(
         matches!(err, OAuthError::IdTokenValidation(_)),
         "got {err:?}"
@@ -145,7 +148,7 @@ fn next_secret(rng: &MockRng) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
 }
 
-async fn begin_with_seed(seed: u64) -> (url::Url, String, String) {
+async fn begin_with_seed(clock: &MockClock, seed: u64) -> (url::Url, String, String) {
     use axess_core::authn::service::AuthnService;
     use axess_core::testing::{
         mock_authn::{MockFactorStore, MockIdentityStore},
@@ -155,11 +158,15 @@ async fn begin_with_seed(seed: u64) -> (url::Url, String, String) {
     let server = MockServer::start().await;
     let (_, jwk, _) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &jwk).await;
-    let provider = oauth_setup_provider(&server.uri()).await;
-    let authn = AuthnService::builder(MockIdentityStore::new(), MockFactorStore::new())
-        .with_oauth_provider(provider)
-        .with_rng(MockRng::new(seed))
-        .build();
+    let provider = oauth_setup_provider_on(&server.uri(), Arc::new(clock.clone())).await;
+    let authn = AuthnService::builder(
+        MockIdentityStore::new().with_clock(clock.clone()),
+        MockFactorStore::new(),
+    )
+    .with_clock(clock.clone())
+    .with_oauth_provider(provider)
+    .with_rng(MockRng::new(seed))
+    .build();
     let session = test_session();
     let (url, state) = authn
         .begin_oauth_login("test", &Default::default(), &session)
@@ -176,7 +183,8 @@ async fn begin_with_seed(seed: u64) -> (url::Url, String, String) {
 
 #[tokio::test]
 async fn pkce_state_and_nonce_come_from_the_service_rng() {
-    let (url, state, nonce) = begin_with_seed(42).await;
+    let clock = common::test_clock();
+    let (url, state, nonce) = begin_with_seed(&clock, 42).await;
 
     let reference = MockRng::new(42);
     let verifier = next_secret(&reference);
@@ -194,7 +202,7 @@ async fn pkce_state_and_nonce_come_from_the_service_rng() {
     assert_eq!(query["nonce"], expected_nonce);
     assert_eq!(query["code_challenge"], challenge);
 
-    let (_, other_state, _) = begin_with_seed(43).await;
+    let (_, other_state, _) = begin_with_seed(&clock, 43).await;
     assert_ne!(state, other_state);
 }
 
@@ -207,22 +215,22 @@ async fn dpop_iat_and_jti_come_from_the_service_clock_and_rng() {
     let server = MockServer::start().await;
     let (_, jwk, _) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &jwk).await;
-    let provider = oauth_setup_provider(&server.uri()).await;
     let clock = mock_clock();
-    let authn = AuthnService::builder(MockIdentityStore::new(), MockFactorStore::new())
-        .with_oauth_provider(provider)
-        .with_rng(MockRng::new(5))
-        .with_clock(MockClock::clone(&clock))
-        .build();
+    let provider = oauth_setup_provider_on(&server.uri(), clock.clone()).await;
+    let authn = AuthnService::builder(
+        MockIdentityStore::new().with_clock(clock.clone()),
+        MockFactorStore::new(),
+    )
+    .with_oauth_provider(provider)
+    .with_rng(MockRng::new(5))
+    .with_clock(MockClock::clone(&clock))
+    .build()
+    .with_audit_context(axess_core::authn::AuditContext::default());
 
     // The key is drawn once, from the service's rng; each proof then draws
     // only its `jti`.
     let key = authn.new_dpop_key();
-    let proof = |c: &str| {
-        authn
-            .generate_dpop_proof("test", &key, "GET", "https://rs.example/x", Some(c))
-            .expect("proof")
-    };
+    let scoped = authn.oauth_global();
     let payload = |jwt: &str| -> serde_json::Value {
         let part = jwt.split('.').nth(1).unwrap();
         let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -231,9 +239,17 @@ async fn dpop_iat_and_jti_come_from_the_service_clock_and_rng() {
         serde_json::from_slice(&bytes).unwrap()
     };
 
-    let first = payload(&proof("at-1").proof_jwt);
+    let first = scoped
+        .generate_dpop_proof("test", &key, "GET", "https://rs.example/x", Some("at-1"))
+        .await
+        .expect("proof");
+    let first = payload(&first.proof_jwt);
     clock.advance_secs(30);
-    let second = payload(&proof("at-1").proof_jwt);
+    let second = scoped
+        .generate_dpop_proof("test", &key, "GET", "https://rs.example/x", Some("at-1"))
+        .await
+        .expect("proof");
+    let second = payload(&second.proof_jwt);
 
     assert_eq!(first["iat"], MOCK_EPOCH);
     assert_eq!(second["iat"], MOCK_EPOCH + 30);
@@ -260,6 +276,7 @@ async fn dpop_iat_and_jti_come_from_the_service_clock_and_rng() {
 }
 
 async fn authn_with(
+    clock: &Arc<MockClock>,
     provider: axess_factors::oauth::OAuthProviderConfig,
 ) -> axess_core::authn::service::AuthnService<
     axess_core::testing::mock_authn::MockIdentityStore,
@@ -267,9 +284,10 @@ async fn authn_with(
 > {
     use axess_core::testing::mock_authn::{MockFactorStore, MockIdentityStore};
     axess_core::authn::service::AuthnService::builder(
-        MockIdentityStore::new(),
+        MockIdentityStore::new().with_clock(clock.clone()),
         MockFactorStore::new(),
     )
+    .with_clock(clock.clone())
     .with_oauth_provider(provider)
     .build()
 }
@@ -297,7 +315,7 @@ async fn refresh_all_jwks_follows_the_provider_clock() {
         .with_clock(clock.clone())
         .build()
         .expect("build");
-    let authn = authn_with(provider).await;
+    let authn = authn_with(&clock, provider).await;
     let at_discovery = jwks_requests(&server).await;
 
     assert!(authn.refresh_all_jwks().await.is_empty());
@@ -317,11 +335,12 @@ async fn refresh_all_jwks_follows_the_provider_clock() {
 
 #[tokio::test]
 async fn refresh_all_jwks_reports_the_failing_provider() {
+    let clock = mock_clock();
     let server = MockServer::start().await;
     let (_, jwk, _) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &jwk).await;
-    let provider = oauth_setup_provider(&server.uri()).await;
-    let authn = authn_with(provider).await;
+    let provider = oauth_setup_provider_on(&server.uri(), clock.clone()).await;
+    let authn = authn_with(&clock, provider).await;
 
     server.reset().await;
     Mock::given(method("GET"))
@@ -389,16 +408,18 @@ async fn cached_jwks_expire_after_the_maximum_age() {
 #[tokio::test]
 async fn builder_started_refresh_loop_runs_and_stops_with_the_service() {
     use axess_core::testing::mock_authn::{MockFactorStore, MockIdentityStore};
+    let clock = common::test_clock();
     let server = MockServer::start().await;
     let (_, jwk, _) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &jwk).await;
-    let provider = oauth_setup_provider(&server.uri()).await;
+    let provider = oauth_setup_provider_on(&server.uri(), Arc::new(clock.clone())).await;
     let at_discovery = jwks_requests(&server).await;
 
     let authn = axess_core::authn::service::AuthnService::builder(
-        MockIdentityStore::new(),
+        MockIdentityStore::new().with_clock(clock.clone()),
         MockFactorStore::new(),
     )
+    .with_clock(clock.clone())
     .with_oauth_provider(provider)
     .with_jwks_refresh(std::time::Duration::from_millis(30))
     .build();

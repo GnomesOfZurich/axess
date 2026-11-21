@@ -16,6 +16,9 @@
 //! 5. If the session was modified, save it back to the store (or cycle the ID first).
 //! 6. Set the session cookie on the response.
 
+mod audit;
+#[cfg(feature = "device-keys")]
+pub(crate) mod device_keys;
 mod handle;
 mod lifecycle;
 mod service;
@@ -25,10 +28,14 @@ mod swap;
 pub(crate) use handle::SessionHandle;
 pub(crate) use lifecycle::mark_cookie_response;
 pub(crate) use service::FreshSession;
+// Tests outside the layer build a handle for a session of their own.
+#[cfg(test)]
+pub(crate) use signing::CookieSession;
 // `SessionInner` is `pub(crate)` only so test modules and the
 // `testing::*` fixture helpers can construct sessions directly.
 // Production callers go through `SessionHandle`, so gate the
 // re-export to avoid an unused-import warning in plain prod builds.
+pub use audit::{LayerSessionEnded, SessionEndAudit, SessionEndReason, UnrecordedSessionEnds};
 #[cfg(any(test, feature = "testing"))]
 pub(crate) use handle::SessionInner;
 pub use service::SessionService;
@@ -43,6 +50,7 @@ use axess_rng::{SecureRng, SystemRng};
 use cookie::SameSite;
 use signing::SigningKeyRing;
 use std::{sync::Arc, time::Duration};
+use zeroize::Zeroize;
 
 /// What the session layer does with an authenticated session when the
 /// registry given to [`SessionLayer::new`] cannot answer (it errored).
@@ -55,6 +63,15 @@ pub enum UnknownLiveness {
     Reject,
     /// Trust the stored session. A registry outage then does not log anyone
     /// out, and does not enforce revocation either.
+    ///
+    /// It does not keep a session whose rotation the registry could not
+    /// move (the move erred, or the registry holds too many former keys of
+    /// the user): that session is ended at once, as `session_not_tracked`.
+    /// The registry still holds the old key and not the new one, and the
+    /// cookie would carry the new one, so the first later request the
+    /// registry answers for would end the session as not registered;
+    /// keeping it would only postpone its end by a request and record a
+    /// reason that hides the cause.
     Accept,
 }
 
@@ -66,7 +83,7 @@ pub enum UnknownLiveness {
 /// ```text
 /// let app = Router::new()
 ///     .route("/login", post(login_handler))
-///     .layer(SessionLayer::new(store, signing_key, registry));
+///     .layer(SessionLayer::new(store, signing_key, registry, audit));
 /// ```
 ///
 /// # Configuration
@@ -74,7 +91,7 @@ pub enum UnknownLiveness {
 /// Cookie attributes and TTL are set via the `with_*` builder methods:
 ///
 /// ```text
-/// let layer = SessionLayer::new(store, key, registry)
+/// let layer = SessionLayer::new(store, key, registry, audit)
 ///     .with_ttl(Duration::from_secs(7200))
 ///     .with_secure(false)
 ///     .with_same_site(SameSite::Strict);
@@ -107,26 +124,33 @@ pub struct SessionLayer<S> {
     /// Source of every session id the layer mints (new sessions and
     /// rotations). Defaults to [`SystemRng`]; see [`with_rng`](Self::with_rng).
     pub(super) rng: Arc<dyn SecureRng>,
-    /// Clock for the absolute session age cap; defaults to [`SystemClock`].
+    /// Clock for the age caps and the idle refresh; defaults to [`SystemClock`].
     pub(super) clock: Arc<dyn Clock>,
     /// Registry consulted for every authenticated record. `None` only for a
     /// layer built by [`without_registry_insecure`](Self::without_registry_insecure).
     pub(super) registry: Option<Arc<dyn SessionRegistryHandle>>,
     pub(super) unknown_liveness: UnknownLiveness,
+    /// Where the layer records a session it ends by itself, before it
+    /// removes the row. Every constructor takes it.
+    pub(super) audit: Arc<dyn SessionEndAudit>,
     /// Origins a WebSocket upgrade may come from; empty means the request's
     /// own host. See [`with_websocket_origins`](Self::with_websocket_origins).
     pub(super) websocket_origins: Arc<[Arc<str>]>,
     /// Optional device resolver invoked once per request between
-    /// session-data load and the inner handler. Stamps
-    /// [`SessionData::device_id`](crate::session::SessionData::device_id)
-    /// when the resolver returns `Some`.
+    /// session-data load and the inner handler. Its answer becomes
+    /// [`SessionData::device_id`](crate::session::SessionData::device_id):
+    /// `Some` sets it, `None` clears it, and a resolver error leaves it.
     #[cfg(feature = "device")]
     pub(super) device_resolver: Option<Arc<dyn ErasedDeviceResolver>>,
+    /// The device-key service, when sessions and devices are held to device
+    /// keys. See [`with_device_keys`](Self::with_device_keys).
+    #[cfg(feature = "device-keys")]
+    pub(super) device_keys: Option<Arc<dyn crate::device_key::erased::ErasedDeviceKeys>>,
 }
 
 impl<S: SessionStore> SessionLayer<S> {
-    /// Create a session layer with the given store, 32-byte HMAC signing key
-    /// and session registry.
+    /// Create a session layer with the given store, 32-byte HMAC signing
+    /// key, session registry and audit sink.
     ///
     /// Uses [`SessionConfig::default()`]: production-safe defaults (24-hour
     /// sliding TTL, a 7-day cap from authentication and a 1-hour cap on
@@ -147,15 +171,31 @@ impl<S: SessionStore> SessionLayer<S> {
     /// that truly keeps no registry builds with
     /// [`without_registry_insecure`](Self::without_registry_insecure).
     ///
-    /// The signing key derives sub-keys via HKDF for cookie HMAC,
-    /// fingerprint HMAC, and CSRF; keep it in a secret store and rotate
+    /// `audit` is told of every session the layer ends by itself: one that
+    /// outlived an age cap, one the registry no longer holds, one revoked
+    /// or untracked while its id rotated, one whose rotation the store
+    /// could not make, one that device keys require and that stayed unbound
+    /// ([`SessionEndReason`]). It is told first: the row is
+    /// removed only when the sink answered, and a session whose ending
+    /// cannot be recorded is refused and kept, to be ended by a later
+    /// request. Pass
+    /// [`AuthnService::session_end_audit`](crate::authn::service::AuthnService::session_end_audit)
+    /// for rows in the identity store beside the rest of the audit trail.
+    /// A layer that is to record none of this says so by name, with
+    /// [`UnrecordedSessionEnds::insecure`].
+    ///
+    /// The signing key derives sub-keys via HKDF for the cookie HMAC and
+    /// the fingerprint HMAC (the CSRF layer takes a key of its own); keep
+    /// it in a secret store and rotate
     /// per your key-management policy (a fresh layer is required on
     /// rotation since the derived keys are cached).
     ///
     /// # Example
     ///
-    /// ```no_run
-    /// use axess_core::{MemorySessionRegistry, MemorySessionStore, session::SessionLayer};
+    #[cfg_attr(feature = "memory", doc = "```no_run")]
+    #[cfg_attr(not(feature = "memory"), doc = "```ignore")]
+    /// use axess_core::session::{SessionLayer, UnrecordedSessionEnds};
+    /// use axess_core::{MemorySessionRegistry, MemorySessionStore};
     /// use axess_core::session::store::SessionRegistryAdapter;
     /// use std::{sync::Arc, time::Duration};
     ///
@@ -167,8 +207,11 @@ impl<S: SessionStore> SessionLayer<S> {
     ///     .expect("exactly 32 bytes");
     /// let store = MemorySessionStore::default();
     /// let registry = Arc::new(SessionRegistryAdapter(MemorySessionRegistry::new()));
+    /// // Production: `authn.session_end_audit()`, the authentication
+    /// // service's sink. This example has no service, and says so.
+    /// let audit = UnrecordedSessionEnds::insecure();
     ///
-    /// let layer = SessionLayer::new(store, signing_key, registry)
+    /// let layer = SessionLayer::new(store, signing_key, registry, audit)
     ///     .with_ttl(Duration::from_secs(3600))
     ///     .with_cookie_name("myapp.sid");
     ///
@@ -177,15 +220,26 @@ impl<S: SessionStore> SessionLayer<S> {
     /// # let _ = layer;
     /// ```
     ///
+    /// The signing key is copied into buffers that are zeroed on drop, and
+    /// the copy handed to this call is zeroed before it returns. The
+    /// caller's own copy is the caller's to wipe.
+    ///
     /// # Panics
     ///
     /// On a `signing_key` that is a single repeated byte (all zeros
     /// included), a placeholder that reached production. Use
     /// [`try_new`](Self::try_new) to handle the refusal.
     #[track_caller]
-    pub fn new(store: S, signing_key: [u8; 32], registry: Arc<dyn SessionRegistryHandle>) -> Self {
+    pub fn new(
+        store: S,
+        mut signing_key: [u8; 32],
+        registry: Arc<dyn SessionRegistryHandle>,
+        audit: Arc<dyn SessionEndAudit>,
+    ) -> Self {
         super::weak_key::refuse_constant_key("session signing key", &signing_key);
-        Self::build(store, signing_key, Some(registry))
+        let layer = Self::build(store, &signing_key, Some(registry), audit);
+        signing_key.zeroize();
+        layer
     }
 
     /// [`new`](Self::new) without the constant-key check, for tests that use
@@ -193,10 +247,13 @@ impl<S: SessionStore> SessionLayer<S> {
     #[cfg(any(test, feature = "testing"))]
     pub fn new_unchecked(
         store: S,
-        signing_key: [u8; 32],
+        mut signing_key: [u8; 32],
         registry: Arc<dyn SessionRegistryHandle>,
+        audit: Arc<dyn SessionEndAudit>,
     ) -> Self {
-        Self::build(store, signing_key, Some(registry))
+        let layer = Self::build(store, &signing_key, Some(registry), audit);
+        signing_key.zeroize();
+        layer
     }
 
     /// Create a session layer that keeps no registry, so a revocation removes
@@ -204,11 +261,18 @@ impl<S: SessionStore> SessionLayer<S> {
     /// route not behind the validator middleware. Logs at error level once, at
     /// build. Prefer [`new`](Self::new).
     ///
+    /// Such a layer still ends a session at an age cap, and `audit` is told
+    /// of it as for [`new`](Self::new).
+    ///
     /// # Panics
     ///
     /// On a constant `signing_key`, as [`new`](Self::new).
     #[track_caller]
-    pub fn without_registry_insecure(store: S, signing_key: [u8; 32]) -> Self {
+    pub fn without_registry_insecure(
+        store: S,
+        mut signing_key: [u8; 32],
+        audit: Arc<dyn SessionEndAudit>,
+    ) -> Self {
         super::weak_key::refuse_constant_key("session signing key", &signing_key);
         tracing::error!(
             target: "axess::session::layer",
@@ -216,13 +280,20 @@ impl<S: SessionStore> SessionLayer<S> {
              administrator kick, log-out-everywhere) stays valid in the store on every route \
              not behind the validator middleware"
         );
-        Self::build(store, signing_key, None)
+        let layer = Self::build(store, &signing_key, None, audit);
+        signing_key.zeroize();
+        layer
     }
 
+    /// The layer every constructor returns. The signing key is read through
+    /// a reference, so the only copies made of it are the ones in the key
+    /// ring's own buffers; each constructor then zeroes the copy it was
+    /// handed.
     fn build(
         store: S,
-        signing_key: [u8; 32],
+        signing_key: &[u8; 32],
         registry: Option<Arc<dyn SessionRegistryHandle>>,
+        audit: Arc<dyn SessionEndAudit>,
     ) -> Self {
         Self {
             store,
@@ -239,9 +310,12 @@ impl<S: SessionStore> SessionLayer<S> {
             clock: Arc::new(SystemClock),
             registry,
             unknown_liveness: UnknownLiveness::default(),
+            audit,
             websocket_origins: Arc::from(Vec::new()),
             #[cfg(feature = "device")]
             device_resolver: None,
+            #[cfg(feature = "device-keys")]
+            device_keys: None,
         }
     }
 
@@ -254,13 +328,16 @@ impl<S: SessionStore> SessionLayer<S> {
     /// is a single repeated byte.
     pub fn try_new(
         store: S,
-        signing_key: [u8; 32],
+        mut signing_key: [u8; 32],
         registry: Arc<dyn SessionRegistryHandle>,
+        audit: Arc<dyn SessionEndAudit>,
     ) -> Result<Self, super::weak_key::WeakKeyError> {
         if super::weak_key::is_constant_key(&signing_key) {
             return Err(super::weak_key::WeakKeyError);
         }
-        Ok(Self::build(store, signing_key, Some(registry)))
+        let layer = Self::build(store, &signing_key, Some(registry), audit);
+        signing_key.zeroize();
+        Ok(layer)
     }
 
     /// Configure a previous signing master key for zero-downtime
@@ -289,7 +366,7 @@ impl<S: SessionStore> SessionLayer<S> {
     /// security behavior for an emergency-rotate-again scenario
     /// (compromised previous key must not remain valid): see
     /// `OPERATIONS.md#signing-key-rotation`.
-    pub fn with_previous_signing_key(mut self, previous_master: [u8; 32]) -> Self {
+    pub fn with_previous_signing_key(mut self, mut previous_master: [u8; 32]) -> Self {
         // Same "mutate before cloning" contract as `config_mut`. When
         // the Arc has been shared, `Arc::make_mut` deep-copies the
         // ring (key material included) into a fresh Arc and mutates
@@ -307,7 +384,8 @@ impl<S: SessionStore> SessionLayer<S> {
              before passing it to `tower::Layer` / `Router::layer`.",
             Arc::strong_count(&self.signing_keys),
         );
-        Arc::make_mut(&mut self.signing_keys).set_previous(previous_master);
+        Arc::make_mut(&mut self.signing_keys).set_previous(&previous_master);
+        previous_master.zeroize();
         self
     }
 
@@ -399,7 +477,7 @@ impl<S: SessionStore> SessionLayer<S> {
         // and try-current-then-previous themselves. Wiring rotation
         // into every downstream sub-key derivation would leak the
         // rotation state through an otherwise-simple API.
-        zeroize::Zeroizing::new(self.signing_keys.derive_subkey(info))
+        self.signing_keys.derive_subkey(info)
     }
 
     /// Replace the layer's cookie and TTL settings with a [`SessionConfig`],
@@ -460,8 +538,8 @@ impl<S: SessionStore> SessionLayer<S> {
     }
 
     /// End an authenticated session once it is older than `max_age`
-    /// measured from when it authenticated, however recently it was used
-    /// (default: 7 days). `None` lifts the cap, so that only the sliding TTL
+    /// measured from its login, however recently it was used and however
+    /// recently it stepped up (default: 7 days). `None` lifts the cap, so that only the sliding TTL
     /// bounds a session. The age is read from the layer's clock; see
     /// [`with_clock`](Self::with_clock).
     pub fn with_max_session_age(mut self, max_age: Option<Duration>) -> Self {
@@ -481,9 +559,10 @@ impl<S: SessionStore> SessionLayer<S> {
         self
     }
 
-    /// Replace the clock the layer reads (default: [`SystemClock`]). Only the
-    /// absolute age cap reads it, so a simulated clock makes that cap
-    /// deterministic.
+    /// Replace the clock the layer reads (default: [`SystemClock`]). The
+    /// age caps (a session's and an impersonation's) and the idle refresh
+    /// that re-arms a stored row's lifetime read it, so a simulated clock
+    /// makes them deterministic.
     pub fn with_clock(mut self, clock: impl Clock) -> Self {
         self.clock = Arc::new(clock);
         self
@@ -578,14 +657,16 @@ impl<S: SessionStore> SessionLayer<S> {
     ///
     /// When enabled, the library hashes client-specific request properties
     /// (determined by the [`SessionBinding`] implementation) and stores the
-    /// hash in the session upon authentication. On every subsequent request
-    /// the hash is recomputed and compared; a mismatch resets the session
-    /// to `Guest` (the cookie may have been stolen by a different client).
+    /// hash in the session at its first step out of `Guest`. On every
+    /// subsequent request the hash is recomputed and compared; on a
+    /// mismatch the request runs as a guest under a new id (the cookie may
+    /// have been stolen by a different client) and the stored session is
+    /// left for the client it is bound to.
     ///
     /// ```text
     /// use axess::session::UserAgentBinding;
     ///
-    /// let layer = SessionLayer::new(store, key, registry)
+    /// let layer = SessionLayer::new(store, key, registry, audit)
     ///     .with_binding(UserAgentBinding);
     /// ```
     pub fn with_binding(mut self, binding: impl SessionBinding) -> Self {
@@ -633,10 +714,47 @@ impl<S: SessionStore> SessionLayer<S> {
         self.device_resolver = Some(Arc::new(resolver));
         self
     }
+
+    /// Hold sessions and devices to device keys.
+    ///
+    /// With a key service whose policy is not
+    /// [`Off`](crate::device_key::KeyBindingPolicy::Off), the layer:
+    ///
+    /// - verifies the request's proof cookies and hands the device resolver
+    ///   what they prove, so a device that has a key is proven only by it;
+    /// - serves a session bound to a key only to a request that proves that
+    ///   key, and any other request of it as a guest, leaving the row alone;
+    /// - binds a signed-in session inside its registration window on a
+    ///   request that proved its device by key, and offers a key
+    ///   registration to a session that has just signed in on a device that
+    ///   has none;
+    /// - under [`Require`](crate::device_key::KeyBindingPolicy::Require),
+    ///   ends a signed-in session (in a step-up too) that is still not bound
+    ///   when the registration window, counted from its login, has passed:
+    ///   the ending is recorded through the layer's audit sink before the
+    ///   row is removed, as every ending the layer makes is.
+    ///
+    /// The two paths a key is registered and proven at are answered by
+    /// [`DeviceKeyService::router`](crate::device_key::DeviceKeyService::router),
+    /// which is merged into the application's router inside this layer. A
+    /// CSRF layer between the two lets those requests through without a
+    /// token: a signature over a challenge the server chose authenticates
+    /// them. A rate limit that should cover them sits outside this layer.
+    ///
+    /// The design is in `docs/sessions/device-bound-sessions.md`.
+    #[cfg(feature = "device-keys")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "device-keys")))]
+    pub fn with_device_keys<D>(mut self, keys: crate::device_key::DeviceKeyService<D>) -> Self
+    where
+        D: crate::device::DeviceStore,
+    {
+        self.device_keys = Some(Arc::new(keys));
+        self
+    }
 }
 
-// Regression: confirm the `config_mut` debug_assert
-// actually fires when a `SessionLayer` is cloned and *then* mutated.
+// The `config_mut` debug_assert fires when a `SessionLayer` is cloned
+// and *then* mutated.
 // The Arc<SessionConfig> deep-copy in `Arc::make_mut` would otherwise
 // silently divorce the two layers' configs. The assertion is a debug-only
 // guard so the test is gated behind `debug_assertions`.
@@ -653,6 +771,7 @@ mod make_mut_tests {
             store,
             [0u8; 32],
             crate::MemorySessionRegistry::new().handle(),
+            std::sync::Arc::new(crate::session::UnrecordedSessionEnds),
         );
         let cloned = layer.clone();
         // Cloning bumps the Arc strong count to 2; the next `with_ttl`
@@ -668,6 +787,7 @@ mod make_mut_tests {
             store,
             [0u8; 32],
             crate::MemorySessionRegistry::new().handle(),
+            std::sync::Arc::new(crate::session::UnrecordedSessionEnds),
         )
         .with_ttl(Duration::from_secs(60))
         .with_secure(false);
@@ -689,21 +809,51 @@ mod weak_signing_key_tests {
     #[test]
     #[should_panic(expected = "session signing key is a single repeated byte")]
     fn new_refuses_a_constant_key() {
-        let _ = SessionLayer::new(MemorySessionStore::new(), [0u8; 32], registry());
+        let _ = SessionLayer::new(
+            MemorySessionStore::new(),
+            [0u8; 32],
+            registry(),
+            std::sync::Arc::new(crate::session::UnrecordedSessionEnds),
+        );
     }
 
     #[test]
     #[should_panic(expected = "session signing key is a single repeated byte")]
     fn without_registry_insecure_refuses_a_constant_key() {
-        let _ = SessionLayer::without_registry_insecure(MemorySessionStore::new(), [9u8; 32]);
+        let _ = SessionLayer::without_registry_insecure(
+            MemorySessionStore::new(),
+            [9u8; 32],
+            std::sync::Arc::new(crate::session::UnrecordedSessionEnds),
+        );
     }
 
     #[test]
     fn try_new_refuses_and_new_unchecked_accepts_a_constant_key() {
-        assert!(SessionLayer::try_new(MemorySessionStore::new(), [0u8; 32], registry()).is_err());
-        let _ = SessionLayer::new_unchecked(MemorySessionStore::new(), [0u8; 32], registry());
+        assert!(
+            SessionLayer::try_new(
+                MemorySessionStore::new(),
+                [0u8; 32],
+                registry(),
+                std::sync::Arc::new(crate::session::UnrecordedSessionEnds)
+            )
+            .is_err()
+        );
+        let _ = SessionLayer::new_unchecked(
+            MemorySessionStore::new(),
+            [0u8; 32],
+            registry(),
+            std::sync::Arc::new(crate::session::UnrecordedSessionEnds),
+        );
         let mixed = crate::testing::test_key(1);
-        assert!(SessionLayer::try_new(MemorySessionStore::new(), mixed, registry()).is_ok());
+        assert!(
+            SessionLayer::try_new(
+                MemorySessionStore::new(),
+                mixed,
+                registry(),
+                std::sync::Arc::new(crate::session::UnrecordedSessionEnds)
+            )
+            .is_ok()
+        );
     }
 }
 
@@ -732,6 +882,7 @@ mod with_secure_warning_tests {
                 store,
                 [0u8; 32],
                 crate::MemorySessionRegistry::new().handle(),
+                std::sync::Arc::new(crate::session::UnrecordedSessionEnds),
             )
             .with_secure(false),
         );
@@ -750,6 +901,7 @@ mod with_secure_warning_tests {
                 store,
                 [0u8; 32],
                 crate::MemorySessionRegistry::new().handle(),
+                std::sync::Arc::new(crate::session::UnrecordedSessionEnds),
             )
             .with_secure(true),
         );
@@ -784,6 +936,7 @@ mod with_path_warning_tests {
                 MemorySessionStore::new(),
                 [0u8; 32],
                 crate::MemorySessionRegistry::new().handle(),
+                std::sync::Arc::new(crate::session::UnrecordedSessionEnds),
             )
             .with_path("/app"),
         );
@@ -798,6 +951,7 @@ mod with_path_warning_tests {
                 MemorySessionStore::new(),
                 [0u8; 32],
                 crate::MemorySessionRegistry::new().handle(),
+                std::sync::Arc::new(crate::session::UnrecordedSessionEnds),
             )
             .with_path("/"),
         );
@@ -806,6 +960,7 @@ mod with_path_warning_tests {
                 MemorySessionStore::new(),
                 [0u8; 32],
                 crate::MemorySessionRegistry::new().handle(),
+                std::sync::Arc::new(crate::session::UnrecordedSessionEnds),
             )
             .with_cookie_name("sid")
             .with_path("/app"),
@@ -834,6 +989,7 @@ mod signing_key_retire_tests {
             store,
             [0xBB; 32],
             crate::MemorySessionRegistry::new().handle(),
+            std::sync::Arc::new(crate::session::UnrecordedSessionEnds),
         )
         .with_previous_signing_key([0xAA; 32]);
         assert!(
@@ -859,6 +1015,7 @@ mod signing_key_retire_tests {
             store,
             [0xBB; 32],
             crate::MemorySessionRegistry::new().handle(),
+            std::sync::Arc::new(crate::session::UnrecordedSessionEnds),
         );
         assert!(!layer.has_previous_signing_key());
         let after = layer.remove_previous_signing_key();

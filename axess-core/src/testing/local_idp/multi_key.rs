@@ -1,4 +1,8 @@
+use axess_clock::testing::Shift;
+use std::sync::Arc;
+
 use super::*;
+use crate::testing::MockClock;
 use axess_factors::jwt::verifier::JwtVerifier;
 use serde::Deserialize;
 
@@ -12,23 +16,26 @@ struct CustomClaims {}
 /// dispatches per token's header.
 #[tokio::test]
 async fn historical_key_still_verifies_under_combined_jwks() {
-    let now = Utc::now();
+    let clock = MockClock::at_reference();
+    let now = axess_clock::testing::MockClock::reference_time();
     let k_old = LocalIdpSigningKey::generate_rsa().with_key_id("k-old");
     let k_new = LocalIdpSigningKey::generate_rsa().with_key_id("k-new");
 
     // Snapshot fixture under the old key; mint a token.
-    let old_idp = LocalIdpFixture::with_signing_key("https://idp", k_old.clone());
+    let old_idp =
+        LocalIdpFixture::with_signing_key("https://idp", k_old.clone()).with_clock(clock.clone());
     let token_under_old = old_idp.mint(
-        &MintClaims::new("alice", now + Duration::hours(1))
+        &MintClaims::new("alice", now.plus(SignedDuration::hours(1)))
             .with_audience("https://api")
             .with_issued_at(now),
     );
 
     // Build a rotated fixture: current = k_new, historical = k_old.
-    let rotated_idp =
-        LocalIdpFixture::with_signing_key("https://idp", k_new).with_historical_signing_key(k_old);
+    let rotated_idp = LocalIdpFixture::with_signing_key("https://idp", k_new)
+        .with_clock(clock.clone())
+        .with_historical_signing_key(k_old);
     let token_under_new = rotated_idp.mint(
-        &MintClaims::new("alice", now + Duration::hours(1))
+        &MintClaims::new("alice", now.plus(SignedDuration::hours(1)))
             .with_audience("https://api")
             .with_issued_at(now),
     );
@@ -48,6 +55,7 @@ async fn historical_key_still_verifies_under_combined_jwks() {
 
     // Verifier dispatches by header kid; both tokens succeed.
     let verifier = JwtVerifier::new(rotated_idp.jwks_handle())
+        .with_clock(Arc::new(clock.clone()))
         .with_audience("https://api")
         .allow_any_issuer();
     verifier
@@ -66,13 +74,14 @@ async fn historical_key_still_verifies_under_combined_jwks() {
 /// use NEW.
 #[tokio::test]
 async fn rotate_signing_key_moves_previous_current_to_historical() {
-    let now = Utc::now();
+    let clock = MockClock::at_reference();
+    let now = axess_clock::testing::MockClock::reference_time();
     let k1 = LocalIdpSigningKey::generate_rsa().with_key_id("k1");
     let k2 = LocalIdpSigningKey::generate_rsa().with_key_id("k2");
 
-    let idp_v1 = LocalIdpFixture::with_signing_key("https://idp", k1);
+    let idp_v1 = LocalIdpFixture::with_signing_key("https://idp", k1).with_clock(clock.clone());
     let token_v1 = idp_v1.mint(
-        &MintClaims::new("alice", now + Duration::hours(1))
+        &MintClaims::new("alice", now.plus(SignedDuration::hours(1)))
             .with_audience("https://api")
             .with_issued_at(now),
     );
@@ -82,7 +91,7 @@ async fn rotate_signing_key_moves_previous_current_to_historical() {
     assert_eq!(idp_v2.jwks().keys.len(), 2);
 
     let token_v2 = idp_v2.mint(
-        &MintClaims::new("alice", now + Duration::hours(1))
+        &MintClaims::new("alice", now.plus(SignedDuration::hours(1)))
             .with_audience("https://api")
             .with_issued_at(now),
     );
@@ -92,6 +101,7 @@ async fn rotate_signing_key_moves_previous_current_to_historical() {
     );
 
     let verifier = JwtVerifier::new(idp_v2.jwks_handle())
+        .with_clock(Arc::new(clock.clone()))
         .with_audience("https://api")
         .allow_any_issuer();
     verifier
@@ -108,28 +118,29 @@ async fn rotate_signing_key_moves_previous_current_to_historical() {
 /// all of which remain verifiable.
 #[tokio::test]
 async fn multiple_rotations_accumulate_historical_keys() {
-    let now = Utc::now();
+    let clock = MockClock::at_reference();
+    let now = axess_clock::testing::MockClock::reference_time();
     let k1 = LocalIdpSigningKey::generate_rsa().with_key_id("k1");
     let k2 = LocalIdpSigningKey::generate_rsa().with_key_id("k2");
     let k3 = LocalIdpSigningKey::generate_rsa().with_key_id("k3");
 
-    let idp = LocalIdpFixture::with_signing_key("https://idp", k1);
+    let idp = LocalIdpFixture::with_signing_key("https://idp", k1).with_clock(clock.clone());
     let t1 = idp.mint(
-        &MintClaims::new("alice", now + Duration::hours(1))
+        &MintClaims::new("alice", now.plus(SignedDuration::hours(1)))
             .with_audience("https://api")
             .with_issued_at(now),
     );
 
     let idp = idp.rotate_signing_key(k2);
     let t2 = idp.mint(
-        &MintClaims::new("alice", now + Duration::hours(1))
+        &MintClaims::new("alice", now.plus(SignedDuration::hours(1)))
             .with_audience("https://api")
             .with_issued_at(now),
     );
 
     let idp = idp.rotate_signing_key(k3);
     let t3 = idp.mint(
-        &MintClaims::new("alice", now + Duration::hours(1))
+        &MintClaims::new("alice", now.plus(SignedDuration::hours(1)))
             .with_audience("https://api")
             .with_issued_at(now),
     );
@@ -140,6 +151,7 @@ async fn multiple_rotations_accumulate_historical_keys() {
         "three keys: k3 current, k1+k2 historical"
     );
     let verifier = JwtVerifier::new(idp.jwks_handle())
+        .with_clock(Arc::new(clock.clone()))
         .with_audience("https://api")
         .allow_any_issuer();
     for (label, token) in [("t1", &t1), ("t2", &t2), ("t3", &t3)] {
@@ -155,29 +167,34 @@ async fn multiple_rotations_accumulate_historical_keys() {
 /// with another IdP's tokens through one `JwtVerifier`.
 #[tokio::test]
 async fn extra_public_jwk_appears_in_jwks_but_not_used_for_signing() {
-    let now = Utc::now();
+    let clock = MockClock::at_reference();
+    let now = axess_clock::testing::MockClock::reference_time();
     let foreign_key = LocalIdpSigningKey::generate_rsa().with_key_id("foreign");
     let foreign_jwk = foreign_key.jwk().clone();
     // Construct a token from the foreign IdP (separate fixture, same
     // protocol shape).
-    let foreign_idp = LocalIdpFixture::with_signing_key("https://foreign-idp", foreign_key);
+    let foreign_idp = LocalIdpFixture::with_signing_key("https://foreign-idp", foreign_key)
+        .with_clock(clock.clone());
     let foreign_token = foreign_idp.mint(
-        &MintClaims::new("bob", now + Duration::hours(1))
+        &MintClaims::new("bob", now.plus(SignedDuration::hours(1)))
             .with_audience("https://api")
             .with_issued_at(now),
     );
 
-    let our_idp = LocalIdpFixture::new("https://our-idp").with_extra_public_jwk(foreign_jwk);
+    let our_idp = LocalIdpFixture::new("https://our-idp")
+        .with_clock(clock.clone())
+        .with_extra_public_jwk(foreign_jwk);
     assert_eq!(our_idp.jwks().keys.len(), 2);
 
     // A verifier configured with our combined JWKS accepts both the
     // foreign-issued token and our own.
     let our_token = our_idp.mint(
-        &MintClaims::new("alice", now + Duration::hours(1))
+        &MintClaims::new("alice", now.plus(SignedDuration::hours(1)))
             .with_audience("https://api")
             .with_issued_at(now),
     );
     let verifier = JwtVerifier::new(our_idp.jwks_handle())
+        .with_clock(Arc::new(clock.clone()))
         .with_audience("https://api")
         .allow_any_issuer();
     verifier
@@ -194,7 +211,8 @@ async fn extra_public_jwk_appears_in_jwks_but_not_used_for_signing() {
 /// historical + extra entries survive intact.
 #[tokio::test]
 async fn with_key_id_preserves_historical_keys_and_extra_jwks() {
-    let now = Utc::now();
+    let clock = MockClock::at_reference();
+    let now = axess_clock::testing::MockClock::reference_time();
     let k_old = LocalIdpSigningKey::generate_rsa().with_key_id("old");
     let foreign_jwk = LocalIdpSigningKey::generate_rsa()
         .with_key_id("foreign")
@@ -202,6 +220,7 @@ async fn with_key_id_preserves_historical_keys_and_extra_jwks() {
         .clone();
 
     let idp = LocalIdpFixture::new("https://idp")
+        .with_clock(clock.clone())
         .with_historical_signing_key(k_old)
         .with_extra_public_jwk(foreign_jwk)
         .with_key_id("renamed-current");
@@ -220,7 +239,7 @@ async fn with_key_id_preserves_historical_keys_and_extra_jwks() {
 
     // Tokens still mint under the renamed current.
     let token = idp.mint(
-        &MintClaims::new("alice", now + Duration::hours(1))
+        &MintClaims::new("alice", now.plus(SignedDuration::hours(1)))
             .with_audience("https://api")
             .with_issued_at(now),
     );

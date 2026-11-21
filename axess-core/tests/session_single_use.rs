@@ -4,11 +4,13 @@
 
 #![cfg(all(feature = "memory", feature = "testing"))]
 
+use axess_core::session::SessionKey;
+use axess_core::testing::fixtures as common;
+
 use axess_clock::testing::MockClock;
 use axess_core::authn::ids::testing;
 use axess_core::session::{
     extractor::AuthSession,
-    id::SessionId,
     layer::SessionLayer,
     store::{ConditionalUpdate, MemorySessionStore, SessionStore},
 };
@@ -19,7 +21,6 @@ use axum::{
     http::{Request, header},
     routing::get,
 };
-use chrono::{TimeZone, Utc};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Barrier;
@@ -34,13 +35,16 @@ struct World {
 }
 
 fn world(rendezvous: Option<Arc<Barrier>>) -> World {
-    let clock = MockClock::at(Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap());
+    let clock = common::test_clock();
     let store = MemorySessionStore::new().with_clock(Arc::new(clock.clone()));
-    let layer =
-        SessionLayer::without_registry_insecure(store.clone(), axess_core::testing::test_key(9))
-            .with_secure(false)
-            .with_ttl(TTL)
-            .with_clock(clock.clone());
+    let layer = SessionLayer::without_registry_insecure(
+        store.clone(),
+        axess_core::testing::test_key(9),
+        std::sync::Arc::new(axess_core::session::UnrecordedSessionEnds),
+    )
+    .with_secure(false)
+    .with_ttl(TTL)
+    .with_clock(clock.clone());
     let clock_login = clock.clone();
     let app = Router::new()
         .route(
@@ -63,7 +67,7 @@ fn world(rendezvous: Option<Arc<Barrier>>) -> World {
             "/whoami",
             get(|s: AuthSession| async move {
                 if s.is_authenticated().await {
-                    s.session_id().await.to_string()
+                    s.session_key().await.to_string()
                 } else {
                     "guest".to_owned()
                 }
@@ -95,7 +99,7 @@ fn world(rendezvous: Option<Arc<Barrier>>) -> World {
                     async move {
                         // A logout on another node removes the row while this
                         // request runs.
-                        store.delete(&s.session_id().await).await.unwrap();
+                        store.delete(&s.session_key().await).await.unwrap();
                         match s.take_custom("ceremony").await {
                             Some(_) => "got",
                             None => "none",
@@ -175,7 +179,7 @@ async fn a_session_deleted_while_its_request_runs_hands_out_nothing() {
 async fn the_store_refuses_a_write_against_a_stale_revision() {
     let w = world(None);
     let cookie = login(&w).await;
-    let sid: SessionId = send(&w.app, Some(&cookie), "/whoami")
+    let sid: SessionKey = send(&w.app, Some(&cookie), "/whoami")
         .await
         .0
         .parse()
@@ -214,19 +218,19 @@ async fn a_read_only_request_past_half_the_ttl_keeps_the_session_alive() {
     let cookie = login(&w).await;
 
     // Within half the lifetime nothing is written and no cookie is set.
-    w.clock.advance(chrono::Duration::seconds(400));
+    w.clock.advance(axess_clock::SignedDuration::seconds(400));
     let (sid, set) = send(&w.app, Some(&cookie), "/whoami").await;
     assert_ne!(sid, "guest");
     assert!(set.is_none(), "no refresh before half the TTL has passed");
 
     // Past half, the read re-arms the row and the cookie.
-    w.clock.advance(chrono::Duration::seconds(200));
+    w.clock.advance(axess_clock::SignedDuration::seconds(200));
     let (_, set) = send(&w.app, Some(&cookie), "/whoami").await;
     assert!(set.is_some(), "the cookie is re-issued once the row is due");
 
     // 1400 s after login is past the original expiry (1000 s) and inside the
     // refreshed one (600 + 1000 s).
-    w.clock.advance(chrono::Duration::seconds(800));
+    w.clock.advance(axess_clock::SignedDuration::seconds(800));
     let (body, _) = send(&w.app, Some(&cookie), "/whoami").await;
     assert_ne!(body, "guest", "activity kept the session alive");
 }
@@ -235,7 +239,7 @@ async fn a_read_only_request_past_half_the_ttl_keeps_the_session_alive() {
 async fn an_idle_session_still_expires_at_the_ttl() {
     let w = world(None);
     let cookie = login(&w).await;
-    w.clock.advance(chrono::Duration::seconds(1100));
+    w.clock.advance(axess_clock::SignedDuration::seconds(1100));
     assert_eq!(send(&w.app, Some(&cookie), "/whoami").await.0, "guest");
 }
 
@@ -243,7 +247,7 @@ async fn an_idle_session_still_expires_at_the_ttl() {
 async fn a_request_dropped_mid_handler_still_has_its_session_finalized() {
     let w = world(None);
     let cookie = login(&w).await;
-    let sid: SessionId = send(&w.app, Some(&cookie), "/whoami")
+    let sid: SessionKey = send(&w.app, Some(&cookie), "/whoami")
         .await
         .0
         .parse()
@@ -293,19 +297,22 @@ async fn a_failing_handler_has_its_session_stored_before_the_error_returns() {
 
     let w = world(None);
     let cookie = login(&w).await;
-    let sid: SessionId = send(&w.app, Some(&cookie), "/whoami")
+    let sid: SessionKey = send(&w.app, Some(&cookie), "/whoami")
         .await
         .0
         .parse()
         .unwrap();
 
-    let layer =
-        SessionLayer::without_registry_insecure(w.store.clone(), axess_core::testing::test_key(9))
-            .with_secure(false)
-            .with_ttl(TTL)
-            .with_clock(w.clock.clone());
+    let layer = SessionLayer::without_registry_insecure(
+        w.store.clone(),
+        axess_core::testing::test_key(9),
+        std::sync::Arc::new(axess_core::session::UnrecordedSessionEnds),
+    )
+    .with_secure(false)
+    .with_ttl(TTL)
+    .with_clock(w.clock.clone());
     let failing = tower::service_fn(|req: Request<Body>| async move {
-        let (mut parts, _body) = req.into_parts();
+        let (mut parts, _) = req.into_parts();
         let s = AuthSession::from_request_parts(&mut parts, &())
             .await
             .map_err(|_| ())
@@ -331,7 +338,7 @@ async fn a_failing_handler_has_its_session_stored_before_the_error_returns() {
 #[tokio::test]
 async fn the_memory_store_keeps_the_compare_and_swap_contract() {
     axess_core::testing::store_contract::assert_update_if_revision_contract(
-        &MemorySessionStore::new(),
+        &MemorySessionStore::new().with_clock(std::sync::Arc::new(common::test_clock())),
     )
     .await;
 }

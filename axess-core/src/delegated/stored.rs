@@ -10,7 +10,7 @@
 //! returns a fresh bearer string to the caller.
 //!
 //! See [`super`] module docs for the broader OBO concept and the
-//! distinction vs [`super::exchange`](crate::delegated::exchange).
+//! distinction vs [the exchange module](crate::delegated::exchange).
 //!
 //! # Module layout
 //!
@@ -24,7 +24,7 @@
 //!   code for tokens).
 //! - `session`: `StoredDelegationSession::get_access_token()`
 //!   with silent refresh.
-//! - [`encrypted`](crate::delegated::stored::encrypted) (feature `delegated-stored-encrypted`):
+//! - [`encrypted`] (feature `delegated-stored-encrypted`):
 //!   transparent encryption-at-rest wrapper over any inner
 //!   `DelegatedCredentialStore`. AES-256-GCM with per-row random
 //!   nonce and AAD bound to `(provider, tenant, user, field)`.
@@ -44,7 +44,9 @@ pub use encrypted::{
     CurrentKey, EncryptedDelegatedCredentialStore, EncryptionKey, KeyProvider, KeyProviderError,
     MemoryKeyProvider,
 };
-pub use grant::{GrantContext, begin_grant, complete_grant, complete_grant_at};
+pub use grant::{
+    GrantContext, GrantRegistration, begin_grant, complete_grant, complete_grant_at, grant_client,
+};
 pub use provider::DelegatedProvider;
 pub use session::StoredDelegationSession;
 
@@ -54,6 +56,8 @@ mod cancel_tests;
 mod dst_tests;
 #[cfg(test)]
 mod endpoint_tests;
+#[cfg(test)]
+mod registration_tests;
 #[cfg(test)]
 mod response_tests;
 #[cfg(test)]

@@ -6,6 +6,7 @@ use crate::authn::factor::Fido2Ceremony;
 use crate::authz::context::{BuildRequestContext, StandardRequestContext};
 use crate::authz::provider::make_entity_uid;
 use crate::authz::store::{AuthzDecision, PolicyEvaluator, PolicyStore};
+use axess_clock::testing::Shift;
 use cedar_policy::Entities;
 
 /// The rule on the design page.
@@ -49,12 +50,12 @@ fn store(policies: &str) -> PolicyStore {
     PolicyStore::from_text(policies, &schema()).expect("the policies validate against the fragment")
 }
 
-fn now() -> DateTime<Utc> {
-    DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap()
+fn now() -> Timestamp {
+    Timestamp::from_unix_seconds(1_700_000_000).unwrap()
 }
 
-fn ago(seconds: i64) -> DateTime<Utc> {
-    now() - chrono::Duration::seconds(seconds)
+fn ago(seconds: i64) -> Timestamp {
+    now().minus(axess_clock::SignedDuration::seconds(seconds))
 }
 
 fn passkey(user_verified: bool, synced: bool, seconds_ago: i64) -> FactorAssurance {
@@ -238,7 +239,7 @@ fn the_record_reads_back_from_the_context_it_built() {
 fn a_proof_dated_after_the_request_is_left_out() {
     let record = [FactorAssurance::for_kind(
         FactorKind::Password,
-        now() + chrono::Duration::seconds(1),
+        now().plus(axess_clock::SignedDuration::seconds(1)),
     )];
     assert_eq!(
         AssuranceContext::from_session(&record, now()),
@@ -260,6 +261,26 @@ fn the_standard_context_carries_assurance_beside_its_own_attributes() {
     assert_eq!(AssuranceContext::from_context(&context), Some(assurance));
 }
 
+/// `key_bound` is emitted only when the context is built with it, and then
+/// as the boolean it was given.
+#[test]
+fn the_standard_context_carries_key_bound_only_when_asked() {
+    let plain = StandardRequestContext::new(true, None)
+        .to_cedar_context()
+        .unwrap();
+    assert!(plain.get("key_bound").is_none());
+    for bound in [true, false] {
+        let context = StandardRequestContext::new(true, None)
+            .with_key_bound(bound)
+            .to_cedar_context()
+            .unwrap();
+        assert!(
+            matches!(context.get("key_bound"), Some(EvalResult::Bool(b)) if b == bound),
+            "{bound}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn the_refusal_names_the_step_up_and_nothing_else() {
     use http_body_util::BodyExt;
@@ -277,4 +298,96 @@ async fn the_refusal_names_the_step_up_and_nothing_else() {
     let body = denied.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json, serde_json::json!({ "error": "Access denied" }));
+}
+
+/// Two proofs under one attribute: the later proof holds it, whichever of
+/// the two the session recorded first.
+#[test]
+fn of_two_proofs_under_one_attribute_the_later_one_holds_it() {
+    let fresh = passkey(true, false, 5);
+    let stale = passkey(false, true, 300);
+    for record in [[fresh.clone(), stale.clone()], [stale, fresh]] {
+        let built = AssuranceContext::from_session(&record, now());
+        let held = built.factor("fido2").expect("fido2 present");
+        assert_eq!(held.age_seconds, 5, "{record:?}");
+        assert!(held.user_verified, "{record:?}");
+        assert_eq!(held.credential, CredentialBinding::DeviceBound);
+    }
+}
+
+/// An age is in whole seconds, so two proofs inside one second tie. The one
+/// the session recorded last is the later proof and holds the attribute.
+#[test]
+fn of_two_proofs_of_one_age_the_one_recorded_last_holds_the_attribute() {
+    let record = [passkey(false, true, 5), passkey(true, false, 5)];
+    let built = AssuranceContext::from_session(&record, now());
+    let held = built.factor("fido2").expect("fido2 present");
+    assert!(held.user_verified);
+    assert_eq!(held.credential, CredentialBinding::DeviceBound);
+}
+
+/// A schema that already carries the two types as the fragment defines them
+/// merges again and is left as it was.
+#[test]
+fn merging_the_fragment_into_a_schema_that_has_it_changes_nothing() {
+    let mut schema = serde_json::json!({ "App": { "entityTypes": {}, "actions": {} } });
+    merge_assurance_schema(&mut schema, "App").expect("the fragment merges");
+    let once = schema.clone();
+    merge_assurance_schema(&mut schema, "App").expect("the same definitions merge again");
+    assert_eq!(schema, once);
+}
+
+/// A schema that defines one of the two types differently is refused by the
+/// type's name, and its own definition is not overwritten.
+#[test]
+fn a_schema_that_defines_an_assurance_type_differently_is_refused() {
+    let own = serde_json::json!({ "type": "Record", "attributes": {} });
+    let mut schema = serde_json::json!({
+        "App": { "commonTypes": { "AxessAssurance": own.clone() } }
+    });
+    let refused = merge_assurance_schema(&mut schema, "App").unwrap_err();
+    assert!(
+        matches!(&refused, AuthzError::SchemaParse(text) if text.contains("AxessAssurance")),
+        "{refused}"
+    );
+    assert_eq!(schema["App"]["commonTypes"]["AxessAssurance"], own);
+}
+
+/// A context whose `credential` is none of the three values the record
+/// knows is not this record: it reads back as nothing, never as a proof with
+/// a binding it did not state.
+#[test]
+fn a_credential_value_outside_the_three_reads_back_as_no_record() {
+    let context_with = |credential: &str| {
+        let factor = RestrictedExpression::new_record([
+            (
+                "user_verified".to_string(),
+                RestrictedExpression::new_bool(true),
+            ),
+            (
+                "credential".to_string(),
+                RestrictedExpression::new_string(credential.to_string()),
+            ),
+            (
+                "attested".to_string(),
+                RestrictedExpression::new_bool(false),
+            ),
+            ("age_seconds".to_string(), RestrictedExpression::new_long(1)),
+        ])
+        .unwrap();
+        let assurance = RestrictedExpression::new_record([("fido2".to_string(), factor)]).unwrap();
+        Context::from_pairs([(ASSURANCE_ATTRIBUTE.to_string(), assurance)]).unwrap()
+    };
+    assert_eq!(
+        AssuranceContext::from_context(&context_with("hardware")),
+        None
+    );
+    for (stated, binding) in [
+        ("device_bound", CredentialBinding::DeviceBound),
+        ("synced", CredentialBinding::Synced),
+        ("not_applicable", CredentialBinding::NotApplicable),
+    ] {
+        let read = AssuranceContext::from_context(&context_with(stated)).expect("a known value");
+        assert_eq!(read.factor("fido2").unwrap().credential, binding);
+    }
 }

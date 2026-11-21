@@ -1,8 +1,7 @@
 # Inbound: federation
 
-Federation is the pattern where workloads authenticate against your
-application using credentials issued by a third party your
-deployment trusts. The federating issuer typically lives outside
+In federation, workloads authenticate to your application with
+credentials issued by a third party your deployment trusts. The federating issuer typically lives outside
 the trust domain your own services use: Kubernetes issues
 service-account tokens for pods, GitHub issues OIDC tokens for
 Actions runs, an enterprise IdP issues tokens for cross-organisation
@@ -13,26 +12,22 @@ unified workload-principal shape.
 This chapter covers `WorkloadResolver`, the single resolver that
 handles every non-SPIFFE federation. It is gated on the `jwt` feature,
 which `jwt-svid` and the rest of the workload-identity bundle pull in.
-Before 0.7.0 the facade put this module under `federation` and gated it
-on `oauth`, so `features = ["jwt-svid"]` compiled the resolver and left
-no path to it.
+It needs neither the `federation` nor the `oauth` feature, so
+`features = ["jwt-svid"]` reaches the resolver with no OAuth in the build.
 
 ## What federation means here
 
-The unifying claim of federation in axess is that an external
-issuer's token, after validation, produces a `Principal::Workload`
-with the same shape as a SPIFFE workload. The trust domain and the
+In axess, an external issuer's token, once validated, produces a
+`Principal::Workload` with the same shape as a SPIFFE workload. The trust domain and the
 SPIFFE-style path are synthesised from the issuer's claims; the
 issuer field on the principal records which federation produced it
 (`Issuer::OAuth` for the generic case, or one of
 `Issuer::custom("github_actions")` / `Issuer::custom("kubernetes")` /
 `Issuer::custom("gitlab_ci")` when audit logs need finer granularity).
 
-The synthesis matters because the rest of the system stays
-uniform. A Cedar policy that says "any workload in the finance
+The synthesis keeps the rest of the system uniform. A Cedar policy that says "any workload in the finance
 tenant may read this resource" works for a SPIFFE-identified
-service and for a Kubernetes pod and for a GitHub Actions run,
-without branching. The audit pipeline logs the same principal
+service, a Kubernetes pod and a GitHub Actions run without branching. The audit pipeline logs the same principal
 shape for all three. The application's code does not need to know
 which federation produced the request.
 
@@ -42,34 +37,33 @@ axess deliberately ships **no per-issuer adapters**. Each IdP's
 JWT claim shape is small (~20 lines for a `#[derive(Deserialize)]`
 struct, ~30 lines for a mapping closure) and adopters care about
 their *specific* IdP's exact claim semantics, not a generic
-average. Hard-coding `wif-github`, `wif-k8s`, `wif-gitlab` features
-in the library invites endless additions without reuse benefit.
+average. Features such as `wif-github`, `wif-k8s` and `wif-gitlab` would
+invite endless additions with no reuse.
 
-Instead: one `WorkloadResolver<C, F, R>` is generic over
+Instead, one `WorkloadResolver<C, F, R>` is generic over:
 
-- `C`; the adopter's `#[derive(Deserialize)]` claim struct
-- `F`; the closure mapping verified claims to `WorkloadMapping`
-- `R`; JTI replay-store type (defaults to `NoReplay`)
+- `C`: the adopter's `#[derive(Deserialize)]` claim struct
+- `F`: the closure mapping verified claims to `WorkloadMapping`
+- `R`: the JTI replay-store type (defaults to `NoReplay`)
 
 The library handles JWT verification (signature against JWKS,
 `iss`/`aud`/`exp`/`nbf`/`alg` checks), `WorkloadId` construction under the
 resolver's own trust domain, the tenant lookup from the verified claims'
-slug, and `Principal` construction. The closure handles claim
-→ identity-components (service name, tenant slug, attributes); it cannot
-name the trust domain or the tenant.
+slug, and `Principal` construction. The closure maps the claims to identity components (service name,
+tenant slug, attributes); it cannot name the trust domain or the tenant.
 
 ## Ready-made recipes
 
-`examples/workload-identity/` ships claim parsers + mappers for three
-common issuers (GitHub Actions, GitLab CI, Kubernetes service accounts). Adopters copy the recipe that matches their IdP
-into their codebase (recommended for production) or depend on the
-crate directly (useful for prototypes and tests).
+`examples/workload-identity/` ships claim parsers and mappers for three
+common issuers: GitHub Actions, GitLab CI and Kubernetes service accounts.
+Copy the recipe that matches your IdP into your codebase for production, or
+depend on the crate directly for prototypes and tests.
 
 ### Kubernetes service accounts
 
 Kubernetes mints OIDC-style tokens for pods through the
 `TokenRequest` API. A pod requests a token bound to a specific
-audience (the URL of your application, say), and the cluster's
+audience (for example, the URL of your application), and the cluster's
 control plane returns a signed JWT carrying the pod's
 service-account identity. The token's `iss` is the cluster's OIDC
 issuer URL; the `kubernetes.io.{namespace,serviceaccount.name}`
@@ -141,7 +135,7 @@ claim.
 ### GitLab CI
 
 A GitLab job asks for an ID token with the `id_tokens:` keyword, naming the
-audience it wants. Pick the audience to be your service's URL and pin it on
+audience it wants. Use your service's URL as the audience and pin it on
 the verifier; the issuer is the GitLab instance's URL and its keys are at
 `<instance>/oauth/discovery/keys`.
 
@@ -196,19 +190,18 @@ paths (`project_path`, `namespace_path`) are mutable and reusable, as GitHub's
 names are: a renamed, transferred or deleted project or group frees its old
 path. They are kept as attributes for audit. The mapper also requires
 `ref_protected` to be `true` unless the allowlist calls
-`allow_unprotected_refs`, since a job on an unprotected branch is one any
-developer of the project can start, and with environments listed it requires
+`allow_unprotected_refs`, since any developer of the project can start a job
+on an unprotected branch. With environments listed, the mapper also requires
 the job's `environment` to be one of them. Every refusal names the claim that
 decided it. If the instance is GitLab running in your own Azure subscription,
 only the issuer URL and the JWKS handle change.
 
 ### GitHub Actions OIDC
 
-GitHub Actions can issue OIDC tokens for workflow runs. The token
-carries claims naming the repository, the workflow, the branch,
-the run id, and the actor. Combined with a trust-domain mapping,
-the token authenticates a specific workflow run from your
-organisation against your application.
+GitHub Actions can issue OIDC tokens for workflow runs, with claims naming
+the repository, the workflow, the branch, the run id and the actor. With a
+trust-domain mapping, the token authenticates one workflow run from your
+organisation to your application.
 
 ```rust,ignore
 use axess_example_workload_identity::github_actions::{
@@ -229,12 +222,11 @@ let trust_domain = TrustDomain::new("github.actions").unwrap();
 let resolver = WorkloadResolver::<GitHubActionsClaims, _, _>::new(
     verifier.clone(),
     trust_domain.clone(),
-    tenant_id,
+    move |owner_id: &str| tenants.get(owner_id).copied(), // None refuses
     Issuer::custom("github_actions").unwrap(),
     bearer_token,
     // Trust owners and repositories by immutable numeric id, not by name.
     github_actions_mapper(
-        trust_domain,
         GitHubAllowlist::new()
             .owner_id("123456")
             .repository_id("987654321")
@@ -252,9 +244,9 @@ Names are not an identity: a renamed, deleted or transferred organisation or
 repository frees its old name, and whoever registers it next signs tokens
 that carry the name you trusted. The names (`repository`,
 `repository_owner`) are kept as attributes for audit. The recipe also
-preserves `actor`, `workflow`, `ref`, `sha`, `event_name` as
-Cedar attributes for policy use (allow only deploys from the
-default branch, require a specific workflow file, etc.).
+keeps `actor`, `workflow`, `ref`, `sha` and `event_name` as
+Cedar attributes for policies such as allowing deploys only from the
+default branch or requiring a specific workflow file.
 
 The allowlist also restricts the run and fails closed: the token's `ref` or
 `environment` must be one you listed with `git_ref` or `environment`, and its
@@ -263,13 +255,13 @@ allowlist with nothing listed, admits nothing.
 
 ### Requiring a token type
 
-`JwtVerifier::with_typ("at+jwt")` makes the verifier refuse a token whose JOSE
-`typ` header is not that type (compared without case, with a leading
-`application/` dropped), or has none, before it looks at the signature.
-It is off by default: without it the header type is not read, so an ID
-token, a logout token and a DPoP proof that one key signed verify as whatever
-the caller expects, provided `iss` and `aud` match. Set it wherever an issuer
-signs more than one kind of token with one key. The values: `at+jwt` for an
+`JwtVerifier::with_typ("at+jwt")` makes the verifier refuse, before it checks
+the signature, a token whose JOSE `typ` header is missing or is not that type
+(compared case-insensitively, ignoring a leading `application/`).
+It is off by default. Without it the header type is not read, so an ID
+token, a logout token or a DPoP proof signed by the same key verifies as
+whatever the caller expects, provided `iss` and `aud` match. Set it wherever an issuer
+signs more than one kind of token with one key. The values are `at+jwt` for an
 access token (RFC 9068), `logout+jwt` for a logout token, `dpop+jwt` for a DPoP
 proof, `oauth-authz-req+jwt` for a signed authorization request (FAPI 2.0
 message signing) and `token-introspection+jwt` for a signed introspection
@@ -283,37 +275,33 @@ Write your own recipe. For any new IdP:
 1. Decode a sample JWT to identify which claims carry the workload
    identity (a project id? a tenant id? a custom `service`?).
 2. Define a `#[derive(Deserialize)] struct YourClaims { ... }` with
-   only the fields you care about. `JwtVerifier` ignores unknown
-   claims, so you don't have to enumerate everything the issuer
-   sends.
+   only the fields you use. `JwtVerifier` ignores unknown
+   claims, so you need not list everything the issuer sends.
 3. Write a mapper closure
    `Fn(&VerifiedClaims<YourClaims>) -> Result<WorkloadMapping, IdentityError>`
    that produces the `(service_name, tenant_slug, attributes)` shape;
    the resolver builds the workload id from them.
-4. Wire as above, with `Issuer::custom("your_idp_label").unwrap()`
+4. Wire it as above, with `Issuer::custom("your_idp_label").unwrap()`
    for audit-log attribution (the constructor validates the label
    format: `[a-z0-9_]{1,32}`).
 
 `WorkloadId::build` renders `spiffe://<trust_domain>/<service>/<tenant_slug>`,
-and each of those two segments is one path component: `[A-Za-z0-9._~-]`,
-non-empty, with the whole URI capped at 2048 characters. A claim that is
-already a path does not pass through. A path-shaped claim such as
-`group/subgroup/project` fails on the first
-slash, so decide what the segments mean for your issuer and build them
+and each of those two segments is one path component: `[A-Za-z0-9._-]`,
+non-empty, with the whole URI capped at 2048 characters. A path-shaped claim such as `group/subgroup/project`
+fails on the first slash, so decide what the segments mean for your issuer and build them
 rather than forwarding a claim verbatim.
 
-The shipped recipes are the templates; read their source,
-adapt as needed.
+The shipped recipes are the templates: read their source and
+adapt it.
 
 ## Where federation fits
 
 Federation is the right answer when the deployment cannot or does
-not want to issue its own workload identities. A Kubernetes-based
-deployment that wants to use the pods' service-account tokens
-directly fits cleanly; an open-source CI integration that accepts
-tokens from any GitHub Actions run fits cleanly; an enterprise
-deployment that integrates with a partner's Okta tenant fits
-cleanly.
+not want to issue its own workload identities: a Kubernetes-based
+deployment that uses its pods' service-account tokens directly, an
+open-source CI integration that accepts tokens from any GitHub Actions
+run, or an enterprise deployment that integrates with a partner's Okta
+tenant.
 
 Federation is the wrong answer when the deployment runs SPIRE (or
 another SPIFFE issuer) and can mint its own SVIDs. In that case
@@ -330,13 +318,11 @@ the sources.
 
 ## Threat model
 
-The federation flows share the threat model of the underlying
-issuer. A Kubernetes-issued token is as secure as the cluster's
-OIDC issuer; a GitHub Actions token is as secure as GitHub's
-issuance pipeline; an OIDC IdP-issued token is as secure as the
-IdP.
+A federated token is as secure as its issuer: a Kubernetes token as
+the cluster's OIDC issuer, a GitHub Actions token as GitHub's issuance
+pipeline and an OIDC IdP's token as the IdP.
 
-The defences that axess adds are the standard ones: signature
+The defences axess adds are the standard ones: signature
 verification against the issuer's JWKS, `iss` match, `aud` match,
 expiry check, optional clock-skew and max-age bounds, trust-domain
 pinning at the resolver layer, and the adopter's claim-mapper
@@ -352,11 +338,11 @@ issuance patterns, rotate keys on a schedule.
 Nothing is audited for you here. `WorkloadResolver::resolve` verifies
 the token and hands back a `Principal`; it writes no `AuthEvent`, and
 `AuthEventType` has no variant for workload authentication, so a SIEM
-rule watching the catalogue for these will wait forever. Axess emits from
+rule watching the catalogue for these never fires. Axess emits from
 its service layer, which holds an `IdentityAuthnLog` to write through,
 and the workload resolvers sit outside it.
 
-Record it at your call site if you want it: the issuer label and the
+To audit workload authentication, record it at your call site: the issuer label and the
 synthesised `WorkloadId` are both on the principal the resolver returns,
 which is the attribution an issuer-level anomaly rule needs.
 
@@ -364,9 +350,9 @@ which is the attribution an issuer-level anomaly rule needs.
 
 | `resolve()` returns | Usually | What to do |
 |---|---|---|
-| `NotAuthenticated` | The JWT failed verification: wrong issuer, wrong audience, expired, bad signature, or a custom-claim that would not deserialise | Turn on `tracing::debug!` for `axess_factors::federation::workload` to see which step rejected it |
-| `InvalidSpiffeId` | The token verified, but the trust domain in the synthesised `WorkloadId` is not the one the resolver pinned. Usually the mapper closure built the id under the wrong trust domain | Check which `trust_domain` the recipe captured |
-| `InvalidComponent(...)` | The claim mapper rejected the verified claims, or a path segment carried a character outside `[A-Za-z0-9._~-]`. The message names which | Decode the payload (`base64 -d` of the JWT's middle segment) and compare it against what the mapper expects |
+| `NotAuthenticated` | The verifier pins no issuer or no audience, or the JWT failed verification (wrong issuer, wrong audience, expired, bad signature, or a custom claim that would not deserialise), or the tenant lookup answered `None` for the mapped slug. The GitHub Actions recipe also answers this when its allowlist refuses the run | Turn on `tracing::debug!` for `axess_factors::federation::workload` to see which step rejected it |
+| `InvalidSpiffeId` | The token verified and mapped, but the synthesised `WorkloadId` is longer than 2048 characters | Shorten the service name or tenant slug the mapper returns |
+| `InvalidComponent(...)` | The claim mapper rejected the verified claims, or a path segment was empty, was `.` or `..`, or carried a character outside `[A-Za-z0-9._-]`. The message names which | Decode the payload (`base64 -d` of the JWT's middle segment) and compare it against what the mapper expects |
 
 ## Further reading
 

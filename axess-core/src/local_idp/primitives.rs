@@ -1,4 +1,4 @@
-//! Primitives shared between the production [`LocalIdp`](crate::local_idp::LocalIdp)
+//! Primitives shared between the production `LocalIdp`
 //! and the test [`LocalIdpFixture`](crate::testing::local_idp::LocalIdpFixture).
 //! Token-bearing types (signing key, claim builder), the issuance-listener
 //! trait, and small helpers live here so production code does not have to
@@ -10,15 +10,10 @@ use jsonwebtoken::jwk::Jwk;
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, EncodingKey};
 use p256::SecretKey as EcSecretKey;
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::elliptic_curve::Generate as _;
+use p256::elliptic_curve::sec1::ToSec1Point;
 use p256::pkcs8::{DecodePrivateKey as EcDecodePrivateKey, EncodePrivateKey as EcEncodePrivateKey};
-use rsa::RsaPrivateKey;
-use rsa::pkcs1::{DecodeRsaPrivateKey, EncodeRsaPrivateKey};
-use rsa::traits::PublicKeyParts;
-
-pub(crate) const RSA_KEY_BITS: usize = 2048;
-/// Smallest RSA modulus accepted from imported key material.
-pub(crate) const RSA_MIN_BITS: usize = 2048;
+use zeroize::Zeroizing;
 
 /// RFC 7638 thumbprint of a canonical public-key JWK member string, used as
 /// the `kid` of a generated key so two generated keys never share one.
@@ -31,7 +26,7 @@ fn thumbprint_kid(canonical_jwk: &str) -> String {
 
 /// A keypair + JWK + kid + algorithm bundle that drives the signing
 /// side of a [`LocalIdpFixture`](crate::testing::local_idp::LocalIdpFixture).
-/// Extracted as its own type so adopters can:
+/// A type of its own so adopters can:
 ///
 /// - Provide a **stable** keypair across test runs (load from a
 ///   checked-in PEM, environment variable, or HSM-issued file) instead
@@ -41,62 +36,42 @@ fn thumbprint_kid(canonical_jwk: &str) -> String {
 /// - Prototype production wiring where keys come from a `KeyProvider`
 ///   layer rather than in-memory generation.
 ///
-/// The keypair is held as DER bytes internally (PKCS#1 for RSA matching
-/// [`EncodingKey::from_rsa_der`], PKCS#8 for EC matching
-/// [`EncodingKey::from_ec_der`]), plus the precomputed public [`Jwk`]
-/// used to populate the fixture's JWKS. Drop zeroizes the DER bytes held
-/// here via [`zeroize`], and only those: the [`EncodingKey`] built from them
-/// once at construction (one copy of the key, shared by every mint and every
-/// clone of the same value), the parsed `RsaPrivateKey` / `SecretKey` the
-/// constructors started from, and any copy `jsonwebtoken` makes while signing
-/// are not zeroized. This is a test and development IdP, not a place for a
-/// production key.
+/// The key is an EC P-256 key (`ES256`) unless the `local-idp-rsa` feature
+/// is on, which adds the RSA constructors (`RS256`, `RS384`, `RS512`). A
+/// build without that feature does not compile the `rsa` crate.
+///
+/// The keypair is held as DER bytes internally (PKCS#8 for EC matching
+/// [`EncodingKey::from_ec_der`], PKCS#1 for RSA matching
+/// [`EncodingKey::from_rsa_der`]), plus the precomputed public [`Jwk`]
+/// used to populate the fixture's JWKS. The DER bytes held here are in a
+/// [`zeroize`] buffer that is zeroed on drop. The parsed `p256::SecretKey`
+/// or `RsaPrivateKey` a constructor started from zeroizes itself when the
+/// constructor returns (both types wipe their secret parts on drop). What
+/// is not zeroized is the [`EncodingKey`] built from the DER bytes once at
+/// construction (one copy of the key, shared by every mint and every clone
+/// of the same value) and any copy `jsonwebtoken` makes while signing. This
+/// is a test and development IdP, not a place for a production key.
 pub struct LocalIdpSigningKey {
-    material: LocalIdpKeyMaterial,
-    /// Built from `material` once, so signing does not copy the private key
-    /// into a new unzeroized `EncodingKey` on every mint.
+    /// The private key as DER, in the encoding [`EncodingKey`]'s constructor
+    /// for the key type takes. For EC that is PKCS#8 (the body of
+    /// `-----BEGIN PRIVATE KEY-----`), not raw SEC1 `ECPrivateKey`:
+    /// `jsonwebtoken` rejects the SEC1 wrapping silently with an "invalid
+    /// key" surface that is easy to misdiagnose as a DPoP signing failure.
+    /// For RSA (`local-idp-rsa`) it is PKCS#1 (the body of
+    /// `-----BEGIN RSA PRIVATE KEY-----`).
+    private_der: Zeroizing<Vec<u8>>,
+    /// Built from `private_der` once, so signing does not copy the private
+    /// key into a new unzeroized `EncodingKey` on every mint.
     encoding: EncodingKey,
     jwk: Jwk,
     key_id: String,
     algorithm: Algorithm,
 }
 
-/// Internal storage for a [`LocalIdpSigningKey`]'s private key bytes.
-/// Each variant holds the DER format that [`EncodingKey`]'s
-/// per-algorithm constructor expects.
-enum LocalIdpKeyMaterial {
-    /// PKCS#1 DER (`-----BEGIN RSA PRIVATE KEY-----` body): what
-    /// [`EncodingKey::from_rsa_der`] consumes.
-    Rsa { pkcs1_der: Vec<u8> },
-    /// PKCS#8 DER (`-----BEGIN PRIVATE KEY-----` body): what
-    /// [`EncodingKey::from_ec_der`] consumes. NOT raw SEC1
-    /// `ECPrivateKey`; `jsonwebtoken` rejects the SEC1 wrapping
-    /// silently with an "invalid key" surface that is easy to
-    /// misdiagnose as a DPoP signing failure.
-    Ec { pkcs8_der: Vec<u8> },
-}
-
-impl Drop for LocalIdpSigningKey {
-    fn drop(&mut self) {
-        match &mut self.material {
-            LocalIdpKeyMaterial::Rsa { pkcs1_der } => zeroize::Zeroize::zeroize(pkcs1_der),
-            LocalIdpKeyMaterial::Ec { pkcs8_der } => zeroize::Zeroize::zeroize(pkcs8_der),
-        }
-    }
-}
-
 impl Clone for LocalIdpSigningKey {
     fn clone(&self) -> Self {
-        let material = match &self.material {
-            LocalIdpKeyMaterial::Rsa { pkcs1_der } => LocalIdpKeyMaterial::Rsa {
-                pkcs1_der: pkcs1_der.clone(),
-            },
-            LocalIdpKeyMaterial::Ec { pkcs8_der } => LocalIdpKeyMaterial::Ec {
-                pkcs8_der: pkcs8_der.clone(),
-            },
-        };
         Self {
-            material,
+            private_der: self.private_der.clone(),
             encoding: self.encoding.clone(),
             jwk: self.jwk.clone(),
             key_id: self.key_id.clone(),
@@ -116,173 +91,12 @@ impl std::fmt::Debug for LocalIdpSigningKey {
 }
 
 impl LocalIdpSigningKey {
-    /// Generate a fresh RSA-2048 keypair under `RS256` with the
-    /// default key id. Key generation takes ~50-200 ms; expensive to
-    /// run per-test, so reuse via `Clone` across cases.
-    ///
-    /// Prefer [`Self::generate_es256`]: it is faster, its tokens are smaller,
-    /// and it avoids the `rsa` crate's private-key operations, which carry a
-    /// timing side channel (the Marvin advisory, not fixed upstream). Use RSA
-    /// only when a verifier cannot take ES256, and keep signing off shared
-    /// hosts.
-    pub fn generate_rsa() -> Self {
-        Self::generate_rsa_with_algorithm(Algorithm::RS256)
-    }
-
-    /// Generate a fresh RSA-2048 keypair under the given algorithm
-    /// (`RS256` / `RS384` / `RS512`).
-    ///
-    /// # Panics
-    ///
-    /// On another algorithm, or if key generation fails; see
-    /// [`Self::try_generate_rsa_with_algorithm`] for the fallible form.
-    pub fn generate_rsa_with_algorithm(algorithm: Algorithm) -> Self {
-        Self::generate_rsa_with_algorithm_and_rng(algorithm, &axess_rng::SystemRng)
-    }
-
-    /// Like [`Self::generate_rsa_with_algorithm`] but drives keygen with
-    /// the supplied [`SecureRng`](axess_rng::SecureRng), enabling
-    /// deterministic-simulation tests to reproduce key material.
-    ///
-    /// # Panics
-    ///
-    /// As [`Self::generate_rsa_with_algorithm`]; see
-    /// [`Self::try_generate_rsa_with_algorithm_and_rng`] for the fallible form.
-    pub fn generate_rsa_with_algorithm_and_rng(
-        algorithm: Algorithm,
-        rng: &dyn axess_rng::SecureRng,
-    ) -> Self {
-        Self::try_generate_rsa_with_algorithm_and_rng(algorithm, rng)
-            .unwrap_or_else(|e| panic!("LocalIdpSigningKey RSA key generation: {e}"))
-    }
-
-    /// Like [`Self::generate_rsa_with_algorithm`] but returns
-    /// [`LocalIdpKeyError::UnsupportedAlgorithm`] for an algorithm that is
-    /// not `RS256`, `RS384` or `RS512` instead of panicking.
-    pub fn try_generate_rsa_with_algorithm(algorithm: Algorithm) -> Result<Self, LocalIdpKeyError> {
-        Self::try_generate_rsa_with_algorithm_and_rng(algorithm, &axess_rng::SystemRng)
-    }
-
-    /// Like [`Self::generate_rsa_with_algorithm_and_rng`] but returns an
-    /// error instead of panicking.
-    ///
-    /// # Errors
-    ///
-    /// [`LocalIdpKeyError::UnsupportedAlgorithm`] for an algorithm that is
-    /// not `RS256`, `RS384` or `RS512`; [`LocalIdpKeyError::KeyGeneration`]
-    /// if the RSA keypair could not be generated.
-    pub fn try_generate_rsa_with_algorithm_and_rng(
-        algorithm: Algorithm,
-        rng: &dyn axess_rng::SecureRng,
-    ) -> Result<Self, LocalIdpKeyError> {
-        check_rsa_alg(algorithm)?;
-        let mut adapter = SecureRngAdapter(rng);
-        let private_key = RsaPrivateKey::new(&mut adapter, RSA_KEY_BITS)
-            .map_err(|e| LocalIdpKeyError::KeyGeneration(e.to_string()))?;
-        let kid = thumbprint_kid(&format!(
-            r#"{{"e":"{}","kty":"RSA","n":"{}"}}"#,
-            URL_SAFE_NO_PAD.encode(private_key.e().to_bytes_be()),
-            URL_SAFE_NO_PAD.encode(private_key.n().to_bytes_be()),
-        ));
-        Ok(Self::from_rsa_private_key(&private_key, kid, algorithm))
-    }
-
-    /// Load from a PEM-encoded RSA private key. Accepts both
-    /// PKCS#1 (`-----BEGIN RSA PRIVATE KEY-----`) and PKCS#8
-    /// (`-----BEGIN PRIVATE KEY-----`) wrappings; the choice is
-    /// auto-detected from the PEM header.
-    ///
-    /// Use this when the test fixture should reuse a key across
-    /// runs (faster startup, stable signatures for cached
-    /// expectations); check the key into the test tree or load
-    /// from an environment variable.
-    pub fn from_rsa_pem(
-        pem: &str,
-        key_id: impl Into<String>,
-        algorithm: Algorithm,
-    ) -> Result<Self, LocalIdpKeyError> {
-        check_rsa_alg(algorithm)?;
-        let pem_trimmed = pem.trim_start();
-        let private_key = if pem_trimmed.starts_with("-----BEGIN RSA PRIVATE KEY-----") {
-            RsaPrivateKey::from_pkcs1_pem(pem)
-                .map_err(|e| LocalIdpKeyError::PemParse(e.to_string()))?
-        } else {
-            RsaPrivateKey::from_pkcs8_pem(pem)
-                .map_err(|e| LocalIdpKeyError::PemParse(e.to_string()))?
-        };
-        Self::from_imported_rsa_key(&private_key, key_id.into(), algorithm)
-    }
-
-    /// Load from a PKCS#1 DER-encoded RSA private key.
-    pub fn from_rsa_pkcs1_der(
-        der: &[u8],
-        key_id: impl Into<String>,
-        algorithm: Algorithm,
-    ) -> Result<Self, LocalIdpKeyError> {
-        check_rsa_alg(algorithm)?;
-        let private_key = RsaPrivateKey::from_pkcs1_der(der)
-            .map_err(|e| LocalIdpKeyError::DerParse(e.to_string()))?;
-        Self::from_imported_rsa_key(&private_key, key_id.into(), algorithm)
-    }
-
-    /// Load from a PKCS#8 DER-encoded RSA private key.
-    pub fn from_rsa_pkcs8_der(
-        der: &[u8],
-        key_id: impl Into<String>,
-        algorithm: Algorithm,
-    ) -> Result<Self, LocalIdpKeyError> {
-        check_rsa_alg(algorithm)?;
-        let private_key = RsaPrivateKey::from_pkcs8_der(der)
-            .map_err(|e| LocalIdpKeyError::DerParse(e.to_string()))?;
-        Self::from_imported_rsa_key(&private_key, key_id.into(), algorithm)
-    }
-
-    /// Wrap imported RSA key material, refusing a modulus under
-    /// [`RSA_MIN_BITS`]: an imported key is whatever the file held.
-    fn from_imported_rsa_key(
-        private_key: &RsaPrivateKey,
-        key_id: String,
-        algorithm: Algorithm,
-    ) -> Result<Self, LocalIdpKeyError> {
-        let bits = private_key.n().bits();
-        if bits < RSA_MIN_BITS {
-            return Err(LocalIdpKeyError::WeakKey {
-                bits,
-                min: RSA_MIN_BITS,
-            });
-        }
-        Ok(Self::from_rsa_private_key(private_key, key_id, algorithm))
-    }
-
-    fn from_rsa_private_key(
-        private_key: &RsaPrivateKey,
-        key_id: String,
-        algorithm: Algorithm,
-    ) -> Self {
-        let public_key = private_key.to_public_key();
-        let pkcs1_der = private_key
-            .to_pkcs1_der()
-            .expect("PKCS#1 DER encode never fails on valid RSA key")
-            .as_bytes()
-            .to_vec();
-        let n = URL_SAFE_NO_PAD.encode(public_key.n().to_bytes_be());
-        let e = URL_SAFE_NO_PAD.encode(public_key.e().to_bytes_be());
-        let jwk = build_rsa_jwk(&key_id, algorithm, &n, &e);
-        Self {
-            encoding: EncodingKey::from_rsa_der(&pkcs1_der),
-            material: LocalIdpKeyMaterial::Rsa { pkcs1_der },
-            jwk,
-            key_id,
-            algorithm,
-        }
-    }
-
     /// Generate a fresh P-256 keypair under `ES256` with the default
     /// key id. EC key generation is much faster than RSA (~1 ms vs
     /// ~50-200 ms), and the resulting tokens are smaller; adopters
     /// targeting cloud-STS endpoints (which expect ES256-shaped
     /// tokens) or FAPI 2.0 (which mandates ES256/PS256) reach for
-    /// this in preference to [`Self::generate_rsa`].
+    /// this in preference to `generate_rsa` (feature `local-idp-rsa`).
     pub fn generate_es256() -> Self {
         Self::generate_es256_with_rng(&axess_rng::SystemRng)
     }
@@ -292,8 +106,8 @@ impl LocalIdpSigningKey {
     /// deterministic-simulation tests to reproduce key material.
     pub fn generate_es256_with_rng(rng: &dyn axess_rng::SecureRng) -> Self {
         let mut adapter = SecureRngAdapter(rng);
-        let secret = EcSecretKey::random(&mut adapter);
-        let point = secret.public_key().to_encoded_point(false);
+        let secret = EcSecretKey::generate_from_rng(&mut adapter);
+        let point = secret.public_key().to_sec1_point(false);
         let (x, y) = (
             point.x().expect("uncompressed P-256 point has x"),
             point.y().expect("uncompressed P-256 point has y"),
@@ -357,13 +171,15 @@ impl LocalIdpSigningKey {
     }
 
     fn from_ec_secret_key(secret: &EcSecretKey, key_id: String, algorithm: Algorithm) -> Self {
-        let pkcs8_der = secret
-            .to_pkcs8_der()
-            .expect("PKCS#8 DER encode never fails on valid P-256 key")
-            .as_bytes()
-            .to_vec();
+        let pkcs8_der = Zeroizing::new(
+            secret
+                .to_pkcs8_der()
+                .expect("PKCS#8 DER encode never fails on valid P-256 key")
+                .as_bytes()
+                .to_vec(),
+        );
         let public = secret.public_key();
-        let point = public.to_encoded_point(false);
+        let point = public.to_sec1_point(false);
         let x = point.x().expect("uncompressed P-256 point has x");
         let y = point.y().expect("uncompressed P-256 point has y");
         let x_b64 = URL_SAFE_NO_PAD.encode(x.as_slice());
@@ -371,7 +187,7 @@ impl LocalIdpSigningKey {
         let jwk = build_ec_jwk(&key_id, algorithm, &x_b64, &y_b64);
         Self {
             encoding: EncodingKey::from_ec_der(&pkcs8_der),
-            material: LocalIdpKeyMaterial::Ec { pkcs8_der },
+            private_der: pkcs8_der,
             jwk,
             key_id,
             algorithm,
@@ -414,19 +230,6 @@ impl LocalIdpSigningKey {
     }
 }
 
-fn check_rsa_alg(algorithm: Algorithm) -> Result<(), LocalIdpKeyError> {
-    if matches!(
-        algorithm,
-        Algorithm::RS256 | Algorithm::RS384 | Algorithm::RS512
-    ) {
-        Ok(())
-    } else {
-        Err(LocalIdpKeyError::UnsupportedAlgorithm(format!(
-            "{algorithm:?} (RSA constructors support RS256, RS384, RS512)"
-        )))
-    }
-}
-
 fn check_ec_alg(algorithm: Algorithm) -> Result<(), LocalIdpKeyError> {
     if matches!(algorithm, Algorithm::ES256) {
         Ok(())
@@ -435,24 +238,6 @@ fn check_ec_alg(algorithm: Algorithm) -> Result<(), LocalIdpKeyError> {
             "{algorithm:?} (EC constructors support ES256)"
         )))
     }
-}
-
-pub(crate) fn build_rsa_jwk(key_id: &str, algorithm: Algorithm, n: &str, e: &str) -> Jwk {
-    let alg_name = alg_jwk_name(algorithm).unwrap_or_else(|| {
-        panic!(
-            "build_rsa_jwk called with unsupported algorithm {algorithm:?}; \
-             only RS256/RS384/RS512 are supported (check_rsa_alg upstream)"
-        )
-    });
-    let jwk_json = serde_json::json!({
-        "kty": "RSA",
-        "use": "sig",
-        "alg": alg_name,
-        "kid": key_id,
-        "n": n,
-        "e": e,
-    });
-    serde_json::from_value(jwk_json).expect("hand-constructed JWK JSON parses")
 }
 
 pub(crate) fn build_ec_jwk(key_id: &str, algorithm: Algorithm, x: &str, y: &str) -> Jwk {
@@ -578,6 +363,11 @@ pub(crate) use issuance::{TtlRefusal, enforce_max_ttl_fallible};
 
 mod rng_adapter;
 use rng_adapter::SecureRngAdapter;
+
+/// The RSA half of [`LocalIdpSigningKey`], and the one module of this crate
+/// that names the `rsa` crate.
+#[cfg(feature = "local-idp-rsa")]
+mod rsa_key;
 
 #[cfg(test)]
 mod primitives_tests;

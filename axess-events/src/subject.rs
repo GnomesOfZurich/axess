@@ -5,56 +5,133 @@
 //! impersonation (`actor` = admin, `subject` = impersonated user) and
 //! for autonomous flows (`actor` = system principal).
 
-// Module-level `allow(missing_docs)` covers the rkyv-generated
-// `ArchivedEventSubject` and `EventSubjectResolver` types; rkyv 0.8
-// emits undocumented variant fields on the resolver enum and the
-// `attr(...)` helper does not propagate down into them. Every type
-// authored here is fully documented by hand.
-#![allow(missing_docs)]
-
-use crate::id::{DeviceId, SessionId, TenantId, UserId};
+use crate::id::{DeviceId, SessionKey, TenantId, UserId};
 use crate::kind::KindTag;
 use axess_strings::ShortString;
 
-/// Tagged identifier for an entity referenced by an event.
-///
-/// The first four variants cover the typed identifiers shared across
-/// the workspace; [`EventSubject::Other`] is the escape hatch for
-/// domain-specific subjects (governance object id, valuation grid id,
-/// …) that the envelope crate doesn't need to understand.
-///
-/// Owned form: use in envelope fields and anywhere the subject
-/// out-lives the event borrow. For zero-allocation *introspection* on
-/// the hot path: routing, per-tenant filtering, tracing, fan-out:
-/// see the borrowed pair [`EventSubjectRef`] and [`EventSubject::as_ref`].
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
-)]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum EventSubject {
-    /// Subject is a user.
-    User(UserId),
-    /// Subject is a tenant (cross-tenant operations only).
-    Tenant(TenantId),
-    /// Subject is a device.
-    Device(DeviceId),
-    /// Subject is a session.
-    Session(SessionId),
-    /// Domain-specific subject. `kind` describes the entity class
-    /// (e.g. `"governance.constraint"`); `id` is its opaque
-    /// identifier in that domain.
-    Other {
-        /// Entity-class discriminator.
-        kind: KindTag,
-        /// Domain-opaque identifier.
-        id: ShortString,
-    },
+// The definitions sit in a private module because rkyv's derive writes a
+// second public type beside each, `EventSubjectResolver` and
+// `RecordedSessionIdResolver`, whose fields it does not document. A
+// resolver has no use by name (it is `<T as rkyv::Archive>::Resolver`), so
+// it gets no path, and the documented names are exported from here.
+mod owned {
+    use crate::id::{DeviceId, SessionId, SessionKey, TenantId, UserId};
+    use crate::kind::KindTag;
+    use axess_strings::ShortString;
+
+    /// The id of a session as an event written before 0.20.0 recorded it.
+    ///
+    /// A value of this type comes from one place: the reader of a stored
+    /// event (the `serde` and `rkyv` decoders of
+    /// [`EventSubject`](crate::EventSubject)). It has no constructor, from
+    /// a `SessionId`, a `Uuid`, bytes or text, so a new event cannot name a
+    /// session by an id; it names it by its key
+    /// ([`EventSubject::SessionKey`](crate::EventSubject::SessionKey)).
+    ///
+    /// Why nothing else can build one:
+    ///
+    /// 1. Its field is private to this module, and this module holds no
+    ///    function that makes one from another value: no `new`, no `From`,
+    ///    no `TryFrom`, no `FromStr`, no `Default`. `Clone` and `Copy` copy
+    ///    one that exists.
+    /// 2. The only functions that return one are the two derived decoders,
+    ///    `serde::Deserialize` and `rkyv::Deserialize`, and each turns
+    ///    stored bytes into the value: they are the reader of stored events.
+    /// 3. [`EventSubject::as_ref`](crate::EventSubject::as_ref) lends a
+    ///    recorded id and
+    ///    [`EventSubjectRef::to_owned`](crate::EventSubjectRef::to_owned)
+    ///    copies the one it was lent.
+    ///
+    /// So code that holds a `SessionId` can put it into an event only by
+    /// writing it out in the stored form and reading that back, and no API
+    /// of the session layer hands out the id of a live session.
+    /// `Serialize` stays on purpose: an event read from one store is written
+    /// to another unchanged; what the type forbids is building one, not
+    /// carrying one. `serde(transparent)` keeps the text an earlier event
+    /// holds (`{"Session":"<uuid>"}`), and the `rkyv` form is the 16 bytes a
+    /// `SessionId` archives as.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+    #[cfg_attr(feature = "serde", serde(transparent))]
+    #[cfg_attr(
+        feature = "rkyv",
+        derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+    )]
+    pub struct RecordedSessionId(SessionId);
+
+    impl RecordedSessionId {
+        /// The key of the recorded session: the name the records of this
+        /// release give the same session, so events of both forms
+        /// correlate.
+        #[must_use]
+        pub fn key(&self) -> SessionKey {
+            SessionKey::of(&self.0)
+        }
+
+        /// The 16 bytes the event recorded, which the associated data of a
+        /// sealed event authenticated.
+        #[must_use]
+        pub fn as_bytes(&self) -> &[u8; 16] {
+            self.0.as_bytes()
+        }
+
+        /// A recorded id for this crate's own tests, which need an event of
+        /// the earlier form without a stored one to read.
+        #[cfg(test)]
+        pub(crate) fn recorded(id: SessionId) -> Self {
+            Self(id)
+        }
+    }
+
+    /// Tagged identifier for an entity referenced by an event.
+    ///
+    /// The typed variants cover the identifiers shared across the
+    /// workspace (a session by its key, or by the id an earlier event
+    /// recorded); [`EventSubject::Other`] is the escape hatch for
+    /// domain-specific subjects (governance object id, valuation grid id,
+    /// …) that the envelope crate doesn't need to understand.
+    ///
+    /// Owned form: use in envelope fields and anywhere the subject
+    /// out-lives the event borrow. For zero-allocation *introspection* on
+    /// the hot path: routing, per-tenant filtering, tracing, fan-out:
+    /// see the borrowed pair [`EventSubjectRef`](crate::EventSubjectRef) and
+    /// [`EventSubject::as_ref`].
+    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+    #[cfg_attr(
+        feature = "rkyv",
+        derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+    )]
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum EventSubject {
+        /// Subject is a user.
+        User(UserId),
+        /// Subject is a tenant (cross-tenant operations only).
+        Tenant(TenantId),
+        /// Subject is a device.
+        Device(DeviceId),
+        /// Subject is a session, named by the id an event written before
+        /// 0.20.0 recorded. Read from a stored event; it cannot be built.
+        Session(RecordedSessionId),
+        /// Subject is a session, named by its key.
+        SessionKey(SessionKey),
+        /// Domain-specific subject. `kind` describes the entity class
+        /// (e.g. `"governance.constraint"`); `id` is its opaque
+        /// identifier in that domain.
+        Other {
+            /// Entity-class discriminator.
+            kind: KindTag,
+            /// Domain-opaque identifier.
+            id: ShortString,
+        },
+    }
 }
 
+#[cfg(feature = "rkyv")]
+pub use owned::{ArchivedEventSubject, ArchivedRecordedSessionId};
+pub use owned::{EventSubject, RecordedSessionId};
+
 impl EventSubject {
-    /// Borrowed view of this subject. Cheap: five variants each project
+    /// Borrowed view of this subject. Cheap: each typed variant projects
     /// to a `&`-reference; the `Other` variant's `KindTag`/`ShortString`
     /// deref to `&str`.
     ///
@@ -69,6 +146,7 @@ impl EventSubject {
             EventSubject::Tenant(id) => EventSubjectRef::Tenant(id),
             EventSubject::Device(id) => EventSubjectRef::Device(id),
             EventSubject::Session(id) => EventSubjectRef::Session(id),
+            EventSubject::SessionKey(key) => EventSubjectRef::SessionKey(key),
             EventSubject::Other { kind, id } => EventSubjectRef::Other {
                 kind: kind.as_str(),
                 id: id.as_str(),
@@ -127,8 +205,11 @@ pub enum EventSubjectRef<'a> {
     Tenant(&'a TenantId),
     /// Subject is a device.
     Device(&'a DeviceId),
-    /// Subject is a session.
-    Session(&'a SessionId),
+    /// Subject is a session, named by the id an event written before 0.20.0
+    /// recorded; mirrors [`EventSubject::Session`].
+    Session(&'a RecordedSessionId),
+    /// Subject is a session, named by its key.
+    SessionKey(&'a SessionKey),
     /// Domain-opaque subject; mirrors [`EventSubject::Other`]. `kind`
     /// discriminates entity class (e.g. `"Instrument"`, `"Case"`,
     /// `"governance.constraint"`); `id` is the class-scoped identifier.
@@ -143,7 +224,7 @@ pub enum EventSubjectRef<'a> {
 impl EventSubjectRef<'_> {
     /// Materialise the borrowed view into an owned [`EventSubject`].
     /// Allocates for the `Other` variant (its `kind`/`id` bytes become
-    /// `KindTag`/`ShortString`); the four typed variants clone their
+    /// `KindTag`/`ShortString`); the typed variants copy their
     /// identifier by value.
     #[must_use]
     pub fn to_owned(&self) -> EventSubject {
@@ -152,6 +233,7 @@ impl EventSubjectRef<'_> {
             EventSubjectRef::Tenant(id) => EventSubject::Tenant(*id),
             EventSubjectRef::Device(id) => EventSubject::Device(*id),
             EventSubjectRef::Session(id) => EventSubject::Session(*id),
+            EventSubjectRef::SessionKey(key) => EventSubject::SessionKey(*key),
             EventSubjectRef::Other { kind, id } => EventSubject::Other {
                 kind: KindTag::new(kind),
                 id: ShortString::new(id),
@@ -175,8 +257,11 @@ mod tests {
     fn some_device() -> DeviceId {
         DeviceId::from_uuid(mint_v4_default())
     }
-    fn some_session() -> SessionId {
-        SessionId::from_uuid(mint_v4_default())
+    fn some_recorded_session() -> RecordedSessionId {
+        RecordedSessionId::recorded(crate::id::SessionId::from_uuid(mint_v4_default()))
+    }
+    fn some_session_key() -> SessionKey {
+        SessionKey::of(&crate::id::SessionId::from_uuid(mint_v4_default()))
     }
 
     #[test]
@@ -210,7 +295,8 @@ mod tests {
             EventSubject::User(some_user()),
             EventSubject::Tenant(some_tenant()),
             EventSubject::Device(some_device()),
-            EventSubject::Session(some_session()),
+            EventSubject::Session(some_recorded_session()),
+            EventSubject::SessionKey(some_session_key()),
             EventSubject::Other {
                 kind: KindTag::new("Case"),
                 id: ShortString::new("case-42"),

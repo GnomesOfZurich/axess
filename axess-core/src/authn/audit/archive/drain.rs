@@ -53,7 +53,7 @@ impl AuditRetentionSource for Table {
 
     async fn select_unarchived_before(
         &self,
-        _: chrono::DateTime<chrono::Utc>,
+        _: axess_clock::Timestamp,
         limit: usize,
     ) -> Result<Vec<(u64, AuthEvent)>, Self::Error> {
         *self.selects.lock().unwrap() += 1;
@@ -67,14 +67,14 @@ impl AuditRetentionSource for Table {
     async fn mark_archived(
         &self,
         ids: &[u64],
-        _: chrono::DateTime<chrono::Utc>,
+        _: axess_clock::Timestamp,
     ) -> Result<(), Self::Error> {
         self.rows.lock().unwrap().retain(|id| !ids.contains(id));
         Ok(())
     }
     async fn purge_hot_archived_before(
         &self,
-        _: chrono::DateTime<chrono::Utc>,
+        _: axess_clock::Timestamp,
     ) -> Result<u64, Self::Error> {
         *self.purges.lock().unwrap() += 1;
         Ok(0)
@@ -375,7 +375,7 @@ async fn a_row_skipped_while_the_sink_was_down_is_offered_again() {
     }
     let up = Arc::new(Mutex::new(false));
     let table = Table::with(3);
-    let clock = axess_clock::testing::MockClock::now();
+    let clock = axess_clock::testing::MockClock::at_reference();
     let lp = AuditRetentionLoop::new(
         table.clone(),
         Switch(up.clone()),
@@ -388,7 +388,7 @@ async fn a_row_skipped_while_the_sink_was_down_is_offered_again() {
     }
     assert_eq!(table.left(), 3, "nothing could be archived");
     *up.lock().unwrap() = true;
-    clock.advance(chrono::Duration::hours(25));
+    clock.advance(axess_clock::SignedDuration::hours(25));
     for _ in 0..10 {
         let _ = lp.tick().await;
     }

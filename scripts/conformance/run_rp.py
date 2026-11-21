@@ -210,18 +210,24 @@ def port_open(port):
 
 
 def make_key(outdir):
-    """A fresh RSA key for private_key_jwt: returns the PEM path and the
-    public JWK the suite verifies assertions against."""
+    """A fresh P-256 key for private_key_jwt, signing ES256, the algorithm
+    examples/oauth defaults to and builds without the client-assertion-rsa
+    feature: returns the PEM path and the public JWK the suite verifies
+    assertions against."""
     path = os.path.join(outdir, "private-key-jwt.pem")
-    subprocess.run(["openssl", "genpkey", "-algorithm", "RSA", "-pkeyopt",
-                    "rsa_keygen_bits:2048", "-out", path], check=True, capture_output=True)
+    subprocess.run(["openssl", "genpkey", "-algorithm", "EC", "-pkeyopt",
+                    "ec_paramgen_curve:P-256", "-out", path], check=True, capture_output=True)
     os.chmod(path, 0o600)
-    out = subprocess.run(["openssl", "rsa", "-in", path, "-noout", "-modulus"],
-                         check=True, capture_output=True, text=True).stdout
-    modulus = bytes.fromhex(out.strip().split("=", 1)[1])
+    der = subprocess.run(["openssl", "pkey", "-in", path, "-pubout", "-outform", "DER"],
+                         check=True, capture_output=True).stdout
+    # The SubjectPublicKeyInfo of a P-256 key ends with the uncompressed
+    # point: 0x04, then the 32 bytes of x and the 32 bytes of y.
+    point = der[-65:]
+    if len(der) != 91 or point[0] != 0x04:
+        raise SystemExit("openssl wrote a public key that is not an uncompressed P-256 point")
     b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
-    jwk = {"kty": "RSA", "use": "sig", "alg": "RS256", "kid": KEY_ID,
-           "n": b64(modulus), "e": b64((65537).to_bytes(3, "big"))}
+    jwk = {"kty": "EC", "use": "sig", "alg": "ES256", "kid": KEY_ID, "crv": "P-256",
+           "x": b64(point[1:33]), "y": b64(point[33:])}
     return path, jwk
 
 
@@ -245,7 +251,7 @@ def start_rp(binary, issuer, logfile, key_path=None):
     )
     if key_path:
         env.pop("OAUTH_CLIENT_SECRET", None)
-        env.update({"OAUTH_PRIVATE_KEY_FILE": key_path, "OAUTH_PRIVATE_KEY_ALG": "RS256",
+        env.update({"OAUTH_PRIVATE_KEY_FILE": key_path, "OAUTH_PRIVATE_KEY_ALG": "ES256",
                     "OAUTH_PRIVATE_KEY_KID": KEY_ID})
     else:
         env["OAUTH_CLIENT_SECRET"] = CLIENT_SECRET
@@ -364,9 +370,40 @@ def export_plan(suite, plan_id, path):
         return False
 
 
+def tree_of(root):
+    """The tree a run is made against, as the results name it: the axess
+    version of the workspace manifest and the commit, and whether the tree
+    held changes not committed."""
+    with open(os.path.join(root, "Cargo.toml")) as f:
+        manifest = f.read()
+    found = re.search(r'^\[workspace\.package\][^\[]*?^version\s*=\s*"([^"]+)"', manifest, re.M | re.S)
+    version = found.group(1) if found else "of an unknown version"
+
+    def git(*args):
+        return subprocess.run(["git", "-C", root] + list(args), capture_output=True, text=True,
+                              check=True).stdout.strip()
+    commit = git("rev-parse", "--short=12", "HEAD")
+    dirty = git("status", "--porcelain", "--untracked-files=no")
+    return "axess %s at commit %s%s" % (version, commit, ", with changes not committed" if dirty else "")
+
+
+def provenance(run):
+    """The paragraph that opens the results: the run the verdicts come from
+    and the tree it ran against, so a fresh run rewrites it with them."""
+    runs = sorted({(p.get("date", run["date"])[:10], p.get("against", "")) for p in run["plans"]})
+    if len(runs) == 1:
+        day, against = runs[0]
+        return ("**The verdicts below are from a run of %s, against %s.** They say nothing of what "
+                "changed after that tree." % (day, against or "a tree the results do not record"))
+    return ("**The verdicts below come from more than one run: each plan names the date of its run "
+            "and the tree it ran against.** They say nothing of what changed after those trees.")
+
+
 def render_markdown(run):
     """The results section of docs/factors/conformance.md."""
     out = []
+    out.append(provenance(run))
+    out.append("")
     out.append("Suite version %s, image `%s`." % (run["suite_version"], run["suite_image"]))
     out.append("")
     for p in run["plans"]:
@@ -377,13 +414,17 @@ def render_markdown(run):
         summary = ", ".join("%d %s" % (n, k.lower()) for k, n in sorted(counts.items()))
         out.append("### `%s`%s" % (p["plan"], p.get("title_suffix", "")))
         out.append("")
-        out.append("Run %s (UTC). Plan instance on the suite: %s. Variant: `%s`. Modules run: %d (%s)." % (
-            p.get("date", run["date"]), p["plan_id"], json.dumps(p["variant"], sort_keys=True),
+        against = ", against %s" % p["against"] if p.get("against") else ""
+        out.append("Run %s (UTC)%s. Plan instance on the suite: %s. Variant: `%s`. Modules run: %d (%s)." % (
+            p.get("date", run["date"]), against, p["plan_id"], json.dumps(p["variant"], sort_keys=True),
             len(p["modules"]), summary))
         if p.get("modules_in_plan") and p["modules_in_plan"] != len(p["modules"]):
             out.append("")
             out.append("The plan instance holds %d modules for this variant; the %d run are the ones listed." % (
                 p["modules_in_plan"], len(p["modules"])))
+        if p.get("signing_key"):
+            out.append("")
+            out.append("The client assertions were signed with %s." % p["signing_key"])
         out.append("")
         out.append("| Module | Result | Client saw | Suite findings |")
         out.append("|---|---|---|---|")
@@ -420,6 +461,8 @@ def main():
     ap.add_argument("--image", default="", help="suite image reference, recorded in the results")
     ap.add_argument("--results-json", help="write the results here")
     ap.add_argument("--splice", help="rewrite the results section of this markdown file")
+    ap.add_argument("--root", default=os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                    help="the repository the example is built from, named in the results")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -431,6 +474,7 @@ def main():
 
     run = {"date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M"),
            "suite_image": args.image, "plans": []}
+    against = tree_of(args.root)
     key_path, jwk = (make_key(args.out) if any(p.get("private_key") for p in chosen) else (None, None))
     for plan in chosen:
         config = {
@@ -465,9 +509,10 @@ def main():
         export_plan(suite, plan_id, os.path.join(args.out, "%s.export.zip" % plan["alias"]))
         entry = {"key": plan["key"], "plan": plan["name"], "plan_id": plan_id, "variant": plan["variant"],
                  "date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M"),
-                 "modules_in_plan": in_plan, "modules": results}
+                 "against": against, "modules_in_plan": in_plan, "modules": results}
         if plan.get("private_key"):
             entry["title_suffix"] = " (client_auth_type `private_key_jwt`)"
+            entry["signing_key"] = "a P-256 key (ES256)"
         run["plans"].append(entry)
 
     try:

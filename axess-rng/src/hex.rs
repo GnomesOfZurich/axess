@@ -67,8 +67,11 @@ pub fn decode_to_slice(hex: &str, out: &mut [u8]) -> Result<(), HexError> {
         return Err(HexError::WrongLength);
     }
     let (pairs, _) = hex.as_chunks::<2>();
+    // Sixteen times the high digit plus the low one: written so, no other
+    // operator gives the same byte for every pair (with a shift, `|`, `^`
+    // and `+` all do, so a test cannot tell them apart).
     for (byte, [high, low]) in out.iter_mut().zip(pairs) {
-        *byte = (nibble(*high)? << 4) | nibble(*low)?;
+        *byte = nibble(*high)? * 16 + nibble(*low)?;
     }
     Ok(())
 }
@@ -114,6 +117,22 @@ mod tests {
         assert_eq!(lower, lower.to_ascii_lowercase());
         assert_eq!(decode(&lower).unwrap(), all);
         assert_eq!(decode(&lower.to_ascii_uppercase()).unwrap(), all);
+    }
+
+    #[test]
+    fn each_error_says_what_was_refused() {
+        assert_eq!(
+            HexError::OddLength.to_string(),
+            "hex string has an odd number of digits"
+        );
+        assert_eq!(
+            HexError::InvalidDigit.to_string(),
+            "hex string contains a non-hex character"
+        );
+        assert_eq!(
+            HexError::WrongLength.to_string(),
+            "hex string does not match the output length"
+        );
     }
 
     #[test]

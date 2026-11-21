@@ -11,18 +11,12 @@
 #![cfg(test)]
 
 use super::*;
+use axess_clock::testing::Shift;
 
-/// A session row written by an older library that omitted
-/// the `version` field (because it predated `SESSION_DATA_VERSION`)
-/// must deserialise with `version == 1`. A
-/// `default_version -> 0` mutation would silently mark every such
-/// row as v0; `migrate()` would then think it needs an upgrade
-/// every load, churning the store.
-///
-/// Invariant: a missing `version` field deserialises to the
-/// pre-versioning legacy value `1` (NOT to the current
-/// `SESSION_DATA_VERSION`); `migrate()` is responsible for
-/// upgrading from there.
+/// A session row that omits the `version` field (as rows did before the
+/// field existed) deserialises with `version == 1`, never with the current
+/// `SESSION_DATA_VERSION`: such a row is below the current version, and the
+/// session layer does not serve it.
 #[test]
 fn deserialised_session_without_version_field_defaults_to_one() {
     let json = serde_json::json!({
@@ -32,95 +26,6 @@ fn deserialised_session_without_version_field_defaults_to_one() {
     });
     let parsed: SessionData = serde_json::from_value(json).expect("parse");
     assert_eq!(parsed.version, 1);
-}
-
-/// A session already at the current version must NOT be
-/// re-migrated. Pins the `>=` guard against `<` and the
-/// `-> true` / `-> false` body-replacement mutations: the only
-/// behaviour consistent with all four mutation deltas is "false
-/// when current; true when older; never the other way around".
-#[test]
-fn migrate_returns_false_when_version_already_current() {
-    let mut data = SessionData::default();
-    assert_eq!(data.version, SESSION_DATA_VERSION);
-    let migrated = data.migrate();
-    assert!(
-        !migrated,
-        "migrate must be a no-op when already at current version"
-    );
-    assert_eq!(data.version, SESSION_DATA_VERSION);
-}
-
-/// A stale (below-current) session is migrated and the function
-/// returns `true`. Combined with the "current returns false" test
-/// this discriminates `-> true` from `-> false` for `migrate`. Uses
-/// `version: 1` (the real legacy pre-versioning value: see
-/// `default_version`); `0` is not a state any deserialiser produces.
-#[test]
-fn migrate_returns_true_and_bumps_version_when_stale() {
-    let mut data = SessionData {
-        version: 1,
-        ..Default::default()
-    };
-    let migrated = data.migrate();
-    assert!(migrated, "migrate must return true on upgrade");
-    assert_eq!(
-        data.version, SESSION_DATA_VERSION,
-        "migrate must bump version to current"
-    );
-}
-
-/// A v1 session deserialised by a v2-aware library must
-/// land with `device_id = None` via `serde(default)`. Pins the
-/// wire-format compatibility: a `#[serde(default)]` removal would
-/// fail this test because the `device_id` field would be missing
-/// from the input JSON.
-#[test]
-fn deserialised_v1_session_gets_none_device_id() {
-    let json = serde_json::json!({
-        "version": 1,
-        "auth_state": { "kind": "Guest" },
-        "fingerprint": null,
-        "custom": {}
-    });
-    let parsed: SessionData = serde_json::from_value(json).expect("parse v1");
-    assert_eq!(parsed.device_id, None);
-    assert_eq!(parsed.version, 1, "deserialisation must NOT auto-migrate");
-}
-
-/// Explicit migration from v1 bumps the version to v2 and
-/// returns true. A v2 session loaded from disk does not need the
-/// migration to do anything beyond the version bump because
-/// `serde(default)` already filled the in-memory representation.
-#[test]
-fn migrate_v1_to_v2_bumps_version_and_signals_resave() {
-    let mut data = SessionData {
-        version: 1,
-        ..Default::default()
-    };
-    let migrated = data.migrate();
-    assert!(migrated, "v1 → v2 must signal a resave");
-    assert_eq!(data.version, SESSION_DATA_VERSION);
-    assert_eq!(data.device_id, None);
-}
-
-/// A future-version session (someone downgraded the
-/// library) MUST NOT regress its version field. Pins the
-/// `>=` direction: a `<` mutation would treat newer rows as
-/// "needs upgrade" and clobber them down to `SESSION_DATA_VERSION`.
-#[test]
-fn migrate_does_not_regress_future_version() {
-    let mut data = SessionData {
-        version: SESSION_DATA_VERSION.saturating_add(1),
-        ..Default::default()
-    };
-    let before = data.version;
-    let migrated = data.migrate();
-    assert!(!migrated, "migrate must be no-op for future-version data");
-    assert_eq!(
-        data.version, before,
-        "migrate must NOT clobber future-version field"
-    );
 }
 
 /// `pending_user_id()` returns `None` only for Guest and `Some`
@@ -142,7 +47,8 @@ fn only_an_authenticated_state_has_an_authenticated_user_id() {
         AuthState::Authenticated {
             user_id: user,
             tenant_id: tenant,
-            authn_time: chrono::Utc::now(),
+            authn_time: axess_clock::testing::MockClock::reference_time(),
+            signed_in_at: axess_clock::testing::MockClock::reference_time(),
             factors_completed: vec![],
             impersonator: None,
             ldap_groups: None,
@@ -173,7 +79,8 @@ fn pending_user_id_returns_none_only_for_guest() {
         AuthState::Authenticated {
             user_id: user,
             tenant_id: tenant,
-            authn_time: chrono::Utc::now(),
+            authn_time: axess_clock::testing::MockClock::reference_time(),
+            signed_in_at: axess_clock::testing::MockClock::reference_time(),
             factors_completed: vec![],
             impersonator: None,
             ldap_groups: None,
@@ -195,7 +102,8 @@ fn tenant_id_returns_none_only_for_guest() {
         AuthState::Authenticated {
             user_id: user,
             tenant_id: tenant,
-            authn_time: chrono::Utc::now(),
+            authn_time: axess_clock::testing::MockClock::reference_time(),
+            signed_in_at: axess_clock::testing::MockClock::reference_time(),
             factors_completed: vec![],
             impersonator: None,
             ldap_groups: None,
@@ -217,7 +125,8 @@ fn is_authenticated_only_for_authenticated_variant() {
         AuthState::Authenticated {
             user_id: user,
             tenant_id: tenant,
-            authn_time: chrono::Utc::now(),
+            authn_time: axess_clock::testing::MockClock::reference_time(),
+            signed_in_at: axess_clock::testing::MockClock::reference_time(),
             factors_completed: vec![],
             impersonator: None,
             ldap_groups: None,
@@ -238,7 +147,8 @@ fn is_guest_only_for_guest_variant() {
         !AuthState::Authenticated {
             user_id: user,
             tenant_id: tenant,
-            authn_time: chrono::Utc::now(),
+            authn_time: axess_clock::testing::MockClock::reference_time(),
+            signed_in_at: axess_clock::testing::MockClock::reference_time(),
             factors_completed: vec![],
             impersonator: None,
             ldap_groups: None,
@@ -251,7 +161,7 @@ fn is_guest_only_for_guest_variant() {
 /// WorkflowState::new initialises current_step=0.
 #[test]
 fn workflow_state_new_starts_at_step_zero() {
-    let now = chrono::Utc::now();
+    let now = axess_clock::testing::MockClock::reference_time();
     let ws = WorkflowState::new(WorkflowKind::Signup, 3, now);
     assert_eq!(ws.current_step, 0);
     assert_eq!(ws.total_steps, 3);
@@ -267,10 +177,17 @@ fn session_data_json_round_trip() {
         auth_state: AuthState::Authenticated {
             user_id: axess_identity::testing::user("alice"),
             tenant_id: axess_identity::testing::tenant("acme"),
-            authn_time: chrono::Utc::now(),
+            authn_time: axess_clock::testing::MockClock::reference_time(),
+            signed_in_at: axess_clock::testing::MockClock::reference_time(),
             factors_completed: vec![
-                (FactorKind::Password, chrono::Utc::now()),
-                (FactorKind::Totp, chrono::Utc::now()),
+                (
+                    FactorKind::Password,
+                    axess_clock::testing::MockClock::reference_time(),
+                ),
+                (
+                    FactorKind::Totp,
+                    axess_clock::testing::MockClock::reference_time(),
+                ),
             ],
             impersonator: None,
             ldap_groups: None,
@@ -279,9 +196,13 @@ fn session_data_json_round_trip() {
         fingerprint: Some("fp-abc".to_string()),
         device_id: Some(axess_identity::testing::device("dev-1")),
         device_proven: false,
+        device_key: None,
+        key_proven: false,
+        key_binding: None,
         custom: serde_json::json!({"key": "value"}),
         revision: 7,
-        touched_at: Some(chrono::Utc::now()),
+        touched_at: Some(axess_clock::testing::MockClock::reference_time()),
+        ending: None,
     };
     let json = serde_json::to_value(&data).unwrap();
     let restored: SessionData = serde_json::from_value(json).unwrap();
@@ -319,6 +240,7 @@ fn is_authenticating_only_true_for_authenticating_variant() {
             ldap_groups: None,
             assurance: Vec::new(),
             impersonator: None,
+            flow: AuthFlow::Login,
         }
         .is_authenticating()
     );
@@ -326,7 +248,8 @@ fn is_authenticating_only_true_for_authenticating_variant() {
         !AuthState::Authenticated {
             user_id: user,
             tenant_id: tenant,
-            authn_time: chrono::Utc::now(),
+            authn_time: axess_clock::testing::MockClock::reference_time(),
+            signed_in_at: axess_clock::testing::MockClock::reference_time(),
             factors_completed: vec![],
             impersonator: None,
             ldap_groups: None,
@@ -338,7 +261,11 @@ fn is_authenticating_only_true_for_authenticating_variant() {
         !AuthState::PendingWorkflow {
             user_id: user,
             tenant_id: tenant,
-            workflow: WorkflowState::new(WorkflowKind::Signup, 1, chrono::Utc::now()),
+            workflow: WorkflowState::new(
+                WorkflowKind::Signup,
+                1,
+                axess_clock::testing::MockClock::reference_time()
+            ),
         }
         .is_authenticating()
     );
@@ -350,8 +277,8 @@ fn is_authenticating_only_true_for_authenticating_variant() {
 // no `AuthSession`, no `SessionData`, no async, no RwLock. Each test
 // pins one transition's pre- and post-state.
 
-fn now() -> DateTime<Utc> {
-    chrono::Utc::now()
+fn now() -> Timestamp {
+    axess_clock::testing::MockClock::reference_time()
 }
 
 #[test]
@@ -392,7 +319,9 @@ fn begin_authenticating_constructs_authenticating_with_factors_in_order() {
             ldap_groups,
             impersonator,
             assurance,
+            flow,
         } => {
+            assert_eq!(flow, AuthFlow::Login, "a login is opened as a login");
             assert!(assurance.is_empty(), "a login begins with no proof");
             assert_eq!(user_id, user);
             assert_eq!(tenant_id, tenant);
@@ -423,6 +352,7 @@ fn set_authenticated_constructs_authenticated_with_empty_factors() {
             user_id,
             tenant_id,
             authn_time,
+            signed_in_at,
             factors_completed,
             impersonator,
             ldap_groups,
@@ -432,6 +362,7 @@ fn set_authenticated_constructs_authenticated_with_empty_factors() {
             assert_eq!(user_id, user);
             assert_eq!(tenant_id, tenant);
             assert_eq!(authn_time, t);
+            assert_eq!(signed_in_at, t, "a direct transition is its own login");
             assert_eq!(impersonator, None, "a login is nobody's impersonation");
             assert_eq!(ldap_groups, None, "no LDAP bind in this login");
             assert!(
@@ -458,6 +389,7 @@ fn advance_factor_still_authenticating_when_factors_remain() {
         ldap_groups: None,
         assurance: Vec::new(),
         impersonator: None,
+        flow: AuthFlow::Login,
     };
     let outcome = state.advance_factor(crate::authn::assurance::FactorAssurance::for_kind(
         FactorKind::Password,
@@ -493,6 +425,7 @@ fn advance_factor_completes_when_last_factor_verified() {
         ldap_groups: None,
         assurance: Vec::new(),
         impersonator: None,
+        flow: AuthFlow::Login,
     };
     let outcome = state.advance_factor(crate::authn::assurance::FactorAssurance::for_kind(
         FactorKind::Password,
@@ -504,11 +437,16 @@ fn advance_factor_completes_when_last_factor_verified() {
             user_id,
             tenant_id,
             authn_time,
+            signed_in_at,
             factors_completed,
             impersonator,
             ldap_groups,
             assurance,
         } => {
+            assert_eq!(
+                signed_in_at, authn_time,
+                "a login is signed in when it completes"
+            );
             assert_eq!(
                 assurance,
                 vec![crate::authn::assurance::FactorAssurance::for_kind(
@@ -548,6 +486,7 @@ fn advance_factor_carries_completed_factors_into_authenticated() {
         ldap_groups: None,
         assurance: Vec::new(),
         impersonator: None,
+        flow: AuthFlow::Login,
     };
     assert_eq!(
         state.advance_factor(crate::authn::assurance::FactorAssurance::for_kind(
@@ -595,6 +534,7 @@ fn advance_factor_no_op_when_kind_not_in_remaining() {
         ldap_groups: None,
         assurance: Vec::new(),
         impersonator: None,
+        flow: AuthFlow::Login,
     };
     let outcome = state.advance_factor(crate::authn::assurance::FactorAssurance::for_kind(
         FactorKind::Totp,
@@ -647,6 +587,7 @@ fn record_attempt_at_increments_counter_and_captures_timestamp() {
         ldap_groups: None,
         assurance: Vec::new(),
         impersonator: None,
+        flow: AuthFlow::Login,
     };
     state.record_attempt_at(t);
     state.record_attempt_at(t);
@@ -719,7 +660,7 @@ fn a_choice_step_is_completed_by_whichever_factor_it_offers() {
             FactorStep::AnyOf(vec![FactorKind::Totp, FactorKind::RecoveryCode]),
         ],
     );
-    let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let now = Timestamp::from_unix_seconds(1_700_000_000).unwrap();
     assert_eq!(
         state.advance_factor(crate::authn::assurance::FactorAssurance::for_kind(
             FactorKind::Password,
@@ -743,38 +684,6 @@ fn a_choice_step_is_completed_by_whichever_factor_it_offers() {
         ),
         other => panic!("expected Authenticated, got {other:?}"),
     }
-}
-
-/// A session written mid-login by a release that stored `remaining` as a
-/// list of kinds still loads, its kinds read as required steps.
-#[test]
-fn a_mid_login_session_from_an_earlier_release_still_loads() {
-    use crate::authn::factor::FactorStep;
-    let legacy = serde_json::json!({
-        "kind": "Authenticating",
-        "user_id": axess_identity::testing::user("u1"),
-        "tenant_id": axess_identity::testing::tenant("t1"),
-        "method_name": "password+totp",
-        "remaining": ["Totp"],
-        "completed": ["Password"],
-        "attempt_count": 0,
-        "last_attempt": null,
-    });
-    let state: AuthState = serde_json::from_value(legacy.clone()).unwrap();
-    match &state {
-        AuthState::Authenticating { remaining, .. } => {
-            assert_eq!(remaining, &vec![FactorStep::Required(FactorKind::Totp)]);
-        }
-        other => panic!("expected Authenticating, got {other:?}"),
-    }
-    // And through the session codec's own format.
-    let packed = rmp_serde::to_vec_named(&legacy).unwrap();
-    let from_msgpack: AuthState = rmp_serde::from_slice(&packed).unwrap();
-    assert_eq!(from_msgpack, state);
-    // The current shape round-trips.
-    let again: AuthState =
-        rmp_serde::from_slice(&rmp_serde::to_vec_named(&state).unwrap()).unwrap();
-    assert_eq!(again, state);
 }
 
 /// The impersonation is stored as an object with named fields, so a field
@@ -814,6 +723,7 @@ fn ldap_groups_ride_the_login_into_the_authenticated_state() {
         ldap_groups: Some(staff.clone()),
         impersonator: None,
         assurance: Vec::new(),
+        flow: AuthFlow::Login,
     };
     assert_eq!(state.ldap_groups(), None, "not before the login completes");
 
@@ -871,7 +781,7 @@ fn a_step_up_keeps_the_impersonation() {
     );
 }
 
-fn kinds(factors: &[(FactorKind, chrono::DateTime<chrono::Utc>)]) -> Vec<FactorKind> {
+fn kinds(factors: &[(FactorKind, axess_clock::Timestamp)]) -> Vec<FactorKind> {
     factors.iter().map(|(kind, _)| kind.clone()).collect()
 }
 
@@ -887,7 +797,7 @@ fn user_and_tenant() -> (UserId, TenantId) {
 #[test]
 fn a_step_up_keeps_the_time_of_the_factors_before_it() {
     let (user, tenant) = user_and_tenant();
-    let login = now() - chrono::Duration::hours(3);
+    let login = now().minus(axess_clock::SignedDuration::hours(3));
     let step_up = now();
     let mut state = AuthState::Authenticating {
         user_id: user,
@@ -900,6 +810,7 @@ fn a_step_up_keeps_the_time_of_the_factors_before_it() {
         ldap_groups: None,
         assurance: Vec::new(),
         impersonator: None,
+        flow: AuthFlow::Login,
     };
     assert_eq!(
         state.advance_factor(crate::authn::assurance::FactorAssurance::for_kind(
@@ -929,50 +840,133 @@ fn a_step_up_keeps_the_time_of_the_factors_before_it() {
     }
 }
 
-/// A row written by 0.15.0 holds a plain list of kinds: each is read as
-/// verified at the row's `authn_time`, and the next write is the new form.
+/// Whether a request proved the session's device is that request's own
+/// answer and no part of the stored session: it is not written, and a row
+/// that carries it from an earlier release reads as unproven.
 #[test]
-fn a_plain_list_of_factor_kinds_reads_as_verified_at_authn_time() {
-    let (user, tenant) = user_and_tenant();
-    let at = now();
-    let current = AuthState::Authenticated {
-        user_id: user,
-        tenant_id: tenant,
-        authn_time: at,
-        factors_completed: vec![(FactorKind::Password, at), (FactorKind::Totp, at)],
-        impersonator: None,
-        ldap_groups: None,
-        assurance: Vec::new(),
+fn whether_the_device_was_proven_is_never_stored() {
+    let data = SessionData {
+        device_id: Some(axess_identity::testing::device("dev-1")),
+        device_proven: true,
+        device_key: None,
+        key_proven: false,
+        key_binding: None,
+        ..SessionData::default()
     };
-    let mut row = serde_json::to_value(&current).unwrap();
-    row["factors_completed"] = serde_json::json!(["Password", "Totp"]);
+    let stored = serde_json::to_value(&data).unwrap();
+    assert!(stored.get("device_proven").is_none(), "{stored}");
+    assert!(!stored["device_id"].is_null(), "{stored}");
 
-    let read: AuthState = serde_json::from_value(row).unwrap();
-    assert_eq!(read, current);
-
-    let written = serde_json::to_value(&read).unwrap();
-    assert!(written["factors_completed"][0].is_array(), "{written}");
-    assert_eq!(serde_json::from_value::<AuthState>(written).unwrap(), read);
+    let mut earlier = stored;
+    earlier["device_proven"] = serde_json::json!(true);
+    let read: SessionData = serde_json::from_value(earlier).unwrap();
+    assert!(!read.device_proven);
+    assert_eq!(read.device_id, data.device_id);
 }
 
-/// An in-flight login of an earlier release has no `authn_time`; its factors
-/// read as verified at the Unix epoch, which no freshness check passes.
+/// A merge with what another request stored keeps this request's own answer
+/// about the device, whatever the rows on either side say.
 #[test]
-fn a_plain_list_in_an_authenticating_row_reads_as_the_epoch() {
-    let (user, tenant) = user_and_tenant();
-    let current = AuthState::Authenticating {
-        user_id: user,
-        tenant_id: tenant,
-        method_name: "step-up".into(),
-        remaining: required(vec![FactorKind::Totp]),
-        completed: vec![(FactorKind::Password, DateTime::<Utc>::UNIX_EPOCH)],
-        attempt_count: 0,
-        last_attempt: None,
-        ldap_groups: None,
-        assurance: Vec::new(),
-        impersonator: None,
+fn a_merge_keeps_this_requests_own_answer_about_the_device() {
+    let with = |proven: bool| SessionData {
+        device_proven: proven,
+        device_key: None,
+        key_proven: false,
+        key_binding: None,
+        ..SessionData::default()
     };
-    let mut row = serde_json::to_value(&current).unwrap();
-    row["completed"] = serde_json::json!(["Password"]);
-    assert_eq!(serde_json::from_value::<AuthState>(row).unwrap(), current);
+    for (base, local, fresh) in [
+        (false, true, false),
+        (true, true, false),
+        (true, false, true),
+        (false, false, true),
+    ] {
+        let (base, mine, fresh) = (with(base), with(local), with(fresh));
+        assert_eq!(merge_concurrent(&base, &mine, &fresh).device_proven, local);
+        assert_eq!(merge_rotating(&base, &mine, &fresh).device_proven, local);
+    }
+}
+
+/// The person at the browser, whose a session's device is: the user of the
+/// user's own session, the administrator of an impersonation, and nobody
+/// for a state that is not fully authenticated.
+#[test]
+fn the_person_at_the_browser_of_an_impersonation_is_the_administrator() {
+    use axess_identity::testing::{tenant, user};
+    let (alice, admin) = (user("alice"), user("admin"));
+    assert_eq!(AuthState::Guest.person_at_browser(), None);
+
+    let mut state = AuthState::Guest;
+    state.set_authenticated(alice, tenant("t1"), now());
+    assert_eq!(state.person_at_browser(), Some(alice));
+
+    assert!(state.set_impersonator(admin, now()));
+    assert_eq!(state.authenticated_user_id(), Some(&alice));
+    assert_eq!(state.person_at_browser(), Some(admin));
+}
+
+/// The version of a stored row is read on its own, from a row of any shape:
+/// a row with no `version` member reads as 1, and bytes that are not
+/// MessagePack are an error.
+#[cfg(any(
+    feature = "sqlite",
+    feature = "sqlite-unbundled",
+    feature = "postgres",
+    feature = "mysql",
+    feature = "valkey"
+))]
+#[test]
+fn the_version_of_a_stored_row_is_read_whatever_the_rest_holds() {
+    let packed = |row: serde_json::Value| rmp_serde::to_vec_named(&row).unwrap();
+    assert_eq!(
+        stored_version(&packed(serde_json::json!({ "auth_state": "not a state" }))).unwrap(),
+        1
+    );
+    for version in [1u8, 2, 3, 4] {
+        let row = packed(serde_json::json!({ "version": version, "auth_state": 7 }));
+        assert_eq!(stored_version(&row).unwrap(), version);
+    }
+    let current = rmp_serde::to_vec_named(&SessionData::default()).unwrap();
+    assert_eq!(stored_version(&current).unwrap(), SESSION_DATA_VERSION);
+    assert!(stored_version(b"{\"version\":3}").is_err());
+}
+
+/// What a store hands up for a row below the version holds that version and
+/// nothing of the row.
+#[test]
+fn a_row_below_the_version_is_handed_up_as_its_version_alone() {
+    let below = SessionData::below_version(2);
+    assert_eq!(below.version, 2);
+    assert!(below.auth_state.is_guest());
+    assert_eq!(below.revision, 0);
+    assert_eq!(below.custom, serde_json::Value::Null);
+}
+
+/// The anchor of a fixed impersonation is a fixed key: the SHA-256, whole,
+/// of a tag of its own, the administrator, the target and the start time.
+/// It is not the key of the 16-byte id an earlier release used as the anchor.
+#[test]
+fn an_impersonations_registry_anchor_is_a_fixed_key_of_its_own() {
+    use crate::session::id::{SessionId, SessionKey};
+    let admin = crate::authn::ids::UserId::try_new("00000000-0000-4000-8000-0000000000a1")
+        .expect("a user id");
+    let target = crate::authn::ids::UserId::try_new("00000000-0000-4000-8000-0000000000b2")
+        .expect("a user id");
+    let imp = Impersonation {
+        admin,
+        since: Timestamp::from_unix_seconds(1_800_000_000).expect("in range"),
+    };
+    let anchor = imp.registry_anchor(&target);
+    assert_eq!(
+        anchor.to_string(),
+        "76f21623e24ceba36bd55cc09210183fbb9dce838d32788bc15abe93e7578e1a"
+    );
+    let mut earlier = [0u8; 16];
+    earlier.copy_from_slice(&anchor.as_bytes()[..16]);
+    let of_the_earlier_id = SessionKey::of(&SessionId::from_bytes(earlier));
+    assert_eq!(
+        of_the_earlier_id.to_string(),
+        "4514ddd18c946ba80fc5bbb2e2085dd4eb6c603840e726dc894732342b17a7dd"
+    );
+    assert_ne!(anchor, of_the_earlier_id);
 }

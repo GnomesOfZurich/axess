@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>axess FIDO2 example</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main>
+    <h1>axess FIDO2 example</h1>
+    <p id="unsupported" hidden>
+      This browser has no WebAuthn here. Open the page as
+      <code>http://localhost:3000</code> (not <code>127.0.0.1</code>) in a
+      browser that supports passkeys.
+    </p>
+
+    <section id="signed-out" hidden>
+      <h2>Sign in</h2>
+      <form id="password-form">
+        <label>Username
+          <input id="username" name="username" value="alice" autocomplete="username webauthn" required>
+        </label>
+        <label>Password
+          <input id="password" name="password" type="password" autocomplete="current-password">
+        </label>
+        <div class="row">
+          <button type="submit">Sign in with the password</button>
+          <button type="button" id="security-key-login">Sign in with a security key</button>
+        </div>
+      </form>
+      <p class="hint">The demo account is <code>alice</code> with the password <code>Sample2+</code>.</p>
+      <h3>No username</h3>
+      <div class="row">
+        <button type="button" id="passkey-login">Sign in with a passkey</button>
+        <button type="button" id="cross-device-login">Use a passkey on another device</button>
+      </div>
+      <p class="hint">
+        The second button asks the browser to lead with a QR code for a phone
+        (cross-device authentication). The server verifies both the same way.
+      </p>
+      <p id="pending" class="hint" hidden>
+        A step-up is open in this session and waits for its factor. Until it
+        is finished the session is not signed in.
+        <button type="button" id="resume">Continue it</button>
+      </p>
+    </section>
+
+    <section id="signed-in" hidden>
+      <h2>Signed in as <span id="who"></span></h2>
+      <button type="button" id="logout">Sign out</button>
+
+      <h3>What this session proved</h3>
+      <table>
+        <thead><tr><th>Factor</th><th>User verified</th><th>Credential</th><th>Age</th></tr></thead>
+        <tbody id="factors"></tbody>
+      </table>
+
+      <h3>Credentials</h3>
+      <table>
+        <thead><tr><th>Name</th><th>Kind</th><th>Registered</th><th>Last used</th><th></th></tr></thead>
+        <tbody id="credentials"></tbody>
+      </table>
+      <div class="row">
+        <button type="button" data-register="passkey">Add a passkey</button>
+        <button type="button" data-register="security_key">Add a security key</button>
+        <button type="button" data-register="attested_passkey" hidden>Add an attested passkey</button>
+      </div>
+      <p id="offer" class="hint" hidden>
+        That sign-in came from another device.
+        <button type="button" id="offer-accept">Create a passkey on this device</button>
+      </p>
+
+      <h3>A payment</h3>
+      <p class="hint">
+        Approving it takes a FIDO2 assertion that verified you within the last
+        five minutes. The server says so with <code>step_up_required</code>,
+        and the page runs the step-up it names.
+      </p>
+      <button type="button" id="approve">Approve payment 42</button>
+    </section>
+
+    <h3>Log</h3>
+    <ol id="log"></ol>
+  </main>
+
+  <dialog id="password-dialog">
+    <form method="dialog">
+      <label>Enter your password to continue
+        <input id="step-up-password" type="password" autocomplete="current-password" required>
+      </label>
+      <div class="row">
+        <button type="submit" value="confirm">Continue</button>
+        <button type="submit" value="cancel" formnovalidate>Cancel</button>
+      </div>
+    </form>
+  </dialog>
+  <script src="/app.js"></script>
+</body>
+</html>

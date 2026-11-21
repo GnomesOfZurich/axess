@@ -6,7 +6,6 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 documentation = "https://docs.rs/axess-core"
 readme = "README.md"
 description = """
@@ -19,57 +18,133 @@ categories = ["web-programming", "authentication"]
 exclude = ["tests/", "benches/"]
 
 [package.metadata.docs.rs]
-all-features = true
+# Every feature but `sqlite-unbundled`, which needs libclang and the
+# system's SQLite header at build time; `sqlite` documents the same
+# stores. `all-features = true` would switch it on, on a machine this
+# project does not control. scripts/check-docsrs-features.sh holds this
+# list to `[features]`: a feature in neither it nor the script's named
+# exclusions fails the check.
+features = [
+    "authz",
+    "device",
+    "device-keys",
+    "default-error-response",
+    "memory",
+    "testing",
+    "allow-testing-in-release",
+    "accept-client-id",
+    "request-id",
+    "service-secret",
+    "trace-context",
+    "ws",
+    "fapi",
+    "fido2",
+    "jwt",
+    "jwt-aws-lc",
+    "jwt-rust-crypto",
+    "jwt-svid",
+    "ldap",
+    "mtls",
+    "oauth",
+    "social",
+    "outbound-mtls",
+    "outbound-oauth",
+    "client-assertion-rsa",
+    "delegated",
+    "delegated-exchange",
+    "delegated-stored",
+    "delegated-stored-encrypted",
+    "aws-sts",
+    "azure-fic",
+    "cloud-sts",
+    "gcp-wif",
+    "local-idp",
+    "spire",
+    "local-idp-rsa",
+    "valkey-cache",
+    "mysql",
+    "postgres",
+    "sqlite",
+    "valkey",
+    "audit-archive-fs",
+    "rkyv",
+    "serde",
+    "sqlx",
+    "workload-id",
+]
 rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
 
 [dependencies]
 # Workspace internal
-axess-cache = { workspace = true }
-axess-clock = { workspace = true }
+# The TTL caches of `authz` and `device`.
+axess-cache = { workspace = true, optional = true }
+# `serde`: the stored types hold a `Timestamp` or an `Until`.
+axess-clock = { workspace = true, features = ["serde"] }
 axess-factors = { workspace = true }
 axess-identity = { workspace = true, features = ["serde"] }
 axess-rng = { workspace = true }
 
 # External
 aes-gcm = { workspace = true }
-# The policy swap slot: a wait-free read on the request path (already in the
-# tree through `fred`).
-arc-swap = "1.9.3"
-axum = { workspace = true, default-features = false, features = ["original-uri", "form", "json", "query", "tokio"] }
+# The swap slots read on the request path without a lock: the policy of
+# `authz`, the providers of `oauth`, `fido2` and `ldap` (already in the tree
+# through `fred` with `valkey`).
+arc-swap = { version = "1.9.3", optional = true }
+axum = { workspace = true, default-features = false, features = ["original-uri", "matched-path", "form", "json", "query", "tokio"] }
 base64 = { workspace = true }
 cedar-policy = { version = "4.14.1", optional = true }
-chrono = { workspace = true, features = ["serde"] }
 # Only what the Valkey code calls: the standard command families (`i-std`),
 # `EVAL` (`i-scripts`) and the pub/sub client of the policy reload
 # (`subscriber-client`). No transactions, replica routing or cluster commands.
 # `blocking-encoding` stays: it keeps large-frame encoding off the runtime
 # thread, and it is what enables tokio's `rt-multi-thread` for a Valkey build.
 fred = { version = "10.1.0", default-features = false, features = ["i-std", "i-scripts", "subscriber-client", "blocking-encoding"], optional = true }
+# The SPIFFE Workload API client (`spire`) speaks gRPC over HTTP/2 itself,
+# on the `h2` that hyper already puts in the lockfile (for the features that
+# make HTTP requests), with the handful of Workload API messages read and
+# written by hand. A gRPC stack (tonic and prost, or the upstream SPIFFE
+# crates built on them) is new to the lockfile with everything under it, for
+# five small messages; this adds no crate to the lockfile.
+h2 = { version = "0.4.20", optional = true }
 hmac = { workspace = true }
 # No backend here either: see axess-factors' note. The adopter picks with
 # `jwt-aws-lc` or `jwt-rust-crypto`, which this crate passes through.
+# Held at 11: jsonwebtoken 12 requires rsa ^0.10, which openidconnect and
+# crypto-glue keep out of the lock (see rsa).
 jsonwebtoken = { version = "11.1.0", default-features = false, optional = true }
 ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-ring"], optional = true }
 # `timing-resistant-secret-traits` makes secret-bearing types refuse
 # `PartialEq` / `Hash` derives: the property an auth library wants from
 # its OIDC client.
 openidconnect = { version = "4.1.0", default-features = false, features = ["reqwest", "rustls-tls", "timing-resistant-secret-traits"], optional = true }
-# 0.13 to match jsonwebtoken's transitive pin. openidconnect 4.1 and
-# webauthn-rs (through crypto-glue) are on 0.14, so a build with `oauth` or
-# `fido2` carries both. 0.14 additionally needs elliptic-curve 0.14 and drops the `jwk`
-# feature selected here.
-# Carries crypto-bigint 0.5.5 (RUSTSEC-2026-0387, accepted in deny.toml):
-# the upstream pins keep it in the tree whatever this line says.
-p256 = { version = "0.13.2", features = ["ecdsa", "jwk"], optional = true }
+# The local IdP's EC keys: generation, PKCS#8 and SEC1 parsing, point
+# encoding. On the 0.14 line, with openidconnect and webauthn-rs (through
+# crypto-glue), so it adds no package to the workspace's Cargo.lock.
+# jsonwebtoken's `rust_crypto` backend still pins 0.13 and with it
+# crypto-bigint 0.5 (RUSTSEC-2026-0387, accepted in deny.toml). So a
+# `local-idp` build on `jwt-rust-crypto` compiles both curve lines (0.14
+# here, 0.13 under jsonwebtoken), whatever else is on; a build on
+# `jwt-aws-lc` alone carries 0.14 only.
+p256 = { version = "0.14.0", features = ["ecdsa"], optional = true }
 quick-xml = { workspace = true, optional = true }
 unicode-normalization = { version = "0.1.26", default-features = false, features = ["std"] }
 regex = { version = "1.13.1", default-features = false, features = ["std", "unicode-perl"] }
 # 0.12 to match openidconnect's transitive pin; avoids a duplicate-major.
+# Held at 0.12 until oauth2 and openidconnect require reqwest 0.13: a
+# ScreenedClient is handed to openidconnect as its own reqwest client.
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "json"], optional = true }
 rkyv = { workspace = true, optional = true }
 rmp-serde = { version = "1.3.1", optional = true }
-# RUSTSEC-2023-0071 (Marvin Attack on PKCS#1 v1.5 decryption) does not
-# apply here: only used for signature mint+verify in LocalIdp fixtures.
+# Behind `local-idp-rsa` alone: RSA key generation and PKCS#1 / PKCS#8
+# parsing for `LocalIdpSigningKey`, none of them a private-key operation.
+# The signatures are made by jsonwebtoken's backend, and under
+# `jwt-rust-crypto` alone that backend is this crate's 0.9 line, the code
+# RUSTSEC-2023-0071 covers (accepted in deny.toml, which has the account).
+# Held at 0.9 until openidconnect accepts rsa 0.10 and crypto-glue (through
+# webauthn-rs) moves from its rsa 0.10 release candidate to rsa 0.10.0.
 rsa = { version = "0.9.10", features = ["pkcs5"], optional = true }
 # Adopter installs the CryptoProvider at process startup (aws-lc-rs / ring):
 # this crate stays cipher-agnostic.
@@ -110,7 +185,7 @@ zeroize = { workspace = true }
 # etc. without forcing production builds to compile the mocks.
 axess-clock = { workspace = true, features = ["testing", "allow-testing-in-release"] }
 axess-factors = { workspace = true, features = ["testing", "allow-testing-in-release"] }
-axess-identity = { workspace = true, features = ["testing"] }
+axess-identity = { workspace = true, features = ["testing", "allow-testing-in-release"] }
 axess-rng = { workspace = true, features = ["testing", "allow-testing-in-release"] }
 # The tracing capture and the OIDC identity-provider fixture: a dev-dependency
 # only, so `wiremock` and its `rsa` are reachable from no production edge.
@@ -124,6 +199,8 @@ rcgen = "0.14.10"
 # Match the production `outbound-oauth` reqwest pin: rustls only, so
 # `native-tls` and `openssl-sys` stay out of the lockfile. `json` is the live
 # Keycloak test's response decoding.
+# Held at 0.12 until oauth2 and openidconnect require reqwest 0.13: a
+# ScreenedClient is handed to openidconnect as its own reqwest client.
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "cookies", "json"] }
 # rmp-serde is normally feature-gated (sqlite/postgres/valkey); pull into
 # dev-deps so the wire-format proptest suite runs independently of storage.
@@ -131,6 +208,8 @@ rmp-serde = "1.3.1"
 # The WebSocket tests serve over a real socket, which needs axum's HTTP/1
 # server; the library itself stays transport-agnostic.
 axum = { workspace = true, features = ["http1", "ws"] }
+# Held at 0.9 until openidconnect accepts rsa 0.10 and crypto-glue (through
+# webauthn-rs) moves from its rsa 0.10 release candidate to rsa 0.10.0.
 rsa = { version = "0.9.10", features = ["pkcs5"] }
 serial_test = "4.0.1"
 sha1 = { workspace = true }
@@ -145,8 +224,7 @@ tempfile = "3.27.0"
 # the application's decision, and two libraries that both install one
 # conflict.
 tracing-subscriber = { workspace = true }
-tokio = { workspace = true, features = ["full"] }
-tokio-test = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util"] }
 # In-crate `#[cfg(test)]` mods and the integration tests build wiremock
 # fixtures directly. Not a regular dependency under any feature.
 wiremock = "0.6.5"
@@ -164,8 +242,12 @@ harness = false
 default = ["authz", "device", "default-error-response", "serde"]
 
 # Core capabilities
-authz = ["dep:cedar-policy"]
-device = []
+authz = ["dep:cedar-policy", "dep:arc-swap", "dep:axess-cache"]
+device = ["dep:axess-cache"]
+# Device keys: sessions and devices held to a key the client cannot export
+# (`axess_core::device_key`). The proof verifier sits on `jwt`, so a build
+# with this on also picks `jwt-aws-lc` or `jwt-rust-crypto`.
+device-keys = ["device", "axess-factors/key-proof"]
 default-error-response = []
 memory = []
 # Implies `memory` because the test helpers build on the in-memory backends.
@@ -186,34 +268,38 @@ allow-testing-in-release = [
     "axess-clock/allow-testing-in-release",
     "axess-rng/allow-testing-in-release",
     "axess-factors/allow-testing-in-release",
+    "axess-identity/allow-testing-in-release",
 ]
 
 # HTTP middleware
 accept-client-id = []
 request-id = []
 service-secret = []
-trace-id = []
+trace-context = []
 ws = ["axum/ws"]
 
 # Federated authn / OIDC
 # An alias for `oauth`, which carries the FAPI 2.0 client profile and both
 # halves of DPoP.
 fapi = ["oauth", "axess-factors/fapi"]
-fido2 = ["dep:webauthn-rs", "axess-factors/fido2"]
+fido2 = ["dep:webauthn-rs", "dep:arc-swap", "axess-factors/fido2"]
 # Generic JWT primitives + `WorkloadResolver` for non-SPIFFE
 # workload-identity flows. Adopters reach for this when wiring
 # GitHub Actions OIDC, Kubernetes SA, GitLab CI, Okta, Azure AD,
 # Auth0, etc. via a custom claim parser. SPIFFE adopters get the
 # same primitives transitively via `jwt-svid`.
-jwt = ["axess-factors/jwt"]
+# `dep:jsonwebtoken` so that this crate can name the key-set type a
+# `JwtVerifier` is built on (the `spire` client fills one from the agent's
+# JWT bundles); the crate is in the build through axess-factors already.
+jwt = ["axess-factors/jwt", "dep:jsonwebtoken"]
 # The crypto backend `jsonwebtoken` verifies with, passed through: enable
 # exactly one beside `jwt`. See axess-factors' features for the trade.
 jwt-aws-lc = ["jwt", "axess-factors/jwt-aws-lc", "jsonwebtoken?/aws_lc_rs"]
 jwt-rust-crypto = ["jwt", "axess-factors/jwt-rust-crypto", "jsonwebtoken?/rust_crypto"]
 jwt-svid = ["jwt", "axess-factors/jwt-svid"]
-ldap = ["dep:ldap3", "axess-factors/ldap"]
+ldap = ["dep:ldap3", "dep:arc-swap", "axess-factors/ldap"]
 mtls = ["dep:x509-parser", "dep:rustls-pki-types", "axess-factors/mtls"]
-oauth = ["dep:openidconnect", "dep:jsonwebtoken", "axess-factors/oauth"]
+oauth = ["dep:openidconnect", "dep:jsonwebtoken", "dep:arc-swap", "axess-factors/oauth"]
 # Plain-OAuth-2.0 user login. OFF BY DEFAULT: see
 # `axess_factors::social` module docs for the security model and when
 # to reach for this vs OIDC.
@@ -222,6 +308,9 @@ social = ["axess-factors/social"]
 # Outbound authn (axess as client)
 outbound-mtls = ["dep:rustls", "dep:rustls-pki-types"]
 outbound-oauth = ["axess-factors/outbound-oauth"]
+# RSA client keys for `private_key_jwt` on `jwt-rust-crypto`, a choice that
+# signs in rsa 0.9 (RUSTSEC-2023-0071); see the feature in axess-factors.
+client-assertion-rsa = ["axess-factors/client-assertion-rsa"]
 
 # On-behalf-of access (axess acting as the user at a downstream service).
 # Source lives in `src/delegated/`. `oauth` / `outbound-oauth` carry
@@ -233,10 +322,10 @@ delegated-stored = ["oauth", "outbound-oauth", "dep:reqwest"]
 delegated-stored-encrypted = ["delegated-stored"]
 
 # Cloud STS: federated workload-identity → cloud temporary credentials
-aws-sts = ["axess-factors/http-body", "dep:reqwest", "dep:quick-xml"]
-azure-fic = ["axess-factors/http-body", "dep:reqwest"]
+aws-sts = ["axess-factors/http-body", "axess-factors/egress", "dep:reqwest", "dep:quick-xml"]
+azure-fic = ["axess-factors/http-body", "axess-factors/egress", "dep:reqwest"]
 cloud-sts = ["aws-sts", "gcp-wif", "azure-fic"]
-gcp-wif = ["axess-factors/http-body", "dep:reqwest"]
+gcp-wif = ["axess-factors/http-body", "axess-factors/egress", "dep:reqwest"]
 
 # In-process IdP: mints workload JWTs for tests + on-host issuance
 # Primitive types (`LocalIdpSigningKey`, `MintClaims`, `IssuanceListener`)
@@ -244,7 +333,24 @@ gcp-wif = ["axess-factors/http-body", "dep:reqwest"]
 # the production `crate::local_idp::LocalIdp` and the test fixture
 # `crate::testing::local_idp::LocalIdpFixture`. `local-idp` therefore no
 # longer transitively pulls `testing` (the mock-store fixtures stay opt-in).
-local-idp = ["axess-factors/jwt", "dep:jsonwebtoken", "dep:rsa", "dep:p256"]
+# Its keys are EC P-256 (ES256), and it compiles no `rsa` crate.
+local-idp = ["axess-factors/jwt", "dep:jsonwebtoken", "dep:p256"]
+# RSA keys for the local IdP (RS256, RS384, RS512): the `generate_rsa*` and
+# `from_rsa_*` constructors of `LocalIdpSigningKey`, and `new_rsa` and the
+# RSA algorithms of `with_algorithm` on the fixture. It compiles `rsa` 0.9,
+# which carries RUSTSEC-2023-0071 (the Marvin attack: RSA private-key
+# operations that leak timing; fixed in rsa 0.10.0, which jsonwebtoken does
+# not accept yet). Under `jwt-rust-crypto` alone every RSA signature the IdP
+# makes runs in that crate; under `jwt-aws-lc` it runs in aws-lc-rs. Take it
+# only for a verifier that cannot accept ES256.
+local-idp-rsa = ["local-idp", "dep:rsa"]
+
+# SPIFFE Workload API client: fetches and rotates X.509 and JWT SVIDs and
+# trust bundles from a local SPIRE agent's socket. Infra-bound (it needs an
+# agent), so it is in no umbrella. Beside `outbound-mtls` it builds rustls
+# configurations from what the agent serves; beside `jwt` it keeps key sets
+# for `JwtVerifier`.
+spire = ["dep:h2", "tokio/net", "dep:x509-parser", "dep:rustls-pki-types"]
 
 # Authz entity cache decorators (`EntityCache` is the in-tree default; this
 # is the opt-in shared alternative).
@@ -254,6 +360,12 @@ valkey-cache = ["authz", "valkey"]
 mysql = ["dep:sqlx", "sqlx/mysql", "dep:rmp-serde", "sqlx"]
 postgres = ["dep:sqlx", "sqlx/postgres", "dep:rmp-serde", "sqlx"]
 sqlite = ["dep:sqlx", "sqlx/sqlite", "dep:rmp-serde", "sqlx"]
+# The SQLite stores linked to the system's SQLite library instead of the
+# source sqlx bundles (sqlx's `sqlite-unbundled`), so the library is patched
+# with the system. Enable it in place of `sqlite`: with both on, the bundled
+# source is compiled. The build needs the SQLite header and library and
+# libclang, which generates the bindings.
+sqlite-unbundled = ["dep:sqlx", "sqlx/sqlite-unbundled", "dep:rmp-serde", "sqlx"]
 valkey = ["dep:fred", "dep:rmp-serde"]
 
 # Audit archive reference implementations. `audit-archive-fs` ships a
@@ -269,7 +381,7 @@ audit-archive-fs = []
 # context and the gated trait impls aren't silently dropped.
 rkyv = ["axess-identity/rkyv", "dep:rkyv"]
 serde = ["axess-identity/serde"]
-sqlx = ["axess-identity/sqlx"]
+sqlx = ["axess-identity/sqlx", "dep:sqlx"]
 
 # Discoverability umbrellas: purely additive.
 #
@@ -277,7 +389,7 @@ sqlx = ["axess-identity/sqlx"]
 # backends (sqlite + postgres + valkey) and duplicated `--all-features`
 # without serving a real adopter shape. Pick one session backend +
 # the federation / middleware / workload features you actually need;
-# use `cargo … --all-features` for CI / docs.rs only.
+# use `cargo … --all-features` for CI only.
 # `WorkloadResolver` itself lives under `jwt`, exposed via the
 # `crate::workload::workload` re-export. Adopters writing custom
 # claim mappers for non-SPIFFE issuers (GitHub Actions, k8s SA,

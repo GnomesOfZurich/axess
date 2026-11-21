@@ -13,9 +13,10 @@
 //! reload is found at once; a source whose generation does not move (a store
 //! another process writes) is found again once the interval has passed.
 
-use chrono::{DateTime, Duration, Utc};
+use axess_clock::{Timestamp, Until};
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::Duration;
 
 /// Issuers remembered at once. The cache never grows past this: at the bound
 /// a new unknown issuer is simply not remembered, and costs the read it would
@@ -27,17 +28,18 @@ const MAX_ENTRIES: usize = 1024;
 const MAX_ISSUER_BYTES: usize = 512;
 
 /// Default time an unknown issuer is remembered.
-pub(super) const DEFAULT_TTL_SECS: i64 = 30;
+pub(super) const DEFAULT_TTL_SECS: u64 = 30;
 
 /// Issuers recently found to have no provider, each with when it expires.
 pub(super) struct UnknownIssuers {
     ttl: Duration,
-    seen: Mutex<HashMap<String, (DateTime<Utc>, u64)>>,
+    seen: Mutex<HashMap<String, (Until, u64)>>,
 }
 
 impl UnknownIssuers {
-    /// A cache that remembers an unknown issuer for `ttl`. A zero or negative
-    /// `ttl` remembers nothing.
+    /// A cache that remembers an unknown issuer for `ttl`. A `ttl` of no
+    /// time remembers nothing, and one past the range of a reading
+    /// remembers until the source's generation moves.
     pub(super) fn new(ttl: Duration) -> Self {
         Self {
             ttl,
@@ -45,7 +47,7 @@ impl UnknownIssuers {
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, (DateTime<Utc>, u64)>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, (Until, u64)>> {
         self.seen
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -53,31 +55,31 @@ impl UnknownIssuers {
 
     /// Whether `issuer` was found unknown, the answer is still fresh, and the
     /// source has not changed since (`generation`).
-    pub(super) fn is_unknown(&self, issuer: &str, now: DateTime<Utc>, generation: u64) -> bool {
+    pub(super) fn is_unknown(&self, issuer: &str, now: Timestamp, generation: u64) -> bool {
         self.lock()
             .get(issuer)
-            .is_some_and(|(until, seen)| *until > now && *seen == generation)
+            .is_some_and(|(until, seen)| *until > Until::At(now) && *seen == generation)
     }
 
     /// Remember that `issuer` has no provider, as of `generation`, the
     /// source's generation read before it was asked.
-    pub(super) fn remember(&self, issuer: &str, now: DateTime<Utc>, generation: u64) {
-        if self.ttl <= Duration::zero() || issuer.len() > MAX_ISSUER_BYTES {
+    pub(super) fn remember(&self, issuer: &str, now: Timestamp, generation: u64) {
+        if self.ttl.is_zero() || issuer.len() > MAX_ISSUER_BYTES {
             return;
         }
         let mut seen = self.lock();
         if seen.len() >= MAX_ENTRIES {
-            seen.retain(|_, (until, _)| *until > now);
+            seen.retain(|_, (until, _)| *until > Until::At(now));
             if seen.len() >= MAX_ENTRIES {
                 return;
             }
         }
         seen.insert(
             issuer.to_string(),
-            (
-                crate::lifetime::expiry_after_signed(now, self.ttl),
-                generation,
-            ),
+            (Until::after(now, self.ttl), generation),
         );
     }
 }
+
+#[cfg(test)]
+mod tests;

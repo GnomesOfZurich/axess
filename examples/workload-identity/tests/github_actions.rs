@@ -4,8 +4,10 @@
 //! drives the generic `WorkloadResolver` with `github_actions_mapper`,
 //! and asserts the produced `Principal::Workload` matches the claims.
 
-mod common;
+mod signing;
+mod verifier;
 
+use axess_clock::testing::MockClock;
 use std::collections::BTreeMap;
 
 use axess_example_workload_identity::github_actions::{
@@ -32,12 +34,12 @@ fn sample_tenant() -> TenantId {
 fn github_claims(now: i64, exp: i64) -> serde_json::Value {
     serde_json::json!({
         "iss": ISSUER,
-        "sub": "repo:gnomes/axess:ref:refs/heads/main",
+        "sub": "repo:example-org/example-repo:ref:refs/heads/main",
         "aud": AUDIENCE,
         "exp": exp,
         "iat": now,
-        "repository": "gnomes/axess",
-        "repository_owner": "gnomes",
+        "repository": "example-org/example-repo",
+        "repository_owner": "example-org",
         "repository_id": "987654321",
         "repository_owner_id": "123456",
         "actor": "octocat",
@@ -50,16 +52,17 @@ fn github_claims(now: i64, exp: i64) -> serde_json::Value {
 
 #[tokio::test]
 async fn recipe_resolves_real_github_shape_token() {
-    let (der, jwks) = common::rsa_keypair("gha-1");
-    let (now, exp) = common::now_and_exp();
-    let token = common::sign(&github_claims(now, exp), "gha-1", &der);
-    let verifier = common::build_verifier(jwks, ISSUER, AUDIENCE);
+    let clock = MockClock::at_reference();
+    let (der, jwks) = signing::rsa_keypair("gha-1");
+    let (now, exp) = signing::now_and_exp();
+    let token = signing::sign(&github_claims(now, exp), "gha-1", &der);
+    let verifier = verifier::build_verifier(&clock, jwks, ISSUER, AUDIENCE);
     let trust = TrustDomain::new(TRUST_DOMAIN).unwrap();
 
     let resolver = WorkloadResolver::<GitHubActionsClaims, _, _>::new(
         verifier,
         trust.clone(),
-        |_slug: &str| Some(sample_tenant()),
+        |_: &str| Some(sample_tenant()),
         Issuer::custom("github_actions").unwrap(),
         token,
         github_actions_mapper(allowlist()),
@@ -80,8 +83,8 @@ async fn recipe_resolves_real_github_shape_token() {
     assert_eq!(w.tenant_slug, "123456");
     // The names travel as attributes; the five optional fields are preserved.
     let expected: BTreeMap<String, serde_json::Value> = [
-        ("repository", "gnomes/axess"),
-        ("repository_owner", "gnomes"),
+        ("repository", "example-org/example-repo"),
+        ("repository_owner", "example-org"),
         ("actor", "octocat"),
         ("workflow", "ci"),
         ("ref", "refs/heads/main"),
@@ -96,20 +99,21 @@ async fn recipe_resolves_real_github_shape_token() {
 
 #[tokio::test]
 async fn recipe_rejects_repository_owner_mismatch() {
-    // `repository_owner = "evil"` doesn't prefix `repository = "gnomes/axess"`.
+    let clock = MockClock::at_reference();
+    // `repository_owner = "evil"` doesn't prefix `repository = "example-org/example-repo"`.
     // The mapper should refuse to synthesise a workload id.
-    let (der, jwks) = common::rsa_keypair("gha-bad");
-    let (now, exp) = common::now_and_exp();
+    let (der, jwks) = signing::rsa_keypair("gha-bad");
+    let (now, exp) = signing::now_and_exp();
     let mut claims = github_claims(now, exp);
     claims["repository_owner"] = serde_json::json!("evil");
-    let token = common::sign(&claims, "gha-bad", &der);
-    let verifier = common::build_verifier(jwks, ISSUER, AUDIENCE);
+    let token = signing::sign(&claims, "gha-bad", &der);
+    let verifier = verifier::build_verifier(&clock, jwks, ISSUER, AUDIENCE);
     let trust = TrustDomain::new(TRUST_DOMAIN).unwrap();
 
     let resolver = WorkloadResolver::<GitHubActionsClaims, _, _>::new(
         verifier,
         trust.clone(),
-        |_slug: &str| Some(sample_tenant()),
+        |_: &str| Some(sample_tenant()),
         Issuer::custom("github_actions").unwrap(),
         token,
         github_actions_mapper(allowlist()),
@@ -127,20 +131,21 @@ async fn recipe_rejects_repository_owner_mismatch() {
 
 #[tokio::test]
 async fn recipe_omits_missing_optional_attributes() {
+    let clock = MockClock::at_reference();
     // Only the required claims and the ref and event the allowlist needs
     // are set; the other optional fields are absent. Mapper should still resolve, with only those
     // attributes.
-    let (der, jwks) = common::rsa_keypair("gha-min");
-    let (now, exp) = common::now_and_exp();
-    let token = common::sign(
+    let (der, jwks) = signing::rsa_keypair("gha-min");
+    let (now, exp) = signing::now_and_exp();
+    let token = signing::sign(
         &serde_json::json!({
             "iss": ISSUER,
-            "sub": "repo:gnomes/axess",
+            "sub": "repo:example-org/example-repo",
             "aud": AUDIENCE,
             "exp": exp,
             "iat": now,
-            "repository": "gnomes/axess",
-            "repository_owner": "gnomes",
+            "repository": "example-org/example-repo",
+            "repository_owner": "example-org",
             "repository_id": "987654321",
             "repository_owner_id": "123456",
             "ref": "refs/heads/main",
@@ -149,13 +154,13 @@ async fn recipe_omits_missing_optional_attributes() {
         "gha-min",
         &der,
     );
-    let verifier = common::build_verifier(jwks, ISSUER, AUDIENCE);
+    let verifier = verifier::build_verifier(&clock, jwks, ISSUER, AUDIENCE);
     let trust = TrustDomain::new(TRUST_DOMAIN).unwrap();
 
     let resolver = WorkloadResolver::<GitHubActionsClaims, _, _>::new(
         verifier,
         trust.clone(),
-        |_slug: &str| Some(sample_tenant()),
+        |_: &str| Some(sample_tenant()),
         Issuer::custom("github_actions").unwrap(),
         token,
         github_actions_mapper(allowlist()),
@@ -176,20 +181,21 @@ async fn recipe_omits_missing_optional_attributes() {
 }
 
 async fn resolve_with(
+    clock: &MockClock,
     claims_edit: impl FnOnce(&mut serde_json::Value),
     allow: GitHubAllowlist,
 ) -> Result<Principal, axess_identity::IdentityError> {
-    let (der, jwks) = common::rsa_keypair("gha-id");
-    let (now, exp) = common::now_and_exp();
+    let (der, jwks) = signing::rsa_keypair("gha-id");
+    let (now, exp) = signing::now_and_exp();
     let mut claims = github_claims(now, exp);
     claims_edit(&mut claims);
-    let token = common::sign(&claims, "gha-id", &der);
-    let verifier = common::build_verifier(jwks, ISSUER, AUDIENCE);
+    let token = signing::sign(&claims, "gha-id", &der);
+    let verifier = verifier::build_verifier(clock, jwks, ISSUER, AUDIENCE);
     let trust = TrustDomain::new(TRUST_DOMAIN).unwrap();
     WorkloadResolver::<GitHubActionsClaims, _, _>::new(
         verifier,
         trust.clone(),
-        |_slug: &str| Some(sample_tenant()),
+        |_: &str| Some(sample_tenant()),
         Issuer::custom("github_actions").unwrap(),
         token,
         github_actions_mapper(allow),
@@ -202,7 +208,9 @@ async fn resolve_with(
 /// the name the operator trusted and is still refused.
 #[tokio::test]
 async fn a_reused_owner_name_with_a_different_owner_id_is_refused() {
+    let clock = MockClock::at_reference();
     let out = resolve_with(
+        &clock,
         |c| c["repository_owner_id"] = serde_json::json!("999999"),
         allowlist(),
     )
@@ -213,7 +221,9 @@ async fn a_reused_owner_name_with_a_different_owner_id_is_refused() {
 /// A token without the immutable ids is refused rather than falling back to names.
 #[tokio::test]
 async fn a_token_without_the_numeric_ids_is_refused() {
+    let clock = MockClock::at_reference();
     let out = resolve_with(
+        &clock,
         |c| {
             c.as_object_mut().unwrap().remove("repository_id");
         },
@@ -226,10 +236,11 @@ async fn a_token_without_the_numeric_ids_is_refused() {
 /// When repository ids are listed, a sibling repository of a trusted owner is refused.
 #[tokio::test]
 async fn a_repository_outside_the_listed_ids_is_refused() {
+    let clock = MockClock::at_reference();
     let only_other = allowlist().repository_id("1");
-    assert!(resolve_with(|_| {}, only_other).await.is_err());
+    assert!(resolve_with(&clock, |_| {}, only_other).await.is_err());
     let listed = allowlist().repository_id("987654321");
-    assert!(resolve_with(|_| {}, listed).await.is_ok());
+    assert!(resolve_with(&clock, |_| {}, listed).await.is_ok());
 }
 
 /// A run on a ref the allowlist does not name (a feature branch, a pull
@@ -237,13 +248,16 @@ async fn a_repository_outside_the_listed_ids_is_refused() {
 /// an event that is not listed.
 #[tokio::test]
 async fn a_run_on_an_unlisted_ref_or_event_is_refused() {
+    let clock = MockClock::at_reference();
     let out = resolve_with(
+        &clock,
         |c| c["ref"] = serde_json::json!("refs/heads/feature"),
         allowlist(),
     )
     .await;
     assert!(out.is_err(), "feature branch admitted: {out:?}");
     let out = resolve_with(
+        &clock,
         |c| c["event_name"] = serde_json::json!("pull_request"),
         allowlist(),
     )
@@ -255,7 +269,9 @@ async fn a_run_on_an_unlisted_ref_or_event_is_refused() {
 /// closed rather than skipping a check for a claim that is absent.
 #[tokio::test]
 async fn a_token_without_ref_or_event_is_refused() {
+    let clock = MockClock::at_reference();
     let out = resolve_with(
+        &clock,
         |c| {
             let o = c.as_object_mut().unwrap();
             o.remove("ref");
@@ -270,8 +286,9 @@ async fn a_token_without_ref_or_event_is_refused() {
 /// An allowlist that names only owners admits nothing.
 #[tokio::test]
 async fn an_allowlist_without_ref_or_event_rules_admits_nothing() {
+    let clock = MockClock::at_reference();
     let owners_only = GitHubAllowlist::new().owner_id("123456");
-    let out = resolve_with(|_| {}, owners_only).await;
+    let out = resolve_with(&clock, |_| {}, owners_only).await;
     assert!(out.is_err(), "{out:?}");
 }
 
@@ -279,6 +296,7 @@ async fn an_allowlist_without_ref_or_event_rules_admits_nothing() {
 /// events; an unlisted environment does not.
 #[tokio::test]
 async fn a_listed_environment_admits_a_run_and_an_unlisted_one_does_not() {
+    let clock = MockClock::at_reference();
     let by_environment = GitHubAllowlist::new()
         .owner_id("123456")
         .environment("production")
@@ -290,22 +308,28 @@ async fn a_listed_environment_admits_a_run_and_an_unlisted_one_does_not() {
         }
     };
     assert!(
-        resolve_with(edit("production"), by_environment.clone())
+        resolve_with(&clock, edit("production"), by_environment.clone())
             .await
             .is_ok()
     );
-    assert!(resolve_with(edit("staging"), by_environment).await.is_err());
+    assert!(
+        resolve_with(&clock, edit("staging"), by_environment)
+            .await
+            .is_err()
+    );
 }
 
 /// A run admitted through its environment records that environment, so the
 /// audit trail says which rule let it in.
 #[tokio::test]
 async fn a_run_admitted_through_its_environment_records_it() {
+    let clock = MockClock::at_reference();
     let by_environment = GitHubAllowlist::new()
         .owner_id("123456")
         .environment("production")
         .event("push");
     let Principal::Workload(w) = resolve_with(
+        &clock,
         |c| {
             c["ref"] = serde_json::json!("refs/heads/feature");
             c["environment"] = serde_json::json!("production");

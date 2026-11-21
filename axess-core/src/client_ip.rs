@@ -2,11 +2,10 @@
 //!
 //! Five things in axess want to know who a request came from: the audit
 //! trail, the Cedar request context, the rate limiter, the device
-//! freshness gate, and account lockout. Before 0.7.0 each of them took an
-//! `Option<IpAddr>` the adopter had to produce, axess shipped the correct
-//! walk but never the wiring, and the rate limiter read the headers
-//! itself because reaching [`TrustedProxies::client_ip`] meant enabling
-//! `authz` and compiling Cedar.
+//! freshness gate, and account lockout. If each took an `Option<IpAddr>`
+//! the adopter had to produce, the wiring would be the adopter's, and a walk
+//! reachable only through `authz` would leave the rate limiter reading the
+//! headers itself rather than call [`TrustedProxies::client_ip`].
 //!
 //! So the walk lives here, outside any feature gate, and [`layer()`](crate::client_ip::layer)
 //! runs it once per request. Everything downstream reads [`ClientIp`].
@@ -716,6 +715,8 @@ where
             .unwrap_or_default())
     }
 }
+
+pub(crate) mod network;
 
 #[cfg(test)]
 mod tests;

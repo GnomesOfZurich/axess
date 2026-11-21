@@ -36,12 +36,11 @@
 //! use axess_cache::ClockTtlCache;
 //! use axess_clock::Clock;
 //! use axess_clock::testing::MockClock;
-//! use chrono::{TimeZone, Utc};
 //! use std::num::NonZeroUsize;
 //! use std::sync::Arc;
 //! use std::time::Duration;
 //!
-//! let clock = Arc::new(MockClock::at(Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()));
+//! let clock = Arc::new(MockClock::at_reference());
 //! let cache: ClockTtlCache<&'static str, u32> = ClockTtlCache::new(
 //!     NonZeroUsize::new(128).unwrap(),
 //!     Duration::from_secs(60),

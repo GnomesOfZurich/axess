@@ -3,6 +3,7 @@
 use crate::authn::ids::{TenantId, UserId};
 use crate::authn::store::IdentityLookup;
 use crate::session::extractor::AuthSession;
+use crate::session::layer::{SessionEndAudit, SessionEndReason};
 use crate::session::store::SessionRegistryHandle;
 use axum::response::IntoResponse;
 use std::future::Future;
@@ -35,22 +36,47 @@ pub enum ActiveSessionsError {
 pub struct SessionValidator {
     pub(super) registry: Option<Arc<dyn SessionRegistryHandle>>,
     pub(super) identity: Option<Arc<dyn IdentityHandle>>,
+    /// Told of a session the validator ends when no session layer stands
+    /// behind the handle to record it.
+    pub(super) audit: Arc<dyn SessionEndAudit>,
+}
+
+/// What the validator finds a session to be, with the cause when it is not
+/// valid.
+enum Verdict {
+    Valid,
+    /// Not authenticated: a guest, a login in progress, a step-up that has
+    /// not completed. Nothing to end.
+    NotSignedIn,
+    /// The registry does not hold the session.
+    NotRegistered,
+    /// The identity store did not confirm the tenant the session names.
+    TenantNotConfirmed,
 }
 
 impl SessionValidator {
     /// Returns `true` when the session is authenticated, present in the
-    /// registry (if configured), and (if configured) carries the user's
-    /// current `tenant_id`.
+    /// registry (if configured) under the key the registry holds it under
+    /// ([`AuthSession::registered_key`]), and (if configured) carries the
+    /// user's current `tenant_id`.
     #[tracing::instrument(skip(self, session))]
     pub async fn is_valid(&self, session: &AuthSession) -> bool {
+        matches!(self.verdict(session).await, Verdict::Valid)
+    }
+
+    /// The one judgement [`is_valid`](Self::is_valid) and
+    /// [`enforce`](Self::enforce) read.
+    async fn verdict(&self, session: &AuthSession) -> Verdict {
         if !session.is_authenticated().await {
-            return false;
+            return Verdict::NotSignedIn;
         }
         let user_id = match session.user_id().await {
             Some(id) => id,
-            None => return false,
+            None => return Verdict::NotSignedIn,
         };
-        let sid = session.session_id().await;
+        // The key the registry holds: after a rotation in the same handler
+        // it holds the key it held before, until the response is written.
+        let sid = session.registered_key().await;
         let stated = session.tenant_id().await;
 
         // The registry and the identity store are independent, so they are
@@ -85,26 +111,47 @@ impl SessionValidator {
             }
         };
         let (registry_ok, tenant_ok) = tokio::join!(registry_check, tenant_check);
-        if !(registry_ok && tenant_ok) {
-            return false;
+        // A session neither check confirms is named for the registry: the
+        // registry's answer is the one every other check of the session
+        // reads.
+        match (registry_ok, tenant_ok) {
+            (true, true) => Verdict::Valid,
+            (false, _) => Verdict::NotRegistered,
+            (true, false) => Verdict::TenantNotConfirmed,
         }
-        true
     }
 
     /// [`is_valid`](Self::is_valid), and when an authenticated session fails
-    /// the check (revoked in the registry, or a tenant mismatch), clear the
-    /// stored session and rotate its id so the row stops saying
-    /// `Authenticated` and the cookie stops matching it.
+    /// the check, end it through the session layer's ending protocol: the
+    /// handle is a guest's at once, and the stored session is claimed,
+    /// recorded and removed as the response is written, with the reason
+    /// `session_not_registered` (the registry no longer holds it) or
+    /// `session_tenant_not_confirmed` (the identity store does not confirm
+    /// its tenant). With no session layer behind the handle the record goes
+    /// to the validator's own sink, the service's
+    /// ([`AuthnService::session_end_audit`](super::AuthnService::session_end_audit)).
+    /// A session that is not authenticated (a guest, a login in progress, a
+    /// step-up that has not completed) is refused and ends nothing.
     ///
     /// This is what [`require_valid_session`] and the validator form of
     /// `require_authn!` run; call it from a hand-written guard that needs the
     /// same behaviour.
     pub async fn enforce(&self, session: &AuthSession) -> bool {
-        if self.is_valid(session).await {
-            return true;
-        }
-        if session.is_authenticated().await {
-            session.clear().await;
+        let reason = match self.verdict(session).await {
+            Verdict::Valid => return true,
+            Verdict::NotSignedIn => return false,
+            Verdict::NotRegistered => SessionEndReason::NotRegistered,
+            Verdict::TenantNotConfirmed => SessionEndReason::TenantNotConfirmed,
+        };
+        if let Some(record) = session.end_through_layer(reason).await
+            && let Err(e) = self.audit.session_ended(&record).await
+        {
+            tracing::error!(
+                user_id = %record.user_id,
+                error = %e,
+                ending = record.reason.as_str(),
+                "the record of a session the validator ended could not be written"
+            );
         }
         false
     }
@@ -114,9 +161,10 @@ impl SessionValidator {
 /// or no longer valid in the registry.
 ///
 /// When the session claims to be authenticated but the check fails (revoked
-/// in the registry, or a tenant mismatch), the stored session is cleared and
-/// its id rotated before the 401 goes out, so the row no longer says
-/// `Authenticated` and the cookie stops matching it.
+/// in the registry, or a tenant the identity store does not confirm), the
+/// session is ended through the ending protocol with its audit record
+/// ([`SessionValidator::enforce`]): the 401 replaces the cookie, and the
+/// stored row is claimed, recorded and removed.
 pub fn require_valid_session(
     validator: SessionValidator,
 ) -> impl tower::Layer<
@@ -184,3 +232,6 @@ mod tests;
 
 #[cfg(test)]
 mod tenant_lookup;
+
+#[cfg(test)]
+mod ending_tests;

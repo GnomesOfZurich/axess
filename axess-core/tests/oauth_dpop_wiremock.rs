@@ -8,8 +8,12 @@
 
 #![cfg(all(feature = "testing", feature = "oauth"))]
 
+use axess_core::testing::fixtures as common;
+
+use axess_clock::testing::MockClock;
 use axess_core::authn::AuditContext;
 use axess_core::authn::ids::TenantId;
+use axess_core::authn::service::OAuthCallbackRoute;
 use axess_core::authn::service::{AuthnService, RequestAuthnService};
 use axess_core::federation::oauth_tenant::{
     MemoryTenantOAuthProviderStore, StoredTenantOAuthProviders, TenantClientCredential, TenantDpop,
@@ -163,11 +167,10 @@ impl Idp {
     }
 
     fn id_token(&self, nonce: &str) -> String {
-        let now = chrono::Utc::now().timestamp();
-        axess_factors::jwt::ensure_crypto_provider();
+        let now = common::start().unix_seconds();
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(self.kid.clone());
-        jsonwebtoken::encode(
+        axess_factors::jwt::encode(
             &header,
             &json!({
                 "iss": self.issuer,
@@ -183,22 +186,24 @@ impl Idp {
     }
 
     /// The builder of a provider discovered with a client secret.
-    async fn builder(&self) -> OAuthProviderBuilder {
-        OAuthProviderConfig::discover(
+    async fn builder(&self, clock: &MockClock) -> OAuthProviderBuilder {
+        OAuthProviderConfig::discover_screened(
             "test",
             &self.issuer,
             CLIENT_ID,
             SECRET,
             "http://localhost:3000/callback",
+            axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
         )
         .await
         .expect("discovery")
+        .with_clock(std::sync::Arc::new(clock.clone()))
     }
 
     /// A provider discovered with a client secret and nothing else
     /// configured.
-    async fn provider(&self) -> OAuthProviderConfig {
-        self.builder().await.build().expect("build")
+    async fn provider(&self, clock: &MockClock) -> OAuthProviderConfig {
+        self.builder(clock).await.build().expect("build")
     }
 
     /// A token endpoint that answers every grant: with `token_type` `DPoP`
@@ -248,21 +253,26 @@ fn access_jwt(n: usize, jkt: &str) -> String {
     )
 }
 
-fn service(provider: OAuthProviderConfig) -> Authn {
-    AuthnService::builder(MockIdentityStore::new(), MockFactorStore::new())
-        .with_oauth_provider(provider)
-        .build()
-        .with_audit_context(AuditContext::default())
+fn service(clock: &MockClock, provider: OAuthProviderConfig) -> Authn {
+    AuthnService::builder(
+        MockIdentityStore::new().with_clock(clock.clone()),
+        MockFactorStore::new(),
+    )
+    .with_clock(clock.clone())
+    .with_oauth_provider(provider)
+    .build()
+    .with_audit_context(AuditContext::default())
 }
 
 /// Log in through `provider` against `idp`, whose token endpoint answers as
 /// [`Idp::mount_token`] does with `jkt`.
 async fn login(
+    clock: &MockClock,
     idp: &Idp,
     provider: OAuthProviderConfig,
     jkt: Option<&'static str>,
 ) -> (Authn, Result<OAuthClaims, OAuthError>) {
-    let authn = service(provider);
+    let authn = service(clock, provider);
     let session = test_session();
     authn
         .begin_oauth_login("test", &OAuthLoginOptions::default(), &session)
@@ -281,7 +291,15 @@ async fn login(
     let nonce = get("axess.oauth.nonce").await;
     let csrf = get("axess.oauth.csrf_state").await;
     idp.mount_token(Some(idp.id_token(&nonce)), jkt).await;
-    let result = authn.finish_oauth_login("code", &csrf, &session).await;
+    let result = authn
+        .finish_oauth_login(
+            OAuthCallbackRoute::global("test"),
+            "code",
+            &csrf,
+            None,
+            &session,
+        )
+        .await;
     (authn, result)
 }
 
@@ -331,11 +349,12 @@ fn authenticated_by_secret(seen: &Seen) -> bool {
 
 #[tokio::test]
 async fn a_client_secret_provider_binds_tokens_when_the_idp_advertises_dpop() {
+    let clock = common::test_clock();
     let idp = Idp::advertising_dpop().await;
-    let provider = idp.provider().await;
+    let provider = idp.provider(&clock).await;
     assert!(provider.binds_to_dpop(), "on by default when advertised");
 
-    let (authn, claims) = login(&idp, provider, None).await;
+    let (authn, claims) = login(&clock, &idp, provider, None).await;
     let claims = claims.expect("login");
 
     let exchange = &idp.requests_to("/token")[0];
@@ -359,6 +378,7 @@ async fn a_client_secret_provider_binds_tokens_when_the_idp_advertises_dpop() {
     idp.mount_userinfo().await;
     let access = String::from(&*claims.access_token.clone().expect("an access token"));
     authn
+        .oauth_global()
         .fetch_userinfo("test", &access, "alice-subject", Some(&key))
         .await
         .expect("userinfo");
@@ -375,6 +395,7 @@ async fn a_client_secret_provider_binds_tokens_when_the_idp_advertises_dpop() {
     );
 
     let err = authn
+        .oauth_global()
         .fetch_userinfo("test", &access, "alice-subject", None)
         .await
         .expect_err("a bound token is not sent as Bearer");
@@ -388,9 +409,10 @@ async fn a_client_secret_provider_binds_tokens_when_the_idp_advertises_dpop() {
 
 #[tokio::test]
 async fn an_access_token_bound_to_another_key_is_refused() {
+    let clock = common::test_clock();
     let idp = Idp::advertising_dpop().await;
-    let provider = idp.provider().await;
-    let (_authn, result) = login(&idp, provider, Some("some-other-thumbprint")).await;
+    let provider = idp.provider(&clock).await;
+    let (authn, result) = login(&clock, &idp, provider, Some("some-other-thumbprint")).await;
     assert!(
         matches!(result, Err(OAuthError::TokenExchange(_))),
         "cnf.jkt names another key: {result:?}"
@@ -399,26 +421,29 @@ async fn an_access_token_bound_to_another_key_is_refused() {
         idp.requests_to("/token")[0].dpop.is_some(),
         "a proof was sent"
     );
+    drop(authn);
 }
 
 #[tokio::test]
 async fn an_idp_that_does_not_advertise_dpop_gets_bearer_requests() {
+    let clock = common::test_clock();
     for extra in [
         json!({}),
         json!({ "dpop_signing_alg_values_supported": [] }),
         json!({ "dpop_signing_alg_values_supported": ["PS256", "EdDSA"] }),
     ] {
         let idp = Idp::start(extra.clone()).await;
-        let provider = idp.provider().await;
+        let provider = idp.provider(&clock).await;
         assert!(!provider.binds_to_dpop(), "off for {extra}");
 
-        let (authn, claims) = login(&idp, provider, None).await;
+        let (authn, claims) = login(&clock, &idp, provider, None).await;
         let claims = claims.expect("login");
         assert!(claims.dpop_key.is_none(), "{extra}");
         assert!(idp.requests_to("/token")[0].dpop.is_none(), "{extra}");
 
         idp.mount_userinfo().await;
         authn
+            .oauth_global()
             .fetch_userinfo("test", "access-1", "alice-subject", None)
             .await
             .expect("userinfo");
@@ -434,21 +459,23 @@ async fn an_idp_that_does_not_advertise_dpop_gets_bearer_requests() {
 
 #[tokio::test]
 async fn without_dpop_sends_no_proof_and_takes_bearer() {
+    let clock = common::test_clock();
     let idp = Idp::advertising_dpop().await;
     let provider = idp
-        .builder()
+        .builder(&clock)
         .await
         .without_dpop()
         .build()
         .expect("without_dpop");
     assert!(!provider.binds_to_dpop());
 
-    let (authn, claims) = login(&idp, provider, None).await;
+    let (authn, claims) = login(&clock, &idp, provider, None).await;
     let claims = claims.expect("login");
     assert!(claims.dpop_key.is_none());
     assert!(idp.requests_to("/token")[0].dpop.is_none(), "no proof");
 
     let outcome = authn
+        .oauth_global()
         .refresh_oauth_token("test", "rt1", "alice-subject", None, None)
         .await
         .expect("a bare refresh");
@@ -457,6 +484,7 @@ async fn without_dpop_sends_no_proof_and_takes_bearer() {
 
     idp.mount_userinfo().await;
     authn
+        .oauth_global()
         .fetch_userinfo("test", "access-2", "alice-subject", None)
         .await
         .expect("userinfo");
@@ -468,9 +496,10 @@ async fn without_dpop_sends_no_proof_and_takes_bearer() {
 
 #[tokio::test]
 async fn with_dpop_requires_the_idp_to_advertise_it() {
+    let clock = common::test_clock();
     let idp = Idp::start(json!({})).await;
     let err = idp
-        .builder()
+        .builder(&clock)
         .await
         .with_dpop()
         .build()
@@ -480,7 +509,7 @@ async fn with_dpop_requires_the_idp_to_advertise_it() {
 
     let idp = Idp::advertising_dpop().await;
     let provider = idp
-        .builder()
+        .builder(&clock)
         .await
         .without_dpop()
         .with_dpop()
@@ -493,9 +522,9 @@ async fn with_dpop_requires_the_idp_to_advertise_it() {
 /// `without_dpop` is refused under it whichever comes first.
 #[tokio::test]
 async fn the_fapi_profile_keeps_dpop_on_whatever_the_order() {
+    let clock = common::test_clock();
     let idp = Idp::start(json!({})).await;
     let client_key = rcgen::KeyPair::generate().unwrap();
-    axess_factors::jwt::ensure_crypto_provider();
     let signer = || {
         ClientAssertionSigner::new(
             CLIENT_ID,
@@ -506,7 +535,7 @@ async fn the_fapi_profile_keeps_dpop_on_whatever_the_order() {
     };
 
     let fapi = idp
-        .builder()
+        .builder(&clock)
         .await
         .with_private_key_jwt(signer())
         .with_fapi(FapiConfig::default())
@@ -517,7 +546,7 @@ async fn the_fapi_profile_keeps_dpop_on_whatever_the_order() {
         "FAPI with DPoP binds, advertised or not"
     );
     for without_first in [true, false] {
-        let builder = idp.builder().await.with_private_key_jwt(signer());
+        let builder = idp.builder(&clock).await.with_private_key_jwt(signer());
         let builder = if without_first {
             builder.without_dpop().with_fapi(FapiConfig::default())
         } else {
@@ -537,6 +566,7 @@ async fn the_fapi_profile_keeps_dpop_on_whatever_the_order() {
 /// either order.
 #[tokio::test]
 async fn the_fapi_profile_with_mtls_turns_dpop_off() {
+    let clock = common::test_clock();
     let idp = Idp::advertising_dpop().await;
     // Removed on drop, whether or not the assertions below pass.
     let tmp = tempfile::tempdir().unwrap();
@@ -557,13 +587,21 @@ async fn the_fapi_profile_with_mtls_turns_dpop_off() {
     };
 
     assert!(
-        idp.provider().await.binds_to_dpop(),
+        idp.provider(&clock).await.binds_to_dpop(),
         "the IdP advertises DPoP"
     );
-    let built = idp.builder().await.with_fapi(mtls()).build();
+    let built = idp.builder(&clock).await.with_fapi(mtls()).build();
     let refused = [
-        idp.builder().await.with_dpop().with_fapi(mtls()).build(),
-        idp.builder().await.with_fapi(mtls()).with_dpop().build(),
+        idp.builder(&clock)
+            .await
+            .with_dpop()
+            .with_fapi(mtls())
+            .build(),
+        idp.builder(&clock)
+            .await
+            .with_fapi(mtls())
+            .with_dpop()
+            .build(),
     ];
     assert!(
         !built.expect("with_fapi").binds_to_dpop(),
@@ -583,14 +621,18 @@ async fn the_fapi_profile_with_mtls_turns_dpop_off() {
 /// refresh is refused before anything is sent.
 #[tokio::test]
 async fn a_refresh_after_a_restart_presents_the_key_restored_from_its_seed() {
+    let clock = common::test_clock();
     let idp = Idp::advertising_dpop().await;
-    let (_first_process, claims) = login(&idp, idp.provider().await, None).await;
+    let (first_process, claims) = login(&clock, &idp, idp.provider(&clock).await, None).await;
     let claims = claims.expect("login");
     let seed = claims.dpop_key.expect("key").to_seed_bytes();
     let thumbprint = DpopKey::from_seed(*seed).thumbprint().unwrap();
 
-    let restarted = service(idp.provider().await);
+    // The first process ends before the restarted one begins.
+    drop(first_process);
+    let restarted = service(&clock, idp.provider(&clock).await);
     let err = restarted
+        .oauth_global()
         .refresh_oauth_token("test", "rt1", "alice-subject", None, None)
         .await
         .expect_err("a bound refresh token is not refreshed bare");
@@ -599,6 +641,7 @@ async fn a_refresh_after_a_restart_presents_the_key_restored_from_its_seed() {
 
     let key = DpopKey::from_seed(*seed);
     let outcome = restarted
+        .oauth_global()
         .refresh_oauth_token("test", "rt1", "alice-subject", None, Some(&key))
         .await
         .expect("refresh");
@@ -633,18 +676,22 @@ fn tenant_record(idp: &Idp, dpop: TenantDpop) -> TenantOAuthProviderRecord {
         scopes: vec![],
         credential: TenantClientCredential::Secret(FactorSecret::Plain(SECRET.into())),
         dpop,
+        kind: None,
         revision: 0,
     }
 }
 
 async fn tenant_directory(
+    clock: &MockClock,
     record: TenantOAuthProviderRecord,
 ) -> Arc<StoredTenantOAuthProviders<MemoryTenantOAuthProviderStore>> {
     let directory = Arc::new(
-        StoredTenantOAuthProviders::new_unencrypted(MemoryTenantOAuthProviderStore::new())
-            .with_egress_policy(
-                axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
-            ),
+        StoredTenantOAuthProviders::new_unencrypted(
+            MemoryTenantOAuthProviderStore::new(),
+            axess_core::testing::oauth_tenant::ownership_assumed(),
+        )
+        .with_clock(std::sync::Arc::new(clock.clone()))
+        .with_egress_policy(axess_factors::egress::EgressPolicy::screened_allowing_loopback_http()),
     );
     directory.upsert(record).await.expect("upsert");
     directory
@@ -655,8 +702,9 @@ async fn tenant_directory(
 /// and returns no key.
 #[tokio::test]
 async fn a_tenant_record_set_to_off_sends_bearer_requests() {
+    let clock = common::test_clock();
     let idp = Idp::advertising_dpop().await;
-    let directory = tenant_directory(tenant_record(&idp, TenantDpop::Off)).await;
+    let directory = tenant_directory(&clock, tenant_record(&idp, TenantDpop::Off)).await;
     let provider = directory
         .provider(&tenant(), "test")
         .await
@@ -664,10 +712,14 @@ async fn a_tenant_record_set_to_off_sends_bearer_requests() {
         .expect("a provider");
     assert!(!provider.binds_to_dpop(), "off whatever the IdP advertises");
 
-    let authn: Authn = AuthnService::builder(MockIdentityStore::new(), MockFactorStore::new())
-        .with_tenant_oauth_providers(directory.clone())
-        .build()
-        .with_audit_context(AuditContext::default());
+    let authn: Authn = AuthnService::builder(
+        MockIdentityStore::new().with_clock(clock.clone()),
+        MockFactorStore::new(),
+    )
+    .with_clock(clock.clone())
+    .with_tenant_oauth_providers(directory.clone())
+    .build()
+    .with_audit_context(AuditContext::default());
     let session = test_session();
     authn
         .begin_oauth_login_with_tenant_provider(
@@ -690,7 +742,13 @@ async fn a_tenant_record_set_to_off_sends_bearer_requests() {
         .expect("csrf");
     idp.mount_token(Some(idp.id_token(&nonce)), None).await;
     let claims = authn
-        .finish_oauth_login("code", &csrf, &session)
+        .finish_oauth_login(
+            OAuthCallbackRoute::of_tenant(&tenant(), "test"),
+            "code",
+            &csrf,
+            None,
+            &session,
+        )
         .await
         .expect("login");
     assert!(claims.dpop_key.is_none());
@@ -703,8 +761,9 @@ async fn a_tenant_record_set_to_off_sends_bearer_requests() {
 /// and refuses to build one against an IdP that does not.
 #[tokio::test]
 async fn a_tenant_record_that_requires_dpop_is_refused_where_the_idp_does_not_advertise_it() {
+    let clock = common::test_clock();
     let silent = Idp::start(json!({})).await;
-    let directory = tenant_directory(tenant_record(&silent, TenantDpop::Required)).await;
+    let directory = tenant_directory(&clock, tenant_record(&silent, TenantDpop::Required)).await;
     let err = directory
         .provider(&tenant(), "test")
         .await
@@ -713,7 +772,8 @@ async fn a_tenant_record_that_requires_dpop_is_refused_where_the_idp_does_not_ad
     assert!(matches!(err, OAuthError::Config(_)), "{err:?}");
 
     let advertising = Idp::advertising_dpop().await;
-    let directory = tenant_directory(tenant_record(&advertising, TenantDpop::Required)).await;
+    let directory =
+        tenant_directory(&clock, tenant_record(&advertising, TenantDpop::Required)).await;
     let provider = directory
         .provider(&tenant(), "test")
         .await
@@ -727,6 +787,7 @@ async fn a_tenant_record_that_requires_dpop_is_refused_where_the_idp_does_not_ad
 /// sends Bearer requests where it does not.
 #[tokio::test]
 async fn a_tenant_record_without_the_field_follows_the_advertisement() {
+    let clock = common::test_clock();
     for (idp, binds) in [
         (Idp::advertising_dpop().await, true),
         (Idp::start(json!({})).await, false),
@@ -739,7 +800,7 @@ async fn a_tenant_record_without_the_field_follows_the_advertisement() {
         let record: TenantOAuthProviderRecord = serde_json::from_value(stored).expect("reads");
         assert_eq!(record.dpop, TenantDpop::Advertised);
 
-        let directory = tenant_directory(record).await;
+        let directory = tenant_directory(&clock, record).await;
         let provider = directory
             .provider(&tenant(), "test")
             .await
@@ -757,13 +818,16 @@ async fn a_tenant_record_without_the_field_follows_the_advertisement() {
 #[tokio::test]
 async fn a_refresh_without_the_key_is_audited_as_a_missing_key() {
     use axess_core::authn::event::AuthFailureReason;
+    let clock = common::test_clock();
     let idp = Idp::advertising_dpop().await;
-    let identity = MockIdentityStore::new();
+    let identity = MockIdentityStore::new().with_clock(clock.clone());
     let authn: Authn = AuthnService::builder(identity.clone(), MockFactorStore::new())
-        .with_oauth_provider(idp.provider().await)
+        .with_clock(clock.clone())
+        .with_oauth_provider(idp.provider(&clock).await)
         .build()
         .with_audit_context(AuditContext::default());
     let err = authn
+        .oauth_global()
         .refresh_oauth_token("test", "rt1", "alice-subject", None, None)
         .await
         .expect_err("a bound refresh token is not refreshed without its key");
@@ -784,10 +848,12 @@ async fn a_refresh_without_the_key_is_audited_as_a_missing_key() {
 #[tokio::test]
 async fn a_ceremony_without_its_dpop_key_is_refused_and_restarts() {
     use axess_core::authn::event::AuthFailureReason;
+    let clock = common::test_clock();
     let idp = Idp::advertising_dpop().await;
-    let identity = MockIdentityStore::new();
+    let identity = MockIdentityStore::new().with_clock(clock.clone());
     let authn: Authn = AuthnService::builder(identity.clone(), MockFactorStore::new())
-        .with_oauth_provider(idp.provider().await)
+        .with_clock(clock.clone())
+        .with_oauth_provider(idp.provider(&clock).await)
         .build()
         .with_audit_context(AuditContext::default());
     let session = test_session();
@@ -807,7 +873,13 @@ async fn a_ceremony_without_its_dpop_key_is_refused_and_restarts() {
     idp.mount_token(Some(idp.id_token("unused")), None).await;
 
     let err = authn
-        .finish_oauth_login("code", &csrf, &session)
+        .finish_oauth_login(
+            OAuthCallbackRoute::global("test"),
+            "code",
+            &csrf,
+            None,
+            &session,
+        )
         .await
         .expect_err("no improvised key");
     assert!(matches!(err, OAuthError::InvalidParameter), "{err:?}");
@@ -830,13 +902,18 @@ async fn a_ceremony_without_its_dpop_key_is_refused_and_restarts() {
 /// tenant; the binding is part of the ceremony and cleared with it.
 #[tokio::test]
 async fn a_tenant_bound_ceremony_keeps_one_binding() {
+    let clock = common::test_clock();
     let idp = Idp::advertising_dpop().await;
-    let directory = tenant_directory(tenant_record(&idp, TenantDpop::Advertised)).await;
-    let authn: Authn = AuthnService::builder(MockIdentityStore::new(), MockFactorStore::new())
-        .with_oauth_provider(idp.provider().await)
-        .with_tenant_oauth_providers(directory.clone())
-        .build()
-        .with_audit_context(AuditContext::default());
+    let directory = tenant_directory(&clock, tenant_record(&idp, TenantDpop::Advertised)).await;
+    let authn: Authn = AuthnService::builder(
+        MockIdentityStore::new().with_clock(clock.clone()),
+        MockFactorStore::new(),
+    )
+    .with_clock(clock.clone())
+    .with_oauth_provider(idp.provider(&clock).await)
+    .with_tenant_oauth_providers(directory.clone())
+    .build()
+    .with_audit_context(AuditContext::default());
     let options = OAuthLoginOptions::default();
     let binding = |session: axess_core::session::extractor::AuthSession| async move {
         session.get_custom("axess.oauth.expected_tenant").await

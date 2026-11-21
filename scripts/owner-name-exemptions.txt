@@ -1,0 +1,55 @@
+# The publishing company's name, matched without regard to case.
+# Every other line of this file is an exemption: a path glob (`*` crosses
+# `/`) and a Python regular expression, cut out of a line before the line
+# is searched, each under the comment that gives its reason.
+name	gnomes
+
+# The repository's address on GitHub: links, badges, the manifests'
+# `repository` and the book's edit links all point at the published
+# repository, which no sample value replaces.
+allow	*	https://github\.com/GnomesOfZurich/axess\b
+allow	*	https://raw\.githubusercontent\.com/GnomesOfZurich/axess/
+
+# The published book's address on the organisation's pages host.
+allow	*	https://gnomesofzurich\.github\.io/axess/
+
+# The markdown link check resolves the repository's own links to files in
+# the checkout, so it spells the address as a regular expression.
+allow	scripts/check-markdown-links.sh	github\\\.com/GnomesOfZurich/axess/
+
+# The release runbook and the release workflow drive the published
+# repository with gh: its OWNER/REPO, its API paths, the organisation's
+# secret and the trusted-publishing form name the publisher.
+allow	.github/workflows/release.yml	--repo GnomesOfZurich/axess\b
+allow	docs/project/publishing.md	--repo GnomesOfZurich/axess\b
+allow	docs/project/publishing.md	\brepos/GnomesOfZurich/axess\b
+allow	docs/project/publishing.md	\borgs/GnomesOfZurich/
+allow	docs/project/publishing.md	the repository is `GnomesOfZurich/axess`
+allow	docs/project/publishing.md	Repository owner `GnomesOfZurich`
+
+# The GitHub team that holds write access to the published repository.
+
+# The user agent the publish step sends to crates.io names the repository,
+# as crates.io asks; the crafted cases of that step hold the same string.
+allow	.github/workflows/release.yml	agent="GnomesOfZurich/axess release\.yml
+allow	scripts/release-publish-tests.sh	AGENT='GnomesOfZurich/axess release\.yml
+
+# The crates' authors, in the manifests and the book's configuration.
+allow	Cargo.toml	^authors = \["Gnomes"\]$
+allow	docs/book.toml	^authors = \["Gnomes"\]$
+allow	examples/authz/Cargo.toml	^authors = \["Gnomes"\]$
+allow	examples/fapi/Cargo.toml	^authors = \["Gnomes"\]$
+allow	examples/fido2/Cargo.toml	^authors = \["Gnomes"\]$
+allow	examples/oauth/Cargo.toml	^authors = \["Gnomes"\]$
+allow	examples/sqlite/Cargo.toml	^authors = \["Gnomes"\]$
+allow	examples/workload-identity/Cargo.toml	^authors = \["Gnomes"\]$
+
+# The copyright holder of each licence file, at the root and in each crate.
+allow	LICENSE-MIT	^Copyright \(c\) 2025 Gnomes$
+allow	*/LICENSE-MIT	^Copyright \(c\) 2025 Gnomes$
+allow	LICENSE-APACHE	^   Copyright 2025 Gnomes$
+allow	*/LICENSE-APACHE	^   Copyright 2025 Gnomes$
+
+# The published contacts for a security report and a conduct report.
+allow	SECURITY.md	\bsecurity@gnomes\.ch\b
+allow	CODE_OF_CONDUCT.md	\bsupport@gnomes\.ch\b

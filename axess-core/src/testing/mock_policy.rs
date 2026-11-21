@@ -9,7 +9,7 @@
 //! # Example
 //!
 //! ```rust
-//! # tokio_test::block_on(async {
+//! # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
 //! use axess_core::authz::{AuthzStore, AuthzDecision};
 //! use axess_core::testing::mock_policy::{MockEntityProvider, MockPolicyEvaluator};
 //! use std::sync::Arc;
@@ -161,6 +161,12 @@ impl PolicyEvaluator for MockPolicyEvaluator {
         );
         let key = (action.to_string(), resource.to_string());
         self.decisions.get(&key).copied().unwrap_or(self.default)
+    }
+
+    /// The mock decides on the action and the resource alone, so no decision
+    /// of its depends on the context.
+    fn mentions_context(&self) -> bool {
+        false
     }
 }
 

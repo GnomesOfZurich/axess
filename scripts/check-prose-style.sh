@@ -1,38 +1,53 @@
 #!/usr/bin/env bash
-# axess: keep the typographic conventions the 0.6.0 language pass established.
+# axess: keep the conventions of the repository's prose and comments.
 #
-# That pass removed every em dash from the repository. Nothing then preserved
-# the result: the rule lived in a commit message and in nobody's memory, and a
-# later documentation sweep reintroduced 101 of them across nineteen files
-# without a single gate noticing. A convention with no enforcement is a
-# convention with a half-life.
+# A convention with no enforcement does not stay held, so each one the
+# house style keeps is a rule here.
 #
-# Why em dashes specifically: the house style elaborates with a colon and
-# joins clauses with a semicolon, both of which survive `grep`, terminal
-# rendering, and a reader copying a line into a commit message. An em dash
-# also renders inconsistently in the places this prose actually travels.
+# Em dashes. The house style elaborates with a colon and joins clauses with
+# a semicolon, both of which survive `grep`, terminal rendering, and a
+# reader copying a line into a commit message. An em dash also renders
+# inconsistently in the places this prose actually travels. Checked on
+# every line.
 #
-# Checked in tracked text: Rust, Markdown, TOML, shell, YAML.
-# Exempt: `docs/book/` (generated), and `*/migrations/*`: an applied
-# migration's bytes are its checksum, so its prose is frozen whatever it says.
+# Comments say what holds. A regression marker (the word, then a colon)
+# tells the history of a change, which belongs to the commit that made it,
+# and a citation of a source line by its number (a Rust, shell or Python
+# file's name, then a colon or `#L` and the line) is wrong as soon as a
+# line above it moves: name the function or the module instead. Checked in comments only (scripts/lib/comment_text.py): in the
+# comments of Rust, shell and Python files, the Python a shell script hands
+# to `python3` included, and on every line of the Markdown, TOML and YAML.
+# A string literal is data, and the crafted cases of a gate hold such text
+# as the output they expect.
+#
+# Read: the files git lists, tracked or untracked and not ignored, so a file
+# not yet added is checked as well. Em dashes in Rust, Markdown, TOML,
+# shell and YAML; the comment rules in those and in Python. Exempt:
+# `docs/book/` (generated), and `*/migrations/*`: an applied migration's
+# bytes are its checksum, so its prose is frozen whatever it says.
 #
 # Usage: ./scripts/check-prose-style.sh
+#   scripts/check-prose-style-tests.sh holds the crafted cases.
 
 set -uo pipefail
 
 AXESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$AXESS_DIR"
+cd "$AXESS_DIR" || exit 1
 
-python3 - "$AXESS_DIR" <<'PY'
-import os, subprocess, sys
+python3 -I - "$AXESS_DIR" <<'PY'
+import os, re, subprocess, sys
 
 os.chdir(sys.argv[1])
+sys.path.insert(0, os.path.join(sys.argv[1], "scripts", "lib"))
+import comment_text
 
-tracked = subprocess.run(
-    ["git", "ls-files", "-z"], capture_output=True, text=True, check=True
+listed = subprocess.run(
+    ["git", "ls-files", "--cached", "--others", "--exclude-standard", "--deduplicate", "-z"],
+    capture_output=True, text=True, check=True,
 ).stdout.split("\0")
 
 EXTS = (".rs", ".md", ".toml", ".sh", ".yml", ".yaml")
+COMMENT_EXTS = EXTS + (".py",)
 
 def exempt(path):
     return path.startswith("docs/book/") or "/migrations/" in path
@@ -47,22 +62,41 @@ BANNED = {
     chr(0x2014): ("em dash", "a colon to elaborate, a semicolon to join clauses"),
 }
 
+# Any case, any spacing before the colon: the marker is the word as a label.
+# A line citation is a source file's name, a colon or `#L`, and a number.
+COMMENT_RULES = (
+    (re.compile(r"\bregression\s*:", re.IGNORECASE),
+     "regression marker", "a sentence saying what the code does and why"),
+    (re.compile(r"\.(?:rs|sh|py)(?::|#L)[0-9]"),
+     "line-number citation", "the function or the module by name"),
+)
+
 hits = []
-for path in tracked:
-    if not path or exempt(path) or not path.endswith(EXTS):
+read = 0
+for path in listed:
+    if not path or exempt(path) or not path.endswith(COMMENT_EXTS):
         continue
     try:
-        lines = open(path, encoding="utf-8").read().split("\n")
+        text = open(path, encoding="utf-8").read()
     except (OSError, UnicodeDecodeError):
         continue
-    for n, line in enumerate(lines, 1):
-        for ch, (name, fix) in BANNED.items():
-            if ch in line:
-                hits.append((path, n, name, fix, line.strip()[:96]))
+    read += 1
+    if path.endswith(EXTS):
+        for n, line in enumerate(text.split("\n"), 1):
+            for ch, (name, fix) in BANNED.items():
+                if ch in line:
+                    hits.append((path, n, name, fix, line.strip()[:96]))
+    for n, comment in comment_text.comments(path, text):
+        for pattern, name, fix in COMMENT_RULES:
+            if pattern.search(comment):
+                hits.append((path, n, name, fix, comment.strip()[:96]))
+
+if read == 0:
+    print("ERROR: no file read; the listing came back empty.", file=sys.stderr)
+    sys.exit(1)
 
 if hits:
-    print(f"ERROR: {len(hits)} line(s) use punctuation the house style drops:\n",
-          file=sys.stderr)
+    print(f"ERROR: {len(hits)} line(s) break the prose rules:\n", file=sys.stderr)
     for path, n, name, fix, text in hits[:40]:
         print(f"  {path}:{n}  ({name}; use {fix})", file=sys.stderr)
         print(f"      {text}", file=sys.stderr)
@@ -70,5 +104,5 @@ if hits:
         print(f"  ... and {len(hits) - 40} more", file=sys.stderr)
     sys.exit(1)
 
-print("OK: no banned punctuation in tracked prose.")
+print(f"OK: no banned punctuation in the prose and no regression marker or line-number citation in the comments of {read} files git lists.")
 PY

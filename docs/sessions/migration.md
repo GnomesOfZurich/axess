@@ -1,26 +1,22 @@
 # Schema migration
 
-The `SessionData` struct can change between axess versions. New
-fields get added, old fields get renamed or removed, the auth state
-machine gains a new variant. Existing sessions in the store carry
-the old shape; new code reads them and needs to produce the new
-shape. The mechanism that bridges the two is the schema migration
-on read.
+The `SessionData` struct can change between axess versions. Fields are added, renamed or removed, and the auth state machine gains variants. Axess does not carry a stored session
+across such a change: a row is read only in the shape the running
+release writes, and a row written under an earlier schema version is
+not served. Its holder signs in again.
 
-This is a short chapter because the mechanism is small. The
-mechanism is small because the design pushes the version field
-into the data itself rather than into the store.
+This is a short chapter because there is no mechanism to describe
+beyond the version field and what a row below it does.
 
 ## The version field
 
 `SessionData::version` is a `u8` set at construction and serialised
-with the rest of the data. The current value is the
-`SESSION_DATA_VERSION` constant. At read time the deserialiser fills
-in whatever a newer field's `#[serde(default)]` supplies, and
-`migrate` then walks the row forward one version step at a time.
+with the rest of the data on every save. The current value is the
+`SESSION_DATA_VERSION` constant; a row with no `version` member reads
+as 1.
 
 ```rust,ignore
-pub const SESSION_DATA_VERSION: u8 = 2;
+pub const SESSION_DATA_VERSION: u8 = 3;
 
 pub struct SessionData {
     #[serde(default = "default_version")]
@@ -30,105 +26,84 @@ pub struct SessionData {
     #[serde(default)]
     pub device_id: Option<DeviceId>,
     pub custom: serde_json::Value,
-}
-
-impl SessionData {
-    /// Returns whether anything changed, so the caller knows to re-save.
-    pub fn migrate(&mut self) -> bool {
-        if self.version >= SESSION_DATA_VERSION {
-            return false;
-        }
-        // v1 -> v2: added `device_id`. The field's serde default already
-        // supplied `None`, so the only work is bumping the version so a
-        // re-save records the current schema.
-        // ... one arm per step, each bumping `self.version` itself.
-        true
-    }
+    // ... `device_proven` (never stored), `revision`, `touched_at`,
+    // `key_binding` and `ending`.
 }
 ```
 
-Three properties of that shape are worth stating.
+The history of the field: version 1 was the first schema, version 2
+added `device_id`, and version 3 added the pending state's `flow`, the
+signed-in state's `signed_in_at` and the session's `key_binding`.
 
-It migrates in place, `&mut self`, and returns whether anything
-changed. That boolean is the signal to persist: a row already at the
-current version is not rewritten, so a deploy does not rewrite every
-session in the store on first read.
+## What a row below the version does
 
-Each version step bumps `self.version` itself, and there is no
-unconditional assignment to `SESSION_DATA_VERSION` at the end. The
-trailing assignment is tempting and wrong: it makes every step look
-correct from the outside, because the version ends up right whether or
-not the step ran. Bumping per step keeps each one observable, which is
-what lets a mutation test tell "this branch runs" from "this branch is
-dead".
+The stores that share the session codec (SQLite, PostgreSQL, MySQL and
+Valkey) read the version of a row before the rest of it. A row below
+`SESSION_DATA_VERSION` is not decoded: the store hands up its version
+alone, and never re-seals or writes it back. The memory store holds
+typed rows and hands the version up as it was saved.
 
-Most steps do nothing but bump. A field added with
-`#[serde(default)]` is already correct in memory by the time `migrate`
-sees it; the migration exists to record that the row has been read
-under the new schema. Real transformation work only appears when a
-field changes meaning rather than merely appearing.
+The session layer refuses such a row whatever state it carries. The
+request runs as a fresh guest, as for a row the store does not hold,
+and the row is left untouched: not written, not deleted and not claimed, so no ending is made outside the ending protocol and no audit
+row names it. It expires with its lifetime. The refusal is counted
+(`SessionMetrics::session_row_refused`) and logged at `warn`:
 
-The migration functions are pure transformations. They take the
-old shape (which serde has parsed against an older `SessionData`
-definition, possibly with the version-bumped fields defaulted)
-and produce the new shape. Each migration handles one version
-step; chained migrations are run in sequence to bridge multiple
-version gaps.
+```text
+WARN a stored session below the current schema version was not served session=4be3d46f... version=2 current=3
+```
 
-The version is bumped every time the shape changes in a way that
-older code would not handle correctly. Adding an optional field
-with a `Default` impl typically does not bump the version (older
-code reads `None`, which is fine). Removing or renaming a field
-does. Changing the meaning of a field does.
+`session` is the first eight characters of the session's key, never
+the id a cookie carries; the line holds nothing else of the row.
 
-## What migrations cannot do
+Every later read of the row in the same request refuses it too: the
+merge of a rotation, the merging write of a changed session, the
+release of an ending claim and the ending of a failed rotation. A row
+put under the key while the request ran is therefore never served,
+merged, released or ended; each step treats it as a store error, a case it already handles.
 
-A migration is a pure function on the serialised bytes. It cannot
-talk to a database, cannot consult the user store, cannot make
-network calls. The version of the data is determined entirely by
-what is in the cookie's session record at the moment of read.
+A row of a higher version is served, because during a rolling upgrade to a later release an older node must read rows a newer node wrote.
 
-The implication: if a new shape needs information that the old
-shape did not carry, the migration cannot synthesise it. The
-options are to default the field (set it to `None`, or to a known
-placeholder), to discard the session (the migration returns an
-error, the layer treats the session as invalid and starts a fresh
-one), or to defer the population (the field is set later in the
-request lifecycle from your own stores).
+A store of your own whose decoder fails on a row below the version
+reports its own error instead; the request is a guest all the same,
+and nothing is counted.
 
-The first option is the standard pattern. New fields get
-sensible defaults, the session continues to work with the new
-shape, and you populate the real value on the next
-dirty write.
+## One shape is read
 
-## When the session is invalidated
+The reader of `AuthState` reads the shape this release writes and no
+other. A field the writer always writes is required: a pending state's
+`flow` (`login`, or `{"step_up": {"signed_in_at": ...}}`), its
+`remaining` steps and timed `completed` factors, and a signed-in
+state's `signed_in_at` and timed `factors_completed`. A field the
+writer skips when it is empty (`ldap_groups`, `impersonator`,
+`assurance`) reads as empty when it is absent. A row in any other
+shape, whatever version it carries, fails to decode in the store's
+`load`, and the request is a guest.
 
-Sometimes the shape change is breaking in a way that no migration
-can bridge. The session's data refers to a user who has been
-deleted, the auth state references a tenant that no longer exists,
-the factor list contains a kind that the new version has removed.
-The migration's right response is to error, and the layer's right
-response is to treat the session as invalid.
+A row that does not decode is logged by the session layer at `warn`
+and the request runs as a fresh `Guest`; the row is not deleted and
+stays until its expiry or the next cleanup. The layer cannot tell a
+row that will never decode from a store that is down for a moment, so
+it does not replace the cookie either: the client keeps presenting it,
+and each request fails the load and logs the warning again, until a
+response stores a session for the guest and sets its cookie. For most applications that is the login; for one whose pages mint a CSRF token it comes earlier.
 
-The mechanism is the `SessionData::deserialize` path returning
-`Err`. The session layer catches the error, deletes the session
-row (or marks it expired), and treats the request as a fresh
-`Guest`. The user's cookie is still valid; the next request sets
-a new session, the user logs in again.
+A row that decodes and no longer means anything (its user was
+deleted, its tenant is gone) is ended by the account-status check on
+the request path, or by the session registry.
 
-The pattern is the right one because the alternative (the layer
-falling through to a degraded state, leaving the session in an
-inconsistent shape) lets bugs persist for the lifetime of the
-session. Invalidating eagerly converts the bug into a one-time
-user-facing event (re-login) that is fixable in one round-trip,
-rather than a long-tail bug that surfaces sporadically.
+## After an upgrade
+
+Every session the previous release stored is signed out once at the upgrade. Watch `session_row_refused` through the upgrade window: it
+rises while clients present cookies of the earlier release's
+sessions, and falls to zero as they sign in again. A count above zero after the window means something other than this library writes rows to the session store. The upgrade from 0.19.0 to 0.20.0 is the exception: the count stays at zero, because 0.20.0 names a stored row by the session's key, a digest of its id, and finds no row 0.19.0 stored under the id.
+
+A rollback serves a row the new release stored only if the earlier release decodes it in the shape that release reads (see "One shape is read"). A rollback from 0.20.0 to 0.19.0 finds none of the sessions 0.20.0 stored, because 0.19.0 looks a row up by the session id.
 
 ## Adding a custom field
 
-Adopters who add their own fields to `SessionData::custom` follow
-the same pattern in their own code. The `custom` value is
-JSON-shaped; each application-owned key is independently
-versioned by you.
+Adopters who add their own fields to `SessionData::custom` version
+them in their own code. The `custom` value is JSON; you version each application-owned key independently.
 
 The common pattern is to wrap the custom value in a small struct
 with its own version field:
@@ -147,38 +122,27 @@ fn read_app_data(session: &SessionData) -> MyAppSessionData {
         .custom
         .get("my_app")
         .and_then(|v| serde_json::from_value::<MyAppSessionData>(v.clone()).ok())
-        .map(|d| d.migrate_if_needed())
+        .map(|d| d.upgrade_if_needed())
         .unwrap_or_default()
 }
 ```
 
-The application's own version field is independent of axess's. The
-two evolve on different cadences, and your own version field
-captures your changes.
+The application's version field is independent of axess's: the two change on different schedules, and yours records your changes.
 
 ## When to reach for a different mechanism
 
-The schema migration is the right tool for evolutions of the
-session data shape. It is the wrong tool for migrations between
-storage backends (use the cross-backend `Store<K, V>` trait or a
-one-off copy script) or for changes to the encryption envelope
-(the key-rotation mechanism, covered in *Operations runbook*).
+The version field covers the shape of the session data. It is not a tool for moving between storage backends, which takes a one-off copy script over the old backend's own rows (neither store trait lists them), or for changes to the encryption envelope, which the key-rotation mechanism handles (see *Operations runbook*).
 
-It is also the wrong tool for application-level data migrations
-that touch the database. A migration that says "every user gains
-a new field on their user record" runs against the user store
-(via `sqlx::migrate!` or whatever migration tool you use), not
-against the session store. The session machinery does not interact
-with the user table.
-
-The mechanism's scope is narrow on purpose. Each piece of state
-has its own evolution mechanism, and conflating them produces
-migrations that have to consider too many cases at once.
+Nor is it a tool for application-level data migrations that touch the
+database. A change that says "every user gains a new field on their
+user record" runs against the user store (via `sqlx::migrate!` or
+whatever migration tool you use), not against the session store. The
+session machinery does not interact with the user table.
 
 ## Further reading
 
-*Session lifecycle and crypto envelope* covers the lifecycle that
-the migration runs as part of. *Backends* covers the storage
-backends and their own (database-level) migration mechanisms.
-*Migration guide* in Part VIII covers the cross-axess-version
-migrations that bump the `SESSION_DATA_VERSION` constant.
+*Session lifecycle and crypto envelope* covers the load this check is
+part of. *Backends* covers the storage backends and their own
+(database-level) schema statements. *Migration guide* in Part VIII
+covers each release's breaking changes, the ones that raise
+`SESSION_DATA_VERSION` among them.

@@ -2,7 +2,7 @@
 
 #![cfg(all(feature = "oauth", feature = "testing"))]
 
-mod common;
+use axess_core::testing::fixtures as common;
 
 use axess_core::authn::AuditContext;
 use axess_core::authn::event::AuthFailureReason;
@@ -15,22 +15,29 @@ use common::test_tenant;
 /// OAuth refresh roundtrip: refresh_oauth_token returns updated claims.
 #[tokio::test]
 async fn oauth_refresh_roundtrip() {
+    let clock = common::test_clock();
     use axess_factors::oauth::MockOAuthProvider;
 
-    let mock = MockOAuthProvider::new("refresh-idp").with_user(
-        "user-99",
-        "carol@example.com",
-        vec!["team-a"],
-        vec!["editor"],
-    );
+    let mock = MockOAuthProvider::new("refresh-idp")
+        .with_clock(std::sync::Arc::new(clock.clone()))
+        .with_user(
+            "user-99",
+            "carol@example.com",
+            vec!["team-a"],
+            vec!["editor"],
+        );
 
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
     let authn = AuthnService::builder(identity.clone(), MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_oauth_provider(mock)
         .build()
         .with_audit_context(AuditContext::default());
 
     let claims = authn
+        .oauth_global()
         .refresh_oauth_token("refresh-idp", "stored-refresh-token", "user-99", None, None)
         .await
         .expect("refresh should succeed");
@@ -50,18 +57,25 @@ async fn oauth_refresh_roundtrip() {
 /// `token_refresh_no_token` Failure audit event.
 #[tokio::test]
 async fn oauth_refresh_empty_token_rejected() {
+    let clock = common::test_clock();
     use axess_core::authn::event::AuthEventStatus;
     use axess_factors::oauth::MockOAuthProvider;
 
-    let mock = MockOAuthProvider::new("test-idp2").with_user("user-1", "a@b.com", vec![], vec![]);
+    let mock = MockOAuthProvider::new("test-idp2")
+        .with_clock(std::sync::Arc::new(clock.clone()))
+        .with_user("user-1", "a@b.com", vec![], vec![]);
 
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
     let authn = AuthnService::builder(identity.clone(), MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_oauth_provider(mock)
         .build()
         .with_audit_context(AuditContext::default());
 
     let result = authn
+        .oauth_global()
         .refresh_oauth_token("test-idp2", "", "user-1", None, None)
         .await;
     assert!(matches!(
@@ -83,13 +97,19 @@ async fn oauth_refresh_empty_token_rejected() {
 /// records a `token_refresh_unknown_provider` Failure audit event.
 #[tokio::test]
 async fn oauth_refresh_unknown_provider_rejected() {
+    let clock = common::test_clock();
     use axess_core::authn::event::AuthEventStatus;
 
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let authn = AuthnService::new(identity.clone(), MockFactorStore::new())
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
+    let authn = AuthnService::builder(identity.clone(), MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build()
         .with_audit_context(AuditContext::default());
 
     let result = authn
+        .oauth_global()
         .refresh_oauth_token("nonexistent", "some-token", "user-1", None, None)
         .await;
     assert!(matches!(
@@ -110,16 +130,25 @@ async fn oauth_refresh_unknown_provider_rejected() {
 /// fetch_userinfo with empty access token returns NoAccessToken error.
 #[tokio::test]
 async fn oauth_userinfo_empty_token_rejected() {
+    let clock = common::test_clock();
     use axess_factors::oauth::MockOAuthProvider;
 
-    let mock = MockOAuthProvider::new("ui-idp").with_user("u1", "x@y.com", vec![], vec![]);
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
+    let mock = MockOAuthProvider::new("ui-idp")
+        .with_clock(std::sync::Arc::new(clock.clone()))
+        .with_user("u1", "x@y.com", vec![], vec![]);
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
     let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_oauth_provider(mock)
         .build()
         .with_audit_context(AuditContext::default());
 
-    let result = authn.fetch_userinfo("ui-idp", "", "u1", None).await;
+    let result = authn
+        .oauth_global()
+        .fetch_userinfo("ui-idp", "", "u1", None)
+        .await;
     assert!(matches!(
         result.unwrap_err(),
         axess_factors::oauth::OAuthError::NoAccessToken
@@ -129,11 +158,19 @@ async fn oauth_userinfo_empty_token_rejected() {
 /// fetch_userinfo with unknown provider returns UnknownProvider error.
 #[tokio::test]
 async fn oauth_userinfo_unknown_provider_rejected() {
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let authn = AuthnService::new(identity, MockFactorStore::new())
+    let clock = common::test_clock();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
+    let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build()
         .with_audit_context(AuditContext::default());
 
-    let result = authn.fetch_userinfo("nope", "some-token", "u1", None).await;
+    let result = authn
+        .oauth_global()
+        .fetch_userinfo("nope", "some-token", "u1", None)
+        .await;
     assert!(matches!(
         result.unwrap_err(),
         axess_factors::oauth::OAuthError::UnknownProvider(_)
@@ -145,18 +182,24 @@ async fn oauth_userinfo_unknown_provider_rejected() {
 /// subject is accepted.
 #[tokio::test]
 async fn oauth_refresh_refuses_a_response_for_another_subject() {
+    let clock = common::test_clock();
     use axess_core::authn::event::AuthEventStatus;
     use axess_factors::oauth::{MockOAuthProvider, OAuthError};
 
-    let mock =
-        MockOAuthProvider::new("sub-idp").with_user("user-99", "c@example.com", vec![], vec![]);
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
+    let mock = MockOAuthProvider::new("sub-idp")
+        .with_clock(std::sync::Arc::new(clock.clone()))
+        .with_user("user-99", "c@example.com", vec![], vec![]);
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
     let authn = AuthnService::builder(identity.clone(), MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_oauth_provider(mock)
         .build()
         .with_audit_context(AuditContext::default());
 
     let err = authn
+        .oauth_global()
         .refresh_oauth_token(
             "sub-idp",
             "stored-refresh-token",
@@ -180,6 +223,7 @@ async fn oauth_refresh_refuses_a_response_for_another_subject() {
     );
 
     authn
+        .oauth_global()
         .refresh_oauth_token("sub-idp", "stored-refresh-token", "user-99", None, None)
         .await
         .expect("the recorded subject is accepted");

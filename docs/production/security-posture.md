@@ -17,17 +17,17 @@ between backends.
 
 The one backend an adopter chooses is for **JWT signature
 verification**, because `jsonwebtoken` takes its provider from a
-cargo feature and will not pick one for you. Anything enabling
-`jwt` names one of:
+cargo feature and will not pick one for you. A build that enables
+`jwt` must name one of:
 
 ```toml
 [dependencies]
 # Pure Rust, builds anywhere. The default choice.
-axess = { version = "0.19.0", features = ["jwt", "jwt-rust-crypto"] }
+axess = { version = "0.20.0", features = ["jwt", "jwt-rust-crypto"] }
 
 # aws-lc-rs: wraps the FIPS-validated aws-lc, needs a C toolchain
 # (and NASM on Windows), and does not build on every target.
-axess = { version = "0.19.0", features = ["jwt", "jwt-aws-lc"] }
+axess = { version = "0.20.0", features = ["jwt", "jwt-aws-lc"] }
 ```
 
 Naming neither is a compile error. Naming both is allowed,
@@ -41,7 +41,7 @@ consumers), not through axess's own code.
 
 ## FIPS targeting
 
-**Axess does not today offer a FIPS-validated build.** A
+**Axess offers no FIPS-validated build today.** A
 deployment that needs one should read this section as a
 statement of the gap rather than a route through it.
 
@@ -56,9 +56,9 @@ hashing and HMAC fingerprint binding do not move with it.
 
 The second requirement is that the compile and link chain
 introduces no non-validated crypto. Cargo's dependency graph is
-the source of truth: `cargo tree` and inspecting for non-aws-lc
-crypto crates (rustls, ring, the RustCrypto crates) shows what
-the deployment actually pulls in.
+the source of truth: `cargo tree`, searched for non-aws-lc crypto crates
+(rustls, ring, the RustCrypto crates), shows what the deployment actually
+pulls in.
 
 The third is that the validation certificate covers the
 platform the deployment runs on. NIST publishes FIPS validation
@@ -82,7 +82,7 @@ SOC 2 (the control objectives), and for the retention sweep
 |---|---|---|---|
 | Primary | Identifier (email, username), password hash, TOTP secret, FIDO2 credentials, the IP seen at authentication, device fingerprint | Identity store, device store | Yours to choose, within whatever regulatory bounds apply |
 | Secondary | The audit-event log, which reaches the primary through `user_id`, `tenant_id`, `device_id` and `client_ip` | Audit store | *Audit pipeline*. The usual GDPR pattern keeps it longer than primary PII but scrubs or hashes the IPs once the hot window closes |
-| Pseudonymous | Session id, refresh-token hash, device id (a UUID that names no user) | Session store, device store | Longer than primary PII, with no GDPR implication |
+| Pseudonymous | The session's key (a SHA-256 digest of the session id; the id itself is stored nowhere), refresh-token hash, device id (a UUID that names no user) | Session store, device store | Longer than primary PII, with no GDPR implication |
 
 Pseudonymous is a claim about the data on its own. Each of those values
 becomes PII the moment it is joined to the primary set, and the join needs
@@ -99,28 +99,27 @@ withdrawn. After `Ok(())`, `get_user`, `find_user` and `account_status`
 must report the user gone, and any in-flight session must fail its next
 `is_valid` check.
 
-Its default body panics rather than returning an error, so a backend
-that never overrode it fails loudly the first time an erasure request
-arrives instead of reporting success and deleting nothing. The audit-event entries
-that reference the user are not removed (the audit trail is
-load-bearing for compliance); the user's identifier in the
-events is hashed to a pseudonymous token, which makes the events
-non-PII without losing the ability to correlate them.
+The method has no default body, so a backend that does not implement
+erasure does not compile, instead of failing the first time an erasure
+request arrives. The trait lets audit-event entries that reference the
+user be kept (the audit trail is load-bearing for compliance), with the
+user-identifying columns pseudonymised; your implementation does the
+pseudonymising, for example by replacing the identifier with a keyed
+hash, which keeps the events correlatable without naming the user.
 
 ## Compliance touch-points
 
-The deployment will face one or more of these regulatory frames.
-Axess does not provide compliance on its own; it provides the
-controls each framework requires. The touch-points:
+A deployment faces one or more of these regulatory frames. Axess does not make
+it compliant on its own; it provides controls each frame requires:
 
 | Frame | What axess gives you | What stays yours |
 |---|---|---|
 | GDPR (EU data protection) | The erasure verb above, audit retention configuration, IP scrubbing in the cold-tier archive, `DeviceStore::sweep` against your `SweepConfig` thresholds | Data subject notices, the privacy policy, the legal basis for processing |
 | SOC 2 (operational controls) | The audit catalogue, the lockout policy against credential stuffing, session and refresh-token security, the operational metrics | Policy and procedure documentation |
 | PCI-DSS (card data) | Strong authentication for administrative access, audit retention of at least one year, session data encrypted at rest | The cardholder data environment. Axess covers the authentication boundary into it, not the environment |
-| HIPAA (US healthcare) | Strong authentication for access to protected health information, audit retention of at least six years, session data encrypted at rest and in transit | The HIPAA-covered systems, on the same boundary split |
+| HIPAA (US healthcare) | Strong authentication for access to protected health information, audit retention of at least six years, session data encrypted at rest, the `Secure` cookie flag | The HIPAA-covered systems, on the same boundary split, and TLS for data in transit |
 
-One gap in that first column is easy to miss under SOC 2: every
+One gap is easy to miss under SOC 2: every
 *authentication* decision produces an `AuthEvent`, but *authorisation*
 decisions go to a `tracing` target instead. They are not in the catalogue,
 so an evidence pipeline that reads only `AuthEvent` rows will not have
@@ -137,19 +136,30 @@ The `testing` feature compiles deterministic clocks and random sources,
 mock stores and constructors that skip the constant-key refusal. A release
 build that links them ships them in a production binary, and cargo feature
 unification lets any one dependent switch the feature on for the whole
-build. `axess-core`, `axess-factors`, `axess-rng` and `axess-clock` therefore
-refuse to compile when `testing` is on and debug assertions are off, and the
-error names the feature. A build that means it (a benchmark, a test run in
-release mode) enables `allow-testing-in-release`, which `axess` and
-`axess-core` forward to the crates beneath them.
+build. Every crate that defines the feature (`axess`, `axess-core`,
+`axess-factors`, `axess-identity`, `axess-rng` and `axess-clock`) therefore
+refuses to compile when `testing` is on and debug assertions are off, and
+the error names the feature; `scripts/check-testing-gates.sh` refuses a
+crate that defines the feature without the gate. A build that needs them on purpose (a
+benchmark, a test run in release mode) enables `allow-testing-in-release`,
+which `axess` and `axess-core` forward to the crates beneath them. An
+example enables the opt-out under its dev-dependencies only: in its
+dependencies it would reach a release build of the whole workspace by
+feature unification and switch every gate off. The four examples built on
+the testing stores (`minimal`, `oauth`, `fapi`, `fido2`) are debug demos and refuse a
+release build by name; CI's `scripts/check-release-build.sh` checks the
+rest of the workspace in release with no testing feature on, and that each
+mock example refuses.
 
 The release preflight and the Hardening workflow check the same thing from
 the other side: `scripts/supply-chain.sh` reads each published crate's and
 each example's normal dependency tree with `cargo tree -e features,normal`
-and fails when it carries `testing`, `testing-oauth` or `memory`, or when
-wiremock resolves. The `oauth` and `fapi` examples enable `testing` for the
-mock stores and mock provider they demonstrate, and are named in that
-script; they are demonstrations, not release targets. A test in
+and fails when it carries `testing` or `testing-oauth` (or `memory`, in the
+default tree of `axess` and `axess-core`), or when wiremock resolves. The
+same four examples enable `testing` for the in-memory stores, mock stores and
+mock provider they demonstrate, and the script exempts them by name (the
+`EXAMPLES_WITH_MOCKS` list in `scripts/lib/mock_examples.sh`); they are
+demonstrations, not release targets. A test in
 `axess/tests/testing_unreachable.rs` compiles a program that names
 `axess::testing` without the feature and expects the compiler to refuse it.
 
@@ -159,24 +169,24 @@ Two stores sit behind the login path, and what happens when each one is
 down is a decision rather than an accident.
 
 The lockout counter is the first. A guess is counted before its
-credential is checked: `reserve_attempt` increments the counter and
-refuses, changing nothing, once the count has reached
-`max_attempts`, in one atomic step on the primary, and `release_attempt`
-gives the guess back when the credential verified. That is what stops
+credential is checked. In one atomic step on the primary, `reserve_attempt`
+increments the counter, or refuses without changing it once the count has
+reached `max_attempts`; `release_attempt` gives the guess back when the
+credential verifies. That is what stops
 parallel guesses all reading a count below the limit and all running their
 verifier. Both are writes, and the read-replica split this library
 encourages puts reads on a replica and writes on the primary, so a primary
 outage leaves logins working and the counter dead. (A correct login that
-overlaps more simultaneous logins than `max_attempts` can be refused for
-the moment their reservations are held; that is the price of a limit that
+overlaps more simultaneous logins than `max_attempts` can be refused while
+their reservations are held; that is the price of a limit that
 holds.) Before the reservation, `LockoutPolicy::throttle` refuses a guess
 that comes inside the delay its key (account and client address) has
 earned, as `FactorOutcome::Throttled`, so one guesser is slowed down
 without the account being locked; its store reads follow the same
 `on_counter_unavailable`. `LockoutPolicy::on_counter_unavailable`
-decides what happens then. It defaults to `CounterUnavailable::Lock`,
+decides what happens when the counter store is down. It defaults to `CounterUnavailable::Lock`,
 which treats the attempt as locked and keeps brute force bounded.
-`CounterUnavailable::Allow` keeps those users logging in and leaves
+`CounterUnavailable::Allow` keeps logins working and leaves
 lockout disabled until the counter returns. Alert on
 `FactorMetrics::factor_counter_store_outage` either way: under `Lock` it
 explains the support calls, and under `Allow` it is the only signal
@@ -191,14 +201,12 @@ develop holes quietly.
 
 The cost is availability, and it is not small: **logins fail while the
 audit store does.** Put the sink behind something durable. Write
-locally and ship asynchronously, so `record_event` only fails when a
-local write fails, rather than calling a remote service on the request
-path. `AuditMetrics::audit_store_outage` fires on this path and should
+locally and ship asynchronously rather than calling a remote service on the
+request path, so `record_event` fails only when a local write fails. `AuditMetrics::audit_store_outage` fires on this path and should
 page rather than feed a dashboard, because every login is failing while
 it does.
 
-One consequence is worth stating, because the obvious implementation
-gets it wrong. Every path that rejects a login emits before it returns,
+The obvious implementation gets one consequence wrong. Every path that rejects a login emits before it returns,
 including the ones where the tenant or the identifier does not exist.
 That is what stops an audit outage from becoming a user-enumeration
 oracle: if only known users triggered an audit write, an attacker who
@@ -206,12 +214,34 @@ could degrade the audit store would see `Err` for real accounts and an
 ordinary rejection for everything else, and could read off which
 identifiers are registered. Both paths write, so both fail identically.
 
-The same change closes a blind spot that had nothing to do with
+The same rule closes a blind spot that has nothing to do with
 outages: a credential-stuffing run against a list of addresses, none of
-which are registered, previously left no audit rows at all. Those
-attempts now appear as `LoginAttempt` / `Failure` with an `error` of
+which are registered, leaves audit rows. Those attempts appear as
+`LoginAttempt` / `Failure` with an `error` of
 `unknown_tenant` or `unknown_identifier`, unattributed or attributed to
 the tenant only.
+
+## Known limits
+
+The sealed rows this library writes (factor secrets, delegated-grant
+envelopes, bound session blobs, encrypted event payloads) bind their
+ciphertext to the row's identity: the tenant, user and kind of a factor
+secret, the grant a delegated envelope belongs to, the envelope fields of
+an event. A blob moved under another row fails to open. The
+associated data carries no version or revision of the row, so someone who can
+write the store can put back an older ciphertext of the same row (a TOTP secret
+from before a rotation, for example), and it opens as the current one. The same writer can already change every
+unencrypted field of that row, so this does not widen what a store writer
+can do; it means the sealing does not narrow it either: treat a store writer as able
+to roll a row back to any state it held.
+
+Closing it would take two things: a monotonic row revision bound into the
+associated data, with the row written by compare-and-set on that revision, so
+a restored older ciphertext fails to open; and a denylist of replaced TOTP
+secrets, so a rolled-back secret is refused even where the revision is not
+kept. Neither is built. A deployment that needs rollback protection
+today gets it from the store: an append-only or versioned table, write
+access held by the service alone, and the store's own audit of writes.
 
 ## Disclosure protocol
 
@@ -220,15 +250,16 @@ The vulnerability disclosure protocol lives in the canonical
 at the repo root. The summary:
 
 Vulnerability reports go through the private channel described
-in `SECURITY.md` (typically a security email or GitHub Security
-Advisories). Do not file vulnerabilities on the public issue
+in `SECURITY.md`: GitHub's private vulnerability reporting (the
+**Report a vulnerability** button under the repository's Security tab)
+or the security email address it gives. Do not file vulnerabilities on the public issue
 tracker.
 
-The maintainers acknowledge reports within a few business days
+The maintainers acknowledge reports within 48 hours
 and triage to a severity level. Critical and high-severity
 issues get a private fix in a security branch, a coordinated
-disclosure window, and a CVE if the issue warrants one. Lower
-severity issues fix in the normal development cycle.
+disclosure window, and a CVE if the issue warrants one. Lower-severity
+issues are fixed in the normal development cycle.
 
 Adopters are expected to keep their `axess` dependency current.
 Vulnerability fixes ship in the next patch release; the changelog

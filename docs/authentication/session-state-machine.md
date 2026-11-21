@@ -3,15 +3,15 @@
 `AuthState` is the most important type in axess. Everything that matters
 about an authenticated session, both for the type system and for a
 reviewer reading a handler, is captured by which of its five variants
-you are looking at. The whole library is built around the
-representational claim that authentication is not a boolean, not a
+you are looking at. The library is built on the
+claim that authentication is not a boolean, not a
 flag column, and not a row in a sessions table that the handler reads
 and then trusts. It is an enum, transitions on the enum are methods on
 the enum, and a partial login is a distinct variant rather than a
 "finished" session with one field missing.
 
-The orchestration-versus-pure split is what keeps the machine
-independently testable, and it is the part worth reading twice.
+The split between the pure state machine and its orchestration keeps
+the machine independently testable.
 
 ## The five variants
 
@@ -36,17 +36,19 @@ pub enum AuthState {
         user_id: UserId,
         tenant_id: TenantId,
         method_name: Arc<str>,
-        remaining: Vec<FactorKind>,
-        completed: Vec<(FactorKind, DateTime<Utc>)>,
+        remaining: Vec<FactorStep>,
+        completed: Vec<(FactorKind, Timestamp)>,
         attempt_count: u32,
-        last_attempt: Option<DateTime<Utc>>,
+        last_attempt: Option<Timestamp>,
+        flow: AuthFlow,
     },
 
     Authenticated {
         user_id: UserId,
         tenant_id: TenantId,
-        authn_time: DateTime<Utc>,
-        factors_completed: Vec<(FactorKind, DateTime<Utc>)>,
+        authn_time: Timestamp,
+        signed_in_at: Timestamp,
+        factors_completed: Vec<(FactorKind, Timestamp)>,
     },
 
     PendingWorkflow {
@@ -70,28 +72,51 @@ two collects the password, possibly with the identifier carried over a
 hidden form field or a short-lived intermediate token. The variant
 records who is being identified but says nothing about credentials.
 
-`Authenticating` is where most of the action happens. The session
-knows six things: who it is trying to authenticate, which method is in
+`Authenticating` is the state in which factors are verified. The session
+knows seven things: who it is trying to authenticate, which method is in
 progress, what factors are still required, what factors have already
 been verified this attempt, how many credential attempts have been
-made, and when the last attempt landed.
+made, when the last attempt landed, and what the pending step is for.
 
 The method is recorded because a tenant might have several, and the
-choice is locked in before any factor runs. The last two fields
-exist because lockout decisions depend on them. A method that allows
-three attempts before locking the user out for fifteen minutes needs
-exactly this information, and putting it in the variant rather than in
-a side table keeps the decision local and reviewable.
+choice is locked in before any factor runs. `attempt_count` and
+`last_attempt` exist because lockout decisions depend on them. A method
+that allows three attempts before locking the user out for fifteen
+minutes needs exactly this information, and putting it in the variant
+rather than in a side table keeps the decision local and reviewable.
+
+The last field is `flow`, an `AuthFlow`: `Login` for a login in progress,
+`StepUp` for a session that was signed in and is asked for another
+factor. Both wait in this state and both finish through `verify_factor`,
+so the state records which it is. `AuthSession::step_up_pending` reads
+it, so a route that finishes a step-up can refuse a login in progress,
+whatever the login's method is called.
+
+A step-up carries the `signed_in_at` of the signed-in state it began from
+(`AuthFlow::StepUp { signed_in_at }`). Until its factor is verified the
+session is still that signed-in session, and the session layer checks it
+as one on every load: against the registry, the absolute age cap from its
+login, and the impersonation cap. A login in progress is in no registry
+yet and is not checked.
 
 `Authenticated` is the terminal success state. It carries the user id,
-the tenant id, the moment of successful authentication (for the audit
-trail), and the list of factors that were used. The factor list is
+the tenant id, two times (`signed_in_at` and `authn_time`, described
+below), and the list of factors that were used, each with the time it
+was verified. Audit events record that list. The factor list is
 load-bearing. A tenant policy that requires `Fido2` for certain routes
 can check `factor_completed_at(&FactorKind::Fido2)` (or `has_completed_factor`) directly,
 without consulting an external store.
 
-`PendingWorkflow` is the variant most adopters do not initially expect
-and end up reaching for once they ship a real signup flow. It models
+`Authenticated` holds two times for two purposes. `signed_in_at` is when
+the login that created the session completed: the absolute age cap counts
+from it, and a step-up or an id rotation leaves it as it is, so stepping
+up now and then never makes a session live for ever. `authn_time` is when
+the person last proved presence, at the login or the latest step-up:
+recency checks (`AuthSession::authenticated_within`, a FIDO2
+`max_authn_age`, the recency an impersonation asks of the administrator)
+read it.
+
+`PendingWorkflow` models
 the state where a user has authenticated enough to identify themselves
 but is in the middle of a multi-step ceremony (signup, password reset,
 email verification, or a custom workflow) and should not be treated as
@@ -104,7 +129,7 @@ pub struct WorkflowState {
     pub kind: WorkflowKind,
     pub current_step: u32,
     pub total_steps: u32,
-    pub initiated_at: DateTime<Utc>,
+    pub initiated_at: Timestamp,
 }
 
 pub enum WorkflowKind {
@@ -118,37 +143,32 @@ pub enum WorkflowKind {
 `Custom(Arc<str>)` is the extension point. If your application has a
 KYC flow, a hardware-key registration flow, or a multi-step recovery
 ceremony, you name it as a custom workflow and the session machinery
-treats it like the built-in kinds. The string is interned through
-`Arc<str>` because workflow names recur and the cost of repeated
-allocation adds up across a busy login surface.
+treats it like the built-in kinds. The name is an `Arc<str>`, so a
+clone of the state shares the string instead of copying it.
 
 ## The transition method
 
-Factor verification is the only mutation that the state machine
-exposes. The transition is `AuthState::advance_factor`, which takes a
-`FactorKind` and a timestamp, and returns an `AdvanceOutcome` that
+Every transition of the state machine is `pub(crate)`. Factor
+verification goes through `AuthState::advance_factor`, which takes the
+factor's proof, a `FactorAssurance` that holds its `FactorKind` and the
+`Timestamp` it was verified at, and returns an `AdvanceOutcome` that
 tells the caller what just happened.
 
 ```rust,ignore
 impl AuthState {
-    pub(crate) fn advance_factor(
-        &mut self,
-        kind: &FactorKind,
-        authn_time: DateTime<Utc>,
-    ) -> AdvanceOutcome { ... }
+    pub(crate) fn advance_factor(&mut self, proof: FactorAssurance) -> AdvanceOutcome { ... }
 }
 
-pub enum AdvanceOutcome {
+pub(crate) enum AdvanceOutcome {
     NotApplicable,
     StillAuthenticating,
     Completed,
 }
 ```
 
-The visibility on the method is `pub(crate)`, which is the choice that
-keeps the orchestration honest. The pure state mutation is reachable
-only from within `axess-core`. Application code never calls it
-directly. Instead, application code calls `RequestAuthnService::verify_factor`,
+The method is `pub(crate)`, which keeps the orchestration honest: the
+pure state mutation is reachable only from within `axess-core`.
+Application code calls `RequestAuthnService::verify_factor` instead,
 which is the orchestrator method that locks the session, performs the
 factor's cryptographic verification through `axess-factors`, calls
 `advance_factor` on the typed state, and dispatches on the returned
@@ -159,22 +179,20 @@ made against a state that does not accept factor verification (you
 cannot verify a factor against a `Guest` session, for instance).
 `StillAuthenticating` means the factor verified and more factors are
 required to complete the method. `Completed` means the final required
-factor for this method just passed, and the session should transition
-to `Authenticated`. The orchestration layer translates `Completed`
-into a typed `Authenticated` variant with the right `authn_time` and
-`factors_completed`, applies session id rotation to defeat fixation,
-and writes the session back to the store.
+factor for this method just passed, and `advance_factor` has replaced
+the state with an `Authenticated` variant carrying the right
+`authn_time`, `signed_in_at` and `factors_completed`. On `Completed` the
+orchestration layer binds the fingerprint, rotates the session id to
+defeat fixation, and marks the session for writing back to the store.
 
 ## The orchestration split
 
 The split between `AuthState` (the pure data and pure transition
 methods) and `AuthSession` (the Axum extractor with its `RwLock`,
-dirty flag, and side-effect dispatch) is a deliberate choice with two
-payoffs.
+dirty flag, and side-effect dispatch) has two payoffs.
 
-The first payoff is testability. Unit tests on the state machine do not
-need `tokio`, do not need `RwLock`, do not need a fake session store,
-and do not need an extractor harness. They construct an `AuthState`
+The first payoff is testability. Unit tests on the state machine need
+no `tokio`, no `RwLock`, no fake session store and no extractor harness. They construct an `AuthState`
 directly, call `advance_factor` (or one of the other `pub(crate)`
 transition methods), and assert on the resulting variant. A regression
 in the transition logic surfaces as a one-line test against the enum,
@@ -184,23 +202,18 @@ The second payoff is auditability. Every orchestration side effect (id
 rotation, fingerprint binding, dirty-flag handling, store write-back)
 lives in one file (the `SessionService::call()` method, walked through
 in *Session lifecycle and crypto envelope*) rather than scattered
-across transition methods. A code review of the orchestration is
-self-contained; a code review of the state machine is self-contained;
-neither has to mentally reconstruct the other.
+across transition methods. Each half can be reviewed without reconstructing the other.
 
-The pattern is worth naming because it shows up again in the runtime.
 Pure state machines compose cleanly with async orchestrators that hold
 the locks and dispatch side effects, and the two halves get reviewed
 and tested independently.
 
 ## Where `Authenticated` stops being the right shape
 
-The natural temptation when integrating axess for the first time is to
-treat `Authenticated` as the "done" state and `Guest` as the "not done"
-state, and to ignore the intermediate variants. Resist it. The
-intermediate variants are how axess represents real-world flows that
-do not fit a binary, and reaching into them lets your application
-behave correctly without inventing parallel state on the side.
+Do not treat `Authenticated` as "done" and `Guest` as "not done" and
+ignore the intermediate variants. The intermediate variants represent
+flows that do not fit a binary; using them lets your application behave
+correctly without keeping parallel state of its own.
 
 A signup flow that captures a username and password, mints a session,
 and then asks the user to verify their email before granting any
@@ -208,7 +221,7 @@ access should sit in `PendingWorkflow { kind: EmailVerification, ... }`,
 not in `Authenticated`. A handler that protects the dashboard checks
 `is_authenticated()`, which returns true only for the `Authenticated`
 variant, and the user sees the email-verification page until the
-ceremony completes. The variant change at completion time then
+ceremony completes. When the ceremony completes, the session
 transitions to `Authenticated`, the same handler now lets the user in,
 and the application does not need to model a "needs to verify email"
 column on the users table.
@@ -224,8 +237,7 @@ both directions: a not-logged-in user should not see it, and a fully
 logged-in user does not need it.
 
 The pattern generalises to any post-identification ceremony. The
-typical question to ask is "should the user be considered fully logged
-in during this step?" If the answer is no, `PendingWorkflow` is the
+question is: should the user count as fully logged in during this step? If the answer is no, `PendingWorkflow` is the
 right variant. If the answer is yes, and you simply want the user to
 do something next, then `Authenticated` plus a flag on the user record
 fits better.
@@ -251,21 +263,20 @@ the orchestration; the state machine just sees the variant change.
 
 Real applications need to attach data to a session that axess does not
 model: a preference, a feature-flag selection, a partial form draft.
-`SessionData` has a `custom` field for this, and the size cap is
-sixty-four kilobytes. The cap exists because the session is
-round-tripped through a cookie (or its server-side analogue), and a
-session that grows without bound becomes a DoS surface. Sixty-four
-kilobytes is enough for almost any sensible use; anything larger
-probably belongs in the database keyed by user id rather than in the
+`SessionData` has a `custom` field for this, with a size cap of 64 KiB
+by default (`SessionConfigBuilder::max_custom_bytes` sets it, and zero
+turns it off). The cap bounds the serialised size of the custom data. A session is
+a server-side record (the cookie carries its id and a signature), and a session
+that grows without bound in the store becomes a DoS surface. 64 KiB is
+enough for almost any sensible use; anything larger probably belongs in the database keyed by user id rather than in the
 session.
 
 Adding a custom field is purely additive. The `SessionData` struct
-exposes `custom: HashMap<String, serde_json::Value>` (the
+exposes `custom: serde_json::Value`, a JSON object keyed by name (the
 implementation may evolve, but the field-with-cap shape is stable),
 and you write through accessor methods on the session handle. The
-state-machine variants do not change. The schema-migration story
-covered in *Schema migration* handles upgrade paths without breaking
-existing sessions.
+state-machine variants do not change. *Schema migration* covers upgrades that keep existing sessions
+working.
 
 ## The foundation the rest of the book stands on
 
@@ -286,11 +297,11 @@ authentication question, and the rest of the library asks it.
 
 ## Further reading
 
-Three chapters build directly on this one. *Factors and methods*
+Four chapters build directly on this one. *Factors and methods*
 covers which factors fit into the variants and how methods compose.
 *Scope hierarchy* covers how `begin_login` picks the right method
-given Global, Tenant and User overrides. *Refresh tokens and session
-continuity* covers how a session survives across long-lived sessions,
+given System, Tenant and User overrides. *Refresh tokens and session
+continuity* covers long-lived sessions,
 key rotation and token theft. *Session lifecycle and crypto envelope*
 in Part V covers the cookie, the encryption envelope, and the
 orchestration's dirty-flag handling.

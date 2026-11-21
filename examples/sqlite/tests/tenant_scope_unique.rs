@@ -4,18 +4,18 @@
 //! reports it was absent no longer, and the migration that adds the partial
 //! indexes also removes duplicates an older database already holds.
 
-use axess::SystemClock;
 use axess::authn::{
     AuthMethod, AuthnScope, FactorConfig, FactorKind, FactorStep, FactorStore, TenantId,
     TotpConfig, ZeroizedString,
 };
+use axess_clock::testing::MockClock;
 use axess_example_sqlite::models::backend::{OurBackend, seed};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::str::FromStr;
 
 const TENANT: &str = "00000000-0000-0000-0000-000000000001";
 
-async fn pool() -> sqlx::SqlitePool {
+async fn pool(clock: &MockClock) -> sqlx::SqlitePool {
     let opts = SqliteConnectOptions::from_str("sqlite::memory:")
         .expect("in-memory url")
         .create_if_missing(true);
@@ -26,9 +26,10 @@ async fn pool() -> sqlx::SqlitePool {
         .expect("connect in-memory sqlite");
     sqlx::migrate!().run(&pool).await.expect("migrations");
     seed(
-        &SystemClock,
+        clock,
         &pool,
-        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF"),
+        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF")
+            .with_clock(std::sync::Arc::new(clock.clone())),
     )
     .await
     .expect("seed");
@@ -51,8 +52,9 @@ async fn count(pool: &sqlx::SqlitePool, sql: &'static str) -> i64 {
 
 #[tokio::test]
 async fn a_tenant_scope_factor_is_saved_once_and_replaced() {
-    let pool = pool().await;
-    let backend = OurBackend::new(pool.clone());
+    let clock = MockClock::at_reference();
+    let pool = pool(&clock).await;
+    let backend = OurBackend::new(pool.clone()).with_clock(std::sync::Arc::new(clock.clone()));
     let scope = AuthnScope::Tenant(TenantId::try_new(TENANT).expect("tenant"));
     let rows = "SELECT COUNT(*) FROM factor_configs WHERE user_id IS NULL AND kind = 'totp' AND tenant_id = '00000000-0000-0000-0000-000000000001'";
 
@@ -85,8 +87,9 @@ async fn a_tenant_scope_factor_is_saved_once_and_replaced() {
 
 #[tokio::test]
 async fn a_tenant_scope_method_is_saved_once_per_name() {
-    let pool = pool().await;
-    let backend = OurBackend::new(pool.clone());
+    let clock = MockClock::at_reference();
+    let pool = pool(&clock).await;
+    let backend = OurBackend::new(pool.clone()).with_clock(std::sync::Arc::new(clock.clone()));
     let scope = AuthnScope::Tenant(TenantId::try_new(TENANT).expect("tenant"));
     let method = |kinds: Vec<FactorKind>| AuthMethod {
         name: "tenant-default".into(),
@@ -115,7 +118,8 @@ async fn a_tenant_scope_method_is_saved_once_per_name() {
 
 #[tokio::test]
 async fn the_migration_removes_duplicates_an_older_database_holds() {
-    let pool = pool().await;
+    let clock = MockClock::at_reference();
+    let pool = pool(&clock).await;
     // Recreate the old state: no partial indexes, then two rows at one scope.
     sqlx::query("DROP INDEX factor_configs_tenant_scope_unique")
         .execute(&pool)
@@ -155,7 +159,8 @@ async fn the_migration_removes_duplicates_an_older_database_holds() {
 
 #[tokio::test]
 async fn the_schema_itself_refuses_a_second_method_row_at_a_tenant_scope() {
-    let pool = pool().await;
+    let clock = MockClock::at_reference();
+    let pool = pool(&clock).await;
     let insert = |id: &'static str| {
         sqlx::query(
             "INSERT INTO auth_methods (id, name, steps_json, user_id, tenant_id)

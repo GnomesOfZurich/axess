@@ -2,7 +2,10 @@
 //! The delay earned by wrong guesses at a later factor is not cleared by the
 //! earlier factor passing: it is cleared when the whole login completes.
 
-mod common;
+mod hotp_code;
+mod totp_code;
+use axess_core::testing::fixtures as common;
+use totp_code::generate_totp_code;
 
 use axess_clock::{Clock, testing::MockClock};
 use axess_core::authn::AuditContext;
@@ -15,8 +18,7 @@ use axess_core::blocking::KdfExecutor;
 use axess_core::testing::mock_authn::{MockFactorStore, MockIdentityStore};
 use axess_core::testing::test_session;
 use common::{
-    generate_totp_code, password_config, password_totp_method, test_tenant, test_user, totp_config,
-    uid, user_scope,
+    password_config, password_totp_method, test_tenant, test_user, totp_config, uid, user_scope,
 };
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -29,7 +31,7 @@ struct World {
 }
 
 fn world() -> World {
-    let clock = MockClock::now();
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
         .with_clock(clock.clone())
         .with_tenant(test_tenant())
@@ -39,7 +41,7 @@ fn world() -> World {
             ..LockoutPolicy::default()
         });
     let factors = MockFactorStore::new()
-        .with_factor(user_scope(), password_config("Gnomes2+"))
+        .with_factor(user_scope(), password_config("Sample2+"))
         .with_factor(user_scope(), totp_config(SECRET))
         .with_method(&uid("u1"), password_totp_method());
     let svc = AuthnService::builder(identity, factors)
@@ -65,7 +67,7 @@ async fn password_then(w: &World, code: &str) -> Option<FactorOutcome> {
         .unwrap();
     let first = w
         .svc
-        .verify_factor(&password("Gnomes2+"), &session)
+        .verify_factor(&password("Sample2+"), &session)
         .await
         .unwrap();
     if matches!(first, FactorOutcome::Throttled { .. }) {
@@ -82,7 +84,7 @@ async fn password_then(w: &World, code: &str) -> Option<FactorOutcome> {
 #[tokio::test]
 async fn a_password_that_passes_does_not_clear_the_delay_earned_at_the_second_factor() {
     let w = world();
-    let step = chrono::Duration::seconds(1);
+    let step = axess_clock::SignedDuration::seconds(1);
 
     let first = password_then(&w, "000000").await;
     assert!(
@@ -113,8 +115,8 @@ async fn completing_the_login_clears_the_delay() {
         matches!(wrong, Some(FactorOutcome::InvalidCredential)),
         "{wrong:?}"
     );
-    w.clock.advance(chrono::Duration::seconds(2));
-    let code = generate_totp_code(SECRET, SystemTime::from(w.clock.now()));
+    w.clock.advance(axess_clock::SignedDuration::seconds(2));
+    let code = generate_totp_code(SECRET, SystemTime::try_from(w.clock.now()).unwrap());
     let done = password_then(&w, &code).await;
     assert!(
         matches!(done, Some(FactorOutcome::Authenticated)),

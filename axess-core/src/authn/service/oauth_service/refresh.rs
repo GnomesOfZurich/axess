@@ -10,7 +10,7 @@ use super::scoped::Scope;
 use crate::authn::service::RequestAuthnService;
 use crate::authn::{
     event::{AuthEventBuilder, AuthEventType, AuthFailureReason},
-    factor::FactorKind,
+    factor::{FactorKind, FederatedProvider},
     store::{FactorStore, IdentityStore},
 };
 
@@ -19,69 +19,13 @@ where
     I: IdentityStore,
     F: FactorStore<Error = I::Error>,
 {
-    /// Refresh an OAuth token using a stored refresh token.
-    ///
-    /// Exchanges the refresh token at the IdP's token endpoint for new
-    /// access/ID tokens. Validates the new ID token, when the IdP sent one,
-    /// and returns it with the rotated tokens.
-    ///
-    /// # Arguments
-    ///
-    /// * `provider_name`: Name of the registered OAuth provider.
-    /// * `refresh_token`: The refresh token obtained from a previous login
-    ///   (stored in [`OAuthClaims::refresh_token`](axess_factors::oauth::OAuthClaims::refresh_token)).
-    /// * `expected_subject`: The IdP subject the login recorded
-    ///   ([`OAuthClaims::subject`](axess_factors::oauth::OAuthClaims::subject)).
-    ///   A response for any other subject is refused (OIDC Core 12.2) and
-    ///   audited as a provider rejection.
-    /// * `original_nonce`: The `nonce` of the login that produced the refresh
-    ///   token ([`OAuthClaims::nonce`](axess_factors::oauth::OAuthClaims::nonce),
-    ///   stored beside the refresh token).
-    ///   A refresh ID token that carries a nonce must equal it (OIDC Core
-    ///   12.2); one without a nonce is accepted, and one with a nonce when
-    ///   this is `None` is refused.
-    /// * `dpop_key`: The key the login's tokens are bound to, for a provider
-    ///   that binds them to a DPoP key: the one the login returned in
-    ///   [`OAuthClaims::dpop_key`](axess_factors::oauth::OAuthClaims::dpop_key),
-    ///   or restored with `DpopKey::from_seed`. The refresh request carries a
-    ///   proof signed by it, and the rotated access token is bound to the
-    ///   same key. `None` for a provider that does not bind.
-    ///
-    /// # Returns
-    ///
-    /// A [`RefreshOutcome`](axess_factors::oauth::RefreshOutcome). Store its
-    /// `refresh_token` in place of the one you sent: a rotating IdP has spent
-    /// the old one even when the response carries no ID token, in which case
-    /// `id_token_claims` is `None` and the claims you already hold stand.
-    ///
-    /// # Errors
-    ///
-    /// [`OAuthError::DpopKeyRequired`](axess_factors::oauth::OAuthError::DpopKeyRequired)
-    /// when the provider binds tokens and `dpop_key` is `None`, refused
-    /// before anything is sent and audited as `token_refresh_dpop_key_missing`;
-    /// the provider's own errors otherwise.
-    #[tracing::instrument(skip(self, refresh_token, expected_subject, original_nonce, dpop_key))]
-    pub async fn refresh_oauth_token(
-        &self,
-        provider_name: &str,
-        refresh_token: &str,
-        expected_subject: &str,
-        original_nonce: Option<&str>,
-        dpop_key: Option<&axess_factors::oauth::DpopKey>,
-    ) -> Result<axess_factors::oauth::RefreshOutcome, axess_factors::oauth::OAuthError> {
-        self.refresh_scoped(
-            &Scope::global(),
-            provider_name,
-            refresh_token,
-            expected_subject,
-            original_nonce,
-            dpop_key,
-        )
-        .await
-    }
-
-    /// The refresh both the by-name methods and [`ScopedOAuth`](super::ScopedOAuth)
-    /// run; `scope` says whose provider `provider_name` names.
+    /// The refresh of [`ScopedOAuth`](super::ScopedOAuth); `scope` says whose
+    /// provider `provider_name` names.
+    #[tracing::instrument(
+        name = "refresh_oauth_token",
+        skip(self, scope, provider_name, refresh_token, expected_subject, original_nonce, dpop_key),
+        fields(provider_name = %super::logged_provider_name(provider_name))
+    )]
     pub(super) async fn refresh_scoped(
         &self,
         scope: &Scope,
@@ -105,10 +49,20 @@ where
         // Success continues to record `token_refresh` so the two are
         // distinguishable in the audit stream.
 
+        // Until the name resolves it is only the caller's text, and the
+        // failure rows carry it as a span does: escaped and cut. A resolved
+        // name is a registered one and is written as it is.
+        let unresolved_name = super::logged_provider_name(provider_name);
+        // A configured kind is the configuration's, not the caller's text,
+        // and is recorded as it is; a name with none is recorded escaped.
+        let unresolved_kind = match self.scoped_provider_kind(scope, provider_name).await {
+            FederatedProvider::Custom(_) => FederatedProvider::Custom(unresolved_name),
+            configured => configured,
+        };
         if refresh_token.is_empty() {
             self.record_oauth_refresh_failure(
                 AuthFailureReason::TokenRefreshNoToken,
-                provider_name,
+                unresolved_kind,
                 scope,
             )
             .await?;
@@ -123,11 +77,14 @@ where
                 } else {
                     AuthFailureReason::TokenRefreshProviderRejected
                 };
-                self.record_oauth_refresh_failure(reason, provider_name, scope)
+                self.record_oauth_refresh_failure(reason, unresolved_kind, scope)
                     .await?;
                 return Err(e);
             }
         };
+
+        // The name resolved: the rows from here record its configured kind.
+        let kind = self.scoped_provider_kind(scope, provider_name).await;
 
         let signer = dpop_key.map(|key| axess_factors::oauth::DpopSigner {
             key,
@@ -147,22 +104,20 @@ where
                 } else {
                     AuthFailureReason::TokenRefreshProviderRejected
                 };
-                self.record_oauth_refresh_failure(reason, provider_name, scope)
+                self.record_oauth_refresh_failure(reason, kind, scope)
                     .await?;
                 return Err(e);
             }
         };
 
         // The IdP subject is never a local user id; the row names the user
-        // and tenant the scope was given (`as_user`, `oauth_in_tenant`, or
+        // and tenant the scope was given (`attributed_to`, `oauth_in_tenant`, or
         // the authenticated session behind `oauth_for_session`).
         let (user, tenant) = scope.attribution();
         self.emit_audit(
             AuthEventBuilder::success(AuthEventType::LoginAttempt)
                 .maybe_attributed_to(user, tenant)
-                .with_factor(FactorKind::Federated(
-                    crate::authn::factor::FederatedProvider::Custom(provider_name.into()),
-                ))
+                .with_factor(FactorKind::Federated(kind))
                 .with_error(AuthFailureReason::TokenRefresh),
         )
         .await
@@ -175,11 +130,13 @@ where
     ///
     /// Mirrors [`record_oauth_failure`](super::login::RequestAuthnService::record_oauth_failure)
     /// but session-free: the refresh path is called with a provider name and
-    /// a token, and the user and tenant the scope was given.
+    /// a token, and the user and tenant the scope was given. `provider` is the
+    /// resolved provider's kind, or `Custom` of the caller's name, escaped,
+    /// while the name has not resolved.
     async fn record_oauth_refresh_failure(
         &self,
         reason: AuthFailureReason,
-        provider_name: &str,
+        provider: FederatedProvider,
         scope: &Scope,
     ) -> Result<(), axess_factors::oauth::OAuthError> {
         use axess_factors::oauth::OAuthError;
@@ -187,9 +144,7 @@ where
         self.emit_audit(
             AuthEventBuilder::failure(AuthEventType::LoginAttempt)
                 .maybe_attributed_to(user, tenant)
-                .with_factor(FactorKind::Federated(
-                    crate::authn::factor::FederatedProvider::Custom(provider_name.into()),
-                ))
+                .with_factor(FactorKind::Federated(provider))
                 .with_error(reason),
         )
         .await

@@ -1,9 +1,8 @@
 #![cfg(feature = "testing")]
 //! A counter outage does not switch the per-key guess throttle off.
 
-mod common;
+use axess_core::testing::fixtures as common;
 
-use axess_clock::testing::MockClock;
 use axess_core::authn::AuditContext;
 use axess_core::authn::factor::{FactorCredential, ZeroizedString};
 use axess_core::authn::service::{AuthnService, FactorOutcome, LoginOutcome, RequestAuthnService};
@@ -11,20 +10,20 @@ use axess_core::authn::types::{CounterUnavailable, LockoutPolicy};
 use axess_core::blocking::KdfExecutor;
 use axess_core::testing::mock_authn::{MockFactorStore, MockIdentityStore};
 use axess_core::testing::test_session;
-use chrono::{TimeZone, Utc};
 use common::{password_config, password_method, test_tenant, test_user, uid, user_scope};
 
 type Svc = RequestAuthnService<MockIdentityStore, MockFactorStore>;
 
 fn rig(policy: LockoutPolicy) -> (Svc, MockIdentityStore) {
-    let clock = MockClock::at(Utc.timestamp_opt(1_700_000_000, 0).unwrap());
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"))
         .with_lockout_policy(policy)
         .with_clock(clock.clone());
     let factors = MockFactorStore::new()
-        .with_factor(user_scope(), password_config("Gnomes2+"))
+        .with_factor(user_scope(), password_config("Sample2+"))
         .with_method(&uid("u1"), password_method());
     let svc = AuthnService::builder(identity.clone(), factors)
         .with_clock(clock)

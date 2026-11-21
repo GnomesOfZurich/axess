@@ -9,9 +9,20 @@
 //! the orchestrator persists with the pending challenge.
 
 use crate::secret::ZeroizedString;
-use chrono::{DateTime, Utc};
+use axess_clock::Until;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Duration;
+
+/// The shortest life an email code may be given: one minute, the time a
+/// mail takes to arrive and be read. A shorter code is refused by the login
+/// service when it is about to be issued.
+pub const MIN_EMAIL_OTP_TTL: Duration = Duration::from_secs(60);
+
+/// The longest life an email code may be given: thirty minutes. A code that
+/// lives longer sits in an inbox for a guesser to find; the login service
+/// refuses to issue one.
+pub const MAX_EMAIL_OTP_TTL: Duration = Duration::from_secs(1800);
 
 /// Email OTP factor configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,12 +31,18 @@ pub struct EmailOtpConfig {
     pub email: Arc<str>,
     /// Length of the generated numeric code (typically 6 to 8 digits).
     pub code_length: u8,
-    /// Time-to-live for an issued code, in seconds.
-    pub ttl_secs: u32,
+    /// Time-to-live for an issued code: a whole number of seconds, at least
+    /// [`MIN_EMAIL_OTP_TTL`] and at most [`MAX_EMAIL_OTP_TTL`], outside which
+    /// the login service refuses to issue a code. Stored as a count of
+    /// seconds under `ttl_secs`, as before.
+    #[serde(rename = "ttl_secs", with = "crate::whole_seconds::u32_seconds")]
+    pub ttl: Duration,
     /// SHA-256 hash of the currently pending code, or `None` when no code is outstanding.
     pub pending_hash: Option<ZeroizedString>,
-    /// Wall-clock instant after which the pending code is considered expired.
-    pub pending_until: Option<DateTime<Utc>>,
+    /// When the pending code ends: it is considered expired after this.
+    /// Computed from the time of issue and a lifetime, so it is an
+    /// [`Until`]; it is stored as the same RFC 3339 text as before.
+    pub pending_until: Option<Until>,
     /// Number of verification attempts made against the current pending code.
     /// Incremented on each failed verification. When `attempt_count >= max_attempts`,
     /// the pending code is invalidated and a new one must be issued.
@@ -50,7 +67,7 @@ impl Default for EmailOtpConfig {
             // infeasible within the 5-minute TTL when combined with the
             // max_attempts limit (default 5 tries before code is burned).
             code_length: 8,
-            ttl_secs: 300,
+            ttl: Duration::from_secs(300),
             pending_hash: None,
             pending_until: None,
             attempt_count: 0,
@@ -59,10 +76,9 @@ impl Default for EmailOtpConfig {
     }
 }
 
-// mutation-testing follow-up: pin the documented `max_attempts` default. A value
-// of 0 would either lock the user out instantly or never expire the
-// counter. Mutation testing found the previous suite didn't
-// assert this default.
+// Pins the documented `max_attempts` default of five. A default of 0 would
+// lock the user out at once or never count a failure, depending on how the
+// verify path reads it.
 #[cfg(test)]
 mod tests {
     use super::{EmailOtpConfig, default_max_email_otp_attempts};

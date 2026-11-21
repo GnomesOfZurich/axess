@@ -25,6 +25,8 @@ mod impersonation;
 mod password_reset;
 mod signup;
 
+pub use signup::SIGNUP_SESSION_NOT_REGISTERED_REASON;
+
 use crate::authn::service::RequestAuthnService;
 use crate::authn::service::outcomes::FactorOutcome;
 use crate::authn::{
@@ -111,16 +113,19 @@ where
     /// The flow fails when the audit store is down, but by then the session
     /// is already authenticated and registered. Returning the error alone
     /// would leave a live session behind a failed login, so end it: drop the
-    /// registry entry and wipe the session state.
+    /// registry entry and wipe the session state. The entry dropped is the
+    /// one the registry holds ([`AuthSession::registered_key`]): after a
+    /// step-up under a layer that moves the entry itself, the session's own
+    /// key names none until the layer's move.
     pub(crate) async fn end_session_after_audit_failure(
         &self,
         user_id: &crate::authn::ids::UserId,
         session: &AuthSession,
     ) {
-        let sid = session.session_id().await;
         if let Some(reg) = &self.inner.registry {
+            let held = session.registered_key().await;
             note_revocation(
-                reg.invalidate_session(user_id, &sid).await,
+                reg.invalidate_session(user_id, &held).await,
                 "refusing a login step",
             );
         }
@@ -132,7 +137,7 @@ where
         &self,
         reg: &dyn crate::session::store::SessionRegistryHandle,
         user_id: &crate::authn::ids::UserId,
-        victims: &[crate::session::id::SessionId],
+        victims: &[crate::session::id::SessionKey],
     ) {
         for old_sid in victims {
             note_revocation(
@@ -141,7 +146,7 @@ where
             );
             tracing::info!(
                 user_id = %user_id,
-                evicted_session = %old_sid,
+                evicted_session = %old_sid.prefix(),
                 "concurrent session limit reached; evicting oldest session"
             );
             self.inner.metrics.session.session_invalidated();
@@ -150,15 +155,21 @@ where
 
     /// Re-read the account status after the session is registered.
     ///
-    /// A status that no longer allows login revokes the just-registered
-    /// session, clears it, counts the lock and breaks with
-    /// [`FactorOutcome::Locked`]. A status-read failure revokes and clears
-    /// too, and is an error (fail closed).
+    /// A status that no longer allows login revokes the session's registry
+    /// entry, clears it and answers as the check before the factor step
+    /// answers the same state, with the same row: a suspension counts the
+    /// lock, writes the locked row and breaks with [`FactorOutcome::Locked`];
+    /// any other state that may not log in writes the failed `FactorVerified`
+    /// row naming `not_active` and is [`AuthnError::NotActive`]. A
+    /// status-read failure revokes and clears too, and is an error (fail
+    /// closed). The entry revoked is the one the registry holds
+    /// ([`AuthSession::registered_key`]); the rows name the session's own
+    /// key.
     async fn recheck_status_after_register(
         &self,
         reg: &dyn crate::session::store::SessionRegistryHandle,
         user_id: &crate::authn::ids::UserId,
-        sid: &crate::session::id::SessionId,
+        tenant_id: &crate::authn::ids::TenantId,
         session: &AuthSession,
     ) -> Result<ControlFlow<FactorOutcome>, AuthnError<I::Error>> {
         // Re-read account status AFTER registering. Closes the
@@ -167,6 +178,8 @@ where
         // initial status check (in `verify_factor`) and the register
         // above; without this re-check, the just-registered session
         // would survive the suspension as if the suspend never happened.
+        let held = session.registered_key().await;
+        let own = session.session_key().await;
         match self.current_account_status(user_id).await {
             Ok(status) if !status.allows_login() => {
                 tracing::warn!(
@@ -176,19 +189,25 @@ where
                      revoking just-registered session and refusing authentication"
                 );
                 note_revocation(
-                    reg.invalidate_session(user_id, sid).await,
+                    reg.invalidate_session(user_id, &held).await,
                     "refusing a login step",
                 );
                 // Wipe the in-memory session state so the response cookie
                 // does not ship a Set-Cookie for an authenticated session.
                 session.clear().await;
-                self.inner.metrics.auth_flow.account_locked();
-                let until = if let crate::authn::types::EntityState::Suspended(detail) = &status {
-                    detail.until
-                } else {
-                    None
-                };
-                return Ok(ControlFlow::Break(FactorOutcome::Locked { until }));
+                // The answer and the row the check before the step gives the
+                // same state: a suspension is a lock, shown with the end of a
+                // lockout only; any other state is `NotActive`.
+                if status.is_suspended() {
+                    self.inner.metrics.auth_flow.account_locked();
+                    self.record_locked_attempt_audit(user_id, tenant_id, None, own)
+                        .await?;
+                    let until = super::factor_pipeline::shown_suspension_end(&status);
+                    return Ok(ControlFlow::Break(FactorOutcome::Locked { until }));
+                }
+                self.record_not_active_attempt_audit(user_id, tenant_id, None, own)
+                    .await?;
+                return Err(AuthnError::NotActive(status));
             }
             Ok(_) => {}
             Err(e) => {
@@ -201,7 +220,7 @@ where
                     "post-register status re-check failed; failing closed"
                 );
                 note_revocation(
-                    reg.invalidate_session(user_id, sid).await,
+                    reg.invalidate_session(user_id, &held).await,
                     "refusing a login step",
                 );
                 session.clear().await;
@@ -211,18 +230,105 @@ where
         Ok(ControlFlow::Continue(()))
     }
 
-    /// Make a just-authenticated session reachable by the eviction path.
+    /// Register a session a login has just signed in: enforce the
+    /// concurrent session limit, register the session's key, note it on
+    /// the session, and trim again. A refusal clears the session and is
+    /// [`AuthnError::NoFlow`]; a registry that cannot list the user's
+    /// sessions under the limit refuses the login.
+    async fn register_login(
+        &self,
+        reg: &dyn crate::session::store::SessionRegistryHandle,
+        user_id: &crate::authn::ids::UserId,
+        session: &AuthSession,
+    ) -> Result<(), AuthnError<I::Error>> {
+        let sid = session.session_key().await;
+        // Enforce concurrent session limit: evict oldest sessions.
+        if let Some(max) = self.inner.max_sessions_per_user {
+            // A registry that cannot list the sessions cannot enforce the
+            // cap, so the login is refused rather than counted as none.
+            let Ok(active) = reg.held_sessions(user_id).await else {
+                tracing::error!(
+                    user_id = %user_id,
+                    "session registry could not list the user's sessions; \
+                     clearing session and refusing authentication under the \
+                     concurrent session limit"
+                );
+                session.clear().await;
+                return Err(AuthnError::NoFlow);
+            };
+            let victims = victims_before_register(&active, &sid, max);
+            self.evict_sessions(reg, user_id, &victims).await;
+        }
+        // Register-failure must clear the session and refuse
+        // authentication. Without this, the just-set Authenticated state
+        // would ride out as a cookie that `invalidate_user` cannot reach.
+        if !reg.register(user_id, &sid).await {
+            tracing::error!(
+                user_id = %user_id,
+                "complete_factor_step register failed; clearing session and \
+                 refusing authentication"
+            );
+            session.clear().await;
+            return Err(AuthnError::NoFlow);
+        }
+        self.note_registration(reg, session, user_id, sid).await;
+
+        // Trim again now that this session is registered. The count above
+        // and the register are separate registry calls, so parallel logins
+        // can each see room and together leave the user above the cap.
+        // Every one of them keeps the NEWEST `max` registrations and
+        // evicts the rest, itself included, so they all pick the same
+        // survivors: the set converges on the cap and the logins that
+        // lost the race fail rather than report success with a session
+        // a peer has already revoked. (Evicting "everyone but me" would make
+        // two parallel logins at a cap of one revoke each other.)
+        if let Some(max) = self.inner.max_sessions_per_user {
+            let Ok(active) = reg.held_sessions(user_id).await else {
+                tracing::error!(
+                    user_id = %user_id,
+                    "session registry could not list the user's sessions after \
+                     registering; revoking this session and refusing authentication \
+                     under the concurrent session limit"
+                );
+                note_revocation(
+                    reg.invalidate_session(user_id, &sid).await,
+                    "refusing a login step",
+                );
+                session.clear().await;
+                return Err(AuthnError::NoFlow);
+            };
+            let victims = victims_after_register(&active, max);
+            self.evict_sessions(reg, user_id, victims).await;
+            if victims.contains(&sid) {
+                tracing::warn!(
+                    user_id = %user_id,
+                    "concurrent session limit: this login lost the race for the \
+                     last slot; clearing session and refusing authentication"
+                );
+                session.clear().await;
+                return Err(AuthnError::NoFlow);
+            }
+        }
+        Ok(())
+    }
+
+    /// Make a just-signed-in session reachable by the eviction path.
     ///
-    /// Enforces the concurrent session limit, registers the session and
-    /// re-reads the account status. Breaks with [`FactorOutcome::Locked`]
-    /// (session revoked and cleared) when the account was suspended in the
-    /// meantime; a register failure or a status-read failure clears the
-    /// session and is an error. With no registry configured it does nothing.
+    /// What the registry is to hold is decided first
+    /// ([`registration_for`]): a login registers the session under the
+    /// limit; a completed step-up of a session the registry already holds
+    /// registers nothing (the layer moves its entry, or it is moved here
+    /// when no layer does). Then the account status is read again. Breaks
+    /// with [`FactorOutcome::Locked`] (session revoked and cleared) when the
+    /// account was suspended in the meantime and is
+    /// [`AuthnError::NotActive`] when it moved to another state that may not
+    /// log in; a register failure or a status-read failure clears the
+    /// session and is an error. With no registry configured only the
+    /// credentials are checked again.
     async fn register_authenticated_session(
         &self,
         user_id: &crate::authn::ids::UserId,
         tenant_id: &crate::authn::ids::TenantId,
-        sid: &crate::session::id::SessionId,
         session: &AuthSession,
     ) -> Result<ControlFlow<FactorOutcome>, AuthnError<I::Error>> {
         // Register in the session registry BEFORE any other store
@@ -233,71 +339,12 @@ where
         // un-trackable. Register first so the session is always reachable
         // by the eviction path even if subsequent steps fail.
         if let Some(reg) = &self.inner.registry {
-            // Enforce concurrent session limit: evict oldest sessions.
-            if let Some(max) = self.inner.max_sessions_per_user {
-                // A registry that cannot list the sessions cannot enforce the
-                // cap, so the login is refused rather than counted as none.
-                let Ok(active) = reg.held_sessions(user_id).await else {
-                    tracing::error!(
-                        user_id = %user_id,
-                        "session registry could not list the user's sessions; \
-                         clearing session and refusing authentication under the \
-                         concurrent session limit"
-                    );
-                    session.clear().await;
-                    return Err(AuthnError::NoFlow);
-                };
-                let victims = victims_before_register(&active, sid, max);
-                self.evict_sessions(reg.as_ref(), user_id, &victims).await;
-            }
-            // Register-failure must clear the session and
-            // refuse authentication. Without this, the just-set
-            // Authenticated state would ride out as a cookie that
-            // `invalidate_user` cannot reach.
-            if !reg.register(user_id, sid).await {
-                tracing::error!(
-                    user_id = %user_id,
-                    "complete_factor_step register failed; clearing session and \
-                     refusing authentication"
-                );
-                session.clear().await;
-                return Err(AuthnError::NoFlow);
-            }
-
-            // Trim again now that this session is registered. The count above
-            // and the register are separate registry calls, so parallel logins
-            // can each see room and together leave the user above the cap.
-            // Every one of them keeps the NEWEST `max` registrations and
-            // evicts the rest, itself included, so they all pick the same
-            // survivors: the set converges on the cap and the logins that
-            // lost the race fail rather than report success with a session
-            // a peer has already revoked. (Evicting "everyone but me" made two
-            // parallel logins at a cap of one revoke each other.)
-            if let Some(max) = self.inner.max_sessions_per_user {
-                let Ok(active) = reg.held_sessions(user_id).await else {
-                    tracing::error!(
-                        user_id = %user_id,
-                        "session registry could not list the user's sessions after \
-                         registering; revoking this session and refusing authentication \
-                         under the concurrent session limit"
-                    );
-                    note_revocation(
-                        reg.invalidate_session(user_id, sid).await,
-                        "refusing a login step",
-                    );
-                    session.clear().await;
-                    return Err(AuthnError::NoFlow);
-                };
-                let victims = victims_after_register(&active, max);
-                self.evict_sessions(reg.as_ref(), user_id, victims).await;
-                if victims.contains(sid) {
-                    tracing::warn!(
-                        user_id = %user_id,
-                        "concurrent session limit: this login lost the race for the \
-                         last slot; clearing session and refusing authentication"
-                    );
-                    session.clear().await;
-                    return Err(AuthnError::NoFlow);
+            match registration_for(user_id, session).await {
+                Registration::Login => self.register_login(reg.as_ref(), user_id, session).await?,
+                Registration::LayerMoves => {}
+                Registration::MoveNow { from } => {
+                    self.move_entry_now(reg.as_ref(), user_id, &from, session)
+                        .await?;
                 }
             }
 
@@ -316,7 +363,8 @@ where
                          revoking just-registered session and refusing authentication"
                     );
                     note_revocation(
-                        reg.invalidate_session(user_id, sid).await,
+                        reg.invalidate_session(user_id, &session.registered_key().await)
+                            .await,
                         "refusing a login step",
                     );
                     session.clear().await;
@@ -324,7 +372,8 @@ where
                 }
                 Err(e) => {
                     note_revocation(
-                        reg.invalidate_session(user_id, sid).await,
+                        reg.invalidate_session(user_id, &session.registered_key().await)
+                            .await,
                         "refusing a login step",
                     );
                     session.clear().await;
@@ -333,7 +382,7 @@ where
             }
 
             if let ControlFlow::Break(outcome) = self
-                .recheck_status_after_register(reg.as_ref(), user_id, sid, session)
+                .recheck_status_after_register(reg.as_ref(), user_id, tenant_id, session)
                 .await?
             {
                 return Ok(ControlFlow::Break(outcome));
@@ -383,14 +432,13 @@ where
                 _ => Vec::new(),
             };
 
-            let sid = session.session_id().await;
-
             if let ControlFlow::Break(outcome) = self
-                .register_authenticated_session(user_id, tenant_id, &sid, session)
+                .register_authenticated_session(user_id, tenant_id, session)
                 .await?
             {
                 return Ok(outcome);
             }
+            let sid = session.session_key().await;
 
             // Reset the failed-attempt counter AFTER registry register
             // and AFTER the status re-check above. If this errors, the
@@ -452,6 +500,42 @@ where
     }
 }
 
+/// What the registry is to hold for a session that has just become signed
+/// in.
+enum Registration {
+    /// A login: enforce the session limit and register the session's key.
+    Login,
+    /// The registry holds this session of this user under another key and
+    /// the layer moves it: nothing to register.
+    LayerMoves,
+    /// The same, and no layer moves it: move it now.
+    MoveNow {
+        from: crate::session::id::SessionKey,
+    },
+}
+
+/// Decide [`Registration`] before anything is registered: an entry of this
+/// user under another key than the session's own is the same session (a
+/// completed step-up, or a login again on a session already signed in as
+/// the user), which is moved and not counted again; anything else is a
+/// login.
+async fn registration_for(
+    user_id: &crate::authn::ids::UserId,
+    session: &AuthSession,
+) -> Registration {
+    let own = session.session_key().await;
+    match session.registered().await {
+        Some((holder, from)) if holder == *user_id && from != own => {
+            if session.layer_moves_registry().await {
+                Registration::LayerMoves
+            } else {
+                Registration::MoveNow { from }
+            }
+        }
+        _ => Registration::Login,
+    }
+}
+
 /// The sessions to evict to make room for `sid` under a cap of `max`:
 /// the oldest of the OTHERS, enough that the others plus `sid` fit.
 ///
@@ -459,10 +543,10 @@ where
 /// is then not counted twice: counting it as an existing session as well
 /// as the incoming one evicted one session too many.
 pub(super) fn victims_before_register(
-    active: &[crate::session::id::SessionId],
-    sid: &crate::session::id::SessionId,
+    active: &[crate::session::id::SessionKey],
+    sid: &crate::session::id::SessionKey,
     max: usize,
-) -> Vec<crate::session::id::SessionId> {
+) -> Vec<crate::session::id::SessionKey> {
     let others: Vec<_> = active.iter().filter(|s| *s != sid).copied().collect();
     let to_evict = (others.len() + 1).saturating_sub(max).min(others.len());
     others[..to_evict].to_vec()
@@ -472,20 +556,22 @@ pub(super) fn victims_before_register(
 /// login: everything but the newest `max`, the new login itself included
 /// if it is not among them.
 pub(super) fn victims_after_register(
-    active: &[crate::session::id::SessionId],
+    active: &[crate::session::id::SessionKey],
     max: usize,
-) -> &[crate::session::id::SessionId] {
+) -> &[crate::session::id::SessionKey] {
     &active[..active.len().saturating_sub(max)]
 }
 
 #[cfg(test)]
 mod eviction_tests {
     use super::*;
-    use crate::session::id::SessionId;
+    use crate::session::id::{SessionId, SessionKey};
 
-    fn ids(n: u64) -> Vec<SessionId> {
+    fn ids(n: u64) -> Vec<SessionKey> {
         let rng = crate::testing::MockRng::new(n);
-        (0..6).map(|_| SessionId::new(&rng)).collect()
+        (0..6)
+            .map(|_| SessionKey::of(&SessionId::new(&rng)))
+            .collect()
     }
 
     #[test]

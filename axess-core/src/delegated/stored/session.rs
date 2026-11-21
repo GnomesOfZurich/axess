@@ -12,25 +12,25 @@ use axess_identity::{TenantId, UserId};
 use crate::delegated::error::DelegatedError;
 
 use super::credential::{CredentialSwap, DelegatedCredentialStore, StoredDelegation, store_err};
-use super::grant::refresh_token_grant;
+use super::grant::{GrantRegistration, refresh_token_grant};
 use super::provider::DelegatedProvider;
 
 /// Default skew applied to `expires_at` when deciding "refresh now?".
 /// Refreshing 60 s before true expiry gives the downstream call
 /// headroom for clock drift between axess and the IdP plus normal
 /// network latency.
-const DEFAULT_REFRESH_SKEW_SECS: i64 = 60;
+const DEFAULT_REFRESH_SKEW: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// The largest refresh skew [`StoredDelegationSession::with_refresh_skew_secs`]
+/// The largest refresh skew [`StoredDelegationSession::with_refresh_skew`]
 /// keeps: one day.
-const MAX_REFRESH_SKEW_SECS: i64 = 86_400;
+const MAX_REFRESH_SKEW: std::time::Duration = std::time::Duration::from_secs(86_400);
 
 /// Idle entries are pruned from the single-flight registry once it
 /// holds more than this many keys.
 const REFRESH_LOCK_PRUNE_THRESHOLD: usize = 1024;
 
 /// The process-wide default HTTP client: built once, so every session
-/// that does not call [`StoredDelegationSession::with_http_client`]
+/// that does not call [`StoredDelegationSession::with_client_settings`]
 /// shares one connection pool. A clone is a reference-count bump.
 ///
 /// A build failure (the TLS backend failed to initialise) is returned, not
@@ -43,7 +43,7 @@ fn default_http_client() -> Result<reqwest::Client, DelegatedError> {
     if let Some(client) = CLIENT.get() {
         return Ok(client.clone());
     }
-    let built = crate::outbound_http::hardened_client()?;
+    let built = crate::outbound_http::hardened_client(|settings| settings)?;
     Ok(CLIENT.get_or_init(|| built).clone())
 }
 
@@ -104,7 +104,7 @@ fn refresh_lock(key: RefreshKey) -> Arc<tokio::sync::Mutex<()>> {
 ///
 /// Construct one per outbound call; the wrapped store and provider
 /// are long-lived and shared via `Arc`. Unless overridden with
-/// [`with_http_client`](Self::with_http_client), every session uses
+/// [`with_client_settings`](Self::with_client_settings), every session uses
 /// one process-wide [`reqwest::Client`] (a single connection pool,
 /// 30-second timeout). Concurrent refreshes of the same credential
 /// are serialised process-wide, so a rotating refresh token is
@@ -123,7 +123,7 @@ where
     user: UserId,
     http: reqwest::Client,
     clock: Arc<dyn Clock>,
-    refresh_skew_secs: i64,
+    refresh_skew: std::time::Duration,
 }
 
 impl<S> StoredDelegationSession<S>
@@ -151,22 +151,35 @@ where
             user,
             http: default_http_client()?,
             clock: Arc::new(SystemClock),
-            refresh_skew_secs: DEFAULT_REFRESH_SKEW_SECS,
+            refresh_skew: DEFAULT_REFRESH_SKEW,
         })
     }
 
-    /// Override the HTTP client; useful for adopter-side TLS / proxy
-    /// / timeout configuration.
+    /// Add settings to the HTTP client of the refresh: a `User-Agent`, a
+    /// trusted root certificate, a client certificate for outbound mTLS,
+    /// timeouts.
     ///
-    /// A replacement client drops the default client's protections: it must
-    /// be built with `redirect(reqwest::redirect::Policy::none())` and a
-    /// connect and request timeout, or a redirect re-sends the client
-    /// credentials and refresh token to wherever it points. The provider's
-    /// token endpoint check (HTTPS, or HTTP to a loopback host) still
-    /// applies.
-    pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
-        self.http = http;
-        self
+    /// The client is built again with `configure`'s settings before the
+    /// library's own, so it still follows no redirect: a
+    /// [`ClientSettings`](axess_factors::egress::ClientSettings) offers
+    /// nothing that could change that, and a whole client of the caller's
+    /// own is not taken, since a redirect it followed would carry the
+    /// credentials to wherever it points. A proxy named in the environment
+    /// (`HTTPS_PROXY`) is followed, as before. The endpoint check (HTTPS, or
+    /// HTTP to a loopback host) still applies.
+    ///
+    /// # Errors
+    ///
+    /// [`DelegatedError::ClientBuild`] when the client cannot be built with the
+    /// settings.
+    pub fn with_client_settings(
+        mut self,
+        configure: impl FnOnce(
+            axess_factors::egress::ClientSettings,
+        ) -> axess_factors::egress::ClientSettings,
+    ) -> Result<Self, DelegatedError> {
+        self.http = crate::outbound_http::hardened_client(configure)?;
+        Ok(self)
     }
 
     /// Inject a clock for deterministic simulation testing.
@@ -176,10 +189,10 @@ where
     }
 
     /// Override the refresh-skew (default: 60 s). Refresh triggers
-    /// when `now >= expires_at - skew`. The value is clamped to 0 through
-    /// one day: a negative skew would keep an expired token in use.
-    pub fn with_refresh_skew_secs(mut self, secs: i64) -> Self {
-        self.refresh_skew_secs = secs.clamp(0, MAX_REFRESH_SKEW_SECS);
+    /// when `now >= expires_at - skew`. A skew longer than one day is held
+    /// to one day.
+    pub fn with_refresh_skew(mut self, skew: std::time::Duration) -> Self {
+        self.refresh_skew = skew.min(MAX_REFRESH_SKEW);
         self
     }
 
@@ -191,6 +204,11 @@ where
     /// stored refresh token was rejected by the IdP; the adopter
     /// surfaces this to the user as "your `<provider>` connection
     /// expired, please reconnect".
+    /// Returns [`DelegatedError::RegistrationMismatch`] when the stored
+    /// credential was granted through another registration than this
+    /// session's provider ([`StoredDelegation::registration`]), one of the
+    /// same name included, or through none: nothing is handed out and
+    /// nothing is sent, fresh or not, and the user grants again.
     ///
     /// Cancelling the returned future (a request timeout, a client that
     /// hangs up) never loses a rotated refresh token: once the IdP has been
@@ -199,7 +217,7 @@ where
     /// is still waiting for the result.
     pub async fn get_access_token(&self) -> Result<String, DelegatedError> {
         let job = self.job();
-        let skew = chrono::Duration::seconds(self.refresh_skew_secs);
+        let skew = self.refresh_skew;
         let cred = job.load_credential().await?;
         if cred.is_fresh(self.clock.now(), skew) {
             return bearer(&cred);
@@ -219,8 +237,9 @@ where
         }
 
         tokio::spawn(async move {
-            let _guard = guard;
-            job.redeem_and_save(cred, skew).await
+            let redeemed = job.redeem_and_save(cred, skew).await;
+            drop(guard);
+            redeemed
         })
         .await
         .map_err(|e| DelegatedError::Transport(format!("refresh task failed: {e}")))?
@@ -230,6 +249,7 @@ where
     /// caller.
     fn job(&self) -> RefreshJob<S> {
         RefreshJob {
+            registration: GrantRegistration::of(&self.provider),
             provider: Arc::clone(&self.provider),
             store: Arc::clone(&self.store),
             tenant: self.tenant,
@@ -255,11 +275,14 @@ where
     /// refresh.
     pub async fn revoke(&self) -> Result<(), DelegatedError> {
         let lock = refresh_lock((self.tenant, self.user, self.provider.name.clone()));
-        let _guard = lock.lock().await;
-        self.store
+        let guard = lock.lock().await;
+        let revoked = self
+            .store
             .revoke(&self.tenant, &self.user, &self.provider.name)
             .await
-            .map_err(store_err)
+            .map_err(store_err);
+        drop(guard);
+        revoked
     }
 }
 
@@ -269,6 +292,9 @@ where
     S: DelegatedCredentialStore,
 {
     provider: Arc<DelegatedProvider>,
+    /// The registration `provider` is: a credential granted through any
+    /// other is not used.
+    registration: GrantRegistration,
     store: Arc<S>,
     tenant: TenantId,
     user: UserId,
@@ -280,12 +306,24 @@ impl<S> RefreshJob<S>
 where
     S: DelegatedCredentialStore,
 {
+    /// The stored credential, when it was granted through this session's
+    /// registration. The store's key is the provider's name, which another
+    /// registration may share: a credential of any other registration, or of
+    /// none, is refused before its access token is handed out or its refresh
+    /// token is sent anywhere.
     async fn load_credential(&self) -> Result<StoredDelegation, DelegatedError> {
-        self.store
+        let credential = self
+            .store
             .load(&self.tenant, &self.user, &self.provider.name)
             .await
             .map_err(store_err)?
-            .ok_or(DelegatedError::NotConnected)
+            .ok_or(DelegatedError::NotConnected)?;
+        if credential.registration.as_ref() != Some(&self.registration) {
+            return Err(DelegatedError::RegistrationMismatch {
+                provider: self.provider.name.clone(),
+            });
+        }
+        Ok(credential)
     }
 
     /// Redeem `cred`'s refresh token and persist the result. The caller
@@ -293,7 +331,7 @@ where
     async fn redeem_and_save(
         &self,
         cred: StoredDelegation,
-        skew: chrono::Duration,
+        skew: std::time::Duration,
     ) -> Result<String, DelegatedError> {
         match self.refresh(&cred).await {
             Err(DelegatedError::RefreshRejected) => {

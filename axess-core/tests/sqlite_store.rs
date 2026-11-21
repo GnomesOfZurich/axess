@@ -1,8 +1,13 @@
 //! SqliteSessionStore tests using in-memory SQLite.
 //!
-//! Run with: `cargo test -p axess-core --features sqlite --test sqlite_store`
+//! Run with: `cargo test -p axess-core --features sqlite,testing --test sqlite_store`
 
-#![cfg(feature = "sqlite")]
+#![cfg(all(
+    any(feature = "sqlite", feature = "sqlite-unbundled"),
+    feature = "testing"
+))]
+
+use axess_core::testing::fixtures as common;
 
 use axess_clock::testing::MockClock;
 use axess_core::{
@@ -10,7 +15,7 @@ use axess_core::{
     session::{
         crypto::SessionCrypto,
         data::SessionData,
-        id::SessionId,
+        id::{SessionId, SessionKey},
         store::{CycleOutcome, SessionStore},
     },
 };
@@ -20,13 +25,13 @@ use sqlx::sqlite::SqlitePoolOptions;
 use std::sync::Arc;
 use std::time::Duration;
 
-async fn make_store() -> SqliteSessionStore {
+async fn make_store(clock: &MockClock) -> SqliteSessionStore {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    let store = SqliteSessionStore::plaintext_insecure(pool);
+    let store = SqliteSessionStore::plaintext_insecure(pool).with_clock(Arc::new(clock.clone()));
     store.init_schema().await.unwrap();
     store
 }
@@ -36,7 +41,7 @@ async fn make_store() -> SqliteSessionStore {
 /// Returns the store + the shared clock handle (caller advances via
 /// `clock.advance_secs(...)` or `clock.set(...)`).
 async fn make_store_with_mock_clock() -> (SqliteSessionStore, Arc<MockClock>) {
-    let clock = Arc::new(MockClock::at(chrono::Utc::now()));
+    let clock = Arc::new(common::test_clock());
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
@@ -50,17 +55,21 @@ async fn make_store_with_mock_clock() -> (SqliteSessionStore, Arc<MockClock>) {
 /// Encrypted store with the supplied current + optional previous key.
 /// Mirrors the production shape from `examples/sqlite/src/web/app.rs`
 /// (current encryption key + a rotation-window previous key).
-async fn make_encrypted_store(key: [u8; 32], previous: Option<[u8; 32]>) -> SqliteSessionStore {
+async fn make_encrypted_store(
+    clock: &MockClock,
+    key: [u8; 32],
+    previous: Option<[u8; 32]>,
+) -> SqliteSessionStore {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    let mut crypto = SessionCrypto::new(key);
+    let mut crypto = SessionCrypto::new(key).with_clock(Arc::new(clock.clone()));
     if let Some(prev) = previous {
         crypto = crypto.with_previous_key(prev);
     }
-    let store = SqliteSessionStore::new(pool, crypto);
+    let store = SqliteSessionStore::new(pool, crypto).with_clock(Arc::new(clock.clone()));
     store.init_schema().await.unwrap();
     store
 }
@@ -70,15 +79,16 @@ async fn make_encrypted_store(key: [u8; 32], previous: Option<[u8; 32]>) -> Sqli
 /// a second store with different crypto reads (or fails to read) the
 /// same row.
 async fn make_encrypted_store_on_pool(
+    clock: &MockClock,
     pool: sqlx::SqlitePool,
     key: [u8; 32],
     previous: Option<[u8; 32]>,
 ) -> SqliteSessionStore {
-    let mut crypto = SessionCrypto::new(key);
+    let mut crypto = SessionCrypto::new(key).with_clock(Arc::new(clock.clone()));
     if let Some(prev) = previous {
         crypto = crypto.with_previous_key(prev);
     }
-    let store = SqliteSessionStore::new(pool, crypto);
+    let store = SqliteSessionStore::new(pool, crypto).with_clock(Arc::new(clock.clone()));
     store.init_schema().await.unwrap();
     store
 }
@@ -93,9 +103,10 @@ async fn fresh_pool() -> sqlx::SqlitePool {
 
 #[tokio::test]
 async fn save_and_load_roundtrip() {
-    let store = make_store().await;
+    let clock = common::test_clock();
+    let store = make_store(&clock).await;
     let rng = SystemRng;
-    let id = SessionId::new(&rng);
+    let id = SessionKey::of(&SessionId::new(&rng));
     let data = SessionData::default();
 
     store
@@ -109,18 +120,20 @@ async fn save_and_load_roundtrip() {
 
 #[tokio::test]
 async fn load_nonexistent_returns_none() {
-    let store = make_store().await;
+    let clock = common::test_clock();
+    let store = make_store(&clock).await;
     let rng = SystemRng;
-    let id = SessionId::new(&rng);
+    let id = SessionKey::of(&SessionId::new(&rng));
     let loaded = store.load(&id).await.unwrap();
     assert!(loaded.is_none());
 }
 
 #[tokio::test]
 async fn delete_removes_session() {
-    let store = make_store().await;
+    let clock = common::test_clock();
+    let store = make_store(&clock).await;
     let rng = SystemRng;
-    let id = SessionId::new(&rng);
+    let id = SessionKey::of(&SessionId::new(&rng));
     let data = SessionData::default();
 
     store
@@ -133,24 +146,26 @@ async fn delete_removes_session() {
 
 #[tokio::test]
 async fn delete_nonexistent_is_idempotent() {
-    let store = make_store().await;
+    let clock = common::test_clock();
+    let store = make_store(&clock).await;
     let rng = SystemRng;
-    let id = SessionId::new(&rng);
+    let id = SessionKey::of(&SessionId::new(&rng));
     // Should not error.
     store.delete(&id).await.unwrap();
 }
 
 #[tokio::test]
 async fn cycle_replaces_old_with_new() {
-    let store = make_store().await;
+    let clock = common::test_clock();
+    let store = make_store(&clock).await;
     let rng = SystemRng;
-    let id_old = SessionId::new(&rng);
+    let id_old = SessionKey::of(&SessionId::new(&rng));
     let data = SessionData::default();
     let ttl = Duration::from_secs(60);
 
     store.save(&id_old, &data, ttl).await.unwrap();
 
-    let id_new = SessionId::new(&rng);
+    let id_new = SessionKey::of(&SessionId::new(&rng));
     assert_eq!(
         store
             .cycle(&id_old, &id_new, &data, ttl, true)
@@ -167,11 +182,11 @@ async fn cycle_replaces_old_with_new() {
 async fn expired_session_not_returned() {
     // DST shape: save with a finite TTL, then advance the injected
     // clock past `expires_at`. The store's `load` query is
-    // `WHERE expires_at > ?1` where `?1 = self.clock.now().timestamp()`,
+    // `WHERE expires_at > ?1` where `?1 = self.clock.now().unix_seconds()`,
     // so once `now > expires_at` the row stops being returned.
     let (store, clock) = make_store_with_mock_clock().await;
     let rng = SystemRng;
-    let id = SessionId::new(&rng);
+    let id = SessionKey::of(&SessionId::new(&rng));
 
     store
         .save(&id, &SessionData::default(), Duration::from_secs(10))
@@ -191,8 +206,8 @@ async fn cleanup_expired_removes_old_sessions() {
     let (store, clock) = make_store_with_mock_clock().await;
     let rng = SystemRng;
 
-    let id_expired = SessionId::new(&rng);
-    let id_valid = SessionId::new(&rng);
+    let id_expired = SessionKey::of(&SessionId::new(&rng));
+    let id_valid = SessionKey::of(&SessionId::new(&rng));
     let data = SessionData::default();
 
     store
@@ -218,8 +233,8 @@ async fn prune_expired_trait_method_reclaims_orphans() {
     let (store, clock) = make_store_with_mock_clock().await;
     let rng = SystemRng;
 
-    let id_expired = SessionId::new(&rng);
-    let id_valid = SessionId::new(&rng);
+    let id_expired = SessionKey::of(&SessionId::new(&rng));
+    let id_valid = SessionKey::of(&SessionId::new(&rng));
     let data = SessionData::default();
 
     store
@@ -250,10 +265,11 @@ async fn prune_expired_trait_method_reclaims_orphans() {
 /// mutations.
 #[tokio::test]
 async fn cleanup_expired_returns_zero_when_no_rows_expired() {
-    let store = make_store().await;
+    let clock = common::test_clock();
+    let store = make_store(&clock).await;
     let rng = SystemRng;
 
-    let id_valid = SessionId::new(&rng);
+    let id_valid = SessionKey::of(&SessionId::new(&rng));
     let data = SessionData::default();
     store
         .save(&id_valid, &data, Duration::from_secs(3600))
@@ -282,7 +298,7 @@ async fn cleanup_expired_returns_actual_count_when_many() {
 
     let data = SessionData::default();
     for _ in 0..3 {
-        let id = SessionId::new(&rng);
+        let id = SessionKey::of(&SessionId::new(&rng));
         store
             .save(&id, &data, Duration::from_secs(10))
             .await
@@ -298,15 +314,16 @@ async fn cleanup_expired_returns_actual_count_when_many() {
 }
 
 /// SQL writes round-trip through the new MessagePack codec.
-/// Regression: a `SessionData` with a populated `custom` bag must
+/// A `SessionData` with a populated `custom` bag must
 /// survive `save → load` byte-perfect. Catches any backend that fell
 /// back to the legacy JSON serialisation but kept the new decoder
 /// (which would still parse the wire form successfully).
 #[tokio::test]
 async fn msgpack_roundtrip_preserves_custom_bag() {
-    let store = make_store().await;
+    let clock = common::test_clock();
+    let store = make_store(&clock).await;
     let rng = SystemRng;
-    let id = SessionId::new(&rng);
+    let id = SessionKey::of(&SessionId::new(&rng));
 
     let data = SessionData {
         custom: serde_json::json!({
@@ -328,9 +345,10 @@ async fn msgpack_roundtrip_preserves_custom_bag() {
 
 #[tokio::test]
 async fn save_overwrites_existing() {
-    let store = make_store().await;
+    let clock = common::test_clock();
+    let store = make_store(&clock).await;
     let rng = SystemRng;
-    let id = SessionId::new(&rng);
+    let id = SessionKey::of(&SessionId::new(&rng));
 
     let data1 = SessionData {
         fingerprint: Some("first".to_string()),
@@ -366,10 +384,11 @@ async fn save_overwrites_existing() {
 /// codec or stripped the encryption call entirely.
 #[tokio::test]
 async fn encrypted_roundtrip_preserves_custom_bag() {
+    let clock = common::test_clock();
     let key = axess_core::testing::test_key(7);
-    let store = make_encrypted_store(key, None).await;
+    let store = make_encrypted_store(&clock, key, None).await;
     let rng = SystemRng;
-    let id = SessionId::new(&rng);
+    let id = SessionKey::of(&SessionId::new(&rng));
 
     let data = SessionData {
         custom: serde_json::json!({
@@ -394,14 +413,15 @@ async fn encrypted_roundtrip_preserves_custom_bag() {
 /// (verified by a follow-up read after re-saving).
 #[tokio::test]
 async fn key_rotation_reads_old_writes_new() {
+    let clock = common::test_clock();
     let key_a = axess_core::testing::test_key(1);
     let key_b = axess_core::testing::test_key(2);
     let pool = fresh_pool().await;
 
     // Phase 1: current = A, no previous.
-    let store_a = make_encrypted_store_on_pool(pool.clone(), key_a, None).await;
+    let store_a = make_encrypted_store_on_pool(&clock, pool.clone(), key_a, None).await;
     let rng = SystemRng;
-    let id = SessionId::new(&rng);
+    let id = SessionKey::of(&SessionId::new(&rng));
     let data = SessionData {
         fingerprint: Some("rotation-test".to_string()),
         ..SessionData::default()
@@ -412,7 +432,7 @@ async fn key_rotation_reads_old_writes_new() {
         .unwrap();
 
     // Phase 2: rotate. Current = B, previous = A.
-    let store_b = make_encrypted_store_on_pool(pool.clone(), key_b, Some(key_a)).await;
+    let store_b = make_encrypted_store_on_pool(&clock, pool.clone(), key_b, Some(key_a)).await;
     let loaded = store_b
         .load(&id)
         .await
@@ -432,7 +452,7 @@ async fn key_rotation_reads_old_writes_new() {
         .unwrap();
 
     // Phase 3: drop the previous key. Row must now decrypt under B alone.
-    let store_b_only = make_encrypted_store_on_pool(pool.clone(), key_b, None).await;
+    let store_b_only = make_encrypted_store_on_pool(&clock, pool.clone(), key_b, None).await;
     let loaded = store_b_only
         .load(&id)
         .await
@@ -447,19 +467,20 @@ async fn key_rotation_reads_old_writes_new() {
 /// misconfiguration on a fleet rotation).
 #[tokio::test]
 async fn wrong_key_fails_to_decrypt() {
+    let clock = common::test_clock();
     let key_a = axess_core::testing::test_key(10);
     let key_b = axess_core::testing::test_key(11);
     let pool = fresh_pool().await;
 
-    let store_a = make_encrypted_store_on_pool(pool.clone(), key_a, None).await;
+    let store_a = make_encrypted_store_on_pool(&clock, pool.clone(), key_a, None).await;
     let rng = SystemRng;
-    let id = SessionId::new(&rng);
+    let id = SessionKey::of(&SessionId::new(&rng));
     store_a
         .save(&id, &SessionData::default(), Duration::from_secs(60))
         .await
         .unwrap();
 
-    let store_b = make_encrypted_store_on_pool(pool.clone(), key_b, None).await;
+    let store_b = make_encrypted_store_on_pool(&clock, pool.clone(), key_b, None).await;
     let outcome = store_b.load(&id).await;
     assert!(
         outcome.is_err(),
@@ -469,24 +490,26 @@ async fn wrong_key_fails_to_decrypt() {
 
 /// A non-default `SessionData` (with a populated `Authenticated`
 /// auth_state, fingerprint, custom bag) must survive `save → load`
-/// byte-perfect. Every prior round-trip test uses
-/// `SessionData::default()` (= `Guest`); any serialization bug
-/// specific to populated authenticated-state fields would slip
-/// through unless this shape is exercised.
+/// byte-perfect. The other round-trip tests use
+/// `SessionData::default()` (= `Guest`); this is the one that would
+/// catch a serialization bug specific to populated authenticated-state
+/// fields.
 #[tokio::test]
 async fn authenticated_state_roundtrip_byte_perfect() {
-    let store = make_store().await;
+    let clock = common::test_clock();
+    let store = make_store(&clock).await;
     let rng = SystemRng;
-    let id = SessionId::new(&rng);
+    let id = SessionKey::of(&SessionId::new(&rng));
 
     let user_id = UserId::from_bytes([2u8; 16]);
     let tenant_id = TenantId::from_bytes([1u8; 16]);
-    let authn_time = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let authn_time = axess_clock::Timestamp::from_unix_seconds(1_700_000_000).unwrap();
     let data = SessionData {
         auth_state: axess_core::session::data::AuthState::Authenticated {
             user_id,
             tenant_id,
             authn_time,
+            signed_in_at: authn_time,
             factors_completed: Vec::new(),
             impersonator: None,
             ldap_groups: None,
@@ -521,9 +544,10 @@ async fn authenticated_state_roundtrip_byte_perfect() {
 #[tokio::test]
 async fn update_if_revision_keeps_the_contract_plaintext_and_encrypted() {
     use axess_core::testing::store_contract::assert_update_if_revision_contract;
-    assert_update_if_revision_contract(&make_store().await).await;
+    let clock = common::test_clock();
+    assert_update_if_revision_contract(&make_store(&clock).await).await;
     assert_update_if_revision_contract(
-        &make_encrypted_store(axess_core::testing::test_key(7), None).await,
+        &make_encrypted_store(&clock, axess_core::testing::test_key(7), None).await,
     )
     .await;
 }

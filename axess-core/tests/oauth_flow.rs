@@ -2,14 +2,16 @@
 
 #![cfg(all(feature = "testing", feature = "oauth"))]
 
-mod common;
+use axess_clock::testing::Shift;
+use axess_core::testing::fixtures as common;
 
 use axess_core::authn::AuditContext;
-use axess_core::testing::oauth_provider::{oauth_discover_provider, oauth_setup_provider};
+use axess_core::authn::service::OAuthCallbackRoute;
+use axess_core::testing::oauth_provider::{oauth_discover_provider, oauth_setup_provider_on};
 use axess_core::{
+    Clock,
     authn::service::AuthnService,
     testing::{
-        MockClock,
         mock_authn::{MockFactorStore, MockIdentityStore},
         test_session,
     },
@@ -24,13 +26,18 @@ use wiremock::MockServer;
 /// OAuth flow with CSRF mismatch should fail.
 #[tokio::test]
 async fn oauth_csrf_mismatch_rejected() {
+    let clock = common::test_clock();
     let server = MockServer::start().await;
     let (_, jwk, _) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &jwk).await;
-    let provider: OAuthProviderConfig = oauth_setup_provider(&server.uri()).await;
+    let provider: OAuthProviderConfig =
+        oauth_setup_provider_on(&server.uri(), std::sync::Arc::new(clock.clone())).await;
 
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
     let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_oauth_provider(provider)
         .build()
         .with_audit_context(AuditContext::default());
@@ -42,7 +49,13 @@ async fn oauth_csrf_mismatch_rejected() {
         .unwrap();
 
     let result = authn
-        .finish_oauth_login("fake-code", "wrong-state", &session)
+        .finish_oauth_login(
+            OAuthCallbackRoute::global("test"),
+            "fake-code",
+            "wrong-state",
+            None,
+            &session,
+        )
         .await;
     assert!(matches!(
         result.unwrap_err(),
@@ -53,13 +66,15 @@ async fn oauth_csrf_mismatch_rejected() {
 /// OAuth flow with expired ceremony should fail.
 #[tokio::test]
 async fn oauth_expired_ceremony_rejected() {
+    let clock = common::test_clock();
     let server = MockServer::start().await;
     let (_, jwk, _) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &jwk).await;
-    let provider = oauth_setup_provider(&server.uri()).await;
+    let provider = oauth_setup_provider_on(&server.uri(), std::sync::Arc::new(clock.clone())).await;
 
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let clock = MockClock::now();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
     let authn = AuthnService::builder(identity, MockFactorStore::new())
         .with_clock(clock.clone())
         .with_oauth_provider(provider)
@@ -82,7 +97,13 @@ async fn oauth_expired_ceremony_rejected() {
     clock.advance_secs(601);
 
     let result = authn
-        .finish_oauth_login("fake-code", &stored_state, &session)
+        .finish_oauth_login(
+            OAuthCallbackRoute::global("test"),
+            "fake-code",
+            &stored_state,
+            None,
+            &session,
+        )
         .await;
     assert!(matches!(
         result.unwrap_err(),
@@ -95,13 +116,15 @@ async fn oauth_expired_ceremony_rejected() {
 /// clock needs to catch up.
 #[tokio::test]
 async fn oauth_ceremony_started_in_the_future_is_expired() {
+    let clock = common::test_clock();
     let server = MockServer::start().await;
     let (_, jwk, _) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &jwk).await;
-    let provider = oauth_setup_provider(&server.uri()).await;
+    let provider = oauth_setup_provider_on(&server.uri(), std::sync::Arc::new(clock.clone())).await;
 
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let clock = MockClock::now();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
     let authn = AuthnService::builder(identity, MockFactorStore::new())
         .with_clock(clock.clone())
         .with_oauth_provider(provider)
@@ -118,16 +141,22 @@ async fn oauth_ceremony_started_in_the_future_is_expired() {
         .await
         .and_then(|v| v.as_str().map(|s| s.to_string()))
         .unwrap();
-    let later = chrono::Utc::now() + chrono::Duration::hours(1);
+    let later = clock.now().plus(axess_clock::SignedDuration::hours(1));
     session
         .set_custom(
             "axess.oauth.started",
-            serde_json::Value::String(later.to_rfc3339()),
+            serde_json::Value::String(later.to_rfc3339_numeric_offset()),
         )
         .await;
 
     let result = authn
-        .finish_oauth_login("fake-code", &stored_state, &session)
+        .finish_oauth_login(
+            OAuthCallbackRoute::global("test"),
+            "fake-code",
+            &stored_state,
+            None,
+            &session,
+        )
         .await;
     assert!(
         matches!(result, Err(axess_factors::oauth::OAuthError::Expired)),
@@ -142,6 +171,7 @@ async fn oauth_ceremony_started_in_the_future_is_expired() {
 /// the exact thing the spec is trying to prevent.
 #[tokio::test]
 async fn oauth_ceremony_capped_at_rfc_600s_even_when_provider_overrides() {
+    let clock = common::test_clock();
     let server = MockServer::start().await;
     let (_, jwk, _) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &jwk).await;
@@ -149,12 +179,14 @@ async fn oauth_ceremony_capped_at_rfc_600s_even_when_provider_overrides() {
     // honour it; the axess-side cap clamps the *axess* expiry check at 600 s.
     let provider = oauth_discover_provider(&server.uri())
         .await
+        .with_clock(std::sync::Arc::new(clock.clone()))
         .with_ceremony_timeout(std::time::Duration::from_secs(1800))
         .build()
         .expect("build");
 
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let clock = MockClock::now();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
     let authn = AuthnService::builder(identity, MockFactorStore::new())
         .with_clock(clock.clone())
         .with_oauth_provider(provider)
@@ -178,7 +210,13 @@ async fn oauth_ceremony_capped_at_rfc_600s_even_when_provider_overrides() {
     clock.advance_secs(601);
 
     let result = authn
-        .finish_oauth_login("fake-code", &stored_state, &session)
+        .finish_oauth_login(
+            OAuthCallbackRoute::global("test"),
+            "fake-code",
+            &stored_state,
+            None,
+            &session,
+        )
         .await;
     match result {
         Err(axess_factors::oauth::OAuthError::Expired) => {}
@@ -191,8 +229,13 @@ async fn oauth_ceremony_capped_at_rfc_600s_even_when_provider_overrides() {
 /// Unknown provider should fail.
 #[tokio::test]
 async fn oauth_unknown_provider_rejected() {
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let authn = AuthnService::new(identity, MockFactorStore::new())
+    let clock = common::test_clock();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
+    let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build()
         .with_audit_context(AuditContext::default());
 
     let session = test_session();
@@ -211,21 +254,28 @@ async fn oauth_unknown_provider_rejected() {
 #[tokio::test]
 async fn mock_oauth_provider_returns_configured_user() {
     use axess_factors::oauth::MockOAuthProvider;
+    let clock = common::test_clock();
 
-    let mock = MockOAuthProvider::new("mock-idp").with_user(
-        "user-42",
-        "bob@example.com",
-        vec!["engineers", "admins"],
-        vec!["viewer"],
-    );
+    let mock = MockOAuthProvider::new("mock-idp")
+        .with_clock(std::sync::Arc::new(clock.clone()))
+        .with_user(
+            "user-42",
+            "bob@example.com",
+            vec!["engineers", "admins"],
+            vec!["viewer"],
+        );
 
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
     let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_oauth_provider(mock)
         .build()
         .with_audit_context(AuditContext::default());
 
     let claims = authn
+        .oauth_global()
         .refresh_oauth_token("mock-idp", "any-refresh-token", "user-42", None, None)
         .await
         .expect("mock refresh should succeed")
@@ -247,16 +297,23 @@ async fn mock_oauth_provider_returns_configured_user() {
 #[tokio::test]
 async fn mock_oauth_provider_simulates_failure() {
     use axess_factors::oauth::MockOAuthProvider;
+    let clock = common::test_clock();
 
-    let mock = MockOAuthProvider::new("failing-idp").with_failure("IdP is down for maintenance");
+    let mock = MockOAuthProvider::new("failing-idp")
+        .with_clock(std::sync::Arc::new(clock.clone()))
+        .with_failure("IdP is down for maintenance");
 
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
     let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_oauth_provider(mock)
         .build()
         .with_audit_context(AuditContext::default());
 
     let result = authn
+        .oauth_global()
         .refresh_oauth_token("failing-idp", "some-token", "user-1", None, None)
         .await;
     assert!(result.is_err());

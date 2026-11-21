@@ -257,7 +257,7 @@ impl MockOAuthProvider {
             "typ": "JWT"
         });
 
-        let now = self.clock.now().timestamp();
+        let now = self.clock.now().unix_seconds();
         let serial = self.logout_tokens_minted.fetch_add(1, Ordering::Relaxed) + 1;
         let mut payload = serde_json::json!({
             "iss": self.issuer_url,
@@ -404,7 +404,7 @@ impl OAuthProvider for MockOAuthProvider {
     /// from `rng`, so a ceremony can begin and finish against the mock.
     fn build_auth_url(
         &self,
-        _options: &OAuthLoginOptions,
+        _: &OAuthLoginOptions,
         rng: &dyn axess_rng::SecureRng,
     ) -> Result<AuthUrlResult, OAuthError> {
         use base64::Engine as _;
@@ -438,7 +438,7 @@ impl OAuthProvider for MockOAuthProvider {
 
     fn fetch_userinfo_unchecked<'a>(
         &'a self,
-        _access_token: &'a str,
+        _: &'a str,
         dpop: Option<DpopSigner<'a>>,
     ) -> Pin<Box<dyn Future<Output = Result<UserInfoClaims, OAuthError>> + Send + 'a>> {
         Box::pin(async move {
@@ -450,7 +450,7 @@ impl OAuthProvider for MockOAuthProvider {
     fn refresh_token_unchecked<'a>(
         &'a self,
         refresh_token: &'a str,
-        _original_nonce: Option<&'a str>,
+        _: Option<&'a str>,
         dpop: Option<DpopSigner<'a>>,
     ) -> Pin<Box<dyn Future<Output = Result<RefreshOutcome, OAuthError>> + Send + 'a>> {
         Box::pin(async move {
@@ -475,8 +475,8 @@ impl OAuthProvider for MockOAuthProvider {
 
     fn exchange_code<'a>(
         &'a self,
-        _code: &'a str,
-        _pkce_verifier: String,
+        _: &'a str,
+        _: String,
         nonce: String,
         dpop: Option<DpopSigner<'a>>,
     ) -> Pin<Box<dyn Future<Output = Result<OAuthClaims, OAuthError>> + Send + 'a>> {
@@ -525,8 +525,8 @@ mod tests {
 
     #[test]
     fn logout_token_iat_comes_from_the_injected_clock() {
-        let clock = axess_clock::testing::MockClock::now();
-        let start = clock.now().timestamp();
+        let clock = axess_clock::testing::MockClock::at_reference();
+        let start = clock.now().unix_seconds();
         let provider = MockOAuthProvider::new("idp").with_clock(Arc::new(clock.clone()));
 
         let first = payload_of(&provider.mock_logout_token(Some("u"), None));
@@ -599,8 +599,8 @@ mod tests {
 
     #[test]
     fn two_logout_tokens_in_one_second_have_different_jtis() {
-        let clock = axess_clock::testing::MockClock::now();
-        let iat = clock.now().timestamp();
+        let clock = axess_clock::testing::MockClock::at_reference();
+        let iat = clock.now().unix_seconds();
         let provider = MockOAuthProvider::new("idp").with_clock(Arc::new(clock));
 
         let a = payload_of(&provider.mock_logout_token(Some("u"), None));

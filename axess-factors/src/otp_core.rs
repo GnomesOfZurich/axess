@@ -80,12 +80,11 @@ pub(crate) fn hotp_value(
         }
     };
 
-    // mutation-testing follow-up: use u64 modulus. `binary` is at most a 31-bit
-    // integer (top bit stripped by `& 0x7f` during Dynamic Truncation,
-    // RFC 4226 §5.3), so it always fits in u32; but `10^digits` for
-    // `digits = 10` overflows u32 (10^10 > 2^32). Promoting to u64
-    // makes the full `MAX_HOTP_DIGITS = 10` range usable without
-    // panicking on the boundary.
+    // The modulus is a u64. `binary` is at most a 31-bit integer (top bit
+    // stripped by `& 0x7f` during Dynamic Truncation, RFC 4226 §5.3), so
+    // it always fits in u32; but `10^digits` for `digits = 10` overflows
+    // u32 (10^10 > 2^32). In u64 the full `MAX_HOTP_DIGITS = 10` range
+    // works without panicking on the boundary.
     let modulus: u64 = 10u64.pow(digits as u32);
     u64::from(binary) % modulus
 }

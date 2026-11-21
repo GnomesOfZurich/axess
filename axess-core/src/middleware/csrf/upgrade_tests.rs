@@ -7,7 +7,7 @@ use tower::{Layer, ServiceExt, service_fn};
 fn ok()
 -> impl tower::Service<Request<Body>, Response = Response<Body>, Error = Infallible, Future: Send>
 + Clone {
-    service_fn(|_req: Request<Body>| async {
+    service_fn(|_: Request<Body>| async {
         Ok(Response::builder().status(200).body(Body::empty()).unwrap())
     })
 }

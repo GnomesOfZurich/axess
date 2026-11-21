@@ -18,10 +18,10 @@ facade crate instead.** Use `axess-core` directly only if you're building a cust
 | `authn/` | `IdentityStore` / `FactorStore`, `AuthnService`, factor pipeline, OAuth/OIDC, JWT, device identity, audit, federation resolvers |
 | `authz/` | Cedar Policy evaluation, `AuthzStore`, `PolicyStore`, entity caches |
 | `session/` | `SessionLayer`, `AuthSession`, `SessionStore`, `SessionRegistry`, binding, crypto, refresh tokens, storage backends |
-| `middleware/` | `RateLimitLayer`, `RequestIdLayer`, `TraceIdLayer`, CSRF |
+| `middleware/` | `RateLimitLayer`, `RequestIdLayer`, `TraceContextLayer`, CSRF |
 | `principal/` | `Principal { Human, Workload }`, `PrincipalResolver`, Cedar entity bridge |
 | `store/` | Shared key/value-with-TTL store abstraction (`Store<K, V>`); per-backend value codecs live with each store impl |
-| `workload/` | Inbound workload-identity hub, outbound mTLS / OAuth clients |
+| `workload/` | Inbound workload-identity hub, outbound mTLS / OAuth clients, SPIRE Workload API client (`spire`) |
 | `health/`, `metrics/` | `HealthCheck`, `CompositeHealthCheck`, `MetricSinks` and the metric traits |
 | `testing/` | `MockIdentityStore`, `MockFactorStore`, `MockClock`, `MockRng`, `LocalIdpFixture` (gated by `testing` feature) |
 
@@ -38,18 +38,24 @@ let key: [u8; 32] = load_key_from_secrets();
 let store = SqliteSessionStore::new(pool, SessionCrypto::new(key));
 store.init_schema().await?;
 
-let signing_key: [u8; 32] = load_signing_key();
-// One registry for the layer and the service: the layer ends a revoked
-// session on every route, the service records each login in it.
-let session_layer = SessionLayer::new(store, signing_key, session_registry_handle)
-    .with_ttl(Duration::from_secs(86400));
-
 let authn = Arc::new(
     AuthnService::builder(identity_store, factor_store)
         .with_metrics(my_metrics)
         .with_registry(session_registry)
         .build(),
 );
+
+let signing_key: [u8; 32] = load_signing_key();
+// One registry for the layer and the service: the layer ends a revoked
+// session on every route, the service records each login in it. The
+// service's sink records each session the layer ends by itself.
+let session_layer = SessionLayer::new(
+    store,
+    signing_key,
+    session_registry_handle,
+    authn.session_end_audit(),
+)
+.with_ttl(Duration::from_secs(86400));
 ```
 
 See the [workspace README](https://github.com/GnomesOfZurich/axess#readme) for the full integration walkthrough.

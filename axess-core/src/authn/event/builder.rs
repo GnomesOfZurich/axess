@@ -9,8 +9,8 @@
 use super::{AuditContext, AuthEvent, AuthEventStatus, AuthEventType, AuthFailureReason};
 use crate::authn::factor::FactorKind;
 use crate::authn::ids::{DeviceId, TenantId, UserId};
-use crate::session::id::SessionId;
-use chrono::{DateTime, Utc};
+use crate::session::id::SessionKey;
+use axess_clock::Timestamp;
 use std::net::IpAddr;
 
 /// Builder for constructing [`AuthEvent`] records ergonomically.
@@ -36,7 +36,7 @@ pub struct AuthEventBuilder {
     tenant_id: Option<TenantId>,
     event_type: AuthEventType,
     event_status: AuthEventStatus,
-    session_id: Option<SessionId>,
+    session_id: Option<SessionKey>,
     factor_kind: Option<FactorKind>,
     ip_address: Option<IpAddr>,
     ip_source: crate::client_ip::Source,
@@ -194,9 +194,10 @@ impl AuthEventBuilder {
         self
     }
 
-    /// Attach a session ID.
-    pub fn with_session(mut self, id: SessionId) -> Self {
-        self.session_id = Some(id);
+    /// Name the event's session by its key
+    /// ([`AuthSession::session_key`](crate::session::extractor::AuthSession::session_key)).
+    pub fn with_session(mut self, session: SessionKey) -> Self {
+        self.session_id = Some(session);
         self
     }
 
@@ -284,10 +285,10 @@ impl AuthEventBuilder {
     pub fn with_factors_completed(
         mut self,
         kind: FactorKind,
-        completed_at: chrono::DateTime<chrono::Utc>,
+        completed_at: axess_clock::Timestamp,
     ) -> Self {
         self.factors_completed
-            .push((kind, completed_at.timestamp_micros()));
+            .push((kind, completed_at.unix_micros()));
         self
     }
 
@@ -320,15 +321,11 @@ impl AuthEventBuilder {
         if let Some(geo) = &ctx.geo_country {
             self.geo_country = Some(geo.clone());
         }
-        if let Some(sid) = &ctx.session_id {
-            // Only set session_id on the builder if the caller hasn't already
-            // attached one via `with_session`. AuditContext carries a String
-            // while the builder uses SessionId, so we parse it.
-            if self.session_id.is_none()
-                && let Ok(parsed) = sid.parse::<uuid::Uuid>()
-            {
-                self.session_id = Some(SessionId::from_bytes(*parsed.as_bytes()));
-            }
+        // A session the caller attached with `with_session` stands; the
+        // context's fills the field otherwise. Both are keys, so nothing is
+        // parsed and nothing can be dropped on the way.
+        if self.session_id.is_none() {
+            self.session_id = ctx.session_id;
         }
         self
     }
@@ -340,22 +337,25 @@ impl AuthEventBuilder {
     /// [`build_at`](Self::build_at) instead, so the event time follows the
     /// injected time.
     pub fn build(self) -> AuthEvent {
-        self.build_at(Utc::now())
+        // A host clock outside the range of a reading reads as the nearer
+        // end of the range.
+        let now = Timestamp::from_system_time(std::time::SystemTime::now());
+        self.build_at(now)
     }
 
     /// Consume the builder and produce an [`AuthEvent`] with a specific timestamp.
     ///
     /// Use this with an injectable [`Clock`](axess_clock::Clock) for DST.
-    /// The `DateTime<Utc>` is converted to epoch microseconds at the
+    /// The `Timestamp` is converted to epoch microseconds at the
     /// boundary so the resulting event is rkyv-archivable.
-    pub fn build_at(self, event_time: DateTime<Utc>) -> AuthEvent {
+    pub fn build_at(self, event_time: Timestamp) -> AuthEvent {
         AuthEvent {
             user_id: self.user_id,
             tenant_id: self.tenant_id,
             session_id: self.session_id,
             event_type: self.event_type,
             event_status: self.event_status,
-            event_time: event_time.timestamp_micros(),
+            event_time: event_time.unix_micros(),
             factor_kind: self.factor_kind,
             ip_address: self.ip_address,
             ip_source: self.ip_source,

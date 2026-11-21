@@ -4,20 +4,18 @@
 use super::*;
 use crate::authn::ids::testing;
 use crate::device::store::MemoryDeviceStore;
-use chrono::{Duration, TimeZone};
+use axess_clock::testing::Shift;
+use axess_clock::{SignedDuration, Timestamp};
 
-fn at() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 1, 1, 9, 0, 0).unwrap()
+fn at() -> Timestamp {
+    Timestamp::from_utc(2026, 1, 1, 9, 0, 0).unwrap()
 }
 
 fn fp(byte: u8) -> FingerprintHash {
     FingerprintHash::from_bytes([byte; 32])
 }
 
-async fn last_seen(
-    svc: &DeviceLifecycleService<MemoryDeviceStore>,
-    id: &DeviceId,
-) -> DateTime<Utc> {
+async fn last_seen(svc: &DeviceLifecycleService<MemoryDeviceStore>, id: &DeviceId) -> Timestamp {
     svc.store()
         .load(&testing::tenant("t"), id)
         .await
@@ -36,14 +34,14 @@ async fn a_known_device_is_written_once_per_granularity_window() {
         .unwrap();
 
     // Four minutes later: inside the five-minute window, no write.
-    let soon = at() + Duration::minutes(4);
+    let soon = at().plus(SignedDuration::minutes(4));
     svc.ensure_device(&tenant, Some(&user), fp(1), soon, || unreachable!())
         .await
         .unwrap();
     assert_eq!(last_seen(&svc, &id).await, at());
 
     // Five minutes after the recorded sighting the window has passed.
-    let later = at() + Duration::minutes(5);
+    let later = at().plus(SignedDuration::minutes(5));
     svc.ensure_device(&tenant, Some(&user), fp(1), later, || unreachable!())
         .await
         .unwrap();
@@ -53,20 +51,20 @@ async fn a_known_device_is_written_once_per_granularity_window() {
 #[tokio::test]
 async fn zero_granularity_records_every_sighting() {
     let svc = DeviceLifecycleService::new(MemoryDeviceStore::new())
-        .with_sighting_granularity(Duration::zero());
+        .with_sighting_granularity(std::time::Duration::ZERO);
     let (tenant, user) = (testing::tenant("t"), testing::user("u"));
     let id = testing::device("d");
     svc.ensure_device(&tenant, Some(&user), fp(1), at(), || id)
         .await
         .unwrap();
-    let next = at() + Duration::seconds(1);
+    let next = at().plus(SignedDuration::seconds(1));
     svc.ensure_device(&tenant, Some(&user), fp(1), next, || unreachable!())
         .await
         .unwrap();
     assert_eq!(last_seen(&svc, &id).await, next);
 }
 
-fn device_of(user: UserId, id: &str, fingerprint: FingerprintHash, seen: DateTime<Utc>) -> Device {
+fn device_of(user: UserId, id: &str, fingerprint: FingerprintHash, seen: Timestamp) -> Device {
     Device {
         id: testing::device(id),
         tenant_id: testing::tenant("t"),
@@ -94,14 +92,16 @@ async fn an_old_device_beyond_the_scan_limit_is_still_found() {
     // The user's own device with the shared fingerprint is the oldest.
     store
         .save(
-            &device_of(user, "mine", shared, at() - Duration::days(30)),
+            &device_of(user, "mine", shared, at().minus(SignedDuration::days(30))),
             at(),
         )
         .await
         .unwrap();
     // 150 newer devices push it past the 100 most recent.
     for i in 0..150u8 {
-        let seen = at() - Duration::days(1) + Duration::seconds(i64::from(i));
+        let seen = at()
+            .minus(SignedDuration::days(1))
+            .plus(SignedDuration::seconds(i64::from(i)));
         store
             .save(
                 &device_of(user, &format!("other-{i}"), fp(100 + (i % 100)), seen),
@@ -114,7 +114,12 @@ async fn an_old_device_beyond_the_scan_limit_is_still_found() {
     let stranger = testing::user("stranger");
     store
         .save(
-            &device_of(stranger, "theirs", shared, at() - Duration::days(2)),
+            &device_of(
+                stranger,
+                "theirs",
+                shared,
+                at().minus(SignedDuration::days(2)),
+            ),
             at(),
         )
         .await
@@ -146,13 +151,13 @@ async fn an_older_request_does_not_move_the_last_sighting_back() {
     svc.ensure_device(&tenant, Some(&user), fp(1), at(), || id)
         .await
         .unwrap();
-    let later = at() + Duration::hours(2);
+    let later = at().plus(SignedDuration::hours(2));
     svc.ensure_device(&tenant, Some(&user), fp(1), later, || unreachable!())
         .await
         .unwrap();
     assert_eq!(last_seen(&svc, &id).await, later);
 
-    let lagging = at() + Duration::hours(1);
+    let lagging = at().plus(SignedDuration::hours(1));
     svc.ensure_device(&tenant, Some(&user), fp(1), lagging, || unreachable!())
         .await
         .unwrap();

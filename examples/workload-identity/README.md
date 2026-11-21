@@ -285,3 +285,29 @@ extensions:
 See [`docs/factors/local-idp.md`](../../docs/factors/local-idp.md) §"KMS-backed key
 storage" for the envelope-encryption pattern and what stays the same
 vs what changes.
+
+## A workload on a SPIRE node: `--bin spire`
+
+[`src/bin/spire.rs`](src/bin/spire.rs) is a workload that has no credential
+of its own: it asks the SPIRE agent on its node, through
+`axess::workload::spire::SpireClient` (feature `spire`), and follows the
+agent as it rotates what it issued.
+
+```sh
+export SPIFFE_ENDPOINT_SOCKET=unix:///run/spire/sockets/agent.sock
+export SPIFFE_TRUST_DOMAIN=example.org
+export SPIFFE_JWT_AUDIENCE=https://api.example.org   # optional
+cargo run -p axess-example-workload-identity --bin spire
+```
+
+It prints the X.509 SVID and the trust domains it holds bundles for, a JWT
+SVID for the audience when one is named, and then each rotation, each failed
+refresh with the wait before the next attempt, and an expiry if the agent
+stays away that long. It needs a running SPIRE agent and a registration entry
+for the process; with no agent it keeps retrying and says so.
+
+The parts to copy are in `main`: one client for the process, one source per
+credential, and a read of the source wherever the credential is used. The
+book chapter [*SPIRE Workload API client*](../../docs/workload-identity/spire.md)
+covers where the credentials go from there (outbound mTLS, the cloud STS
+exchanges, the verifiers) and how to test the wiring with no SPIRE installed.

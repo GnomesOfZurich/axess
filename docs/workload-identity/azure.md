@@ -23,8 +23,8 @@ the Azure adapter described in [Cloud STS exchange](cloud-sts.md).
 
 Two identities are in play and the chapter keeps them apart. The **caller** is
 the pipeline; the service checks who it is and decides whether to answer. The
-**service** has an identity of its own, the Azure managed identity bound to its
-Kubernetes service account; that identity, not the caller's, reads the secret.
+**service** has its own identity: the Azure managed identity bound to its
+Kubernetes service account. That identity, not the caller's, reads the secret.
 The caller's token is never forwarded to Azure.
 
 | Hop | Token | Issuer | Audience | Verified by |
@@ -63,10 +63,10 @@ configuration.
 
 ## Step 2: the service verifies the caller
 
-The recipe block, then the service. The recipe keys the caller on GitLab's
-numeric `project_id` and `namespace_id`, never on the mutable paths, and
-requires a protected ref and the `production` environment. The first block is
-the part that changes with the pipeline's issuer; the second does not.
+Two blocks follow: the recipe, which changes with the pipeline's issuer, and
+the service, which does not. The recipe keys the caller on GitLab's numeric
+`project_id` and `namespace_id`, never on the mutable paths, and requires a
+protected ref and the `production` environment.
 
 ```rust,ignore
 {{#include ../../examples/workload-identity/tests/cloud_azure.rs:inbound_recipe}}
@@ -158,8 +158,8 @@ default token endpoint is the public cloud's; for a sovereign cloud, set
 
 ## What each wrong setting produces
 
-Each row is a test in `cloud_azure.rs` that reproduces it against a mock Azure
-AD holding the federated credential above. The mock compares the assertion's
+Each row names the test in `cloud_azure.rs` that reproduces it against a mock
+Azure AD holding the federated credential above. The mock compares the assertion's
 `iss`, `sub` and `aud` to the credential and answers with the error Azure
 documents for the mismatch. It does not verify signatures, and it was written
 from Microsoft's documentation, not recorded from a live tenant: the numeric
@@ -188,6 +188,6 @@ cargo test -p axess-example-workload-identity --test cloud_azure
 ```
 
 Everything above runs offline: Azure AD and Key Vault are local mock servers.
-What no test here proves is a live tenant: the federated credential, the
-webhook and Key Vault authorisation are configuration this chapter describes
-and the mocks stand in for.
+No test here proves a live tenant: the federated credential, the webhook and
+Key Vault authorisation are configuration that this chapter describes and the
+mocks stand in for.

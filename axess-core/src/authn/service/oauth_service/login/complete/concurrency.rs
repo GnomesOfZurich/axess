@@ -3,72 +3,39 @@
 
 use super::super::helpers::compute_claim_lock;
 use super::concurrent::REGISTRY_CONCURRENCY;
-use crate::authn::ids::UserId;
 use crate::authn::service::AuthnService;
-use crate::session::id::SessionId;
-use crate::session::{MemorySessionRegistry, store::SessionRegistry};
+use crate::session::id::{SessionId, SessionKey};
+use crate::session::store::SessionRegistry;
+use crate::testing::registry_double::{RegistryDouble, RegistryOp, Step};
 use crate::testing::{
     mock_authn::{MockFactorStore, MockIdentityStore},
-    tenant_record, test_session, user_record,
+    tenant_record_at, test_session, user_record_at,
 };
 use axess_factors::oauth::{OAuthClaims, types::keys as oauth_keys};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-/// A registry whose `is_valid` and `invalidate_session` take a few
-/// milliseconds and record the most calls ever in flight at once.
-#[derive(Clone)]
-struct SlowRegistry {
-    inner: MemorySessionRegistry,
-    in_flight: Arc<AtomicUsize>,
-    peak: Arc<AtomicUsize>,
-}
-
-impl SlowRegistry {
-    async fn slow(&self) {
-        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-        self.peak.fetch_max(now, Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        self.in_flight.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-impl SessionRegistry for SlowRegistry {
-    type Error = std::io::Error;
-
-    async fn register(&self, u: &UserId, s: &SessionId) -> Result<(), Self::Error> {
-        self.inner
-            .register(u, s)
-            .await
-            .map_err(std::io::Error::other)
-    }
-    async fn is_valid(&self, u: &UserId, s: &SessionId) -> Result<bool, Self::Error> {
-        self.slow().await;
-        self.inner
-            .is_valid(u, s)
-            .await
-            .map_err(std::io::Error::other)
-    }
-    async fn invalidate_user(&self, u: &UserId) -> Result<(), Self::Error> {
-        self.inner
-            .invalidate_user(u)
-            .await
-            .map_err(std::io::Error::other)
-    }
-    async fn invalidate_session(&self, u: &UserId, s: &SessionId) -> Result<(), Self::Error> {
-        self.slow().await;
-        self.inner
-            .invalidate_session(u, s)
-            .await
-            .map_err(std::io::Error::other)
-    }
-    async fn active_sessions(&self, u: &UserId) -> Result<Vec<SessionId>, Self::Error> {
-        self.inner
-            .active_sessions(u)
-            .await
-            .map_err(std::io::Error::other)
-    }
+/// A registry whose `is_valid`, `current_key` and `invalidate_session` take
+/// a few milliseconds and record in `peak` the most calls ever in flight at
+/// once.
+fn slow_registry(peak: Arc<AtomicUsize>) -> RegistryDouble {
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    RegistryDouble::new().before(move |call, _| {
+        let (in_flight, peak) = (in_flight.clone(), peak.clone());
+        async move {
+            if matches!(
+                call.op(),
+                RegistryOp::IsValid | RegistryOp::CurrentKey | RegistryOp::InvalidateSession
+            ) {
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+            }
+            Step::Forward
+        }
+    })
 }
 
 fn claims(subject: &str, sid: Option<&str>) -> OAuthClaims {
@@ -92,22 +59,27 @@ fn claims(subject: &str, sid: Option<&str>) -> OAuthClaims {
 
 struct Harness {
     svc: AuthnService<MockIdentityStore, MockFactorStore>,
-    registry: SlowRegistry,
+    registry: RegistryDouble,
+    peak: Arc<AtomicUsize>,
     clock: axess_clock::testing::MockClock,
     user: crate::authn::types::User,
 }
 
 fn harness(capacity: usize) -> Harness {
-    let user = user_record("u1", "t1");
+    let user = user_record_at(
+        "u1",
+        "t1",
+        axess_clock::testing::MockClock::reference_time(),
+    );
     let identity = MockIdentityStore::new()
-        .with_tenant(tenant_record("t1"))
+        .with_tenant(tenant_record_at(
+            "t1",
+            axess_clock::testing::MockClock::reference_time(),
+        ))
         .with_user(user.clone());
-    let registry = SlowRegistry {
-        inner: MemorySessionRegistry::new(),
-        in_flight: Arc::default(),
-        peak: Arc::default(),
-    };
-    let clock = axess_clock::testing::MockClock::now();
+    let peak = Arc::new(AtomicUsize::new(0));
+    let registry = slow_registry(peak.clone());
+    let clock = axess_clock::testing::MockClock::at_reference();
     let svc = AuthnService::builder(identity, MockFactorStore::new())
         .with_registry(registry.clone())
         .with_clock(clock.clone())
@@ -116,13 +88,14 @@ fn harness(capacity: usize) -> Harness {
     Harness {
         svc,
         registry,
+        peak,
         clock,
         user,
     }
 }
 
 impl Harness {
-    async fn login(&self, sid: Option<&str>) -> SessionId {
+    async fn login(&self, sid: Option<&str>) -> SessionKey {
         let req = self
             .svc
             .with_audit_context(crate::authn::event::AuditContext::default());
@@ -135,22 +108,24 @@ impl Harness {
         req.complete_oauth_login(&self.user, &c, &session)
             .await
             .expect("login");
-        session.session_id().await
+        session.session_key().await
     }
 
     fn peak(&self) -> usize {
-        self.registry.peak.swap(0, Ordering::SeqCst)
+        self.peak.swap(0, Ordering::SeqCst)
     }
 }
 
-/// The sweep's liveness checks for a full batch of candidates overlap, and
-/// never exceed the bound.
+/// The sweep's questions to the registry for a full batch of candidates
+/// overlap, and never exceed the bound.
 #[tokio::test]
-async fn the_subject_sweep_checks_liveness_concurrently_within_the_bound() {
+async fn the_subject_sweep_asks_the_registry_concurrently_within_the_bound() {
     let h = harness(10_000);
     // 64 sessions the registry never heard of: each reads as gone.
     for _ in 0..64 {
-        let session = SessionId::new(&axess_rng::testing::MockRng::new(rand_seed()));
+        let session = SessionKey::of(&SessionId::new(&axess_rng::testing::MockRng::new(
+            rand_seed(),
+        )));
         h.svc
             .sid_map()
             .register_subject_session("test", "stale-sub", None, h.user.id, session);
@@ -160,7 +135,10 @@ async fn the_subject_sweep_checks_liveness_concurrently_within_the_bound() {
     h.login(None).await;
 
     let peak = h.peak();
-    assert!(peak > 1, "liveness checks ran one at a time (peak {peak})");
+    assert!(
+        peak > 1,
+        "the sweep's questions ran one at a time (peak {peak})"
+    );
     assert!(peak <= REGISTRY_CONCURRENCY, "peak {peak} passed the bound");
     assert_eq!(
         h.svc.sid_map().subject_len(),
@@ -191,7 +169,7 @@ async fn displaced_sessions_are_ended_concurrently_and_all_of_them() {
     for session in &sessions {
         assert!(
             !h.registry
-                .inner
+                .inner()
                 .is_valid(&h.user.id, session)
                 .await
                 .unwrap(),

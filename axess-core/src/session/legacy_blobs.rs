@@ -3,15 +3,16 @@
 //! It lives outside the feature-gated `crypto` module because the OTP secret
 //! cipher uses it too, and that cipher is available with every feature set.
 
-use chrono::{DateTime, Utc};
+use axess_clock::Timestamp;
 
 /// Whether blobs written before row binding (no marker, empty AAD) and the
 /// 0.11.0 zero-joined device formats are read.
 ///
 /// Blobs in the current format are never affected: they are always opened
-/// under their row's AAD. The session crypto applies this to session and
-/// device blobs; the OTP secret cipher applies it to a secret still stored
-/// in plain text.
+/// under their row's AAD. The session crypto applies this to device blobs;
+/// the OTP secret cipher applies it to a secret still stored in plain text.
+/// A session is read in the current sealed form only, whatever this says:
+/// sessions stored by an earlier release are not carried over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LegacyBlobs {
     /// Refuse a blob without the current format marker, including the 0.11.0
@@ -25,12 +26,11 @@ pub enum LegacyBlobs {
     /// in the current format when they read it. A blob without any binding
     /// opens under any row id, so a read cannot tell whether it belongs to
     /// the row it sits under and leaves it as it is; the row's next write
-    /// seals it (a session on its next save, a device on its next bindings
-    /// write; the Valkey device store checks the identity inside the row and
-    /// re-seals on read). Set the cutoff so that every row still wanted is
+    /// seals it (a device on its next bindings write; the Valkey device
+    /// store checks the identity inside the row and re-seals on read). Set the cutoff so that every row still wanted is
     /// written before it: a row not written by then is refused from the
     /// cutoff on.
-    AcceptUntil(DateTime<Utc>),
+    AcceptUntil(Timestamp),
     /// Read such a blob with no end date. A blob without a binding opens
     /// under any row id, so prefer [`AcceptUntil`](Self::AcceptUntil).
     Accept,

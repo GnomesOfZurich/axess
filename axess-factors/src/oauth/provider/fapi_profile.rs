@@ -109,8 +109,12 @@ impl IdTokenAlgs {
 }
 
 /// An HTTP client that presents the client certificate on every TLS
-/// handshake: no redirects, a 30 second timeout, like the one discovery built.
+/// handshake, built by the egress policy discovery ran under, like the one
+/// discovery built: no redirects, a 30 second timeout, and under a screened
+/// policy no connection to a reserved address and no proxy from the
+/// environment.
 pub(super) fn mtls_client(
+    policy: crate::egress::EgressPolicy,
     cert_path: &str,
     key_path: &str,
 ) -> Result<openidconnect::reqwest::Client, OAuthError> {
@@ -123,12 +127,13 @@ pub(super) fn mtls_client(
     );
     let identity = openidconnect::reqwest::Identity::from_pem(&pem)
         .map_err(|e| OAuthError::Config(format!("mTLS client certificate or key invalid: {e}")))?;
-    openidconnect::reqwest::ClientBuilder::new()
-        .redirect(openidconnect::reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(30))
-        .use_rustls_tls()
-        .identity(identity)
-        .build()
+    policy
+        .build_client(|settings| {
+            settings
+                .timeout(std::time::Duration::from_secs(30))
+                .client_certificate(identity)
+        })
+        .map(crate::egress::ScreenedClient::into_inner)
         .map_err(|e| OAuthError::Config(format!("mTLS HTTP client build failed: {e}")))
 }
 
@@ -162,30 +167,40 @@ pub(super) fn check_client_and_par(
 impl OAuthProviderConfig {
     /// Point the token, userinfo, revocation and PAR requests at the
     /// `mtls_endpoint_aliases` the server advertised, for the ones it did.
+    ///
+    /// Discovery already screened every alias of the document it read
+    /// under the egress policy it ran under, and the policy here is that
+    /// one, so the check below repeats discovery's on the value about to
+    /// be installed: defence in depth, reached by no alias discovery let
+    /// through.
     pub(super) fn use_mtls_aliases(&mut self) -> Result<(), OAuthError> {
         use openidconnect::{TokenUrl, UserInfoUrl};
         let aliases = self.mtls_aliases.clone();
         let invalid =
             |what: &str| OAuthError::Config(format!("mtls_endpoint_aliases {what} is not a URL"));
+        let policy = self.egress;
+        let screened = |url: &str, what: &str| -> Result<(), OAuthError> {
+            super::endpoint::require_secure(Some(url), what)?;
+            policy
+                .check_url(url, what)
+                .map_err(|e| OAuthError::Config(e.to_string()))
+        };
         if let Some(url) = &aliases.token_endpoint {
-            super::endpoint::require_secure(Some(url), "mtls token_endpoint")?;
+            screened(url, "mtls token_endpoint")?;
             let url = TokenUrl::new(url.clone()).map_err(|_| invalid("token_endpoint"))?;
             self.metadata = self.metadata.clone().set_token_endpoint(Some(url));
         }
         if let Some(url) = &aliases.userinfo_endpoint {
-            super::endpoint::require_secure(Some(url), "mtls userinfo_endpoint")?;
+            screened(url, "mtls userinfo_endpoint")?;
             let url = UserInfoUrl::new(url.clone()).map_err(|_| invalid("userinfo_endpoint"))?;
             self.metadata = self.metadata.clone().set_userinfo_endpoint(Some(url));
         }
         if let Some(url) = aliases.revocation_endpoint {
-            super::endpoint::require_secure(Some(&url), "mtls revocation_endpoint")?;
+            screened(&url, "mtls revocation_endpoint")?;
             self.revocation_endpoint = Some(url);
         }
         if let Some(url) = aliases.pushed_authorization_request_endpoint {
-            super::endpoint::require_secure(
-                Some(&url),
-                "mtls pushed_authorization_request_endpoint",
-            )?;
+            screened(&url, "mtls pushed_authorization_request_endpoint")?;
             self.par_endpoint = Some(url);
         }
         Ok(())
@@ -226,7 +241,11 @@ impl OAuthProviderConfig {
             iss,
             code: text("code"),
             state: text("state"),
-            error: text("error"),
+            // The refusal's code is the IdP's text and is usually logged:
+            // escaped and cut, as every other upstream error text.
+            error: text("error").map(|code| {
+                crate::http_body::log_safe(&code, crate::http_body::ERROR_CODE_LOG_BYTES)
+            }),
         })
     }
 }

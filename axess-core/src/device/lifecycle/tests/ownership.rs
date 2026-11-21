@@ -3,10 +3,10 @@
 use super::*;
 use crate::authn::service::{StepUpPolicy, decide_step_up_for_user};
 use crate::device::store::MemoryDeviceStore;
-use chrono::TimeZone;
+use axess_clock::Timestamp;
 
-fn at() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 1, 1, 9, 0, 0).unwrap()
+fn at() -> Timestamp {
+    Timestamp::from_utc(2026, 1, 1, 9, 0, 0).unwrap()
 }
 
 fn fp() -> FingerprintHash {
@@ -35,7 +35,7 @@ async fn victim_with_trusted_device()
 
 #[tokio::test]
 async fn another_user_with_the_same_fingerprint_gets_a_new_unknown_device() {
-    let (svc, _victim, victim_device) = victim_with_trusted_device().await;
+    let (svc, _, victim_device) = victim_with_trusted_device().await;
     let attacker = crate::authn::ids::testing::user("attacker");
     let fresh = crate::authn::ids::testing::device("attacker-device");
 
@@ -94,7 +94,7 @@ async fn each_user_finds_their_own_device_again() {
 /// their own.
 #[tokio::test]
 async fn a_guest_resolves_the_fingerprint_device_but_inherits_none_of_its_trust() {
-    let (svc, _victim, victim_device) = victim_with_trusted_device().await;
+    let (svc, _, victim_device) = victim_with_trusted_device().await;
     let got = svc
         .ensure_device(&tenant(), None, fp(), at(), || {
             crate::authn::ids::testing::device("unused")

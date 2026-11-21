@@ -37,6 +37,7 @@ fn the_realm_authenticates_the_client_by_private_key_jwt() {
 /// so the key file and the realm cannot drift apart unnoticed.
 #[test]
 fn the_development_key_is_the_key_the_realm_registers() {
+    let clock = axess::testing::MockClock::at_reference();
     let client = realm_client();
     let jwks: serde_json::Value = serde_json::from_str(
         client["attributes"]["jwks.string"]
@@ -50,7 +51,7 @@ fn the_development_key_is_the_key_the_realm_registers() {
     let assertion = ClientKey::development()
         .signer("axess-fapi-client")
         .expect("the development key parses")
-        .mint(REALM_ISSUER, &axess::SystemClock, &axess::SystemRng)
+        .mint(REALM_ISSUER, &clock, &axess::SystemRng)
         .expect("an assertion");
     let key = jsonwebtoken::DecodingKey::from_ec_components(
         jwk["x"].as_str().expect("x"),
@@ -59,8 +60,16 @@ fn the_development_key_is_the_key_the_realm_registers() {
     .expect("the realm's key");
     let mut validation = jsonwebtoken::Validation::new(Algorithm::ES256);
     validation.set_audience(&[REALM_ISSUER]);
-    let verified = jsonwebtoken::decode::<serde_json::Value>(&assertion, &key, &validation)
+    // jsonwebtoken checks `exp` against the machine's clock; the assertion
+    // was minted at the test's, so its lifetime is checked against that.
+    validation.validate_exp = false;
+    let verified = axess::jwt::decode::<serde_json::Value>(&assertion, &key, &validation)
         .expect("the assertion verifies under the realm's key");
+    let exp = verified.claims["exp"].as_i64().expect("exp");
+    assert!(
+        exp > clock.now().unix_seconds(),
+        "the assertion is live at minting"
+    );
     assert_eq!(verified.header.kid.as_deref(), Some(DEV_CLIENT_KEY_ID));
     assert_eq!(verified.claims["iss"], "axess-fapi-client");
     assert_eq!(verified.claims["sub"], "axess-fapi-client");
@@ -225,21 +234,29 @@ fn the_development_key_signs_only_for_a_local_issuer() {
 }
 
 fn test_app() -> Router {
-    let (provider, provider_name) = build_mock_provider();
+    let clock: Arc<dyn Clock> = Arc::new(axess::testing::MockClock::at_reference());
+    let (provider, provider_name) = build_mock_provider(clock.clone());
     let tenant = TenantId::new(&SystemRng);
-    let identity = MockIdentityStore::new().with_tenant(
-        Tenant::new(
-            tenant.to_string(),
-            "fapi-test",
-            "FAPI test tenant",
-            EntityState::Active,
-            UserId::system(),
-            SystemClock.now(),
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(
+            Tenant::new(
+                tenant.to_string(),
+                "fapi-test",
+                "FAPI test tenant",
+                EntityState::Active,
+                UserId::system(),
+                clock.now(),
+            )
+            .expect("tenant"),
+        );
+    let registry = axess::MemorySessionRegistry::new().with_clock(clock.clone());
+    let authn = SecurityProfile::Strict
+        .values()
+        .authn_service_builder(
+            AuthnService::builder(identity.clone(), MockFactorStore::new())
+                .with_clock(clock.clone()),
         )
-        .expect("tenant"),
-    );
-    let registry = axess::MemorySessionRegistry::new();
-    let authn = AuthnService::builder(identity.clone(), MockFactorStore::new())
         .with_registry(registry.clone())
         .with_oauth_provider(provider)
         .build();
@@ -250,14 +267,17 @@ fn test_app() -> Router {
         allowed_email_domains: vec!["bank.example.com".to_string()],
         provider_name,
         post_logout_redirect: format!("{APP_ORIGIN}/"),
+        clock: clock.clone(),
     };
     let layer = SessionLayer::new(
-        MemorySessionStore::new(),
+        MemorySessionStore::new().with_clock(clock.clone()),
         *b"0123456789abcdef0123456789abcdeF",
         registry.handle(),
+        state.authn.session_end_audit(),
     )
+    .with_clock(clock.clone())
     .with_secure(false);
-    routes().with_state(state).layer(layer)
+    routes(clock).with_state(state).layer(layer)
 }
 
 async fn send(
@@ -354,22 +374,26 @@ fn claims(sub: &str, email: &str) -> OAuthClaims {
 }
 
 fn test_state() -> AppState {
+    let clock: Arc<dyn Clock> = Arc::new(axess::testing::MockClock::at_reference());
     let tenant = TenantId::new(&SystemRng);
-    let identity = MockIdentityStore::new().with_tenant(
-        Tenant::new(
-            tenant.to_string(),
-            "fapi-test",
-            "FAPI test tenant",
-            EntityState::Active,
-            UserId::system(),
-            SystemClock.now(),
-        )
-        .expect("tenant"),
-    );
-    let (provider, provider_name) = build_mock_provider();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(
+            Tenant::new(
+                tenant.to_string(),
+                "fapi-test",
+                "FAPI test tenant",
+                EntityState::Active,
+                UserId::system(),
+                clock.now(),
+            )
+            .expect("tenant"),
+        );
+    let (provider, provider_name) = build_mock_provider(clock.clone());
     AppState {
         authn: Arc::new(
             AuthnService::builder(identity.clone(), MockFactorStore::new())
+                .with_clock(clock.clone())
                 .with_oauth_provider(provider)
                 .build(),
         ),
@@ -378,6 +402,7 @@ fn test_state() -> AppState {
         allowed_email_domains: vec!["bank.example.com".to_string()],
         provider_name,
         post_logout_redirect: format!("{APP_ORIGIN}/"),
+        clock,
     }
 }
 

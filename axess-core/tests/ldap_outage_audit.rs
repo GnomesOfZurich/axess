@@ -2,7 +2,7 @@
 //! A directory outage during an LDAP bind leaves an audit row, and the log
 //! line names the user rather than the bind DN.
 
-mod common;
+use axess_core::testing::fixtures as common;
 
 use axess_core::authn::AuditContext;
 use axess_core::authn::event::{AuthEventStatus, AuthEventType};
@@ -26,22 +26,24 @@ struct Down;
 impl LdapProvider for Down {
     fn verify_bind<'a>(
         &'a self,
-        _identifier: &'a str,
-        _bind_dn: &'a str,
-        _password: &'a str,
+        _: &'a str,
+        _: &'a str,
+        _: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<LdapBindResult, LdapError>> + Send + 'a>> {
         Box::pin(async { Err(LdapError::Connection("ldap.internal:636 refused".into())) })
     }
 
-    fn build_bind_dn(&self, _identifier: &str) -> String {
+    fn build_bind_dn(&self, _: &str) -> String {
         DN.to_owned()
     }
 }
 
 #[tokio::test]
 async fn a_directory_outage_is_audited_and_does_not_log_the_bind_dn() {
+    let clock = common::test_clock();
     let capture = TracingCapture::install();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new()
@@ -56,6 +58,7 @@ async fn a_directory_outage_is_audited_and_does_not_log_the_bind_dn() {
             AuthMethod::sequential("ldap", vec![FactorKind::LdapBind], user_scope()),
         );
     let svc = AuthnService::builder(identity.clone(), factors)
+        .with_clock(clock.clone())
         .with_ldap(Down)
         .build()
         .with_audit_context(AuditContext::default());
@@ -83,9 +86,9 @@ struct Unavailable;
 impl LdapProvider for Unavailable {
     fn verify_bind<'a>(
         &'a self,
-        _identifier: &'a str,
-        _bind_dn: &'a str,
-        _password: &'a str,
+        _: &'a str,
+        _: &'a str,
+        _: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<LdapBindResult, LdapError>> + Send + 'a>> {
         Box::pin(async {
             Err(LdapError::Directory {
@@ -95,22 +98,24 @@ impl LdapProvider for Unavailable {
         })
     }
 
-    fn build_bind_dn(&self, _identifier: &str) -> String {
+    fn build_bind_dn(&self, _: &str) -> String {
         DN.to_owned()
     }
 }
 
-/// The directory's own error codes used to be read as a wrong password and
-/// counted towards the lockout, so an outage locked every user out. They
-/// are an external-service error now, with the reserved guess given back.
+/// The directory's own error codes are an external-service error, with the
+/// reserved guess given back. Read as a wrong password they would count
+/// towards the lockout, and an outage would lock every user out.
 #[tokio::test]
 async fn a_directory_that_cannot_bind_counts_no_failed_attempt() {
+    let clock = common::test_clock();
     use axess_core::authn::error::AuthnError;
     // A capture of its own: a test in this binary with no subscriber that
     // hits the log callsite first would cache it as never interesting for
     // the sibling test that asserts on the log line.
     let capture = TracingCapture::install();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new()
@@ -125,6 +130,7 @@ async fn a_directory_that_cannot_bind_counts_no_failed_attempt() {
             AuthMethod::sequential("ldap", vec![FactorKind::LdapBind], user_scope()),
         );
     let svc = AuthnService::builder(identity.clone(), factors)
+        .with_clock(clock.clone())
         .with_ldap(Unavailable)
         .build()
         .with_audit_context(AuditContext::default());
@@ -160,9 +166,9 @@ struct AcceptsAnyBind;
 impl LdapProvider for AcceptsAnyBind {
     fn verify_bind<'a>(
         &'a self,
-        _identifier: &'a str,
+        _: &'a str,
         bind_dn: &'a str,
-        _password: &'a str,
+        _: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<LdapBindResult, LdapError>> + Send + 'a>> {
         Box::pin(async move {
             Ok(LdapBindResult {
@@ -172,14 +178,16 @@ impl LdapProvider for AcceptsAnyBind {
         })
     }
 
-    fn build_bind_dn(&self, _identifier: &str) -> String {
+    fn build_bind_dn(&self, _: &str) -> String {
         DN.to_owned()
     }
 }
 
 #[tokio::test]
 async fn an_empty_ldap_password_is_refused_even_when_the_directory_would_bind() {
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new()
@@ -194,6 +202,7 @@ async fn an_empty_ldap_password_is_refused_even_when_the_directory_would_bind() 
             AuthMethod::sequential("ldap", vec![FactorKind::LdapBind], user_scope()),
         );
     let svc = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
         .with_ldap(AcceptsAnyBind)
         .build()
         .with_audit_context(AuditContext::default());
@@ -220,9 +229,11 @@ async fn an_empty_ldap_password_is_refused_even_when_the_directory_would_bind() 
 /// never leaves the session authenticated behind an error.
 #[tokio::test]
 async fn a_store_outage_during_an_ldap_login_never_leaves_the_session_authenticated() {
+    let clock = common::test_clock();
     let mut errored = 0;
     for skip in 0..12 {
         let identity = MockIdentityStore::new()
+            .with_clock(clock.clone())
             .with_tenant(test_tenant())
             .with_user(test_user("u1", "alice"));
         let factors = MockFactorStore::new()
@@ -237,6 +248,7 @@ async fn a_store_outage_during_an_ldap_login_never_leaves_the_session_authentica
                 AuthMethod::sequential("ldap", vec![FactorKind::LdapBind], user_scope()),
             );
         let svc = AuthnService::builder(identity, factors.clone())
+            .with_clock(clock.clone())
             .with_ldap(AcceptsAnyBind)
             .build()
             .with_audit_context(AuditContext::default());
@@ -268,8 +280,10 @@ async fn a_store_outage_during_an_ldap_login_never_leaves_the_session_authentica
 /// fewer steps than the method requires.
 #[tokio::test]
 async fn a_method_with_an_empty_any_of_step_is_skipped_not_shortened() {
+    let clock = common::test_clock();
     use axess_core::authn::factor::FactorStep;
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let mut method = AuthMethod::sequential("ldap", vec![FactorKind::LdapBind], user_scope());
@@ -283,6 +297,7 @@ async fn a_method_with_an_empty_any_of_step_is_skipped_not_shortened() {
         )
         .with_method(&uid("u1"), method);
     let svc = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
         .with_ldap(AcceptsAnyBind)
         .build()
         .with_audit_context(AuditContext::default());
@@ -313,9 +328,9 @@ struct Accepts;
 impl LdapProvider for Accepts {
     fn verify_bind<'a>(
         &'a self,
-        _identifier: &'a str,
-        _bind_dn: &'a str,
-        _password: &'a str,
+        _: &'a str,
+        _: &'a str,
+        _: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<LdapBindResult, LdapError>> + Send + 'a>> {
         Box::pin(async {
             Ok(LdapBindResult {
@@ -325,7 +340,7 @@ impl LdapProvider for Accepts {
         })
     }
 
-    fn build_bind_dn(&self, _identifier: &str) -> String {
+    fn build_bind_dn(&self, _: &str) -> String {
         DN.to_owned()
     }
 }
@@ -334,8 +349,10 @@ impl LdapProvider for Accepts {
 /// session they belong to, as the other rows of a login do.
 #[tokio::test]
 async fn the_ldap_rows_name_their_session() {
+    let clock = common::test_clock();
     for accepts in [false, true] {
         let identity = MockIdentityStore::new()
+            .with_clock(clock.clone())
             .with_tenant(test_tenant())
             .with_user(test_user("u1", "alice"));
         let factors = MockFactorStore::new()
@@ -349,7 +366,7 @@ async fn the_ldap_rows_name_their_session() {
                 &uid("u1"),
                 AuthMethod::sequential("ldap", vec![FactorKind::LdapBind], user_scope()),
             );
-        let builder = AuthnService::builder(identity.clone(), factors);
+        let builder = AuthnService::builder(identity.clone(), factors).with_clock(clock.clone());
         let svc = if accepts {
             builder.with_ldap(Accepts)
         } else {
@@ -360,7 +377,7 @@ async fn the_ldap_rows_name_their_session() {
         let session = test_session();
         svc.begin_login("alice", "default", &session).await.unwrap();
         // The id the row is written under, before a finished login may rotate it.
-        let before = session.session_id().await;
+        let before = session.session_key().await;
         let cred = FactorCredential::Password(ZeroizedString::new("whatever"));
         let _ = svc.verify_factor(&cred, &session).await;
 

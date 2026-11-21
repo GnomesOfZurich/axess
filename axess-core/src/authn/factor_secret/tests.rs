@@ -1,7 +1,8 @@
 use super::*;
 use crate::authn::factor::FederatedProvider;
+use axess_clock::testing::Shift;
 use axess_identity::testing::{tenant, user};
-use chrono::Utc;
+use axess_testing::mock_tracing::TracingCapture;
 
 const KEY: [u8; 32] = *b"0123456789abcdef0123456789abcdeF";
 const OTHER: [u8; 32] = *b"fedcba9876543210fedcba9876543210";
@@ -139,13 +140,14 @@ fn seal_config_seals_otp_secrets_and_leaves_the_rest() {
 
 #[test]
 fn the_plain_window_follows_the_policy_and_the_clock() {
-    let clock = axess_clock::testing::MockClock::at(Utc::now());
-    let until = clock.now() + chrono::Duration::hours(1);
+    let clock =
+        axess_clock::testing::MockClock::at(axess_clock::testing::MockClock::reference_time());
+    let until = clock.now().plus(axess_clock::SignedDuration::hours(1));
     let cipher = FactorSecretCipher::new(KEY)
         .with_clock(Arc::new(clock.clone()))
         .with_plain_secrets(LegacyBlobs::AcceptUntil(until));
     assert!(cipher.plain_secrets_readable());
-    clock.advance(chrono::Duration::hours(2));
+    clock.advance(axess_clock::SignedDuration::hours(2));
     assert!(!cipher.plain_secrets_readable());
     assert!(!FactorSecretCipher::new(KEY).plain_secrets_readable());
     assert!(
@@ -278,13 +280,14 @@ fn the_first_binding_is_refused_by_default_and_read_only_when_asked() {
         Some(FactorSecretError::Open)
     );
 
-    let clock = axess_clock::testing::MockClock::at(Utc::now());
-    let until = clock.now() + chrono::Duration::hours(1);
+    let clock =
+        axess_clock::testing::MockClock::at(axess_clock::testing::MockClock::reference_time());
+    let until = clock.now().plus(axess_clock::SignedDuration::hours(1));
     let windowed = FactorSecretCipher::new(KEY)
         .with_clock(Arc::new(clock.clone()))
         .with_first_binding(LegacyBlobs::AcceptUntil(until));
     assert!(windowed.open(&old, totp).is_ok());
-    clock.advance(chrono::Duration::hours(2));
+    clock.advance(axess_clock::SignedDuration::hours(2));
     assert_eq!(
         windowed.open(&old, totp).err(),
         Some(FactorSecretError::Open)
@@ -331,4 +334,159 @@ fn bound_context_is_authenticated() {
             "{other:?}"
         );
     }
+}
+
+#[test]
+fn the_earlier_tenant_binding_window_follows_the_policy_and_closes_at_its_cutoff() {
+    let clock =
+        axess_clock::testing::MockClock::at(axess_clock::testing::MockClock::reference_time());
+    let until = clock.now().plus(axess_clock::SignedDuration::hours(1));
+    let windowed = FactorSecretCipher::new(KEY)
+        .with_clock(Arc::new(clock.clone()))
+        .with_earlier_tenant_binding(LegacyBlobs::AcceptUntil(until));
+    assert!(windowed.earlier_tenant_binding_readable());
+    clock.advance(axess_clock::SignedDuration::hours(1));
+    assert!(
+        !windowed.earlier_tenant_binding_readable(),
+        "the cutoff itself is past the window"
+    );
+    let rejecting = FactorSecretCipher::new(KEY).with_clock(Arc::new(clock.clone()));
+    assert!(!rejecting.earlier_tenant_binding_readable());
+    assert!(
+        rejecting
+            .with_earlier_tenant_binding(LegacyBlobs::Accept)
+            .earlier_tenant_binding_readable()
+    );
+}
+
+#[test]
+fn the_debug_form_names_the_key_id_and_every_policy_but_never_the_key() {
+    let clock =
+        axess_clock::testing::MockClock::at(axess_clock::testing::MockClock::reference_time());
+    let cipher = FactorSecretCipher::new(KEY)
+        .with_clock(Arc::new(clock.clone()))
+        .with_previous_key(OTHER)
+        .with_earlier_tenant_binding(LegacyBlobs::Accept);
+    assert_eq!(
+        format!("{cipher:?}"),
+        format!(
+            "FactorSecretCipher {{ current_key_id: {:?}, has_previous_key: true, \
+             plain: Reject, first_binding: Reject, earlier_tenant_binding: Accept }}",
+            key_id(&KEY)
+        ),
+        "the whole form, so no rendering of either key, as text, bytes or hex, can join it"
+    );
+
+    let single = FactorSecretCipher::new(OTHER)
+        .with_clock(Arc::new(clock))
+        .with_plain_secrets(LegacyBlobs::Accept);
+    assert_eq!(
+        format!("{single:?}"),
+        format!(
+            "FactorSecretCipher {{ current_key_id: {:?}, has_previous_key: false, \
+             plain: Accept, first_binding: Reject, earlier_tenant_binding: Reject }}",
+            key_id(&OTHER)
+        )
+    );
+}
+
+#[test]
+fn the_plain_and_first_binding_windows_close_at_their_cutoff() {
+    let clock =
+        axess_clock::testing::MockClock::at(axess_clock::testing::MockClock::reference_time());
+    let until = clock.now().plus(axess_clock::SignedDuration::hours(1));
+    let plain = FactorSecretCipher::new(KEY)
+        .with_clock(Arc::new(clock.clone()))
+        .with_plain_secrets(LegacyBlobs::AcceptUntil(until));
+    let first = FactorSecretCipher::new(KEY)
+        .with_clock(Arc::new(clock.clone()))
+        .with_first_binding(LegacyBlobs::AcceptUntil(until));
+
+    clock.advance(
+        axess_clock::SignedDuration::hours(1)
+            .checked_sub(axess_clock::SignedDuration::seconds(1))
+            .unwrap(),
+    );
+    assert!(plain.plain_secrets_readable(), "a second before the cutoff");
+    assert!(first.first_binding_readable(), "a second before the cutoff");
+
+    clock.advance(axess_clock::SignedDuration::seconds(1));
+    assert!(
+        !plain.plain_secrets_readable(),
+        "the cutoff itself is past the window"
+    );
+    assert!(
+        !first.first_binding_readable(),
+        "the cutoff itself is past the window"
+    );
+}
+
+/// The cipher's key is held in a `Zeroizing` buffer, which wipes itself
+/// when the last handle to it is dropped. The key type has no `Drop` of its
+/// own to keep in step with its field: taking the buffer out of it compiles
+/// only while it has none.
+#[test]
+fn the_key_is_held_in_a_zeroizing_buffer() {
+    let Key(held) = Key::new(&KEY);
+    let held: &Zeroizing<[u8; 32]> = &held;
+    assert_eq!(**held, KEY);
+}
+
+/// The ciphertext of an empty secret is a tag alone, and it opens.
+#[test]
+fn the_sealed_form_of_an_empty_secret_opens() {
+    let cipher = FactorSecretCipher::new(KEY);
+    let scope = scope("t1", "u1");
+    let binding = || FactorSecretBinding::new(&scope, &FactorKind::Totp);
+    let sealed = cipher.seal("", binding()).unwrap();
+    assert_eq!(
+        URL_SAFE_NO_PAD.decode(&sealed.ciphertext).unwrap().len(),
+        crate::aead::TAG_LEN
+    );
+    let opened = cipher.open(&sealed, binding()).unwrap();
+    assert_eq!(&*opened.secret, "");
+}
+
+/// A ciphertext one byte short of a tag was never sealed: it is refused,
+/// and logged as damaged, before any key or binding is tried. A full-length
+/// ciphertext that does not authenticate is refused without that line.
+#[test]
+fn a_ciphertext_shorter_than_a_tag_is_refused_before_decrypting() {
+    const TOO_SHORT: &str = "too short to have been sealed";
+    let capture = TracingCapture::install();
+    let cipher = FactorSecretCipher::new(KEY);
+    let scope = scope("t1", "u1");
+    let binding = || FactorSecretBinding::new(&scope, &FactorKind::Totp);
+    let sealed = cipher.seal("", binding()).unwrap();
+    let with_ciphertext = |bytes: &[u8]| SealedFactorSecret {
+        ciphertext: URL_SAFE_NO_PAD.encode(bytes),
+        ..sealed.clone()
+    };
+    let raw = URL_SAFE_NO_PAD.decode(&sealed.ciphertext).unwrap();
+    let too_short = || {
+        capture
+            .events()
+            .iter()
+            .filter(|event| event.message.contains(TOO_SHORT))
+            .count()
+    };
+
+    let mut flipped = raw.clone();
+    flipped[0] ^= 1;
+    assert_eq!(
+        cipher.open(&with_ciphertext(&flipped), binding()).err(),
+        Some(FactorSecretError::Open)
+    );
+    assert_eq!(too_short(), 0, "the control is a full-length ciphertext");
+
+    for length in [crate::aead::TAG_LEN - 1, 1, 0] {
+        assert_eq!(
+            cipher
+                .open(&with_ciphertext(&raw[..length]), binding())
+                .err(),
+            Some(FactorSecretError::Open),
+            "{length} bytes"
+        );
+    }
+    assert_eq!(too_short(), 3, "{:?}", capture.events());
 }

@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::{fmt, ops::Deref, sync::Arc};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// A `String` that is zeroed in memory on drop.
 ///
@@ -17,25 +17,13 @@ use zeroize::Zeroize;
 /// plaintext. An OTP secret is sealed instead: see
 /// [`FactorSecret`](crate::factor_secret::FactorSecret) and the OTP secret
 /// section of the password and TOTP guide.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct ZeroizedString(String);
 
 impl ZeroizedString {
     /// Wrap an owned string so its bytes are zeroed on drop.
     pub fn new(s: impl Into<String>) -> Self {
         Self(s.into())
-    }
-}
-
-impl Drop for ZeroizedString {
-    fn drop(&mut self) {
-        self.0.zeroize();
-    }
-}
-
-impl Zeroize for ZeroizedString {
-    fn zeroize(&mut self) {
-        self.0.zeroize();
     }
 }
 
@@ -82,6 +70,14 @@ mod tests {
         assert_eq!(&*s, "super-secret-password");
         s.zeroize();
         assert!(s.is_empty(), "zeroize() must empty the inner string");
+    }
+
+    /// The string is zeroed when it is dropped: the type carries the
+    /// `ZeroizeOnDrop` marker, which only a type whose drop zeroes it has.
+    #[test]
+    fn the_string_is_zeroed_on_drop() {
+        fn zeroed_on_drop<T: ZeroizeOnDrop>() {}
+        zeroed_on_drop::<ZeroizedString>();
     }
 
     #[test]

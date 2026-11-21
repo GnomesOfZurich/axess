@@ -7,11 +7,13 @@
 //! policy code can name them without `webauthn-rs`. Everything else is
 //! gated on `fido2`: the stored credential ([`Fido2Credential`] holding a
 //! typed [`Fido2Key`]), the ceremony state ([`Fido2Registration`],
-//! [`Fido2Authentication`]), the [`Fido2Provider`] trait and its
+//! [`Fido2Authentication`]), the prompt of a discoverable login
+//! ([`DiscoverablePrompt`]) and whether a registration makes a discoverable
+//! credential ([`DiscoverableCredential`]), the [`Fido2Provider`] trait and its
 //! [`DefaultFido2Provider`].
 
 #[cfg(feature = "fido2")]
-use chrono::{DateTime, Utc};
+use axess_clock::Timestamp;
 use serde::{Deserialize, Serialize};
 
 // ── Fido2Config ──────────────────────────────────────────────────────────────
@@ -184,9 +186,9 @@ pub struct Fido2Credential {
     /// User-supplied label shown in credential management UIs.
     pub name: String,
     /// Timestamp at which the credential was registered.
-    pub registered_at: DateTime<Utc>,
+    pub registered_at: Timestamp,
     /// Timestamp of the most recent successful authentication, if any.
-    pub last_used_at: Option<DateTime<Utc>>,
+    pub last_used_at: Option<Timestamp>,
 }
 
 #[cfg(feature = "fido2")]
@@ -196,7 +198,7 @@ impl Fido2Credential {
     pub fn new(
         key: impl Into<Fido2Key>,
         name: impl Into<String>,
-        registered_at: DateTime<Utc>,
+        registered_at: Timestamp,
     ) -> Self {
         Self {
             key: key.into(),
@@ -216,7 +218,7 @@ impl Fido2Credential {
     pub fn record_authentication(
         &mut self,
         result: &webauthn_rs::prelude::AuthenticationResult,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) {
         // `update_credential` answers `None` for a result that belongs to
         // another credential; only the matching one counts as used.
@@ -254,8 +256,9 @@ pub struct Fido2Options {
     /// change (beginning or finishing a registration, deleting a passkey).
     /// A session whose authentication is older is refused the change and
     /// must step up first, so a session left open on a shared machine
-    /// cannot enrol an attacker's passkey hours later. `None`, the
-    /// default, applies no age limit; a few minutes is the usual choice.
+    /// cannot enrol an attacker's passkey hours later. The default is
+    /// [`DEFAULT_FIDO2_MAX_AUTHN_AGE`], five minutes; `None`, written out,
+    /// is the opt-out that applies no age limit.
     pub max_authn_age: Option<std::time::Duration>,
     /// The ceremony a registration runs unless the call names one
     /// (`begin_fido2_registration_with`). Default
@@ -265,16 +268,29 @@ pub struct Fido2Options {
     /// begun without a ceremony of its own. Default
     /// [`DEFAULT_FIDO2_CEREMONY`], the passkey ceremony.
     pub login_ceremony: Fido2Ceremony,
+    /// Whether a passkey or attested-passkey registration asks the
+    /// authenticator to store the credential, so that it can sign in with no
+    /// username. Default [`DiscoverableCredential::Discouraged`], what
+    /// `webauthn-rs` asks; set [`Required`](DiscoverableCredential::Required)
+    /// where every passkey must serve the passwordless login.
+    pub discoverable_credential: DiscoverableCredential,
 }
+
+/// The default [`Fido2Options::max_authn_age`]: a passkey is enrolled or
+/// removed within five minutes of authenticating, or after a step-up.
+/// A plain duration, so the stub built without the `fido2` feature carries
+/// it as it carries [`DEFAULT_FIDO2_CEREMONY`].
+pub const DEFAULT_FIDO2_MAX_AUTHN_AGE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 #[cfg(feature = "fido2")]
 impl Default for Fido2Options {
     fn default() -> Self {
         Self {
             ceremony_timeout: std::time::Duration::from_secs(300),
-            max_authn_age: None,
+            max_authn_age: Some(DEFAULT_FIDO2_MAX_AUTHN_AGE),
             registration_ceremony: DEFAULT_FIDO2_CEREMONY,
             login_ceremony: DEFAULT_FIDO2_CEREMONY,
+            discoverable_credential: DiscoverableCredential::Discouraged,
         }
     }
 }
@@ -285,6 +301,16 @@ impl Default for Fido2Options {
 mod key;
 #[cfg(feature = "fido2")]
 pub use key::{Fido2Authentication, Fido2Key, Fido2Registration};
+
+#[cfg(feature = "fido2")]
+mod discoverable_credential;
+#[cfg(feature = "fido2")]
+pub use discoverable_credential::DiscoverableCredential;
+
+#[cfg(feature = "fido2")]
+mod prompt;
+#[cfg(feature = "fido2")]
+pub use prompt::DiscoverablePrompt;
 
 #[cfg(feature = "fido2")]
 mod provider;
@@ -298,6 +324,9 @@ pub use mock::MockFido2Provider;
 
 #[cfg(all(test, feature = "fido2"))]
 mod ceremony_tests;
+
+#[cfg(all(test, feature = "fido2"))]
+mod options_tests;
 
 #[cfg(all(test, feature = "fido2"))]
 mod credential_tests;

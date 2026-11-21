@@ -1,7 +1,7 @@
 //! Row writes: the compare-and-swap loop every conditional change runs
 //! through, and the unconditional `save`.
 
-use chrono::{DateTime, Utc};
+use axess_clock::Timestamp;
 
 use super::index::plan_indexes;
 use super::read::StoredRowState;
@@ -46,6 +46,9 @@ impl ValkeyDeviceStore {
         keys: Vec<String>,
         args: Vec<Value>,
     ) -> Result<ScriptStatus, ValkeyDeviceStoreError> {
+        // A store whose keys cannot share a slot refuses by name here,
+        // before the cluster is asked (see `slots`).
+        self.keys_together()?;
         let reply: String = self.client.eval(script, keys, args).await?;
         parse_status(&reply).ok_or(ValkeyDeviceStoreError::UnexpectedScriptReply(reply))
     }
@@ -78,7 +81,7 @@ impl ValkeyDeviceStore {
         &self,
         tenant: &str,
         id: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
         decide: F,
     ) -> Result<Applied, ValkeyDeviceStoreError>
     where
@@ -136,7 +139,7 @@ impl ValkeyDeviceStore {
         &self,
         tenant: &str,
         id: &str,
-        now: Option<DateTime<Utc>>,
+        now: Option<Timestamp>,
         decide: F,
     ) -> Result<Applied, ValkeyDeviceStoreError>
     where
@@ -157,7 +160,7 @@ impl ValkeyDeviceStore {
                         &self.encode_row(new)?,
                         now.and_then(|now| self.ttl_seconds_for(new, now)),
                         id,
-                        new.last_seen_at.timestamp(),
+                        new.last_seen_at.unix_seconds(),
                         &plan.ops(),
                     );
                     let keys = [row_key.clone()]
@@ -190,11 +193,12 @@ impl ValkeyDeviceStore {
     /// write is a compare-and-swap against the row as read (or its absence),
     /// retried against the fresh row on a conflict, so the last writer wins
     /// without two saves interleaving their index changes. A stored
-    /// `Revoked` row is left as it is by a save that is not itself revoked.
+    /// `Revoked` row is left as it is by every save, a revoked one
+    /// included: nothing is written.
     pub(super) async fn save_row(
         &self,
         device: &Device,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Result<(), ValkeyDeviceStoreError> {
         let device = for_save(device, now);
         let tenant = device.tenant_id.to_string();
@@ -235,7 +239,7 @@ impl ValkeyDeviceStore {
                         &payload,
                         ttl,
                         &id,
-                        device.last_seen_at.timestamp(),
+                        device.last_seen_at.unix_seconds(),
                         &plan.ops(),
                     );
                     let keys = [row_key.clone()]
@@ -263,7 +267,7 @@ impl ValkeyDeviceStore {
                 &payload,
                 ttl,
                 &id,
-                device.last_seen_at.timestamp(),
+                device.last_seen_at.unix_seconds(),
                 &plan.ops(),
             );
             let keys = [row_key.clone()]

@@ -1,15 +1,15 @@
-//! `tests`: extracted from `cache.rs` per the
-//! 200-LoC inline-test rule in AGENTS.md.
+//! `tests`: the unit tests of `cache.rs`, kept beside it per the
+//! 200-line inline-test rule in AGENTS.md.
 
 use super::*;
 use crate::device::store::MemoryDeviceStore;
 use crate::device::types::{Device, FingerprintHash};
+use axess_clock::Timestamp;
 use axess_clock::testing::MockClock;
-use chrono::TimeZone;
 
 fn fixed_clock() -> Arc<MockClock> {
     Arc::new(MockClock::at(
-        Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+        Timestamp::from_utc(2026, 1, 1, 0, 0, 0).unwrap(),
     ))
 }
 
@@ -28,8 +28,8 @@ fn build_device(t: &TenantId, u: &UserId, d: &DeviceId) -> Device {
         user_id: Some(*u),
         trust_level: DeviceTrustLevel::Seen,
         fingerprint_hash: FingerprintHash::from_bytes([0u8; 32]),
-        first_seen_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
-        last_seen_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+        first_seen_at: Timestamp::from_utc(2026, 1, 1, 0, 0, 0).unwrap(),
+        last_seen_at: Timestamp::from_utc(2026, 1, 1, 0, 0, 0).unwrap(),
         revoked_at: None,
         demoted_at: None,
         bindings: Vec::new(),
@@ -61,7 +61,7 @@ async fn load_caches_after_first_hit() {
 #[tokio::test]
 async fn load_does_not_cache_none_results() {
     let inner = MemoryDeviceStore::new();
-    let (t, _u, d) = ids();
+    let (t, _, d) = ids();
     let cached = CachedDeviceStore::new(inner).with_clock(fixed_clock() as _);
 
     // No device saved; load returns None.
@@ -113,7 +113,7 @@ async fn set_trust_level_invalidates_cached_row() {
     let cached = CachedDeviceStore::new(inner.clone()).with_clock(fixed_clock() as _);
     drop(cached.load(&t, &d).await.unwrap()); // warm
 
-    let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 5, 0).unwrap();
+    let now = Timestamp::from_utc(2026, 1, 1, 0, 5, 0).unwrap();
     cached
         .set_trust_level(&t, &d, DeviceTrustLevel::Revoked, now)
         .await
@@ -162,7 +162,7 @@ async fn record_sighting_does_not_invalidate() {
     drop(cached.load(&t, &d).await.unwrap()); // warm
     let stats_before = cached.stats();
 
-    let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 5, 0).unwrap();
+    let now = Timestamp::from_utc(2026, 1, 1, 0, 5, 0).unwrap();
     cached.record_sighting(&t, &d, now).await.unwrap();
     drop(cached.load(&t, &d).await.unwrap()); // should hit cache
 
@@ -201,7 +201,7 @@ async fn find_by_fingerprint_does_not_prime_by_id_cache() {
 }
 
 /// Pin: refresh-family cascade revocation propagates through the
-/// cache. When `cascade_revoke_by_refresh_family` walks N devices
+/// cache. When the device-only cascade walks N devices
 /// and calls `set_trust_level(Revoked)` on each, every cached row
 /// must be invalidated so subsequent loads see `Revoked`. Without
 /// per-call invalidation we'd serve stale `Trusted` from cache for
@@ -209,7 +209,7 @@ async fn find_by_fingerprint_does_not_prime_by_id_cache() {
 /// token theft signal.
 #[tokio::test]
 async fn refresh_cascade_revocation_propagates_through_cache() {
-    use crate::device::cascade::cascade_revoke_by_refresh_family;
+    use crate::device::cascade::cascade_revoke_devices;
     use crate::device::types::DeviceBinding;
 
     let inner = MemoryDeviceStore::new();
@@ -217,7 +217,7 @@ async fn refresh_cascade_revocation_propagates_through_cache() {
     let user = crate::authn::ids::testing::user("user-1");
     let dev_a = crate::authn::ids::testing::device("dev-a");
     let dev_b = crate::authn::ids::testing::device("dev-b");
-    let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let now = Timestamp::from_utc(2026, 1, 1, 0, 0, 0).unwrap();
 
     for (id, fp_byte) in [(&dev_a, 0xa1u8), (&dev_b, 0xb2u8)] {
         let device = Device {
@@ -253,10 +253,13 @@ async fn refresh_cascade_revocation_propagates_through_cache() {
     // Refresh-family compromise → cascade revocation through the
     // cached store. Every device bound to `fam-stolen` must end up
     // Revoked, and the cache must reflect that on the next load.
-    let revoked_at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 5, 0).unwrap();
-    let count = cascade_revoke_by_refresh_family(&cached, &tenant, "fam-stolen", revoked_at)
+    let revoked_at = Timestamp::from_utc(2026, 1, 1, 0, 5, 0).unwrap();
+    let bound = cached
+        .find_by_refresh_family(&tenant, "fam-stolen")
         .await
         .unwrap();
+    let targets: Vec<_> = bound.iter().map(|d| (d.tenant_id, d.id)).collect();
+    let count = cascade_revoke_devices(&cached, &targets, revoked_at).await;
     assert_eq!(count, 2, "both refresh-bound devices must be revoked");
 
     // Critical: subsequent loads MUST see Revoked, not stale Trusted.
@@ -274,10 +277,9 @@ async fn refresh_cascade_revocation_propagates_through_cache() {
     );
 }
 
-/// mutant kill: pin `invalidate_all` against a no-op
-/// replacement. After warming the cache, calling `invalidate_all`
-/// must drop every entry so the next load is a miss for both
-/// rows.
+/// After warming the cache, calling `invalidate_all` must drop every
+/// entry, so the next load is a miss for both rows: an
+/// `invalidate_all` that did nothing fails here.
 #[tokio::test]
 async fn invalidate_all_drops_every_entry() {
     let inner = MemoryDeviceStore::new();
@@ -360,3 +362,187 @@ async fn invalidate_tenant_drops_only_matching_entries() {
 }
 
 mod races;
+
+/// An adopter's store wrapped around the cache, forwarding every method the
+/// trait requires.
+#[derive(Clone)]
+struct WrappedCache<S: DeviceStore>(CachedDeviceStore<S>);
+
+impl<S: DeviceStore> DeviceStore for WrappedCache<S> {
+    type Error = S::Error;
+
+    fn load_fresh(
+        &self,
+        t: &TenantId,
+        id: &DeviceId,
+    ) -> impl Future<Output = Result<Option<Device>, Self::Error>> + Send {
+        self.0.load_fresh(t, id)
+    }
+
+    fn load(
+        &self,
+        t: &TenantId,
+        id: &DeviceId,
+    ) -> impl Future<Output = Result<Option<Device>, Self::Error>> + Send {
+        self.0.load(t, id)
+    }
+    fn find_by_fingerprint(
+        &self,
+        t: &TenantId,
+        h: &FingerprintHash,
+    ) -> impl Future<Output = Result<Option<Device>, Self::Error>> + Send {
+        self.0.find_by_fingerprint(t, h)
+    }
+    fn find_for_user(
+        &self,
+        t: &TenantId,
+        u: &UserId,
+        limit: usize,
+    ) -> impl Future<Output = Result<Vec<Device>, Self::Error>> + Send {
+        self.0.find_for_user(t, u, limit)
+    }
+    fn find_by_refresh_family(
+        &self,
+        t: &TenantId,
+        f: &str,
+    ) -> impl Future<Output = Result<Vec<Device>, Self::Error>> + Send {
+        self.0.find_by_refresh_family(t, f)
+    }
+    fn save(
+        &self,
+        d: &Device,
+        now: Timestamp,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        self.0.save(d, now)
+    }
+    fn create_or_find(
+        &self,
+        d: &Device,
+        now: Timestamp,
+    ) -> impl Future<Output = Result<Device, Self::Error>> + Send {
+        self.0.create_or_find(d, now)
+    }
+    fn record_sighting(
+        &self,
+        t: &TenantId,
+        id: &DeviceId,
+        now: Timestamp,
+    ) -> impl Future<Output = Result<DeviceTrustLevel, Self::Error>> + Send {
+        self.0.record_sighting(t, id, now)
+    }
+    fn set_trust_level(
+        &self,
+        t: &TenantId,
+        id: &DeviceId,
+        level: DeviceTrustLevel,
+        now: Timestamp,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        self.0.set_trust_level(t, id, level, now)
+    }
+    fn set_trust_level_if(
+        &self,
+        t: &TenantId,
+        id: &DeviceId,
+        expected: DeviceTrustLevel,
+        level: DeviceTrustLevel,
+        now: Timestamp,
+    ) -> impl Future<Output = Result<TrustTransition, Self::Error>> + Send {
+        self.0.set_trust_level_if(t, id, expected, level, now)
+    }
+    fn claim_owner(
+        &self,
+        t: &TenantId,
+        id: &DeviceId,
+        user: &UserId,
+        now: Timestamp,
+    ) -> impl Future<Output = Result<OwnerClaim, Self::Error>> + Send {
+        self.0.claim_owner(t, id, user, now)
+    }
+    fn replace_bindings(
+        &self,
+        t: &TenantId,
+        id: &DeviceId,
+        expected: &[DeviceBinding],
+        bindings: &[DeviceBinding],
+        now: Timestamp,
+    ) -> impl Future<Output = Result<BindingsUpdate, Self::Error>> + Send {
+        self.0.replace_bindings(t, id, expected, bindings, now)
+    }
+    fn delete(
+        &self,
+        t: &TenantId,
+        id: &DeviceId,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        self.0.delete(t, id)
+    }
+    fn sweep(
+        &self,
+        t: &TenantId,
+        now: Timestamp,
+    ) -> impl Future<Output = Result<SweepCounts, Self::Error>> + Send {
+        self.0.sweep(t, now)
+    }
+}
+
+/// The cache, and a store wrapped around it, keep the contract of the three
+/// conditional writes, with the calls beneath them made to interleave: two
+/// swaps, two trust changes and two claims from one read have one winner.
+#[tokio::test]
+async fn the_cache_and_a_wrapper_around_it_keep_the_conditional_writes_single() {
+    use crate::device::store::consistency as shared;
+    use crate::device::store::interleaving::Interleaved;
+    let cached = || {
+        CachedDeviceStore::new(Interleaved(MemoryDeviceStore::new())).with_clock(fixed_clock() as _)
+    };
+    shared::two_swaps_from_one_read_have_one_winner(cached()).await;
+    shared::two_trust_changes_from_one_level_have_one_winner(cached()).await;
+    shared::two_claims_of_one_unowned_device_have_one_winner(cached()).await;
+    shared::two_swaps_from_one_read_have_one_winner(WrappedCache(cached())).await;
+    shared::two_trust_changes_from_one_level_have_one_winner(WrappedCache(cached())).await;
+    shared::two_claims_of_one_unowned_device_have_one_winner(WrappedCache(cached())).await;
+}
+
+/// A store wrapped around the cache, implementing what the trait requires
+/// and nothing else, reads through on `load_fresh`: a revocation made on
+/// the backing store (as another instance makes it) is seen at once, not
+/// after the cached row expires.
+#[tokio::test]
+async fn a_wrapper_around_the_cache_reads_through_on_load_fresh() {
+    let inner = MemoryDeviceStore::new();
+    let (t, u, d) = ids();
+    let mut device = build_device(&t, &u, &d);
+    device.trust_level = DeviceTrustLevel::Trusted;
+    inner
+        .save(&device, crate::device::test_now())
+        .await
+        .unwrap();
+    let wrapped =
+        WrappedCache(CachedDeviceStore::new(inner.clone()).with_clock(fixed_clock() as _));
+
+    let warm = wrapped.load(&t, &d).await.unwrap().unwrap();
+    assert_eq!(warm.trust_level, DeviceTrustLevel::Trusted);
+    inner
+        .set_trust_level(&t, &d, DeviceTrustLevel::Revoked, crate::device::test_now())
+        .await
+        .unwrap();
+
+    let fresh = wrapped.load_fresh(&t, &d).await.unwrap().unwrap();
+    assert_eq!(
+        fresh.trust_level,
+        DeviceTrustLevel::Revoked,
+        "load_fresh through the wrapper served the cached row"
+    );
+}
+
+/// The cache forwards the sweep and drops what it held of the tenant, so the
+/// shared sweep contract holds through it: every level read after a sweep is
+/// the one that sweep wrote, never the row cached before it.
+#[tokio::test]
+async fn the_sweep_contract_holds_through_the_cache() {
+    use crate::device::store::consistency as shared;
+    let inner = MemoryDeviceStore::new().with_sweep_config(shared::ladder_config());
+    shared::a_sweep_walks_the_ladder_and_counts_what_it_wrote(
+        CachedDeviceStore::new(inner).with_clock(fixed_clock() as _),
+    )
+    .await;
+}

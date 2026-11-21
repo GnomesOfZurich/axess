@@ -345,7 +345,7 @@ fn policy_store_schema_accessor_is_borrow_of_inner() {
 }
 
 /// A store reports whether any of its policies reads `context`, which is what
-/// decides if a missing request-context provider is worth a warning.
+/// decides if a gate without a request-context provider refuses.
 #[test]
 fn a_store_reports_whether_its_policies_read_the_context() {
     assert!(!build_store().mentions_context());

@@ -10,11 +10,21 @@ use crate::device::storage::sql_common::ops::DeviceSql;
 use crate::device::store::consistency::{self as shared, at, dev_id, device, tenant, user};
 use crate::device::store::sql_contract as contract;
 use crate::testing::sql_live;
+use axess_clock::testing::Shift;
 
 async fn store(connections: u32) -> MysqlDeviceStore {
     let store = MysqlDeviceStore::plaintext_insecure(sql_live::mysql_pool(connections).await);
     store.init_schema().await.expect("init_schema");
     store
+}
+
+#[tokio::test]
+#[ignore = "requires a running MySQL (MYSQL_URL)"]
+async fn device_key_contract() {
+    use crate::device::store::key_contract;
+    key_contract::a_key_binding_round_trips(store(4).await).await;
+    key_contract::a_challenge_is_replaced_by_one_compare_and_swap(store(4).await).await;
+    key_contract::a_registration_beside_a_sighting_loses_neither(store(4).await).await;
 }
 
 macro_rules! live_contract {
@@ -45,6 +55,7 @@ live_contract!(
 #[ignore = "requires a running MySQL (MYSQL_URL)"]
 async fn shared_contract() {
     shared::ties_are_broken_by_the_smaller_id(store(4).await).await;
+    shared::the_family_lookup_is_by_family_and_by_tenant(store(4).await).await;
     shared::a_sighting_never_rewinds_and_skips_a_revoked_row(store(4).await).await;
     shared::a_save_never_un_revokes(store(4).await).await;
     shared::a_revoked_device_never_comes_back(|| store(4)).await;
@@ -53,8 +64,15 @@ async fn shared_contract() {
     shared::a_revoked_row_keeps_its_revocation_time(store(4).await).await;
     shared::a_sighting_reports_the_level_it_found(store(4).await).await;
     shared::a_revoked_save_without_a_time_is_stamped_and_purged(store(4).await).await;
+    shared::two_swaps_from_one_read_have_one_winner(store(4).await).await;
+    shared::two_trust_changes_from_one_level_have_one_winner(store(4).await).await;
+    shared::two_claims_of_one_unowned_device_have_one_winner(store(4).await).await;
     shared::sweep_decisions_agree_to_the_second(
         store(4).await.with_sweep_config(shared::tight_config()),
+    )
+    .await;
+    shared::a_sweep_walks_the_ladder_and_counts_what_it_wrote(
+        store(4).await.with_sweep_config(shared::ladder_config()),
     )
     .await;
 }
@@ -118,9 +136,17 @@ async fn a_legacy_revoked_row_without_a_time_ages_out() {
     store.sweep(&t, now).await.unwrap();
     let stamped = store.load(&t, &id).await.unwrap().unwrap();
     assert_eq!(stamped.revoked_at, Some(now));
-    let grace = SweepConfig::default().revoked_grace;
+    let grace =
+        axess_clock::SignedDuration::try_from(SweepConfig::default().revoked_grace).unwrap();
     let counts = store
-        .sweep(&t, now + grace + chrono::Duration::seconds(1))
+        .sweep(
+            &t,
+            now.plus(
+                grace
+                    .checked_add(axess_clock::SignedDuration::seconds(1))
+                    .unwrap(),
+            ),
+        )
         .await
         .unwrap();
     assert_eq!(counts.revoked_purged, 1);
@@ -153,7 +179,7 @@ async fn the_family_index_follows_the_device() {
 
     let now = at(5_000_000);
     let mut gone = device("gone", 2, DeviceTrustLevel::Revoked, now);
-    gone.revoked_at = Some(now - chrono::Duration::days(8));
+    gone.revoked_at = Some(now.minus(axess_clock::SignedDuration::days(8)));
     gone.bindings = vec![refresh("gone-fam")];
     store.save(&gone, now).await.unwrap();
     let counts = store.sweep(&t, now).await.unwrap();
@@ -219,7 +245,7 @@ async fn a_save_that_waits_behind_a_revocation_does_not_undo_it() {
     sqlx::query(
         "UPDATE devices SET trust_level = 'Revoked', revoked_at = ? WHERE tenant_id = ? AND id = ?",
     )
-    .bind(at(20).timestamp())
+    .bind(at(20).unix_seconds())
     .bind(t.to_string())
     .bind(id.to_string())
     .execute(&mut *holder)

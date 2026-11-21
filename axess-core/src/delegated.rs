@@ -46,8 +46,6 @@ pub mod error;
 #[cfg(any(feature = "delegated-stored", feature = "delegated-exchange"))]
 mod body;
 
-/// Stored delegation: refresh token persisted at rest
-/// (`delegated-stored` feature).
 #[cfg(feature = "delegated-stored")]
 pub mod stored;
 

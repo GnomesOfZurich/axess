@@ -27,12 +27,14 @@ where
     /// token is minted with the service's RNG and clock. Returns the
     /// plaintext (hand it to the client once) and the stored record.
     ///
-    /// The token carries the session's authentication time, not the time of
-    /// issue: its family's lifetime ([`RefreshTokenConfig::max_lifetime`])
-    /// counts from the login, and a session rotated from it keeps that
-    /// `authn_time`, so holding a session never buys a fresher login. A
-    /// session that authenticated longer ago than that lifetime is refused
-    /// with [`AuthnError::NoFlow`]: it must authenticate again first.
+    /// The token carries the time of the session's login
+    /// ([`AuthSnapshot::signed_in_at`](crate::session::extractor::AuthSnapshot::signed_in_at)),
+    /// not the time of issue and not a later step-up's: its family's
+    /// lifetime ([`RefreshTokenConfig::max_lifetime`]) counts from the login,
+    /// and a session rotated from it keeps that time, so neither holding a
+    /// session nor stepping it up buys a longer life. A session that logged
+    /// in longer ago than that lifetime is refused with
+    /// [`AuthnError::NoFlow`]: it must log in again first.
     ///
     /// A session that is not authenticated is refused with
     /// [`AuthnError::NoFlow`]. One an administrator is impersonating
@@ -42,7 +44,10 @@ where
     /// token is a credential of the user that would outlive the
     /// impersonation. A service built with
     /// [`with_impersonated_credential_changes_allowed`](crate::authn::service::AuthnServiceBuilder::with_impersonated_credential_changes_allowed)
-    /// issues it.
+    /// issues it, and the token then names no device, whatever `device_id`
+    /// says: the browser of an impersonated session is the administrator's,
+    /// and a token tied to it would hold the user's refreshes to the
+    /// administrator's device and its key.
     ///
     /// # Errors
     ///
@@ -74,13 +79,16 @@ where
             self.emit_audit(
                 AuthEventBuilder::failure(AuthEventType::LoginAttempt)
                     .attributed_to(&snapshot.user_id, &snapshot.tenant_id)
-                    .with_session(snapshot.session_id)
+                    .with_session(snapshot.session_key)
                     .with_actor(admin)
                     .with_error(AuthFailureReason::Impersonated),
             )
             .await?;
             return Err(AuthnError::Impersonated);
         }
+        // The browser of an impersonated session is the administrator's: a
+        // token of the user's names no device.
+        let device_id = device_id.filter(|_| snapshot.impersonation.is_none());
         issue_refresh_token_from_login(
             IssueRequest {
                 user_id: &snapshot.user_id,
@@ -93,7 +101,7 @@ where
             store,
             &self.inner.rng,
             self.inner.clock.now(),
-            snapshot.authn_time,
+            snapshot.signed_in_at,
         )
         .await
         .map_err(|e| match e {

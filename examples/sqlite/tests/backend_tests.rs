@@ -6,10 +6,10 @@
 //! her login asks for TOTP or a recovery code; a code gets her in once and
 //! is refused the second time.
 
-use axess::SystemClock;
+use axess_clock::testing::MockClock;
 use axess_example_sqlite::{
     models::backend::{SEED_PASSWORD, seed},
-    web::app::build_router,
+    web::app::build_router_on,
 };
 use axum::{
     Router,
@@ -26,6 +26,8 @@ use tower::ServiceExt;
 /// in a test uses its own.
 struct Browser {
     router: Router,
+    /// The clock the application behind `router` runs on.
+    clock: MockClock,
     pool: sqlx::SqlitePool,
     cookies: BTreeMap<String, String>,
     peer: SocketAddr,
@@ -39,6 +41,7 @@ struct Page {
 
 impl Browser {
     async fn new() -> Self {
+        let clock = MockClock::at_reference();
         let opts = SqliteConnectOptions::from_str("sqlite::memory:")
             .expect("in-memory url")
             .create_if_missing(true);
@@ -49,16 +52,30 @@ impl Browser {
             .expect("connect in-memory sqlite");
         sqlx::migrate!().run(&pool).await.expect("migrations");
         seed(
-            &SystemClock,
+            &clock,
             &pool,
-            &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF"),
+            &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF")
+                .with_clock(std::sync::Arc::new(clock.clone())),
         )
         .await
         .expect("seed");
-        let (router, _store) = build_router(pool.clone()).await;
+        let (router, _) = build_router_on(pool.clone(), std::sync::Arc::new(clock.clone())).await;
         Self {
             router,
+            clock,
             pool,
+            cookies: BTreeMap::new(),
+            peer: "192.0.2.1:50000".parse().expect("address"),
+        }
+    }
+
+    /// Another visitor of the same application, in the same world: a
+    /// browser of its own, with no cookies, at the first address.
+    fn another_visitor(&self) -> Self {
+        Self {
+            router: self.router.clone(),
+            clock: self.clock.clone(),
+            pool: self.pool.clone(),
             cookies: BTreeMap::new(),
             peer: "192.0.2.1:50000".parse().expect("address"),
         }
@@ -169,7 +186,7 @@ fn totp_code(secret: &str) -> String {
         .with_secret(secret)
         .build()
         .expect("valid totp")
-        .generate_current()
+        .generate(u64::try_from(MockClock::reference_time().unix_seconds()).expect("after 1970"))
         .to_string()
 }
 
@@ -235,7 +252,7 @@ async fn a_recovery_code_stands_in_for_totp_once() {
         .post("/totp", "/recovery-code", vec![("code", &codes[1])])
         .await;
     assert!(page.body.contains("Too many wrong codes"), "{}", page.body);
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    browser.clock.advance_secs(1);
     let page = browser
         .post("/totp", "/recovery-code", vec![("code", &codes[1])])
         .await;
@@ -374,7 +391,8 @@ async fn the_second_totp_insert_for_a_user_loses_and_the_first_stays() {
         AuthnScope, FactorConfig, FactorStore, TenantId, TotpConfig, UserId, ZeroizedString,
     };
     let browser = Browser::new().await;
-    let backend = axess_example_sqlite::models::backend::OurBackend::new(browser.pool.clone());
+    let backend = axess_example_sqlite::models::backend::OurBackend::new(browser.pool.clone())
+        .with_clock(std::sync::Arc::new(browser.clock.clone()));
     let scope = AuthnScope::User {
         tenant_id: TenantId::try_new("00000000-0000-0000-0000-000000000001").expect("tenant"),
         user_id: UserId::try_new("00000000-0000-0000-0000-000000000010").expect("user"),
@@ -563,31 +581,14 @@ async fn setup_totp_turns_a_guest_away() {
 /// Captures what the app logs on the `dev_mail` target, where the example
 /// writes the mail it would send.
 #[derive(Clone, Default)]
-struct MailLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-impl std::io::Write for MailLog {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().expect("log lock").extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for MailLog {
-    type Writer = MailLog;
-    fn make_writer(&'a self) -> MailLog {
-        self.clone()
-    }
-}
+struct MailLog(axess_testing::mock_tracing::PrintedLines);
 
 impl MailLog {
     /// Start capturing on this thread (the test runs on one thread).
     fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
         let log = Self::default();
         let subscriber = tracing_subscriber::fmt()
-            .with_writer(log.clone())
+            .with_writer(log.0.clone())
             .with_env_filter(tracing_subscriber::EnvFilter::new("dev_mail=debug"))
             .with_ansi(false)
             .finish();
@@ -595,7 +596,7 @@ impl MailLog {
     }
 
     fn text(&self) -> String {
-        String::from_utf8(self.0.lock().expect("log lock").clone()).expect("utf8 log")
+        self.0.text()
     }
 
     /// The path of the verification link in the log.
@@ -617,7 +618,7 @@ impl Browser {
             ("username", username),
             ("fullname", "Carol Example"),
             ("email", "carol@example.com"),
-            ("password", "Gnomes2+LongEnough"),
+            ("password", "Sample2+LongEnough"),
         ];
         self.post("/signup", "/signup", fields).await
     }
@@ -635,7 +636,7 @@ async fn user_status(pool: &sqlx::SqlitePool, username: &str) -> Option<String> 
 /// the link mailed to the address, opened in the browser that signed up.
 #[tokio::test]
 async fn a_signup_is_completed_by_the_emailed_link() {
-    let (log, _guard) = MailLog::capture();
+    let (log, guard) = MailLog::capture();
     let mut browser = Browser::new().await;
 
     let page = browser.sign_up("carol").await;
@@ -665,11 +666,12 @@ async fn a_signup_is_completed_by_the_emailed_link() {
     );
     let dashboard = browser.send("GET", "/dashboard", None).await;
     assert_eq!(dashboard.status, StatusCode::OK);
+    drop(guard);
 }
 
 #[tokio::test]
 async fn a_wrong_or_foreign_verification_link_completes_nothing() {
-    let (log, _guard) = MailLog::capture();
+    let (log, guard) = MailLog::capture();
     let mut browser = Browser::new().await;
     browser.sign_up("carol").await;
     let link = log.verification_link();
@@ -678,14 +680,14 @@ async fn a_wrong_or_foreign_verification_link_completes_nothing() {
     assert!(wrong.location.is_none(), "{}", wrong.body);
 
     // The right token, from a browser that never began the signup.
-    let mut stranger = Browser::new().await;
-    stranger.router = browser.router.clone();
+    let mut stranger = browser.another_visitor();
     let page = stranger.send("GET", &link, None).await;
     assert!(page.location.is_none(), "{}", page.body);
     assert_eq!(
         user_status(&browser.pool, "carol").await.as_deref(),
         Some("candidate")
     );
+    drop(guard);
 }
 
 /// A signup for a taken username takes about as long as one for a free name,
@@ -699,7 +701,7 @@ async fn a_taken_username_costs_the_same_work_as_a_free_one() {
             ("username", username),
             ("fullname", "Carol Example"),
             ("email", "carol@example.com"),
-            ("password", "Gnomes2+LongEnough"),
+            ("password", "Sample2+LongEnough"),
         ];
         (username, fields)
     };
@@ -709,19 +711,20 @@ async fn a_taken_username_costs_the_same_work_as_a_free_one() {
     let token = browser.token_from("/signup").await;
     let mut fields = free_fields;
     fields.push(("_csrf", &token));
-    let start = std::time::Instant::now();
+    // The cost being compared is real work (a password hash), so it is
+    // measured on the machine's clock, not the world's.
+    let watch = axess_testing::stopwatch::Stopwatch::start();
     let free = browser.send("POST", "/signup", Some(fields)).await;
-    let free_took = start.elapsed();
+    let free_took = watch.elapsed();
 
     // Another visitor, with a session of their own, asks for the same name.
-    let mut visitor = Browser::new().await;
-    visitor.router = browser.router.clone();
+    let mut visitor = browser.another_visitor();
     let token = visitor.token_from("/signup").await;
     let mut fields = taken_fields;
     fields.push(("_csrf", &token));
-    let start = std::time::Instant::now();
+    let watch = axess_testing::stopwatch::Stopwatch::start();
     let taken = visitor.send("POST", "/signup", Some(fields)).await;
-    let taken_took = start.elapsed();
+    let taken_took = watch.elapsed();
 
     assert_eq!(free.body, taken.body, "the two answers differ");
     assert!(
@@ -809,7 +812,7 @@ async fn login_and_forgot_password_do_not_share_a_limit() {
 /// token, so the form cannot be used to flood an inbox.
 #[tokio::test]
 async fn a_second_reset_request_inside_the_cooldown_mints_no_token() {
-    let (log, _guard) = MailLog::capture();
+    let (log, guard) = MailLog::capture();
     let mut browser = Browser::new().await;
     for _ in 0..2 {
         let fields = vec![("identifier", "alice")];
@@ -819,4 +822,5 @@ async fn a_second_reset_request_inside_the_cooldown_mints_no_token() {
     }
     let links = log.text().matches("password reset link").count();
     assert_eq!(links, 1, "{}", log.text());
+    drop(guard);
 }

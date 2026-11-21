@@ -1,13 +1,16 @@
 use super::*;
+use crate::jwt::encode;
+use axess_clock::SignedDuration;
+use axess_clock::testing::Shift;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use jsonwebtoken::{EncodingKey, Header, encode};
+use jsonwebtoken::{EncodingKey, Header};
 use rsa::RsaPrivateKey;
 use rsa::pkcs1::EncodeRsaPrivateKey;
 use rsa::traits::PublicKeyParts;
 use serde::Deserialize;
 use std::sync::Mutex;
 
-fn rsa_keypair() -> (Vec<u8>, JwkSet, String) {
+pub(super) fn rsa_keypair() -> (Vec<u8>, JwkSet, String) {
     let mut rng = rsa::rand_core::OsRng;
     let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("key generation");
     let public_key = private_key.to_public_key();
@@ -37,24 +40,19 @@ fn rsa_keypair() -> (Vec<u8>, JwkSet, String) {
     (private_der, jwks, kid)
 }
 
-fn sign(claims: &serde_json::Value, kid: &str, der: &[u8]) -> String {
-    // Signing needs the same crypto provider verification does, and under
-    // `--all-features` `jsonwebtoken` has no default. Verification installs
-    // one itself; a signer asks, and a test that signs before anything has
-    // verified would otherwise panic on the order tests happened to run in.
-    crate::jwt::ensure_crypto_provider();
+pub(super) fn sign(claims: &serde_json::Value, kid: &str, der: &[u8]) -> String {
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some(kid.to_string());
     let key = EncodingKey::from_rsa_der(der);
     encode(&header, claims, &key).expect("JWT encode")
 }
 
-fn handle(jwks: JwkSet) -> Arc<RwLock<JwkSet>> {
+pub(super) fn handle(jwks: JwkSet) -> Arc<RwLock<JwkSet>> {
     Arc::new(RwLock::new(jwks))
 }
 
 fn now_secs() -> i64 {
-    chrono::Utc::now().timestamp()
+    axess_clock::testing::MockClock::reference_time().unix_seconds()
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,6 +82,9 @@ async fn verify_typed_claims_happy_path() {
     );
 
     let verifier = JwtVerifier::new(handle(jwks))
+        .with_clock(std::sync::Arc::new(
+            axess_clock::testing::MockClock::at_reference(),
+        ))
         .with_issuer("https://idp.example.com")
         .with_audience("my-svc");
 
@@ -117,6 +118,9 @@ async fn issuer_mismatch_rejected() {
     );
 
     let verifier = JwtVerifier::new(handle(jwks))
+        .with_clock(std::sync::Arc::new(
+            axess_clock::testing::MockClock::at_reference(),
+        ))
         .with_issuer("https://idp.example.com")
         .with_audience("my-svc");
 
@@ -147,6 +151,9 @@ async fn missing_nbf_rejected_when_required() {
     );
 
     let verifier = JwtVerifier::new(handle(jwks))
+        .with_clock(std::sync::Arc::new(
+            axess_clock::testing::MockClock::at_reference(),
+        ))
         .with_audience("my-svc")
         .allow_any_issuer()
         .require_nbf(true);
@@ -180,6 +187,9 @@ async fn nbf_in_future_beyond_leeway_rejected() {
     );
 
     let verifier = JwtVerifier::new(handle(jwks))
+        .with_clock(std::sync::Arc::new(
+            axess_clock::testing::MockClock::at_reference(),
+        ))
         .with_audience("my-svc")
         .allow_any_issuer()
         .require_nbf(true);
@@ -205,13 +215,13 @@ impl JtiReplayStore for InMemReplay {
     fn check_and_record(
         &self,
         jti: &str,
-        _ttl: Duration,
+        _: Duration,
     ) -> impl Future<Output = Result<(), JtiReplayError>> + Send {
         let key = jti.to_string();
         let result = {
             let mut seen = self.seen.lock().unwrap();
             if seen.contains(&key) {
-                Err(JtiReplayError::AlreadyUsed(key))
+                Err(JtiReplayError::already_used(&key))
             } else {
                 seen.insert(key);
                 Ok(())
@@ -238,6 +248,9 @@ async fn replay_store_rejects_second_use() {
     );
 
     let verifier = JwtVerifier::new(handle(jwks))
+        .with_clock(std::sync::Arc::new(
+            axess_clock::testing::MockClock::at_reference(),
+        ))
         .with_audience("my-svc")
         .allow_any_issuer()
         .with_replay_store(InMemReplay::default());
@@ -277,6 +290,9 @@ async fn the_same_jti_from_two_issuers_is_not_a_replay() {
         )
     };
     let verifier = JwtVerifier::new(handle(jwks))
+        .with_clock(std::sync::Arc::new(
+            axess_clock::testing::MockClock::at_reference(),
+        ))
         .with_audience("my-svc")
         .allow_any_issuer()
         .with_replay_store(InMemReplay::default());
@@ -315,6 +331,9 @@ async fn replay_store_requires_jti() {
     );
 
     let verifier = JwtVerifier::new(handle(jwks))
+        .with_clock(std::sync::Arc::new(
+            axess_clock::testing::MockClock::at_reference(),
+        ))
         .with_audience("my-svc")
         .allow_any_issuer()
         .with_replay_store(InMemReplay::default());
@@ -341,15 +360,15 @@ async fn exp_validation_uses_injected_clock() {
     let (der, jwks, kid) = rsa_keypair();
     // Anchor the mock clock at a known wall-clock moment so the
     // token's `exp` claim and the clock's `now` agree.
-    let t0 = chrono::Utc::now();
-    let exp = t0.timestamp() + 100;
+    let t0 = axess_clock::testing::MockClock::reference_time();
+    let exp = t0.unix_seconds() + 100;
     let token = sign(
         &serde_json::json!({
             "iss": "https://idp.example.com",
             "sub": "workload-42",
             "aud": "my-svc",
             "exp": exp,
-            "iat": t0.timestamp(),
+            "iat": t0.unix_seconds(),
         }),
         &kid,
         &der,
@@ -384,7 +403,7 @@ async fn exp_validation_uses_injected_clock() {
     }
 
     // Rewind to t0 + 30s (within exp): valid again.
-    clock.set(t0 + chrono::Duration::seconds(30));
+    clock.set(t0.plus(SignedDuration::seconds(30)));
     verifier
         .verify::<serde_json::Value>(&token)
         .await
@@ -399,8 +418,8 @@ async fn nbf_validation_uses_injected_clock() {
     use axess_clock::testing::MockClock;
 
     let (der, jwks, kid) = rsa_keypair();
-    let t0 = chrono::Utc::now();
-    let nbf = t0.timestamp() + 300; // not valid until t0 + 5 min
+    let t0 = axess_clock::testing::MockClock::reference_time();
+    let nbf = t0.unix_seconds() + 300; // not valid until t0 + 5 min
     let exp = nbf + 3600;
     let token = sign(
         &serde_json::json!({
@@ -409,7 +428,7 @@ async fn nbf_validation_uses_injected_clock() {
             "aud": "my-svc",
             "nbf": nbf,
             "exp": exp,
-            "iat": t0.timestamp(),
+            "iat": t0.unix_seconds(),
         }),
         &kid,
         &der,
@@ -487,12 +506,14 @@ async fn ps256_opt_in_via_with_algorithms() {
     let mut header = Header::new(Algorithm::PS256);
     header.kid = Some(kid.clone());
     let signing_key = EncodingKey::from_rsa_der(&private_der);
-    crate::jwt::ensure_crypto_provider();
     let token = encode(&header, &claims, &signing_key).expect("PS256 JWT encode");
 
     // Default allowlist rejects PS256; proves the conservative
     // default still excludes it.
     let default_verifier = JwtVerifier::new(handle(jwks.clone()))
+        .with_clock(std::sync::Arc::new(
+            axess_clock::testing::MockClock::at_reference(),
+        ))
         .with_issuer("https://idp.example.com")
         .with_audience("my-svc");
     let err = default_verifier
@@ -506,6 +527,9 @@ async fn ps256_opt_in_via_with_algorithms() {
 
     // Opt in via `with_algorithms`; verification now succeeds.
     let opt_in_verifier = JwtVerifier::new(handle(jwks))
+        .with_clock(std::sync::Arc::new(
+            axess_clock::testing::MockClock::at_reference(),
+        ))
         .with_issuer("https://idp.example.com")
         .with_audience("my-svc")
         .with_algorithms([Algorithm::PS256]);
@@ -537,6 +561,9 @@ async fn aud_array_round_trips_into_verified_claims() {
     );
 
     let verifier = JwtVerifier::new(handle(jwks))
+        .with_clock(std::sync::Arc::new(
+            axess_clock::testing::MockClock::at_reference(),
+        ))
         .with_issuer("https://idp.example.com")
         .with_audience("my-svc");
     let claims = verifier
@@ -559,11 +586,11 @@ async fn aud_array_round_trips_into_verified_claims() {
 ///   forgotten while still accepted, so its replay would pass).
 #[test]
 fn compute_replay_ttl_covers_the_leeway_window() {
+    use axess_clock::Timestamp;
     use axess_clock::testing::MockClock;
-    use chrono::{TimeZone, Utc};
 
     let now: i64 = 1_700_000_000;
-    let clock = MockClock::at(Utc.timestamp_opt(now, 0).single().unwrap());
+    let clock = MockClock::at(Timestamp::from_unix_seconds(now).unwrap());
     let skew = Duration::from_secs(60);
 
     // 900 seconds in the future → TTL = 960s (exp + skew - now).
@@ -596,7 +623,7 @@ fn compute_replay_ttl_covers_the_leeway_window() {
         "exp + skew in the past must clamp TTL to zero"
     );
 
-    // Without skew the old behaviour holds exactly.
+    // Without skew the TTL runs to `exp`, its last accepted second included.
     assert_eq!(
         compute_replay_ttl(Some(now + 900), Duration::ZERO, &clock),
         Duration::from_secs(901)
@@ -613,9 +640,14 @@ fn compute_replay_ttl_covers_the_leeway_window() {
 #[test]
 fn the_pins_are_reported() {
     let (_, jwks, _) = rsa_keypair();
-    let bare = JwtVerifier::new(handle(jwks.clone()));
+    let bare = JwtVerifier::new(handle(jwks.clone())).with_clock(std::sync::Arc::new(
+        axess_clock::testing::MockClock::at_reference(),
+    ));
     assert!(!bare.has_issuer() && !bare.has_audience());
     let pinned = JwtVerifier::new(handle(jwks))
+        .with_clock(std::sync::Arc::new(
+            axess_clock::testing::MockClock::at_reference(),
+        ))
         .with_issuer("https://idp.example.com")
         .with_audience("svc");
     assert!(pinned.has_issuer() && pinned.has_audience());
@@ -636,7 +668,9 @@ async fn a_missing_audience_pin_refuses_unless_waived() {
     });
     let token = sign(&claims, &kid, &der);
 
-    let bare = JwtVerifier::new(handle(jwks.clone()));
+    let bare = JwtVerifier::new(handle(jwks.clone())).with_clock(std::sync::Arc::new(
+        axess_clock::testing::MockClock::at_reference(),
+    ));
     let err = bare
         .verify::<serde_json::Value>(&token)
         .await
@@ -644,11 +678,17 @@ async fn a_missing_audience_pin_refuses_unless_waived() {
     assert!(err.to_string().contains("audience"), "{err}");
 
     let waived = JwtVerifier::new(handle(jwks.clone()))
+        .with_clock(std::sync::Arc::new(
+            axess_clock::testing::MockClock::at_reference(),
+        ))
         .allow_any_audience()
         .allow_any_issuer();
     waived.verify::<serde_json::Value>(&token).await.unwrap();
 
     let pinned = JwtVerifier::new(handle(jwks))
+        .with_clock(std::sync::Arc::new(
+            axess_clock::testing::MockClock::at_reference(),
+        ))
         .with_audience("svc")
         .allow_any_issuer();
     let mut with_aud = claims;
@@ -678,6 +718,9 @@ async fn an_oversized_signed_token_is_refused() {
         &der,
     );
     let verifier = JwtVerifier::new(handle(jwks))
+        .with_clock(std::sync::Arc::new(
+            axess_clock::testing::MockClock::at_reference(),
+        ))
         .with_audience("my-svc")
         .allow_any_issuer();
     let err = verifier.verify::<WorkloadClaims>(&token).await.unwrap_err();
@@ -701,7 +744,11 @@ async fn a_missing_issuer_pin_refuses_unless_waived() {
         &der,
     );
 
-    let bare = JwtVerifier::new(handle(jwks.clone())).with_audience("svc");
+    let bare = JwtVerifier::new(handle(jwks.clone()))
+        .with_clock(std::sync::Arc::new(
+            axess_clock::testing::MockClock::at_reference(),
+        ))
+        .with_audience("svc");
     let err = bare
         .verify::<serde_json::Value>(&token)
         .await
@@ -709,11 +756,17 @@ async fn a_missing_issuer_pin_refuses_unless_waived() {
     assert!(err.to_string().contains("issuer"), "{err}");
 
     let waived = JwtVerifier::new(handle(jwks.clone()))
+        .with_clock(std::sync::Arc::new(
+            axess_clock::testing::MockClock::at_reference(),
+        ))
         .with_audience("svc")
         .allow_any_issuer();
     waived.verify::<serde_json::Value>(&token).await.unwrap();
 
     let pinned = JwtVerifier::new(handle(jwks))
+        .with_clock(std::sync::Arc::new(
+            axess_clock::testing::MockClock::at_reference(),
+        ))
         .with_audience("svc")
         .with_issuer("https://any.example.com");
     pinned.verify::<serde_json::Value>(&token).await.unwrap();
@@ -723,7 +776,6 @@ async fn a_missing_issuer_pin_refuses_unless_waived() {
 
 /// A token signed with `typ` as its header type (`None`: no `typ`).
 fn sign_typed(claims: &serde_json::Value, kid: &str, der: &[u8], typ: Option<&str>) -> String {
-    crate::jwt::ensure_crypto_provider();
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some(kid.to_string());
     header.typ = typ.map(str::to_string);
@@ -741,6 +793,9 @@ fn typed_claims() -> serde_json::Value {
 
 fn pinned(jwks: JwkSet) -> JwtVerifier {
     JwtVerifier::new(handle(jwks))
+        .with_clock(std::sync::Arc::new(
+            axess_clock::testing::MockClock::at_reference(),
+        ))
         .with_issuer("https://idp.example.com")
         .with_audience("my-svc")
 }
@@ -808,4 +863,18 @@ async fn without_a_required_typ_any_type_is_accepted() {
             .await
             .unwrap_or_else(|e| panic!("{sent:?}: {e}"));
     }
+}
+
+/// The required type is reported as it was set, and kept across the
+/// replay-store type change; a verifier without one reports none.
+#[test]
+fn the_required_typ_is_reported() {
+    let (_, jwks, _) = rsa_keypair();
+    assert_eq!(pinned(jwks.clone()).expected_typ(), None);
+    let typed = pinned(jwks).with_typ("at+jwt");
+    assert_eq!(typed.expected_typ(), Some("at+jwt"));
+    assert_eq!(
+        typed.with_replay_store(NoReplay).expected_typ(),
+        Some("at+jwt")
+    );
 }

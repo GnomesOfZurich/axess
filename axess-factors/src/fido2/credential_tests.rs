@@ -3,7 +3,7 @@
 //! since webauthn-rs offers no constructor without a ceremony.
 
 use super::*;
-use chrono::TimeZone;
+use axess_clock::Timestamp;
 use serde_json::json;
 
 /// Credential ids are URL-safe base64: `YWFhYQ` is `aaaa`, `YmJiYg` is `bbbb`.
@@ -48,13 +48,13 @@ fn result_for(id: &str, counter: u32) -> AuthenticationResult {
 }
 
 fn credential(id: &str) -> Fido2Credential {
-    let registered = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let registered = Timestamp::from_utc(2026, 1, 1, 0, 0, 0).unwrap();
     Fido2Credential::new(passkey(id, 1), "key", registered)
 }
 
 #[test]
 fn record_authentication_stamps_the_matching_credential() {
-    let now = Utc.with_ymd_and_hms(2026, 2, 1, 0, 0, 0).unwrap();
+    let now = Timestamp::from_utc(2026, 2, 1, 0, 0, 0).unwrap();
     let mut cred = credential(AAAA);
     cred.record_authentication(&result_for(AAAA, 5), now);
     assert_eq!(cred.last_used_at, Some(now));
@@ -62,7 +62,7 @@ fn record_authentication_stamps_the_matching_credential() {
 
 #[test]
 fn record_authentication_leaves_other_credentials_untouched() {
-    let now = Utc.with_ymd_and_hms(2026, 2, 1, 0, 0, 0).unwrap();
+    let now = Timestamp::from_utc(2026, 2, 1, 0, 0, 0).unwrap();
     let mut other = credential(BBBB);
     other.record_authentication(&result_for(AAAA, 5), now);
     assert_eq!(other.last_used_at, None);

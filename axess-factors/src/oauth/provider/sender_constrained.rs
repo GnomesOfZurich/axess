@@ -17,6 +17,12 @@ use crate::oauth::types::*;
 use openidconnect::reqwest;
 use std::future::Future;
 use std::sync::Arc;
+use zeroize::Zeroizing;
+
+/// The most bytes of a provider's name a log line keeps. A tenant's
+/// provider is named by its tenant, so the name is written as every text
+/// bound for a log line is: escaped and cut.
+const PROVIDER_NAME_LOG_BYTES: usize = 128;
 
 /// Send a request, and send it once more with the server's nonce when the
 /// answer asks for one (RFC 9449 sections 8 and 9). `send` makes and sends
@@ -51,7 +57,7 @@ fn dpop_nonce_header(headers: &reqwest::header::HeaderMap) -> Option<String> {
 struct FormAnswer {
     status: reqwest::StatusCode,
     nonce: Option<String>,
-    body: Vec<u8>,
+    body: Zeroizing<Vec<u8>>,
 }
 
 impl FormAnswer {
@@ -61,10 +67,8 @@ impl FormAnswer {
         if self.status != reqwest::StatusCode::BAD_REQUEST {
             return None;
         }
-        let wants = serde_json::from_slice::<serde_json::Value>(&self.body)
-            .ok()
-            .and_then(|v| v.get("error")?.as_str().map(|e| e == "use_dpop_nonce"))
-            .unwrap_or(false);
+        let wants = crate::http_body::string_member(&self.body, "error")
+            .is_some_and(|e| e == "use_dpop_nonce");
         wants.then(|| self.nonce.clone()).flatten()
     }
 }
@@ -136,7 +140,7 @@ impl OAuthProviderConfig {
             url,
             access_token,
             server_nonce,
-            self.clock.now().timestamp(),
+            self.clock.now().unix_seconds(),
             jti,
         )?;
         Ok(proof.proof_jwt)
@@ -172,7 +176,9 @@ impl OAuthProviderConfig {
 
     /// POST `form` to `url` and read the answer: the body in full on
     /// success (up to [`MAX_TOKEN_BODY_BYTES`](crate::http_body::MAX_TOKEN_BODY_BYTES)),
-    /// a short snippet otherwise. `basic` is the client id and secret for a
+    /// and as much of a refusal as its `error` code needs to be found
+    /// otherwise; whoever puts a refusal's text into an error or a log line
+    /// cuts it there. `basic` is the client id and secret for a
     /// `client_secret_basic` header (see
     /// [`token_grant_auth`](Self::token_grant_auth)). With a signer the
     /// request carries a DPoP proof, and a `use_dpop_nonce` refusal (RFC 9449
@@ -185,7 +191,7 @@ impl OAuthProviderConfig {
         basic: Option<(&str, &str)>,
         dpop: Option<DpopSigner<'_>>,
         what: &str,
-    ) -> Result<(reqwest::StatusCode, Vec<u8>), OAuthError> {
+    ) -> Result<(reqwest::StatusCode, Zeroizing<Vec<u8>>), OAuthError> {
         let send = |nonce: Option<String>| async move {
             // A client assertion is single-use (FAPI 2.0 has the server
             // refuse a repeated `jti`), so a retry signs its own.
@@ -213,7 +219,15 @@ impl OAuthProviderConfig {
             })?;
             let status = response.status();
             let nonce = dpop_nonce_header(response.headers());
-            let body = crate::http_body::read_for_status(
+            if !status.is_success() {
+                let body = crate::http_body::read_error_body(&mut response).await;
+                return Ok(FormAnswer {
+                    status,
+                    nonce,
+                    body,
+                });
+            }
+            let body = crate::http_body::read_limited(
                 &mut response,
                 crate::http_body::MAX_TOKEN_BODY_BYTES,
             )
@@ -244,7 +258,11 @@ impl OAuthProviderConfig {
 
     /// A token response of the authorization code or refresh grant, parsed
     /// as the ID-token verification reads it. A refusal carries the server's
-    /// `error` (and description) in the message.
+    /// `error` (and description) in the message, which callers log: the
+    /// text is the IdP's, so it is escaped and cut at
+    /// [`ERROR_BODY_BYTES`](crate::http_body::ERROR_BODY_BYTES) as every
+    /// other upstream error text. A body that does not parse whole still
+    /// gives its `error` code when it holds one.
     fn token_response(
         status: reqwest::StatusCode,
         body: &[u8],
@@ -256,12 +274,24 @@ impl OAuthProviderConfig {
             let refusal = serde_json::from_slice::<
                 openidconnect::StandardErrorResponse<openidconnect::core::CoreErrorResponseType>,
             >(body)
-            .map(|e| format!("server returned error response: {e}"))
-            .unwrap_or_else(|_| format!("token endpoint returned HTTP {status}"));
+            .map(|e| e.to_string())
+            .ok()
+            .or_else(|| crate::http_body::string_member(body, "error"))
+            .map(|text| {
+                format!(
+                    "server returned error response: {}",
+                    crate::http_body::log_safe(&text, crate::http_body::ERROR_BODY_BYTES)
+                )
+            })
+            .unwrap_or_else(|| format!("token endpoint returned HTTP {status}"));
             return Err(OAuthError::TokenExchange(refusal));
         }
-        serde_json::from_slice(body)
-            .map_err(|e| OAuthError::TokenExchange(format!("failed to parse token response: {e}")))
+        serde_json::from_slice(body).map_err(|e| {
+            OAuthError::TokenExchange(format!(
+                "failed to parse token response: {}",
+                crate::remote_text::parse_error(&e)
+            ))
+        })
     }
 
     /// The client credentials grant (RFC 6749 section 4.4), with the token
@@ -290,10 +320,9 @@ impl OAuthProviderConfig {
             return Err(OAuthError::transient(Some(status.as_u16())));
         }
         if !status.is_success() {
-            let error_code = serde_json::from_slice::<serde_json::Value>(&body)
-                .ok()
-                .and_then(|v| v.get("error")?.as_str().map(String::from))
-                .unwrap_or_else(|| format!("HTTP {status}"));
+            // The code is the IdP's text and is logged: escaped and cut, as
+            // every other upstream error text.
+            let error_code = crate::http_body::log_safe_error_code(&body, status);
             tracing::warn!(
                 status = status.as_u16(),
                 error_code = %error_code,
@@ -303,7 +332,10 @@ impl OAuthProviderConfig {
         }
 
         let token: ClientCredentialsToken = serde_json::from_slice(&body).map_err(|e| {
-            OAuthError::TokenExchange(format!("failed to parse token response: {e}"))
+            OAuthError::TokenExchange(format!(
+                "failed to parse token response: {}",
+                crate::remote_text::parse_error(&e)
+            ))
         })?;
         if let Some(signer) = dpop {
             Self::check_bound_token(&token.token_type, &token.access_token, signer.key)?;
@@ -339,7 +371,10 @@ impl OAuthProviderConfig {
             .await?;
 
         if status.is_success() {
-            tracing::info!(provider = %self.name, "token revoked successfully");
+            tracing::info!(
+                provider = %crate::log_text::log_safe(&self.name, PROVIDER_NAME_LOG_BYTES),
+                "token revoked successfully"
+            );
             return Ok(());
         }
 
@@ -348,13 +383,14 @@ impl OAuthProviderConfig {
         // `error: "unsupported_token_type"` means the AS cannot revoke this
         // token kind (callers treat it as a no-op); a 5xx is transient and
         // may be retried; any other 4xx is a TokenExchange error.
-        let body = String::from_utf8_lossy(&body).into_owned();
-        let parsed_error = serde_json::from_str::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string));
+        // The code alone is logged, escaped and cut as every other upstream
+        // error text; the comparison below reads the escaped form, which a
+        // code without control characters leaves as it was.
+        let parsed_error = crate::http_body::string_member(&body, "error")
+            .map(|code| crate::http_body::log_safe(&code, crate::http_body::ERROR_CODE_LOG_BYTES));
 
         tracing::warn!(
-            provider = %self.name,
+            provider = %crate::log_text::log_safe(&self.name, PROVIDER_NAME_LOG_BYTES),
             status = status.as_u16(),
             error_code = parsed_error.as_deref().unwrap_or("<none>"),
             "token revocation failed"
@@ -559,8 +595,12 @@ impl OAuthProviderConfig {
         .await
         .map_err(|e| OAuthError::UserInfo(format!("failed to read response body: {e}")))?;
 
-        serde_json::from_slice(&body)
-            .map_err(|e| OAuthError::UserInfo(format!("failed to parse response: {e}")))
+        serde_json::from_slice(&body).map_err(|e| {
+            OAuthError::UserInfo(format!(
+                "failed to parse response: {}",
+                crate::remote_text::parse_error(&e)
+            ))
+        })
     }
 }
 
@@ -572,7 +612,7 @@ mod tests {
         FormAnswer {
             status: reqwest::StatusCode::from_u16(status).unwrap(),
             nonce: nonce.map(str::to_string),
-            body: body.to_string().into_bytes(),
+            body: Zeroizing::new(body.to_string().into_bytes()),
         }
     }
 
@@ -614,7 +654,7 @@ mod tests {
         assert_eq!(*sent.lock().unwrap(), [None, Some("n1".to_string())]);
 
         let sent = std::sync::Mutex::new(0);
-        let send = |_nonce: Option<String>| {
+        let send = |_: Option<String>| {
             *sent.lock().unwrap() += 1;
             async { Ok::<_, OAuthError>(()) }
         };

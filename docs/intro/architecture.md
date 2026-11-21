@@ -2,20 +2,20 @@
 
 Which crate owns what, how the pieces compose, and where you plug in.
 Four decisions carry the rest of the book: the
-verifier-versus-orchestrator line, the three state slices, the DST
-foundation, and the naming conventions. With those in mind, later
-chapters need no further scaffolding.
+verifier-versus-orchestrator line, the three state slices, the
+deterministic simulation testing (DST) foundation, and the naming
+conventions. Later chapters build on these four.
 
 Evaluating? Read it end to end. Mid-integration? Skim, and come back
 when something surprises you.
 
 ## Workspace shape
 
-Axess is ten library crates plus a set of example applications. The split
-is not cosmetic. It enforces a structural invariant (leaf crates do not
-depend on the orchestrator), it gates compile cost for features
-adopters do not use, and it makes the verifier-versus-orchestrator line
-explicit in the dependency graph.
+Axess is eleven library crates plus a set of example applications. The split
+does three things: it enforces a structural invariant (leaf crates do not
+depend on the orchestrator), it spares adopters the compile cost of
+features they do not use, and it makes the verifier-versus-orchestrator
+line explicit in the dependency graph.
 
 ```mermaid
 flowchart TD
@@ -29,32 +29,36 @@ flowchart TD
   clock["axess-clock<br/><i>Clock trait</i>"]
   rng["axess-rng<br/><i>SecureRng trait</i>"]
   strings["axess-strings<br/><i>ShortString</i>"]
+  testing["axess-testing<br/><i>test fixtures</i>"]
 
   facade --> core
   facade --> factors
   facade --> macros
+  facade --> identity
+
+  macros --> core
 
   core --> factors
   core --> identity
-  core --> events
   core --> cache
   core --> clock
   core --> rng
-  core --> strings
 
   factors --> identity
   factors --> clock
   factors --> rng
 
+  identity --> rng
   cache --> clock
   events --> identity
+  events --> strings
 ```
 
 The `axess` crate is a thin facade that re-exports the curated public
 API from `axess-core` and `axess-factors`. Application code depends on
-this crate and only this crate. The internal split is free to
-reorganise without breaking adopters, provided the types surfaced at
-the facade level stay compatible.
+this crate alone. The internal crates can be reorganised without
+breaking adopters as long as the types the facade exposes stay
+compatible.
 
 `axess-core` is the orchestrator. It owns the session state machine,
 `AuthnService`, `AuthzStore`, the Axum middleware stack (CSRF, rate
@@ -64,27 +68,30 @@ dispatch. If a type drives a transition or owns persistent state, it
 lives here.
 
 `axess-factors` holds the per-credential verifiers. The list is long
-because the credential surface authentication actually has is long:
+because authentication has many kinds of credential:
 
-- Argon2id, TOTP, HOTP and email OTP.
+- Argon2id, TOTP, HOTP, email OTP and recovery codes.
 - FIDO2, LDAP bind and mTLS.
 - OAuth and OIDC, with discovery, a JWKS cache and logout-token claim
   validation; plus JWT validation and the PKCE helpers.
-- Federation adapters for Kubernetes service accounts, GitHub Actions
-  and generic OAuth resource servers.
+- One generic resolver for JWT-bearer workload tokens (Kubernetes
+  service accounts, GitHub Actions OIDC and the like); the per-issuer
+  claim mappings are recipes in `examples/workload-identity`.
 - A bearer-token extractor and an outbound OAuth client.
 
 The crate is
-composable on its own and is the obvious extension point when you need
-a custom factor: implement the verifier trait, register it with the
-service, the rest stays the same.
+composable on its own and is the extension point for a custom factor:
+implement the verifier trait and register it with the service; nothing
+else changes.
 
-Everything else in the workspace is a leaf. Each leaf crate owns one
-concept (typed IDs, TTL cache, the Clock trait), and depends only on
-other leaves on its own row of the dependency graph. The structural
-invariant under review is straightforward: no leaf crate may depend on
-`axess-core`. Flipping any of these to depend on the orchestrator would
-create a cycle through the facade and is rejected at review.
+`axess-macros` depends on `axess-core`, whose types its guard macros
+name. Everything else in the workspace is a leaf. Each leaf crate owns one
+concept (typed IDs, TTL cache, the Clock trait) and depends on nothing in
+the workspace but other leaf crates. The structural
+invariant is that no leaf crate may depend on
+`axess-core`. A leaf that `axess-core` itself depends on cannot depend on
+it in turn, because Cargo refuses to build the cycle; for the other leaves
+the rule is held at review.
 
 ## The verifier-versus-orchestrator line
 
@@ -93,22 +100,21 @@ and `axess-core`. Per-credential algorithms and their data shapes live
 on the verifier side. The sum types and the composition machinery that
 combine them live on the orchestrator side.
 
-This is concrete. The `Fido2Config` struct, the `Fido2Provider` trait,
+For example, the `Fido2Config` struct, the `Fido2Provider` trait,
 and the WebAuthn ceremony itself live in `axess-factors`. The
 `FactorKind::Fido2` variant, the `FactorConfig::Fido2(Fido2Config)`
 wrapping, and the `FactorStep::factor(FactorKind::Fido2)` composition
 helper live in `axess-core`. The same pattern applies to LDAP, to OAuth,
-to every factor: the algorithm and its config are verifier-side, the
+to every factor: the algorithm and its config are verifier-side; the
 enum variant and the composition are orchestrator-side.
 
-The reason for the line is the kind of change each side absorbs. The
+The line separates two kinds of change. The
 verifier is the thing you might want to swap (an alternative WebAuthn
 library, a custom OTP scheme, an LDAP binding that reads from a sidecar
 rather than directly). The orchestrator is the thing you do not swap
 (the state machine, the audit dispatch, the storage interface) but do
-want to extend (add a factor, add a workflow, add a backend). Keeping
-the two in separate crates makes the swap and the extension into
-independent operations. A change in `axess-factors` does not invalidate
+want to extend (add a factor, add a workflow, add a backend). Separate
+crates make the swap and the extension independent. A change in `axess-factors` does not invalidate
 orchestrator code; a change in `axess-core` does not touch the verifier
 crates.
 
@@ -121,35 +127,32 @@ depends on `axess-factors`, never the reverse.
 RP-side-orchestrator framing: the in-process IdP under
 `crate::local_idp` (feature `local-idp`, off by default). `LocalIdp`
 mints workload-identity JWTs on-host, which is OP-side issuance, not
-verifier composition. It lives in `axess-core` deliberately, not by
-oversight. The choice is between two costs: carve `LocalIdp` into a
-sibling crate that mirrors the verifier/issuer split at workspace
-shape, or accept one feature-gated OP-side module inside the
-orchestrator crate. The carve-out has been considered and rejected
-on the same reasoning that retired the earlier
-`axess-delegated` crate: the structural benefit is real but small,
-the maintenance overhead of an additional workspace member is real,
-and no adopter is asking for `LocalIdp` as a separate dependency.
+verifier composition. It lives in `axess-core` by design. The choice is between two costs: carve `LocalIdp` into a
+sibling crate that mirrors the verifier/issuer split in the workspace
+layout, or accept one feature-gated OP-side module inside the
+orchestrator crate. The carve-out was rejected for the reasons that retired the earlier
+`axess-delegated` crate: the structural benefit is small, an additional
+workspace member costs maintenance, and no adopter has asked for
+`LocalIdp` as a separate dependency.
 Adopters who do not enable `local-idp` pay nothing for it; adopters
 who do enable it find it through `axess::local_idp::*` regardless of
 which crate hosts the implementation.
 
 The internal layout reflects the boundary even when the crate
 boundary does not. Primitives shared between the production
-[`LocalIdp`] and the test [`LocalIdpFixture`] live in
+`LocalIdp` and the test `LocalIdpFixture` live in
 `axess-core/src/local_idp/primitives.rs`, outside the `testing/`
 tree, so production code does not have to import from a test module.
 The fixture itself stays under `crate::testing::local_idp` and
-imports the primitives, which is the dependency direction the prior
-arrangement got backwards.
+imports the primitives: test code depends on production code, never the
+reverse.
 
 ## The three state slices
 
 Most authentication libraries conflate three independent state machines
 into one bag of fields and call the result a "session". Axess keeps
-them separate. This is not a stylistic choice; the slices answer
-different questions, change on different cadences, and are owned by
-different concerns.
+them separate: the slices answer different questions, change on
+different cadences, and are owned by different concerns.
 
 ```mermaid
 flowchart LR
@@ -180,8 +183,7 @@ flowchart LR
 covered in Part II. It transitions through factor verification, lives
 inside `SessionData` behind a cookie, and is what `RequestAuthnService::verify_factor`
 mutates. It answers the question *"is this caller authenticated, and to
-what tier?"* It changes on factor verification, which is rare in
-absolute terms.
+what tier?"* It changes on factor verification, which is rare.
 
 *Authorisation state* is `AuthzStore`, holding the Cedar policy set and
 its schema, loaded once at startup. A per-request `AuthzSession` then
@@ -197,35 +199,38 @@ principal carries a `UserId` and `TenantId`; a workload principal
 carries a `WorkloadId`. The principal is extracted from the
 authentication state for humans and from a workload-identity resolver
 (bearer JWT, mTLS, K8s service account, and so on) for non-humans. It
-changes on every single request.
+changes on every request.
 
-The slices are independent because they answer different questions and
-change on different cadences. Treating them as one bag conflates the
-questions and the cadences. Keeping them apart lets each evolve without
-disturbing the others.
+Keeping the slices apart lets each evolve without disturbing the others.
 
 ## Deterministic simulation testing
 
 Every place in axess that reads wall time or sources entropy on the hot
-path goes through an injected trait. This is the discipline that lets
-the test suite be reproducible and that lets subtle timing or ordering
-bugs become failing tests rather than rare incidents.
+path goes through an injected trait. This makes the test suite
+reproducible and turns subtle timing or ordering bugs into failing tests
+rather than rare incidents.
 
 Two traits carry the foundation. `Clock` is the first:
 
 ```rust,ignore
-pub trait Clock: Send + Sync {
-    fn now(&self) -> chrono::DateTime<chrono::Utc>;
+pub trait Clock: Send + Sync + 'static {
+    fn now(&self) -> Timestamp;
 }
 
-pub struct SystemClock;          // delegates to chrono::Utc::now()
+pub struct SystemClock;          // reads std::time::SystemTime::now()
 pub struct MockClock { /* ... */ } // advances under test control
 ```
+
+The reading is a `Timestamp`, one of the time types axess-clock builds on
+the standard library alone, alongside `SignedDuration` (an exact signed span),
+`Until` (an end that comes at a reading or never) and `UtcDate` (a day in
+UTC). Their arithmetic is checked: a result past the range is `None`, never
+a panic.
 
 `SecureRng` is the second:
 
 ```rust,ignore
-pub trait SecureRng: Send + Sync {
+pub trait SecureRng: Send + Sync + 'static {
     fn fill_bytes(&self, dest: &mut [u8]);
 }
 
@@ -233,14 +238,14 @@ pub struct SystemRng;          // delegates to getrandom
 pub struct MockRng { /* ... */ } // seeded; reproduces byte sequence
 ```
 
-A small detail matters here. `SecureRng::fill_bytes` takes `&self`, not
-`&mut self`. The mock implementation guards its internal counter with a
-`Mutex` so that `Arc<dyn SecureRng>` is dyn-compatible and concurrent
-use is serialised without forcing every call site to plumb a mutable
-borrow through. The trade is a single locked critical section per
-random fill, which is irrelevant on the authentication hot path.
+`SecureRng::fill_bytes` takes `&self`, not
+`&mut self`, so one generator can be shared as `Arc<dyn SecureRng>`
+without forcing every call site to plumb a mutable borrow through. A
+generator with state therefore needs interior mutability: `MockRng` keeps
+its seed behind a `Mutex`, which also serialises concurrent use at the
+cost of one lock per fill. `SystemRng` holds no state and takes no lock.
 
-The wiring matches. `AuthnService<I, F>` holds `Arc<dyn SecureRng>` and
+`AuthnService<I, F>` holds `Arc<dyn SecureRng>` and
 `Arc<dyn Clock>` as construction-time fields. The service is generic
 over the identity store (`I`) and factor store (`F`) but type-erased
 over clock and RNG, so swapping in `MockRng` or `MockClock` does not
@@ -248,7 +253,7 @@ change the service's type signature. Tests do this with
 `.with_rng(MockRng::new(seed))` and `.with_clock(MockClock::default())`;
 production wires `SystemRng` and `SystemClock`.
 
-The same discipline extends to backends. The pattern is uniform: the
+The same discipline extends to backends: the
 production implementation talks to a real database or external service,
 and a `Mock*` implementation does the same thing in memory under test
 control.
@@ -263,13 +268,13 @@ control.
 | `DeviceStore` | SQL or Valkey | `MemoryDeviceStore` |
 | `DeviceResolver` | header or IP | `RedactedResolver`, `NoopDeviceResolver` |
 
-A complete login including session-registry interactions, factor
-verification, refresh-token rotation, and audit emission can be
+A complete login, including session-registry interactions, factor
+verification, refresh-token rotation and audit emission, can be
 exercised in a `#[tokio::test]` with no database, no Valkey, no
 network. The same test that detects a regression on a development
 laptop detects it in CI without further configuration.
 
-One carve-out is worth naming: axum's `IntoResponse` for `AuthnError`, behind the
+One exception: axum's `IntoResponse` for `AuthnError`, behind the
 `default-error-response` feature. The trait method takes no arguments, so
 it reads the wall clock to compute `Retry-After`. Anything that holds a
 clock calls `AuthnError::into_response_at(clock.now())`, which is
@@ -277,39 +282,41 @@ deterministic, and the trait impl is only the convenience path.
 
 ## Storage backends
 
-Identity persistence is adopter-owned. Axess does not prescribe a user
-or tenant or factor schema, because every application already has one
-and the schemas do not agree on much. What axess does prescribe is the
-trait surface you implement, split into three tiers so that adopters
-can narrow what they have to write.
+Identity persistence is adopter-owned. Axess does not prescribe a user,
+tenant or factor schema, because every application already has one
+and the schemas do not agree on much. It prescribes the trait surface
+you implement, split into three tiers so that adopters write only what
+they need.
 
-The narrowest tier is `IdentityLookup`, with ten read verbs. It is
+The narrowest tier is `IdentityLookup`, with eleven read verbs (two of
+them with default bodies). It is
 enough to support a read-replica path or a test fixture. The middle
-tier, `IdentityAuthnLog: IdentityLookup`, adds four per-attempt audit
-writes; it is required for production because lockout decisions depend
-on the audit log. The widest tier, `IdentityAdmin: IdentityAuthnLog`,
-adds nine verbs covering privileged provisioning, suspension, and GDPR
-erasure, and is required for any control-plane surface.
+tier, `IdentityAuthnLog: IdentityLookup`, adds ten per-attempt verbs: the
+audit event, the failed-attempt and throttle counters, and the last-login
+time. It is required for production because lockout decisions depend
+on those counters. The widest tier, `IdentityAdmin: IdentityAuthnLog`,
+adds six verbs covering privileged provisioning, activation, suspension,
+and GDPR erasure, and is required for any control-plane surface.
 
 The umbrella alias `IdentityStore: IdentityAdmin` preserves the
 all-three-tiers shape for production backends. `NoopAuthnLog` is an
 adapter that wraps an `IdentityLookup` and satisfies the
 `IdentityAuthnLog` signature with a no-op, suitable for fixtures and
-read-replica contexts. Production must implement `IdentityAuthnLog`
-directly, however; the noop disables lockout, which is a security
-posture you do not want by accident.
+read-replica contexts. Production must still implement `IdentityAuthnLog`
+directly: the no-op disables lockout.
 
 Session, refresh-token, and device storage have first-party backends
 for the obvious targets:
 
 | Trait | Memory | SQLite | Postgres | MySQL | Valkey |
 |---|---|---|---|---|---|
-| `SessionStore` | always-on | `sqlite` | `postgres` | `mysql` | `valkey` |
-| `SessionRegistry` | always-on | (adopter) | (adopter) | (adopter) | `valkey` |
-| `RefreshTokenStore` | always-on | adopter | adopter | adopter | adopter |
-| `DeviceStore` | `device` | `device, sqlite` | `device, postgres` | (adopter) | `device, valkey` |
-| `DelegatedCredentialStore` | always-on | adopter | adopter | adopter | adopter |
+| `SessionStore` | `memory` | `sqlite` | `postgres` | `mysql` | `valkey` |
+| `SessionRegistry` | `memory` | adopter | adopter | adopter | `valkey` |
+| `RefreshTokenStore` | `testing` | adopter | adopter | adopter | adopter |
+| `DeviceStore` | `device` | `device, sqlite` | `device, postgres` | `device, mysql` | `device, valkey` |
+| `DelegatedCredentialStore` | `delegated-stored` | adopter | adopter | adopter | adopter |
 
+A cell in code font names the features that turn the implementation on.
 The word "adopter" means axess defines the trait and provides a memory
 implementation; the SQL or Valkey-backed implementation is yours. The
 chapter *Identity store implementation* walks through the pattern, and
@@ -325,10 +332,12 @@ detail; backend module paths inside `axess-core` are internal.
 ### The generic `Store<K, V>` surface
 
 All five session backends also implement the generic
-`axess_core::store::Store<SessionId, SessionData>` trait. Adopters who
+`axess_core::store::Store<SessionKey, SessionData>` trait (a session is
+stored under its key, a digest of the id its cookie carries). Adopters who
 want a backend-agnostic key/value-with-TTL surface (test doubles,
-generic operations endpoints, multi-backend deployments) can hold an
-`Arc<dyn Store<…>>` or a generic `S: Store<…>` and dispatch uniformly.
+generic operations endpoints, multi-backend deployments) can hold a
+generic `S: Store<…>` and dispatch uniformly. The trait returns `impl
+Future` and has `Clone` as a supertrait, so it cannot be a `dyn Store`.
 `SessionStore` stays the primary surface for session-domain operations
 (`cycle`, `find_sessions_for_user`) because those carry primitives the
 generic `Store` deliberately omits.
@@ -374,9 +383,8 @@ that it is bridging authentication state into authorisation evaluation.
 | `*Error` | Error type (`AuthnError`, `OAuthError`, `CryptoError`) |
 | `*Builder` | Builder pattern (`SessionConfigBuilder`, `AuthEventBuilder`) |
 
-The conventions are not retroactive style guides. They are how the
-public surface is built today. New types adopt them; PR review catches
-violations.
+The public surface follows these conventions. New types adopt them, and
+review catches violations.
 
 ### Method verb conventions
 
@@ -407,7 +415,7 @@ Three invariants run through every part of the workspace. They are not
 advice; they are enforced by lints, by review, and in some cases by
 the type system.
 
-**`#![forbid(unsafe_code)]`**, declared at the root of all ten
+**`#![forbid(unsafe_code)]`**, declared at the root of all eleven
 published crates. There is no unsafe code in axess.
 
 **Constant-time comparison** for any byte-level secret
@@ -417,10 +425,9 @@ compare bytes through `subtle::ConstantTimeEq`. The alternative, `==`
 on bytes, leaks timing information and is rejected at review.
 
 **Zeroization on drop.** Password hashes are wrapped
-in `ZeroizedString`. TOTP and HOTP shared secrets use `Zeroizing`. The
-session signing key zeroes its bytes in its `Drop` impl. The
-discipline is not perfect (an attacker with sufficient memory access
-can still win), but the surface is reduced.
+in `ZeroizedString`. TOTP and HOTP shared secrets use `Zeroizing`, and
+so do the session signing keys and the encryption keys. Zeroization narrows the exposure but does not close it: an attacker with
+enough memory access can still read secrets.
 
 The full production posture, including integration requirements and
 compliance touch-points, is in *Security posture*.
@@ -428,15 +435,16 @@ compliance touch-points, is in *Security posture*.
 ## What lives where, in one paragraph
 
 If you read nothing else from this chapter: state machines, storage,
-middleware, federation adapters, device identity, and OBO/delegated
-access live in `axess-core`. Factor algorithm primitives (Argon2id,
-TOTP, HOTP) live in `axess-factors`. Typed IDs and the principal
-enum live in `axess-identity`. Anything that delegates to time or
+middleware, the federation orchestration (the OAuth provider registry,
+IdP-initiated logout), device identity, and OBO/delegated
+access live in `axess-core`. The per-credential verifiers (Argon2id,
+TOTP, HOTP, FIDO2, LDAP, mTLS, OAuth, OIDC, JWT) live in `axess-factors`. Typed IDs and the principal
+enum live in `axess-identity`. Anything that reads time or
 randomness goes through `axess-clock` or `axess-rng`. Adopters
 depend on the `axess` facade; the internal split is free to
 reorganise behind that boundary.
 
-Everything else is detail. The rest of the book is detail.
+The rest of the book is detail.
 
 ## Further reading
 

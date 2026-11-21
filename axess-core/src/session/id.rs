@@ -1,17 +1,28 @@
-//! Session identifier: re-export from `axess-identity`.
+//! Session identifier and session key: re-exports from `axess-identity`.
 //!
-//! Internal callers use `axess_core::session::id::SessionId`; the
-//! workload-identity `HumanPrincipal { session_id }` carries
-//! `axess_identity::SessionId`. Both names resolve to the same nominal
-//! type, and `pub use` preserves type identity, so the resolver boundary
-//! is a direct assignment, not a `from_bytes` round-trip.
+//! A [`SessionId`] is the value a session cookie carries. A [`SessionKey`]
+//! is the SHA-256 of a fixed tag and that id, and it is the name the session
+//! is stored under: the session layer computes it once from the verified
+//! cookie, every [`SessionStore`](crate::session::store::SessionStore)
+//! method takes it, and no store ever sees the id. `SessionKey::of` is the
+//! one way from an id to its key.
 //!
-//! Constructors: `SessionId::new(&mut rng)` requires `rng:
+//! The id is read in one place, the cookie codec of the session layer,
+//! which signs it into the cookie and verifies it out of one; everything
+//! else names the session by its key. The workload-identity
+//! `HumanPrincipal { session_id }` carries the session's key
+//! (`axess_identity::SessionKey`, which `pub use` makes the same type as
+//! [`SessionKey`] here), read from the session's
+//! [`AuthSnapshot`](crate::session::extractor::AuthSnapshot).
+//!
+//! Constructors: `SessionId::new(&rng)` requires `rng:
 //! axess_rng::SecureRng`. Depend on `axess-rng` directly (and use its
 //! `SystemRng` / `MockRng` / `SecureRng`); the bound is satisfied by
 //! identity.
 
-pub use axess_identity::SessionId;
+pub use axess_identity::{
+    SESSION_KEY_DOMAIN, SessionId, SessionKey, SessionKeyError, SessionKeyPrefix,
+};
 
 #[cfg(test)]
 mod tests {

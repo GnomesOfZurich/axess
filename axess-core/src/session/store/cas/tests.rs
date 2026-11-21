@@ -1,6 +1,7 @@
 //! The compare-and-swap driver against a row whose answers a test scripts.
 
 use super::*;
+use crate::session::id::{SessionId, SessionKey};
 use std::sync::Mutex;
 
 /// A row that answers reads with the revisions queued in `reads` and
@@ -31,17 +32,17 @@ impl CasRow for Scripted {
     type Seen = ();
     type Error = std::convert::Infallible;
 
-    async fn read(&self, _: &SessionId) -> Result<Option<(u64, ())>, Self::Error> {
+    async fn read(&self, _: &SessionKey) -> Result<Option<(u64, ())>, Self::Error> {
         Ok(self.reads.lock().unwrap().remove(0).map(|r| (r, ())))
     }
 
-    async fn delete_if(&self, _: &SessionId, _: &()) -> Result<CasWrite, Self::Error> {
+    async fn delete_if(&self, _: &SessionKey, _: &()) -> Result<CasWrite, Self::Error> {
         Ok(self.next_write("delete"))
     }
 
     async fn replace_if(
         &self,
-        _: &SessionId,
+        _: &SessionKey,
         _: &(),
         _: &SessionData,
         _: Duration,
@@ -52,8 +53,10 @@ impl CasRow for Scripted {
 
 const TTL: Duration = Duration::from_secs(60);
 
-fn id() -> SessionId {
-    SessionId::new(&crate::testing::mock_random::MockRng::new(1))
+fn id() -> SessionKey {
+    SessionKey::of(&SessionId::new(&crate::testing::mock_random::MockRng::new(
+        1,
+    )))
 }
 
 async fn run(row: &Scripted, ttl: Duration) -> ConditionalUpdate {

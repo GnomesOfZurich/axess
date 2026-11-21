@@ -41,13 +41,13 @@
 //!
 //! - Accepts any of several named secrets, so a secret can be rotated by
 //!   adding the new one, moving callers over, then dropping the old one.
-//! - Refuses a secret shorter than [`MIN_SECRET_LEN`](crate::middleware::service_secret::MIN_SECRET_LEN) bytes. Generate one
+//! - Refuses a secret shorter than [`MIN_SECRET_LEN`] bytes. Generate one
 //!   with `openssl rand -hex 32`.
 //! - Keeps only values derived from each secret, never the secret, and
 //!   compares in constant time against every configured secret on every
 //!   request, so neither a secret's length nor which caller matched shows
 //!   in timing.
-//! - Tells the handler which caller it was, through [`ServiceCaller`](crate::middleware::service_secret::ServiceCaller).
+//! - Tells the handler which caller it was, through [`ServiceCaller`].
 //! - Answers `404 Not Found` when no secret is configured, so a route that
 //!   has not been given a secret is indistinguishable from one that does
 //!   not exist, and `401 Unauthorized` when the credential is missing or
@@ -83,8 +83,8 @@
 //! ```
 //!
 //! The caller signs with the same secret, naming the audience, through
-//! [`ServiceSigner`](crate::middleware::service_secret::ServiceSigner);
-//! [`SIGNATURE_HEADER`](crate::middleware::service_secret::SIGNATURE_HEADER) documents the scheme for a caller
+//! [`ServiceSigner`];
+//! [`SIGNATURE_HEADER`] documents the scheme for a caller
 //! not written in Rust.
 
 mod rejection;
@@ -142,6 +142,16 @@ pub enum ServiceSecretError {
         name: String,
         /// Its length in bytes after trimming.
         len: usize,
+    },
+    /// The environment variable is set but its value is not valid UTF-8, so
+    /// it cannot be the secret it was meant to be. Refused rather than read
+    /// as unset, which would leave the route answering `404` in silence.
+    #[error("the variable `{var}` for `{name}` is set but is not valid UTF-8")]
+    NotUnicode {
+        /// The caller the secret belongs to.
+        name: String,
+        /// The variable that was read.
+        var: String,
     },
     /// A signed-request route was configured with neither an audience nor an
     /// unaddressed window, so it would accept nothing.
@@ -230,8 +240,10 @@ impl ServiceSecret {
     /// # Errors
     ///
     /// As [`ServiceSecret::from_file`] and [`ServiceSecret::new`]. A
-    /// variable that is set but empty is an error rather than "unset", so
-    /// a misconfigured deployment fails loudly at start-up.
+    /// variable that is set but empty is an error rather than "unset", and
+    /// so is one that is set but not valid UTF-8
+    /// ([`ServiceSecretError::NotUnicode`]), so a misconfigured deployment
+    /// fails loudly at start-up.
     pub fn from_env(
         name: impl Into<Arc<str>>,
         var: &str,
@@ -240,9 +252,24 @@ impl ServiceSecret {
         if let Some(path) = std::env::var_os(format!("{var}_FILE")) {
             return Self::from_file(name, path).map(Some);
         }
-        match std::env::var(var) {
+        Self::from_env_value(name, var, std::env::var(var))
+    }
+
+    /// [`from_env`](Self::from_env) after the read: what one answer of
+    /// `std::env::var` means for the route. Unset leaves it unconfigured;
+    /// set but not UTF-8 is a misconfiguration, not an absence.
+    pub(crate) fn from_env_value(
+        name: Arc<str>,
+        var: &str,
+        value: Result<String, std::env::VarError>,
+    ) -> Result<Option<Self>, ServiceSecretError> {
+        match value {
             Ok(secret) => Self::new(name, &Zeroizing::new(secret)).map(Some),
-            Err(_) => Ok(None),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => Err(ServiceSecretError::NotUnicode {
+                name: name.to_string(),
+                var: var.to_owned(),
+            }),
         }
     }
 
@@ -337,7 +364,9 @@ impl ServiceCaller {
 impl<S: Send + Sync> FromRequestParts<S> for ServiceCaller {
     type Rejection = StatusCode;
 
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+    // The trait fixes the state parameter and this extractor reads none of
+    // it, so it is taken as `_`.
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
         parts
             .extensions
             .get::<ServiceCaller>()
@@ -525,5 +554,7 @@ where
     }
 }
 
+#[cfg(test)]
+mod env_tests;
 #[cfg(test)]
 mod tests;

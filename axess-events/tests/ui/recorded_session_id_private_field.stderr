@@ -1,0 +1,12 @@
+error[E0423]: cannot initialize a tuple struct which contains private fields
+ --> tests/ui/recorded_session_id_private_field.rs:6:13
+  |
+6 |     let _ = RecordedSessionId(SessionId::NIL);
+  |             ^^^^^^^^^^^^^^^^^
+  |
+  = note: a struct named `RecordedSessionId` exists in another namespace
+note: constructor is not visible here due to private fields
+ --> src/subject.rs
+  |
+  |     pub struct RecordedSessionId(SessionId);
+  |                                  ^^^^^^^^^ private field

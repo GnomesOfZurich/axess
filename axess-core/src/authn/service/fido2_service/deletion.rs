@@ -25,6 +25,12 @@ where
     /// An account that may not log in is refused as an enrolment is
     /// ([`AuthnError::Locked`] or [`AuthnError::NotActive`], with a
     /// `FactorDisabled` row): its credentials are frozen with it.
+    ///
+    /// Once the passkey is removed its `FactorDisabled` row is written and
+    /// its credential-id claim given back. A row that cannot be written is
+    /// the error returned, after the claim was released, and is logged at
+    /// error level as a removal without its row; a release the store
+    /// refuses is logged and does not fail the call.
     #[tracing::instrument(skip(self, user, session, credential_id))]
     pub async fn delete_fido2_credential(
         &self,
@@ -66,20 +72,48 @@ where
         if removed.is_none() {
             return Ok(false);
         }
-        // The id is free to register again, to this user or another.
-        self.inner
+        // The passkey is gone once the swap committed, so the row that says
+        // the factor was disabled is written now, before anything that could
+        // still fail. A row that cannot be written does not stop the claim
+        // from being given back: the passkey is removed either way.
+        let audited = self
+            .emit_audit(
+                AuthEventBuilder::success(AuthEventType::FactorDisabled)
+                    .attributed_to(&user.id, &user.tenant_id)
+                    .with_factor(FactorKind::Fido2)
+                    .with_session(session.session_key().await),
+            )
+            .await;
+
+        // The id is free to register again, to this user or another. A
+        // release the store refuses does not undo the removal: the deletion
+        // is a success, and the held id is logged so an operator can free it.
+        if let Err(error) = self
+            .inner
             .factors
             .release_fido2_credential(&user.tenant_id, &user.id, credential_id.as_slice())
             .await
-            .map_err(AuthnError::Store)?;
+        {
+            tracing::warn!(
+                tenant_id = %user.tenant_id,
+                user_id = %user.id,
+                error = %error,
+                "passkey deleted but its credential-id claim could not be released; the id \
+                 stays held by this user until the store releases it"
+            );
+        }
 
-        self.emit_audit(
-            AuthEventBuilder::success(AuthEventType::FactorDisabled)
-                .attributed_to(&user.id, &user.tenant_id)
-                .with_factor(FactorKind::Fido2)
-                .with_session(session.session_id().await),
-        )
-        .await?;
+        // The caller learns the row is missing, and the log says what the
+        // error alone does not: the passkey is already removed.
+        if let Err(error) = audited {
+            tracing::error!(
+                tenant_id = %user.tenant_id,
+                user_id = %user.id,
+                error = %error,
+                "passkey removed but its FactorDisabled audit row could not be written"
+            );
+            return Err(error);
+        }
 
         Ok(true)
     }

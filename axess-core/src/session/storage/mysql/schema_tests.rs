@@ -26,3 +26,16 @@ fn the_binary_column_is_a_nullable_longblob() {
     assert!(line.contains("LONGBLOB"), "{line}");
     assert!(!line.contains("NOT NULL"), "{line}");
 }
+
+/// The `id` column holds a session's key, which is 64 characters: a narrower
+/// column cuts the key or refuses the row.
+#[test]
+fn the_id_column_holds_the_64_characters_of_a_key() {
+    let line = SESSIONS_DDL
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("id "))
+        .expect("id column");
+    assert!(line.contains("VARCHAR(64)"), "{line}");
+    assert_eq!(crate::session::id::SessionKey::HEX_LEN, 64);
+}

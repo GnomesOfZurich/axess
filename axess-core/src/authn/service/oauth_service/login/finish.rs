@@ -5,6 +5,7 @@
 //! lock that `complete_oauth_login` will verify.
 
 use super::helpers::{compute_claim_lock, is_valid_pkce_verifier, normalize_issuer};
+use super::route::OAuthCallbackRoute;
 use crate::authn::service::RequestAuthnService;
 use crate::authn::{
     event::{AuthEventBuilder, AuthEventType, AuthFailureReason},
@@ -14,15 +15,6 @@ use crate::authn::{
 use crate::session::extractor::AuthSession;
 use subtle::ConstantTimeEq;
 
-/// Whether the callback's `iss` parameter is compared.
-#[derive(Clone, Copy)]
-pub(super) enum IssCheck<'a> {
-    /// The caller used the form that does not take it.
-    Skipped,
-    /// The caller passed what the callback carried, possibly nothing.
-    Compared(Option<&'a str>),
-}
-
 /// How the callback's `code`, `state` and `iss` arrived.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ResponseForm {
@@ -31,6 +23,20 @@ pub(super) enum ResponseForm {
     /// Out of a verified JWT Secured Authorization Response (JARM); a
     /// provider that requires JARM refuses them any other way.
     Jarm,
+}
+
+/// The authorization response the callback carried.
+#[derive(Clone, Copy)]
+pub(super) struct AuthorizationResponse<'a> {
+    /// The authorization code.
+    pub(super) code: &'a str,
+    /// The `state` the response echoes.
+    pub(super) state: &'a str,
+    /// The `iss` parameter (RFC 9207), or `None` when the response had
+    /// none. It is always compared.
+    pub(super) iss: Option<&'a str>,
+    /// How the three arrived.
+    pub(super) form: ResponseForm,
 }
 
 /// RFC 9207 §2.4: a present `iss` equals the provider's issuer by simple
@@ -64,99 +70,99 @@ where
     I: IdentityStore,
     F: FactorStore<Error = I::Error>,
 {
-    /// Complete an OAuth/OIDC login flow.
+    /// Complete an OAuth/OIDC login flow at the callback route `route`.
     ///
-    /// This form does not look at the `iss` parameter of the authorization
-    /// response, so the mix-up defence of RFC 9207 rests on the session state
-    /// alone. Prefer
-    /// [`finish_oauth_login_with_iss`](Self::finish_oauth_login_with_iss),
-    /// which compares it. A provider that advertises
-    /// `authorization_response_iss_parameter_supported` refuses this form
-    /// with [`OAuthError::Config`](axess_factors::oauth::OAuthError::Config)
-    /// before the code is exchanged, and the ceremony is cleared: its
-    /// responses carry an `iss` this form cannot compare, so a callback that
-    /// drops the parameter would give up the defence the provider offers.
-    #[tracing::instrument(skip(self, code, state, session))]
-    pub async fn finish_oauth_login(
-        &self,
-        code: &str,
-        state: &str,
-        session: &AuthSession,
-    ) -> Result<axess_factors::oauth::OAuthClaims, axess_factors::oauth::OAuthError> {
-        self.finish_oauth_login_checked(
-            code,
-            state,
-            IssCheck::Skipped,
-            ResponseForm::Plain,
-            None,
-            session,
-        )
-        .await
-    }
-
-    /// Complete an OAuth/OIDC login flow, comparing the `iss` parameter of
-    /// the authorization response with the provider's issuer (RFC 9207).
+    /// `route` is the redirect URI the callback arrived on, named by the
+    /// registration it belongs to ([`OAuthCallbackRoute`]): the global
+    /// registration's provider (the `{provider}` of a `/callback/{provider}`
+    /// route), or a tenant's own (the `{tenant}` and `{provider}` of a
+    /// `/callback/{tenant}/{provider}` route). It must be the route of the
+    /// registration the login began with, the same provider name and the
+    /// same tenant or none: an answer that comes back on another provider's
+    /// redirect URI is a mix-up (the user was sent to one authorization
+    /// server by another) and is refused as
+    /// [`OAuthError::CsrfMismatch`](axess_factors::oauth::OAuthError::CsrfMismatch)
+    /// before any code is exchanged, with a `provider_mismatch` audit row,
+    /// and the ceremony is cleared. That covers a callback on another
+    /// tenant's route for a provider of the same name, a callback on the
+    /// global route for a login begun with a tenant's provider, and the
+    /// reverse. RFC 9207 names one redirect URI per provider, checked
+    /// against the provider the login began with, as the defence for an
+    /// authorization server that sends no `iss`; this is that check.
+    /// Register one redirect URI per provider at each IdP, and one per
+    /// tenant for a provider a tenant brings, for it to hold.
     ///
-    /// Pass the `iss` query (or form) parameter of the callback, or `None`
-    /// when the response had none. A present `iss` must equal the issuer of
-    /// the provider the flow began with, exactly; a different one is a mix-up
-    /// attempt and is refused as a CSRF mismatch. A missing `iss` is refused
-    /// when the provider's metadata advertises
+    /// `iss` is the `iss` query (or form) parameter of the callback, or
+    /// `None` when the response had none. A present `iss` must equal the
+    /// issuer of the provider the flow began with, exactly; a different one
+    /// is refused as a CSRF mismatch too. A missing `iss` is refused when the
+    /// provider's metadata advertises
     /// `authorization_response_iss_parameter_supported`, and accepted when it
     /// does not.
-    ///
-    /// Register one redirect URI per provider as well: the parameter is the
-    /// defence for an authorization server that cannot be told from another by
-    /// the redirect URI alone.
-    #[tracing::instrument(skip(self, code, state, iss, session))]
-    pub async fn finish_oauth_login_with_iss(
+    #[tracing::instrument(
+        skip(self, route, code, state, iss, session),
+        fields(
+            callback_provider = %super::super::logged_provider_name(route.provider()),
+            callback_tenant = ?route.tenant(),
+        )
+    )]
+    pub async fn finish_oauth_login(
         &self,
+        route: OAuthCallbackRoute<'_>,
         code: &str,
         state: &str,
         iss: Option<&str>,
         session: &AuthSession,
     ) -> Result<axess_factors::oauth::OAuthClaims, axess_factors::oauth::OAuthError> {
         self.finish_oauth_login_checked(
-            code,
-            state,
-            IssCheck::Compared(iss),
-            ResponseForm::Plain,
+            route,
+            AuthorizationResponse {
+                code,
+                state,
+                iss,
+                form: ResponseForm::Plain,
+            },
             None,
             session,
         )
         .await
     }
 
-    /// The shared body of the finish forms. `form` says how the `code`,
-    /// `state` and `iss` arrived. `resolved` is the ceremony's provider when
-    /// the caller already resolved it (the JARM form, to verify the response
-    /// with it); otherwise it is resolved here, once.
+    /// The shared body of the finish forms. `route` is the route the
+    /// callback arrived on; it must be the ceremony's. `response` is the
+    /// authorization response and how it arrived. `resolved` is the
+    /// ceremony's provider when the caller already resolved it (the JARM
+    /// form, to verify the response with it); otherwise it is resolved here,
+    /// once.
     pub(super) async fn finish_oauth_login_checked(
         &self,
-        code: &str,
-        state: &str,
-        iss: IssCheck<'_>,
-        form: ResponseForm,
+        route: OAuthCallbackRoute<'_>,
+        response: AuthorizationResponse<'_>,
         resolved: Option<std::sync::Arc<dyn axess_factors::oauth::OAuthProvider>>,
         session: &AuthSession,
     ) -> Result<axess_factors::oauth::OAuthClaims, axess_factors::oauth::OAuthError> {
         use crate::validation::MAX_OAUTH_PARAM_BYTES;
         use axess_factors::oauth::OAuthError;
 
+        let AuthorizationResponse {
+            code,
+            state,
+            iss,
+            form,
+        } = response;
         // Reject oversized callback parameters before processing.
-        let iss_len = match iss {
-            IssCheck::Compared(Some(iss)) => iss.len(),
-            _ => 0,
-        };
         if code.len() > MAX_OAUTH_PARAM_BYTES
             || state.len() > MAX_OAUTH_PARAM_BYTES
-            || iss_len > MAX_OAUTH_PARAM_BYTES
+            || iss.is_some_and(|iss| iss.len() > MAX_OAUTH_PARAM_BYTES)
+            || route.provider().len() > MAX_OAUTH_PARAM_BYTES
         {
             return Err(OAuthError::InvalidParameter);
         }
 
         let (stored_csrf, stored_nonce, stored_verifier, provider_name) =
             read_stashed_ceremony(session).await?;
+        self.refuse_another_registrations_callback(route, &provider_name, session)
+            .await?;
         // The provider the ceremony began with, resolved once: the expiry
         // check reads its timeout, the exchange runs against it.
         let provider = match resolved {
@@ -244,7 +250,7 @@ where
             Ok(provider) => Ok(provider),
             Err(e) => {
                 tracing::warn!(
-                    provider = %provider_name,
+                    provider = %super::super::logged_provider_name(provider_name),
                     error = %e,
                     "the ceremony's provider does not resolve at the callback"
                 );
@@ -257,6 +263,62 @@ where
                 Err(e)
             }
         }
+    }
+
+    /// Refuse a callback that arrived on another registration's redirect URI
+    /// than the one the ceremony began with: another provider name, another
+    /// tenant's provider of the same name, the global route for a tenant's
+    /// provider, or a tenant's route for the global one. This is the mix-up
+    /// RFC 9207 names, where one authorization server sends the browser on
+    /// to another and the honest server's code would be exchanged at the
+    /// first. Refused before the code is exchanged, recorded as a provider
+    /// mismatch, and the ceremony cleared. A tenant binding that does not
+    /// read is refused as the provider lookup refuses it.
+    async fn refuse_another_registrations_callback(
+        &self,
+        route: OAuthCallbackRoute<'_>,
+        provider_name: &str,
+        session: &AuthSession,
+    ) -> Result<(), axess_factors::oauth::OAuthError> {
+        use axess_factors::oauth::OAuthError;
+
+        let binding = match super::state::ceremony_tenant(session).await {
+            Ok(binding) => binding,
+            Err(super::state::UnreadableBinding) => {
+                tracing::warn!(
+                    provider = %super::super::logged_provider_name(provider_name),
+                    "the ceremony's tenant binding does not read at the callback"
+                );
+                self.record_oauth_failure_and_clear(
+                    AuthFailureReason::ProviderUnavailable,
+                    provider_name,
+                    session,
+                )
+                .await?;
+                return Err(OAuthError::NoFlow);
+            }
+        };
+        if route.is_route_of(provider_name, binding) {
+            return Ok(());
+        }
+        // The callback's name is the request's text: written escaped and
+        // cut, as the span of the entry point carries it, so it cannot
+        // forge a log line or fill one. The tenant is a parsed id.
+        let callback_provider = super::super::logged_provider_name(route.provider());
+        tracing::warn!(
+            provider = %super::super::logged_provider_name(provider_name),
+            callback_provider = %callback_provider,
+            callback_tenant = ?route.tenant(),
+            "the callback arrived at another registration's redirect URI than the login \
+             began with; refusing the mix-up before the code is exchanged"
+        );
+        self.record_oauth_failure_and_clear(
+            AuthFailureReason::ProviderMismatch,
+            provider_name,
+            session,
+        )
+        .await?;
+        Err(OAuthError::CsrfMismatch)
     }
 
     /// Refuse a stashed PKCE verifier outside RFC 7636, recording the
@@ -277,7 +339,7 @@ where
         // would reject the exchange anyway.
         if !is_valid_pkce_verifier(stored_verifier) {
             tracing::warn!(
-                provider = %provider_name,
+                provider = %super::super::logged_provider_name(provider_name),
                 verifier_len = stored_verifier.len(),
                 "stashed PKCE code_verifier failed RFC 7636 §4.1 validation"
             );
@@ -309,7 +371,7 @@ where
             Some(value) => match value.as_str().and_then(super::helpers::decode_dpop_key) {
                 Some(key) => Ok(Some(key)),
                 None => {
-                    tracing::warn!(provider = %provider_name, "stashed DPoP key does not decode");
+                    tracing::warn!(provider = %super::super::logged_provider_name(provider_name), "stashed DPoP key does not decode");
                     self.record_oauth_failure_and_clear(
                         AuthFailureReason::DpopKeyInvalid,
                         provider_name,
@@ -323,13 +385,13 @@ where
     }
 
     /// Refuse an authorization response in a form the provider does not
-    /// accept: a plain response where it requires JARM, an `iss` that does
-    /// not match, or a form that skips the `iss` the provider sends.
+    /// accept: a plain response where it requires JARM, or an `iss` that
+    /// does not match.
     async fn check_authorization_response_form(
         &self,
         provider: &std::sync::Arc<dyn axess_factors::oauth::OAuthProvider>,
         provider_name: &str,
-        iss: IssCheck<'_>,
+        iss: Option<&str>,
         form: ResponseForm,
         session: &AuthSession,
     ) -> Result<(), axess_factors::oauth::OAuthError> {
@@ -337,7 +399,7 @@ where
 
         if provider.authorization_response_jwt_required() && form != ResponseForm::Jarm {
             tracing::warn!(
-                provider = %provider_name,
+                provider = %super::super::logged_provider_name(provider_name),
                 "plain authorization response for a provider that requires JARM; refusing"
             );
             self.record_oauth_failure_and_clear(
@@ -349,32 +411,8 @@ where
             return Err(OAuthError::InvalidParameter);
         }
 
-        match iss {
-            IssCheck::Compared(response_iss) => {
-                self.verify_response_iss(provider, provider_name, response_iss, session)
-                    .await?;
-            }
-            IssCheck::Skipped if provider.authorization_response_iss_required() => {
-                tracing::warn!(
-                    provider = %provider_name,
-                    "the provider sends the iss parameter (RFC 9207) and this callback did not \
-                     pass it; use finish_oauth_login_with_iss"
-                );
-                self.record_oauth_failure_and_clear(
-                    AuthFailureReason::MissingIssuer,
-                    provider_name,
-                    session,
-                )
-                .await?;
-                return Err(OAuthError::Config(
-                    "this provider sends the authorization response iss parameter; finish the \
-                     callback with finish_oauth_login_with_iss so it is compared"
-                        .to_string(),
-                ));
-            }
-            IssCheck::Skipped => {}
-        }
-        Ok(())
+        self.verify_response_iss(provider, provider_name, iss, session)
+            .await
     }
 
     /// Exchange the code at the provider, recording and clearing the ceremony
@@ -403,7 +441,7 @@ where
             (true, Some(key)) => Some(key),
             (true, None) => {
                 tracing::warn!(
-                    provider = %provider_name,
+                    provider = %super::super::logged_provider_name(provider_name),
                     "the provider binds tokens to a DPoP key and the ceremony has none; \
                      the login restarts"
                 );
@@ -430,7 +468,7 @@ where
                 // Log the original error server-side but return a generic error
                 // to prevent leaking provider-specific details to the caller.
                 tracing::error!(
-                    provider = %provider_name,
+                    provider = %super::super::logged_provider_name(provider_name),
                     error = %e,
                     "OAuth token exchange failed"
                 );
@@ -484,17 +522,13 @@ where
         // whatever local user shares that id). The tenant is the one the
         // begin bound the ceremony to, when it did; a row with no tenant is
         // a platform row that every tenant's `include_unscoped` query sees.
-        let tenant = super::state::ceremony_tenant(session)
-            .await
-            .ok()
-            .flatten()
-            .map(|binding| binding.tenant);
+        let binding = super::state::ceremony_tenant(session).await.ok().flatten();
+        let tenant = binding.map(|binding| binding.tenant);
+        let kind = self.ceremony_provider_kind(binding, provider_name).await;
         self.emit_audit(
             AuthEventBuilder::success(AuthEventType::LoginAttempt)
                 .maybe_attributed_to(None, tenant.as_ref())
-                .with_factor(FactorKind::Federated(
-                    crate::authn::factor::FederatedProvider::Custom(provider_name.to_string()),
-                )),
+                .with_factor(FactorKind::Federated(kind)),
         )
         .await
         .map_err(|e| axess_factors::oauth::OAuthError::AuditStore(e.to_string()))?;
@@ -521,7 +555,7 @@ where
             return Ok(());
         }
         tracing::warn!(
-            provider = %provider_name,
+            provider = %super::super::logged_provider_name(provider_name),
             "authorization response `iss` does not match the provider's issuer; refusing"
         );
         self.record_oauth_failure_and_clear(

@@ -3,7 +3,7 @@
 
 use super::*;
 
-fn owned(t: &TenantId, u: &UserId, id: &str, fp: u8, seen: DateTime<Utc>) -> Device {
+fn owned(t: &TenantId, u: &UserId, id: &str, fp: u8, seen: Timestamp) -> Device {
     let mut d = build_device(
         t,
         Some(u),

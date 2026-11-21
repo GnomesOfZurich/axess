@@ -1,11 +1,11 @@
 # Shared secrets: the last resort
 
-Some machine callers cannot do any of what the rest of this part
-describes. A mail relay posting a bounce, an intake worker handing over
-a document, a cron job poking an endpoint: often the only credential
+Some machine callers can use none of the mechanisms the rest of this
+part describes. A mail relay posting a bounce, an intake worker handing over
+a document, a cron job calling an endpoint: often the only credential
 such a caller can be given is a string both ends know. The
-`service-secret` feature checks that string properly, so routes stop
-comparing it by hand. It is off by default.
+`service-secret` feature checks that string properly, so routes need not
+compare it by hand. It is off by default.
 
 **A shared secret is the weakest machine credential axess offers.** Use
 it only for a caller that cannot hold a key or fetch a token, and only
@@ -17,7 +17,7 @@ over TLS.
 |---|---|---|---|
 | Layer | `ServiceSecretLayer::bearer`, `ServiceSecretLayer::header` | `ServiceSecretLayer::signed` | `jwt-svid`, `jwt`, `mtls` resolvers |
 | What travels | The secret, on every request | A signature over time, method, path and body | A short-lived token, or a TLS handshake |
-| A captured request lets an attacker | Call any route that accepts the secret, for as long as it is valid | Nothing; it is refused once replayed or too old | Nothing beyond the token's short lifetime |
+| A captured request lets an attacker | Call any route that accepts the secret, for as long as it is valid | Nothing once it is too old; a replay inside the window is refused only by the instance that accepted the request | Nothing beyond the token's short lifetime |
 | The server holds | A digest that cannot be presented | A key that can sign as the caller | Only public keys; it cannot impersonate the caller |
 | Expiry | Only when someone rotates it | Only when someone rotates it | Built in |
 | Identity | A configured name (`ServiceCaller`) | A configured name (`ServiceCaller`) | A `Principal::Workload` that Cedar policies see |
@@ -28,7 +28,7 @@ use the other chapters of this part instead.
 
 `ServiceCaller` is a gate, not a principal: it tells the handler which
 configured secret matched, and Cedar policies do not see it. A route
-that needs per-caller authorization beyond "is one of these" wants a
+that needs per-caller authorization beyond "is one of these" needs a
 workload identity.
 
 ## Signed requests
@@ -37,7 +37,10 @@ The caller and the route share a secret of at least `MIN_SECRET_LEN`
 (32) bytes; `openssl rand -hex 32` makes a good one. Both sides load it
 the same way. `ServiceSecret::from_env` reads the file named by
 `{VAR}_FILE` when it is set, as container secret stores mount them, and
-`{VAR}` otherwise.
+`{VAR}` otherwise. A variable that is unset leaves the route unconfigured
+(it answers `404`); one that is set but empty, too short or not valid UTF-8
+is refused at start-up (`ServiceSecretError::TooShort`,
+`ServiceSecretError::NotUnicode`), never read as unset.
 
 The route:
 
@@ -73,7 +76,9 @@ then hands it on unchanged. The body is held in memory before any
 secret is checked, so each concurrent request, signed or not, can hold up
 to that many bytes: set the limit to the largest body the route takes and
 cap the concurrency of every signed route (a `tower` `ConcurrencyLimitLayer`
-outside the layer), since N concurrent requests can hold N times the limit. It refuses a signature whose timestamp is
+outside the layer), since N concurrent requests can hold N times the limit.
+
+The route refuses a signature whose timestamp is
 more than `SignedRequests::tolerance` (five minutes by default) from
 its clock in either direction, and one it has already accepted within
 that window. What is remembered is the request (the caller, the stamp, the
@@ -92,15 +97,15 @@ A signature names its recipient. The route is configured with
 that shares the secret. A `SignedRequests` with no audience is refused by
 `ServiceSecretLayer::signed` with `ServiceSecretError::MissingAudience`.
 Even so, give every recipient its own secret: a secret shared by two
-recipients is one recipient's compromise away from being both's.
+recipients is exposed at both when either is compromised.
 
 Callers written before the audience existed sign `v1`, which names no
 recipient and can be replayed against any other service sharing the secret.
 A route refuses `v1` unless it opts in for a migration window with
 `SignedRequests::accept_unaddressed_until(instant)`, checked against the
 route's clock. Move the callers to `sign_for` first, set the window to the
-date by which they will have moved, and delete the setting afterwards (at the
-instant the route stops reading `v1` whether or not it is deleted).
+date by which they will have moved, and delete the setting afterwards; the route stops reading `v1` when
+the window ends, whether or not the setting is deleted.
 
 The `v3` signature also covers the request's `Content-Type` and
 `Content-Encoding` (each hashed with SHA-256, an absent header hashing as the
@@ -136,8 +141,10 @@ route that does more than the caller needs.
 - **Timing.** Every configured secret is compared in constant time on
   every request, so neither a secret's length nor which caller matched
   shows in how long a refusal takes.
-- **Nothing to leak from memory.** The secret itself is not kept, only
-  values derived from it, and `{:?}` prints the caller's name alone.
+- **No plaintext kept.** Only values derived from the secret are
+  held: a SHA-256 digest, which cannot be presented,
+  and an HMAC key, which can sign as the caller and is wiped on drop.
+  `{:?}` prints the caller's name alone.
 - **Unconfigured routes are absent.** With no secret configured the
   route answers `404`, as if it did not exist, rather than `401` or,
   worse, letting requests through. A wrong or missing credential

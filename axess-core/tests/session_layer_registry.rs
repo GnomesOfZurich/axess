@@ -3,6 +3,8 @@
 
 #![cfg(all(feature = "memory", feature = "testing"))]
 
+use axess_core::testing::fixtures as common;
+
 use axess_core::authn::ids::testing;
 use axess_core::session::{
     extractor::AuthSession,
@@ -19,7 +21,6 @@ use axum::{
     http::{Request, header},
     routing::get,
 };
-use chrono::Utc;
 use std::sync::Arc;
 use tower::ServiceExt;
 
@@ -36,9 +37,9 @@ fn app(layer: SessionLayer<MemorySessionStore>, reg: Arc<dyn SessionRegistryHand
                 let reg = reg.clone();
                 async move {
                     let u = testing::user("u1");
-                    s.set_authenticated(u, testing::tenant("t1"), Utc::now())
+                    s.set_authenticated(u, testing::tenant("t1"), common::start())
                         .await;
-                    reg.register(&u, &s.session_id().await).await;
+                    reg.register(&u, &s.session_key().await).await;
                     "in"
                 }
             }),
@@ -75,9 +76,18 @@ async fn call(app: &Router, jar: &mut Option<String>, path: &str) -> String {
 
 #[tokio::test]
 async fn a_layer_built_with_a_registry_ends_a_revoked_session_on_any_route() {
-    let reg: Arc<dyn SessionRegistryHandle> =
-        Arc::new(SessionRegistryAdapter(MemorySessionRegistry::new()));
-    let layer = SessionLayer::new(MemorySessionStore::new(), KEY, reg.clone()).with_secure(false);
+    let clock = common::test_clock();
+    let reg: Arc<dyn SessionRegistryHandle> = Arc::new(SessionRegistryAdapter(
+        MemorySessionRegistry::new().with_clock(std::sync::Arc::new(clock.clone())),
+    ));
+    let layer = SessionLayer::new(
+        MemorySessionStore::new().with_clock(std::sync::Arc::new(clock.clone())),
+        KEY,
+        reg.clone(),
+        std::sync::Arc::new(axess_core::session::UnrecordedSessionEnds),
+    )
+    .with_clock(clock.clone())
+    .with_secure(false);
     let app = app(layer, reg.clone());
     let mut jar = None;
     assert_eq!(call(&app, &mut jar, "/login").await, "in");
@@ -88,11 +98,18 @@ async fn a_layer_built_with_a_registry_ends_a_revoked_session_on_any_route() {
 
 #[tokio::test]
 async fn the_insecure_opt_out_keeps_the_stored_row_valid_and_logs_an_error_once() {
+    let clock = common::test_clock();
     let capture = TracingCapture::install();
-    let reg: Arc<dyn SessionRegistryHandle> =
-        Arc::new(SessionRegistryAdapter(MemorySessionRegistry::new()));
-    let layer =
-        SessionLayer::without_registry_insecure(MemorySessionStore::new(), KEY).with_secure(false);
+    let reg: Arc<dyn SessionRegistryHandle> = Arc::new(SessionRegistryAdapter(
+        MemorySessionRegistry::new().with_clock(std::sync::Arc::new(clock.clone())),
+    ));
+    let layer = SessionLayer::without_registry_insecure(
+        MemorySessionStore::new().with_clock(std::sync::Arc::new(clock.clone())),
+        KEY,
+        std::sync::Arc::new(axess_core::session::UnrecordedSessionEnds),
+    )
+    .with_clock(clock.clone())
+    .with_secure(false);
     let app = app(layer, reg.clone());
     let mut jar = None;
     assert_eq!(call(&app, &mut jar, "/login").await, "in");
@@ -108,4 +125,25 @@ async fn the_insecure_opt_out_keeps_the_stored_row_valid_and_logs_an_error_once(
         .filter(|e| e.level == tracing::Level::ERROR && e.message.contains("without a registry"))
         .count();
     assert_eq!(errors, 1, "events: {:?}", capture.events());
+}
+
+/// The sink that records nothing is asked for by name, and each time it is
+/// it says in the log what a layer built with it leaves out.
+#[test]
+fn the_sink_that_records_nothing_says_so_when_it_is_asked_for() {
+    let capture = TracingCapture::install();
+    let said = || {
+        capture
+            .events()
+            .iter()
+            .filter(|e| {
+                e.level == tracing::Level::ERROR && e.message.contains("UnrecordedSessionEnds")
+            })
+            .count()
+    };
+    assert_eq!(said(), 0, "events: {:?}", capture.events());
+
+    drop(axess_core::session::UnrecordedSessionEnds::insecure());
+
+    assert_eq!(said(), 1, "events: {:?}", capture.events());
 }

@@ -35,8 +35,8 @@
 //! by side. [`verify_recovery_code`] with no pepper cannot match a keyed row
 //! and says so by returning `None`, never by guessing.
 
+use axess_clock::Timestamp;
 use axess_rng::SecureRng;
-use chrono::{DateTime, Utc};
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -142,7 +142,7 @@ pub struct StoredRecoveryCode {
     /// or an Argon2id PHC string. See the module docs.
     pub hash: String,
     /// When the code was spent, or `None` while it is still usable.
-    pub used_at: Option<DateTime<Utc>>,
+    pub used_at: Option<Timestamp>,
 }
 
 impl StoredRecoveryCode {
@@ -341,7 +341,7 @@ fn find_match(
 pub fn verify_recovery_code(
     config: &RecoveryCodesConfig,
     submitted: &str,
-    now: DateTime<Utc>,
+    now: Timestamp,
     pepper: Option<&RecoveryCodePepper>,
 ) -> Option<RecoveryCodesConfig> {
     verify_recovery_code_rotating(config, submitted, now, pepper, None).map(|m| m.config)
@@ -367,7 +367,7 @@ pub struct RecoveryMatch {
 pub fn verify_recovery_code_rotating(
     config: &RecoveryCodesConfig,
     submitted: &str,
-    now: DateTime<Utc>,
+    now: Timestamp,
     pepper: Option<&RecoveryCodePepper>,
     previous: Option<&RecoveryCodePepper>,
 ) -> Option<RecoveryMatch> {

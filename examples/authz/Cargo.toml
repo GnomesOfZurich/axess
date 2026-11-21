@@ -1,6 +1,6 @@
 [package]
 name = "axess-example-authz"
-version = "0.19.0"
+version = "0.20.0"
 edition = "2024"
 rust-version.workspace = true
 publish = false
@@ -10,8 +10,11 @@ authors = ["Gnomes"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/GnomesOfZurich/axess"
 
+[lints]
+workspace = true
+
 [dependencies]
-axess = { path = "../../axess", version = "=0.19.0", features = ["authz"] }
+axess = { path = "../../axess", version = "=0.20.0", features = ["authz"] }
 axum = { version = "0.8.9", features = ["json"] }
 cedar-policy = "4.14.1"
 serde = { version = "1.0.229", features = ["derive"] }

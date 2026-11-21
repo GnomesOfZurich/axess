@@ -4,16 +4,18 @@ use super::device_binding;
 use super::store::RefreshTokenStore;
 use super::types::*;
 use crate::authn::ids::{DeviceId, TenantId, UserId};
+use axess_clock::{Timestamp, Until};
 use axess_rng::SecureRng;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 
 mod pipeline;
 
-pub use pipeline::Refresh;
+pub use pipeline::{DeviceCheckDecided, DeviceCheckUndecided, Refresh};
 #[cfg(feature = "device")]
-pub(super) use pipeline::{DeviceGate, DeviceRefusal};
+pub(super) use pipeline::{DeviceGate, DeviceRefusal, Keyed};
+#[cfg(feature = "device-keys")]
+pub(super) use pipeline::{KeyGate, KeyRefusal};
 
 /// Compute the storage-side hash of a plaintext refresh token, returned
 /// as URL-safe base64.
@@ -135,7 +137,7 @@ pub async fn issue_refresh_token<S: RefreshTokenStore>(
     config: &RefreshTokenConfig,
     store: &S,
     rng: &impl SecureRng,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<(String, RefreshToken), RefreshError<S::Error>> {
     issue_anchored(req, config, store, rng, now, None).await
 }
@@ -145,21 +147,27 @@ pub async fn issue_refresh_token<S: RefreshTokenStore>(
 ///
 /// The record carries `authenticated_at`: the family's absolute lifetime
 /// ([`RefreshTokenConfig::max_lifetime`]) counts from it, and every session
-/// rotated from the token has it as its `authn_time`. A refresh token is
-/// therefore never a way to make an old authentication look new.
+/// rotated from the token has it as its `authn_time` and its
+/// `signed_in_at`. A refresh token is therefore never a way to make an old
+/// authentication look new. A session hands in the time of its login.
 ///
 /// A session whose authentication is already past the family's lifetime
-/// gets [`RefreshError::Expired`] and nothing is stored. Otherwise as
+/// gets [`RefreshError::Expired`] and nothing is stored. An
+/// `authenticated_at` after `now` (a clock that ran ahead, a caller's
+/// mistake) is read as `now`: an authentication is never anchored in the
+/// future, where it would extend the family's lifetime and pass every
+/// recency gate for longer than any login could. Otherwise as
 /// [`issue_refresh_token`].
 pub async fn issue_refresh_token_from_login<S: RefreshTokenStore>(
     req: IssueRequest<'_>,
     config: &RefreshTokenConfig,
     store: &S,
     rng: &impl SecureRng,
-    now: DateTime<Utc>,
-    authenticated_at: DateTime<Utc>,
+    now: Timestamp,
+    authenticated_at: Timestamp,
 ) -> Result<(String, RefreshToken), RefreshError<S::Error>> {
     config.check()?;
+    let authenticated_at = authenticated_at.min(now);
     if config
         .lifetime_end(authenticated_at)
         .is_some_and(|end| end <= now)
@@ -174,8 +182,8 @@ async fn issue_anchored<S: RefreshTokenStore>(
     config: &RefreshTokenConfig,
     store: &S,
     rng: &impl SecureRng,
-    now: DateTime<Utc>,
-    authn_time: Option<DateTime<Utc>>,
+    now: Timestamp,
+    authn_time: Option<Timestamp>,
 ) -> Result<(String, RefreshToken), RefreshError<S::Error>> {
     config.check()?;
     config
@@ -228,7 +236,7 @@ async fn handle_revoked_reuse<S: RefreshTokenStore>(
     record: &RefreshToken,
     store: &S,
     config: &RefreshTokenConfig,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> RefreshError<S::Error> {
     match record.revoked_reason {
         Some(
@@ -240,17 +248,25 @@ async fn handle_revoked_reuse<S: RefreshTokenStore>(
         Some(RevocationReason::Rotated) | None => {}
     }
     if let Some(at) = record.revoked_at
-        && (now - at).abs() < config.reuse_grace
+        && now.since(at).unsigned_abs() < config.reuse_grace
     {
         return RefreshError::ConcurrentRefresh;
     }
 
-    let fid = family_of(record);
     tracing::warn!(
-        family_id = %fid,
+        family_id = %family_of(record),
         user_id = %record.user_id,
         "rotated-out refresh token reused; revoking entire family (compromise signal)"
     );
+    revoke_compromised_family(record, store).await;
+    RefreshError::Revoked
+}
+
+/// Revoke the family of a token that is known to be in the wrong hands, and
+/// run the compromise hook with the family's devices, whether or not the
+/// revocation succeeded.
+async fn revoke_compromised_family<S: RefreshTokenStore>(record: &RefreshToken, store: &S) {
+    let fid = family_of(record);
     // Collect the (tenant, device) pairs linked to every member of the
     // family BEFORE revoke_family runs, so the cascade primitive stays
     // backend-agnostic.
@@ -266,7 +282,6 @@ async fn handle_revoked_reuse<S: RefreshTokenStore>(
     store
         .on_token_compromise(&record.user_id, &fid, &compromised_devices)
         .await;
-    RefreshError::Revoked
 }
 
 /// Gather the unique `(tenant, device)` pairs participating in a
@@ -327,8 +342,8 @@ pub(super) fn build_refresh_token(
     req: IssueRequest<'_>,
     config: &RefreshTokenConfig,
     rng: &impl SecureRng,
-    now: DateTime<Utc>,
-    authn_time: Option<DateTime<Utc>>,
+    now: Timestamp,
+    authn_time: Option<Timestamp>,
 ) -> (String, RefreshToken) {
     build_refresh_token_for(generate_token_value(rng), req, config, rng, now, authn_time)
 }
@@ -341,8 +356,8 @@ fn build_refresh_token_for(
     req: IssueRequest<'_>,
     config: &RefreshTokenConfig,
     rng: &impl SecureRng,
-    now: DateTime<Utc>,
-    authn_time: Option<DateTime<Utc>>,
+    now: Timestamp,
+    authn_time: Option<Timestamp>,
 ) -> (String, RefreshToken) {
     let token_hash = hash_token(&plaintext, config.pepper());
 
@@ -357,9 +372,9 @@ fn build_refresh_token_for(
 
     // Sliding expiry, capped by the family's absolute lifetime when one is
     // configured. A token issued at login descends from `now`.
-    let mut expires_at = crate::lifetime::expiry_after_signed(now, config.ttl);
+    let mut expires_at = Until::after(now, config.ttl);
     if let Some(end) = config.lifetime_end(authn_time.unwrap_or(now)) {
-        expires_at = expires_at.min(end);
+        expires_at = expires_at.min(Until::At(end));
     }
 
     let record = RefreshToken {

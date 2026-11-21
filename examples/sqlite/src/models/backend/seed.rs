@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 /// The password of both seeded accounts. It meets the example's own password
 /// rules (12 characters or more, upper case, lower case, a digit).
-pub const SEED_PASSWORD: &str = "Gnomes2+Example";
+pub const SEED_PASSWORD: &str = "Sample2+Example";
 
 /// Whether the example seeds its test accounts: in a debug build always, in a
 /// release build only when `EXAMPLE_SEED=1`. The accounts have a published
@@ -45,7 +45,7 @@ pub async fn seed(
     let tenant_identifier = "default";
     // Seed rows are created by the reserved system user.
     let system_user_id = axess::authn::UserId::SYSTEM_STR;
-    let now = clock.now().to_rfc3339();
+    let now = clock.now().to_rfc3339_numeric_offset();
 
     // Tenant
     sqlx::query(

@@ -89,7 +89,7 @@ FAPI 2.0 lets the client authenticate by `private_key_jwt` or mTLS, never by a c
 
 The key:
 
-- `FAPI_PRIVATE_KEY_FILE=/path/to/key.pem` names the PEM private key the client signs with. `FAPI_PRIVATE_KEY_ALG` is its algorithm (`ES256` by default; FAPI 2.0 allows `PS256`, `ES256` and `EdDSA`) and `FAPI_PRIVATE_KEY_KID` the `kid` the IdP registered it under. Register the public half at your IdP for the client.
+- `FAPI_PRIVATE_KEY_FILE=/path/to/key.pem` names the PEM private key the client signs with. `FAPI_PRIVATE_KEY_ALG` is its algorithm (`ES256` by default; FAPI 2.0 allows `PS256`, `ES256` and `EdDSA`, and `PS256` needs the `client-assertion-rsa` feature of `axess` on this example's `jwt-rust-crypto` backend, since that signature runs in rsa 0.9 (RUSTSEC-2023-0071)) and `FAPI_PRIVATE_KEY_KID` the `kid` the IdP registered it under. Register the public half at your IdP for the client.
 - Without `FAPI_PRIVATE_KEY_FILE`, and only when the issuer host is `localhost` or `127.0.0.1`, the example signs with [`keycloak/dev-client-key.pem`](keycloak/dev-client-key.pem) (`ES256`, `kid` `axess-fapi-dev`) and logs a warning; any other issuer makes it exit with an error. That key is published with the source: the bundled realm accepts it and nothing else must. Never register it at a real IdP.
 
 To use a key of your own with the bundled realm, generate one and put its public JWK in the client's `jwks.string` attribute in `keycloak/fapi-realm.json`, then recreate the container (below):

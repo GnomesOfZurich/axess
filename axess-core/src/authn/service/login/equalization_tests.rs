@@ -13,10 +13,10 @@ use crate::authn::ids::UserId;
 use crate::authn::types::{EntityState, IpPolicy, Tenant, User};
 use crate::authn::{AuditContext, RequestAuthnService};
 use crate::blocking::KdfExecutor;
-use crate::session::data::SessionData;
 use crate::session::extractor::AuthSession;
 use crate::session::layer::{SessionHandle, SessionInner};
 use crate::testing::mock_authn::{CallLog, MockFactorStore, MockIdentityStore};
+use axess_clock::testing::Shift;
 use axess_rng::SecureRng;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -34,23 +34,12 @@ const PRE_USER_SEQUENCE: [&str; 7] = [
 ];
 
 fn session() -> AuthSession {
-    let inner = SessionInner {
-        id: crate::session::id::SessionId::new(&axess_rng::SystemRng),
-        data: SessionData::default(),
-        modified: false,
-        needs_persist: false,
-        regenerate: false,
-        pre_cycle_id: None,
-        rng: std::sync::Arc::new(axess_rng::SystemRng),
-        pending_fingerprint: None,
-        max_custom_bytes: 64 * 1024,
-        consume: None,
-    };
+    let inner = SessionInner::detached(std::sync::Arc::new(axess_rng::SystemRng));
     AuthSession(SessionHandle(Arc::new(RwLock::new(inner))))
 }
 
 fn tenant(identifier: &str, status: EntityState) -> Tenant {
-    let now = chrono::Utc::now();
+    let now = axess_clock::testing::MockClock::reference_time();
     Tenant {
         id: axess_identity::testing::tenant("t-eq"),
         identifier: identifier.into(),
@@ -64,7 +53,7 @@ fn tenant(identifier: &str, status: EntityState) -> Tenant {
 }
 
 fn user(display_name: &str) -> User {
-    let now = chrono::Utc::now();
+    let now = axess_clock::testing::MockClock::reference_time();
     User {
         id: axess_identity::testing::user("u-eq"),
         tenant_id: axess_identity::testing::tenant("t-eq"),
@@ -82,7 +71,8 @@ fn user(display_name: &str) -> User {
 fn suspended() -> EntityState {
     EntityState::Suspended(crate::authn::types::StatusDetail::administrative(
         "hold",
-        chrono::Utc::now() - chrono::Duration::days(1),
+        axess_clock::testing::MockClock::reference_time()
+            .minus(axess_clock::SignedDuration::days(1)),
     ))
 }
 

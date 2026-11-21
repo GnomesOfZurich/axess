@@ -8,13 +8,16 @@
 
 #![cfg(all(feature = "testing", feature = "oauth"))]
 
-mod common;
+use axess_core::testing::fixtures as common;
 
+use axess_clock::testing::MockClock;
+use axess_core::authn::AuditContext;
+use axess_core::authn::factor::FederatedProvider;
 use axess_core::authn::service::AuthnService;
 use axess_core::testing::mock_authn::{MockFactorStore, MockIdentityStore};
 use axess_factors::oauth::{OAuthError, OAuthProviderBuilder, OAuthProviderConfig};
 use axess_testing::oauth_wiremock::{oauth_generate_rsa_keypair, oauth_mount_oidc_endpoints};
-use common::{test_tenant, test_user};
+use common::{provider_admin, test_tenant, test_user};
 use std::time::Duration;
 use wiremock::MockServer;
 
@@ -27,10 +30,22 @@ async fn idp(keys: &serde_json::Value) -> MockServer {
     server
 }
 
-async fn candidate(name: &str, uri: &str) -> Result<OAuthProviderConfig, OAuthError> {
-    OAuthProviderConfig::discover(name, uri, "client", "secret", REDIRECT)
-        .await
-        .and_then(OAuthProviderBuilder::build)
+async fn candidate(
+    clock: &MockClock,
+    name: &str,
+    uri: &str,
+) -> Result<OAuthProviderConfig, OAuthError> {
+    OAuthProviderConfig::discover_screened(
+        name,
+        uri,
+        "client",
+        "secret",
+        REDIRECT,
+        axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
+    )
+    .await
+    .map(|b| b.with_clock(std::sync::Arc::new(clock.clone())))
+    .and_then(OAuthProviderBuilder::build)
 }
 
 async fn key_set_fetches(server: &MockServer) -> usize {
@@ -55,13 +70,16 @@ async fn within_two_seconds(what: &str, mut check: impl AsyncFnMut() -> bool) {
 }
 
 fn service(
+    clock: &MockClock,
     providers: Vec<OAuthProviderConfig>,
     tick: Duration,
 ) -> AuthnService<MockIdentityStore, MockFactorStore> {
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
-    let mut builder = AuthnService::builder(identity, MockFactorStore::new());
+    let mut builder =
+        AuthnService::builder(identity, MockFactorStore::new()).with_clock(clock.clone());
     for provider in providers {
         builder = builder.with_oauth_provider(provider);
     }
@@ -70,13 +88,24 @@ fn service(
 
 #[tokio::test]
 async fn after_a_reload_the_loop_fetches_the_new_key_set_and_not_the_old_one() {
+    let clock = common::test_clock();
     let (_, jwks, _) = oauth_generate_rsa_keypair();
     let old = idp(&jwks).await;
     let new = idp(&jwks).await;
-    let service = service(vec![candidate("sso", &old.uri()).await.unwrap()], TICK);
+    let service = service(
+        &clock,
+        vec![candidate(&clock, "sso", &old.uri()).await.unwrap()],
+        TICK,
+    );
 
     service
-        .reload_oauth_provider("sso", candidate("sso", &new.uri()))
+        .with_audit_context(AuditContext::default())
+        .reload_oauth_provider_as(
+            &provider_admin(),
+            "sso",
+            FederatedProvider::Custom("sso".into()),
+            candidate(&clock, "sso", &new.uri()),
+        )
         .await
         .expect("a reachable provider is accepted");
     let old_before = key_set_fetches(&old).await;
@@ -103,16 +132,21 @@ async fn after_a_reload_the_loop_fetches_the_new_key_set_and_not_the_old_one() {
 /// does.
 #[tokio::test]
 async fn a_provider_removed_before_the_first_pass_is_never_polled_by_the_loop() {
+    let clock = common::test_clock();
     let (_, jwks, _) = oauth_generate_rsa_keypair();
     let kept = idp(&jwks).await;
     let gone = idp(&jwks).await;
-    let kept_config = candidate("kept", &kept.uri()).await.unwrap();
-    let gone_config = candidate("gone", &gone.uri()).await.unwrap();
+    let kept_config = candidate(&clock, "kept", &kept.uri()).await.unwrap();
+    let gone_config = candidate(&clock, "gone", &gone.uri()).await.unwrap();
     // A tick long enough that the removal below lands before the first pass.
     let tick = Duration::from_millis(400);
-    let service = service(vec![kept_config, gone_config], tick);
+    let service = service(&clock, vec![kept_config, gone_config], tick);
 
-    service.remove_oauth_provider("gone").await.unwrap();
+    service
+        .with_audit_context(AuditContext::default())
+        .remove_oauth_provider_as(&provider_admin(), "gone")
+        .await
+        .unwrap();
     let gone_baseline = key_set_fetches(&gone).await;
     let kept_baseline = key_set_fetches(&kept).await;
 

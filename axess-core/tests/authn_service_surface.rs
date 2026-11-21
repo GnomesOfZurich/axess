@@ -5,7 +5,8 @@
 //! eviction, LDAP bind-DN validation, `begin_login` boundary inputs, the
 //! email-OTP cooldown edge, and the `oauth_providers()` accessor.
 
-mod common;
+use axess_core::session::{SessionId, SessionKey};
+use axess_core::testing::fixtures as common;
 
 use axess_core::authn::Actor;
 use axess_core::authn::AuditContext;
@@ -18,11 +19,10 @@ use axess_core::authn::{
 use axess_core::session::store::MemorySessionRegistry;
 use axess_core::testing::AuthSessionTestExt;
 use axess_core::testing::{
-    MockClock, MockRng,
+    MockRng,
     mock_authn::{MockFactorStore, MockIdentityStore},
     test_session,
 };
-use chrono::Utc;
 use common::{password_config, password_method, test_tenant, test_user, tid, uid, user_scope};
 
 // ── SessionValidator polarity ──────────────────────────────────────────────
@@ -34,21 +34,24 @@ use common::{password_config, password_method, test_tenant, test_user, tid, uid,
 /// session.
 #[tokio::test]
 async fn validator_with_live_registry_passes_registered_session() {
+    let clock = common::test_clock();
     let user = test_user("u1", "alice");
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(user.clone());
-    let registry = MemorySessionRegistry::new();
+    let registry = MemorySessionRegistry::new().with_clock(std::sync::Arc::new(clock.clone()));
     let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_registry(registry.clone())
         .build()
         .with_audit_context(AuditContext::default());
 
     let session = test_session();
     session
-        .set_authenticated(uid("u1"), tid("default"), Utc::now())
+        .set_authenticated(uid("u1"), tid("default"), common::start())
         .await;
-    let sid = session.session_id().await;
+    let sid = session.session_key().await;
     use axess_core::session::store::SessionRegistry;
     registry.register(&uid("u1"), &sid).await.unwrap();
 
@@ -64,19 +67,22 @@ async fn validator_with_live_registry_passes_registered_session() {
 /// test to discriminate the polarity flip from a stuck-true mutation.
 #[tokio::test]
 async fn validator_with_live_registry_rejects_unregistered_session() {
+    let clock = common::test_clock();
     let user = test_user("u1", "alice");
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(user);
-    let registry = MemorySessionRegistry::new();
+    let registry = MemorySessionRegistry::new().with_clock(std::sync::Arc::new(clock.clone()));
     let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_registry(registry)
         .build()
         .with_audit_context(AuditContext::default());
 
     let session = test_session();
     session
-        .set_authenticated(uid("u1"), tid("default"), Utc::now())
+        .set_authenticated(uid("u1"), tid("default"), common::start())
         .await;
     // Deliberately do NOT register the session id with the registry.
 
@@ -91,17 +97,26 @@ async fn validator_with_live_registry_rejects_unregistered_session() {
 
 #[tokio::test]
 async fn has_session_registry_false_without_registry() {
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let svc = AuthnService::new(identity, MockFactorStore::new())
+    let clock = common::test_clock();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
+    let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build()
         .with_audit_context(AuditContext::default());
     assert!(!svc.has_session_registry());
 }
 
 #[tokio::test]
 async fn has_session_registry_true_with_registry() {
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let registry = MemorySessionRegistry::new();
+    let clock = common::test_clock();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
+    let registry = MemorySessionRegistry::new().with_clock(std::sync::Arc::new(clock.clone()));
     let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_registry(registry)
         .build()
         .with_audit_context(AuditContext::default());
@@ -112,8 +127,13 @@ async fn has_session_registry_true_with_registry() {
 
 #[tokio::test]
 async fn invalidate_user_sessions_no_registry_returns_err() {
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let svc = AuthnService::new(identity, MockFactorStore::new())
+    let clock = common::test_clock();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
+    let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build()
         .with_audit_context(AuditContext::default());
     let result = svc
         .invalidate_user_sessions(&uid("u1"), Actor::System)
@@ -123,19 +143,23 @@ async fn invalidate_user_sessions_no_registry_returns_err() {
 
 #[tokio::test]
 async fn invalidate_user_sessions_with_registry_invalidates() {
+    let clock = common::test_clock();
     use axess_core::session::store::SessionRegistry;
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let registry = MemorySessionRegistry::new();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
+    let registry = MemorySessionRegistry::new().with_clock(std::sync::Arc::new(clock.clone()));
     let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_registry(registry.clone())
         .build()
         .with_audit_context(AuditContext::default());
 
     let session = test_session();
     session
-        .set_authenticated(uid("u1"), tid("default"), Utc::now())
+        .set_authenticated(uid("u1"), tid("default"), common::start())
         .await;
-    let sid = session.session_id().await;
+    let sid = session.session_key().await;
     registry.register(&uid("u1"), &sid).await.unwrap();
     assert_eq!(
         registry.active_sessions(&uid("u1")).await.unwrap(),
@@ -157,14 +181,19 @@ async fn invalidate_user_sessions_with_registry_invalidates() {
 
 #[tokio::test]
 async fn invalidate_session_no_registry_returns_err() {
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let svc = AuthnService::new(identity, MockFactorStore::new())
+    let clock = common::test_clock();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
+    let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build()
         .with_audit_context(AuditContext::default());
     let session = test_session();
     session
-        .set_authenticated(uid("u1"), tid("default"), Utc::now())
+        .set_authenticated(uid("u1"), tid("default"), common::start())
         .await;
-    let sid = session.session_id().await;
+    let sid = session.session_key().await;
     let result = svc
         .invalidate_session(&uid("u1"), &sid, Actor::System)
         .await;
@@ -173,22 +202,26 @@ async fn invalidate_session_no_registry_returns_err() {
 
 #[tokio::test]
 async fn invalidate_session_with_registry_removes_target_only() {
+    let clock = common::test_clock();
     use axess_core::session::store::SessionRegistry;
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let registry = MemorySessionRegistry::new();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
+    let registry = MemorySessionRegistry::new().with_clock(std::sync::Arc::new(clock.clone()));
     let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_registry(registry.clone())
         .build()
         .with_audit_context(AuditContext::default());
 
     let s1 = test_session();
-    s1.set_authenticated(uid("u1"), tid("default"), Utc::now())
+    s1.set_authenticated(uid("u1"), tid("default"), common::start())
         .await;
-    let sid1 = s1.session_id().await;
+    let sid1 = s1.session_key().await;
     let s2 = test_session();
-    s2.set_authenticated(uid("u1"), tid("default"), Utc::now())
+    s2.set_authenticated(uid("u1"), tid("default"), common::start())
         .await;
-    let sid2 = s2.session_id().await;
+    let sid2 = s2.session_key().await;
     registry.register(&uid("u1"), &sid1).await.unwrap();
     registry.register(&uid("u1"), &sid2).await.unwrap();
 
@@ -205,8 +238,13 @@ async fn invalidate_session_with_registry_removes_target_only() {
 
 #[tokio::test]
 async fn active_sessions_no_registry_returns_err() {
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let svc = AuthnService::new(identity, MockFactorStore::new())
+    let clock = common::test_clock();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
+    let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build()
         .with_audit_context(AuditContext::default());
     let result = svc.active_sessions(&uid("u1")).await;
     assert!(result.is_err());
@@ -214,19 +252,23 @@ async fn active_sessions_no_registry_returns_err() {
 
 #[tokio::test]
 async fn active_sessions_with_registry_returns_registry_contents() {
+    let clock = common::test_clock();
     use axess_core::session::store::SessionRegistry;
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let registry = MemorySessionRegistry::new();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
+    let registry = MemorySessionRegistry::new().with_clock(std::sync::Arc::new(clock.clone()));
     let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_registry(registry.clone())
         .build()
         .with_audit_context(AuditContext::default());
 
     let session = test_session();
     session
-        .set_authenticated(uid("u1"), tid("default"), Utc::now())
+        .set_authenticated(uid("u1"), tid("default"), common::start())
         .await;
-    let sid = session.session_id().await;
+    let sid = session.session_key().await;
     registry.register(&uid("u1"), &sid).await.unwrap();
 
     let active = svc.active_sessions(&uid("u1")).await.unwrap();
@@ -245,17 +287,20 @@ async fn active_sessions_with_registry_returns_registry_contents() {
 /// count stays exactly at the cap.
 #[tokio::test]
 async fn max_sessions_per_user_evicts_oldest_to_keep_under_cap() {
-    use axess_core::session::id::SessionId;
+    let clock = common::test_clock();
+    use SessionKey;
     use axess_core::session::store::SessionRegistry;
 
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new()
-        .with_factor(user_scope(), password_config("Gnomes2+"))
+        .with_factor(user_scope(), password_config("Sample2+"))
         .with_method(&uid("u1"), password_method());
-    let registry = MemorySessionRegistry::new();
+    let registry = MemorySessionRegistry::new().with_clock(std::sync::Arc::new(clock.clone()));
     let svc = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
         .with_registry(registry.clone())
         .with_max_sessions_per_user(std::num::NonZeroUsize::new(2).unwrap())
         .build()
@@ -264,8 +309,8 @@ async fn max_sessions_per_user_evicts_oldest_to_keep_under_cap() {
     // Pre-populate the registry with 2 sessions for the user, so the cap is
     // exactly met before the new login.
     let rng = MockRng::new(7);
-    let old1 = SessionId::new(&rng);
-    let old2 = SessionId::new(&rng);
+    let old1 = SessionKey::of(&SessionId::new(&rng));
+    let old2 = SessionKey::of(&SessionId::new(&rng));
     registry.register(&uid("u1"), &old1).await.unwrap();
     registry.register(&uid("u1"), &old2).await.unwrap();
     assert_eq!(
@@ -278,7 +323,7 @@ async fn max_sessions_per_user_evicts_oldest_to_keep_under_cap() {
     // exactly one old session before registering the new one.
     let session = test_session();
     svc.begin_login("alice", "default", &session).await.unwrap();
-    let cred = FactorCredential::Password(ZeroizedString::new("Gnomes2+"));
+    let cred = FactorCredential::Password(ZeroizedString::new("Sample2+"));
     let outcome = svc.verify_factor(&cred, &session).await.unwrap();
     assert!(
         matches!(outcome, FactorOutcome::Authenticated),
@@ -310,11 +355,13 @@ async fn max_sessions_per_user_evicts_oldest_to_keep_under_cap() {
 #[cfg(feature = "ldap")]
 #[tokio::test]
 async fn ldap_factor_completes_login_with_valid_bind_dn_override() {
+    let clock = common::test_clock();
     use axess_core::authn::factor::LdapBindFactorConfig;
     use axess_factors::ldap::MockLdapProvider;
 
     let bind_dn = "uid=alice,ou=people,dc=example,dc=com";
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new()
@@ -333,6 +380,7 @@ async fn ldap_factor_completes_login_with_valid_bind_dn_override() {
     // path's bind succeeds without going through the build_bind_dn template.
     let ldap = MockLdapProvider::new(bind_dn).with_user("alice", "ldap-secret", vec![]);
     let svc = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
         .with_ldap(ldap)
         .build()
         .with_audit_context(AuditContext::default());
@@ -352,11 +400,13 @@ async fn ldap_factor_completes_login_with_valid_bind_dn_override() {
 #[cfg(feature = "ldap")]
 #[tokio::test]
 async fn ldap_groups_from_the_bind_are_readable_on_the_authenticated_session() {
+    let clock = common::test_clock();
     use axess_core::authn::factor::LdapBindFactorConfig;
     use axess_factors::ldap::MockLdapProvider;
 
     let bind_dn = "uid=alice,ou=people,dc=example,dc=com";
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new()
@@ -372,6 +422,7 @@ async fn ldap_groups_from_the_bind_are_readable_on_the_authenticated_session() {
         );
     let ldap = MockLdapProvider::new(bind_dn).with_user("alice", "ldap-secret", vec!["admins"]);
     let svc = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
         .with_ldap(ldap)
         .build()
         .with_audit_context(AuditContext::default());
@@ -395,11 +446,13 @@ async fn ldap_groups_from_the_bind_are_readable_on_the_authenticated_session() {
 /// A session authenticated through an LDAP bind that returned `groups`.
 #[cfg(feature = "ldap")]
 async fn ldap_login_with_groups(groups: Vec<&str>) -> axess_core::session::AuthSession {
+    let clock = common::test_clock();
     use axess_core::authn::factor::LdapBindFactorConfig;
     use axess_factors::ldap::MockLdapProvider;
 
     let bind_dn = "uid=alice,ou=people,dc=example,dc=com";
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new()
@@ -415,6 +468,7 @@ async fn ldap_login_with_groups(groups: Vec<&str>) -> axess_core::session::AuthS
         );
     let ldap = MockLdapProvider::new(bind_dn).with_user("alice", "ldap-secret", groups);
     let svc = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
         .with_ldap(ldap)
         .build()
         .with_audit_context(AuditContext::default());
@@ -473,11 +527,13 @@ async fn ldap_groups_beyond_the_custom_data_cap_are_kept() {
 #[cfg(feature = "ldap")]
 #[tokio::test]
 async fn ldap_bind_dn_without_equals_rejected_even_if_provider_would_accept() {
+    let clock = common::test_clock();
     use axess_core::authn::factor::LdapBindFactorConfig;
     use axess_factors::ldap::MockLdapProvider;
 
     let bind_dn = "uidalice"; // all safe, no `=`
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new()
@@ -493,6 +549,7 @@ async fn ldap_bind_dn_without_equals_rejected_even_if_provider_would_accept() {
         );
     let ldap = MockLdapProvider::new(bind_dn).with_user("alice", "ldap-secret", vec![]);
     let svc = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
         .with_ldap(ldap)
         .build()
         .with_audit_context(AuditContext::default());
@@ -512,6 +569,7 @@ async fn ldap_bind_dn_without_equals_rejected_even_if_provider_would_accept() {
 #[cfg(feature = "ldap")]
 #[tokio::test]
 async fn ldap_bind_dn_over_length_cap_rejected_even_if_provider_would_accept() {
+    let clock = common::test_clock();
     use axess_core::authn::factor::LdapBindFactorConfig;
     use axess_factors::ldap::MockLdapProvider;
 
@@ -522,6 +580,7 @@ async fn ldap_bind_dn_over_length_cap_rejected_even_if_provider_would_accept() {
     assert!(bind_dn.contains('='));
 
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new()
@@ -537,6 +596,7 @@ async fn ldap_bind_dn_over_length_cap_rejected_even_if_provider_would_accept() {
         );
     let ldap = MockLdapProvider::new(bind_dn.as_str()).with_user("alice", "ldap-secret", vec![]);
     let svc = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
         .with_ldap(ldap)
         .build()
         .with_audit_context(AuditContext::default());
@@ -557,6 +617,7 @@ async fn ldap_bind_dn_over_length_cap_rejected_even_if_provider_would_accept() {
 #[cfg(feature = "ldap")]
 #[tokio::test]
 async fn ldap_password_at_max_bytes_is_not_rejected_by_length_guard() {
+    let clock = common::test_clock();
     use axess_core::authn::factor::LdapBindFactorConfig;
     use axess_factors::ldap::MockLdapProvider;
 
@@ -566,6 +627,7 @@ async fn ldap_password_at_max_bytes_is_not_rejected_by_length_guard() {
 
     let bind_dn = "uid=alice,ou=people,dc=example,dc=com";
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new()
@@ -581,6 +643,7 @@ async fn ldap_password_at_max_bytes_is_not_rejected_by_length_guard() {
         );
     let ldap = MockLdapProvider::new(bind_dn).with_user("alice", password.as_str(), vec![]);
     let svc = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
         .with_ldap(ldap)
         .build()
         .with_audit_context(AuditContext::default());
@@ -601,22 +664,27 @@ async fn ldap_password_at_max_bytes_is_not_rejected_by_length_guard() {
 /// (256); the guard uses strict `>` and 256 is the inclusive ceiling.
 #[tokio::test]
 async fn begin_login_identifier_at_max_bytes_is_not_rejected() {
+    let clock = common::test_clock();
     let long_identifier: String = "a".repeat(256);
     assert_eq!(long_identifier.len(), 256);
 
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(axess_core::authn::types::User {
             identifier: long_identifier.clone().into(),
             ..test_user("u1", &long_identifier)
         });
     let factors = MockFactorStore::new()
-        .with_factor(user_scope(), password_config("Gnomes2+"))
+        .with_factor(user_scope(), password_config("Sample2+"))
         .with_method(
             &uid("u1"),
             AuthMethod::sequential("password", vec![FactorKind::Password], user_scope()),
         );
-    let svc = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
+    let svc = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
+        .build()
+        .with_audit_context(AuditContext::default());
 
     let session = test_session();
     let outcome = svc
@@ -633,6 +701,7 @@ async fn begin_login_identifier_at_max_bytes_is_not_rejected() {
 /// `MAX_IDENTIFIER_BYTES` (256).
 #[tokio::test]
 async fn begin_login_tenant_identifier_at_max_bytes_is_not_rejected() {
+    let clock = common::test_clock();
     let long_tenant_identifier: String = "t".repeat(256);
     assert_eq!(long_tenant_identifier.len(), 256);
 
@@ -641,15 +710,19 @@ async fn begin_login_tenant_identifier_at_max_bytes_is_not_rejected() {
         ..test_tenant()
     };
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(tenant)
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new()
-        .with_factor(user_scope(), password_config("Gnomes2+"))
+        .with_factor(user_scope(), password_config("Sample2+"))
         .with_method(
             &uid("u1"),
             AuthMethod::sequential("password", vec![FactorKind::Password], user_scope()),
         );
-    let svc = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
+    let svc = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
+        .build()
+        .with_audit_context(AuditContext::default());
 
     let session = test_session();
     let outcome = svc
@@ -662,27 +735,30 @@ async fn begin_login_tenant_identifier_at_max_bytes_is_not_rejected() {
     );
 }
 
-/// The tenant IP policy gate, which until 0.7.0 was skippable.
+/// The tenant IP policy gate, which no caller can skip.
 ///
-/// The address used to be a `begin_login` parameter, and the check ran
-/// only `if let Some(ip)`, so a caller passing `None` bypassed the policy
-/// entirely. 51 of the 52 call sites in this repository passed `None`, and
-/// the one test that existed installed no policy, so it passed whether or
-/// not the gate ran. The address now arrives on the handle, and the four
-/// cases below are the whole truth table.
+/// The address arrives on the handle. Were it a `begin_login` parameter
+/// checked only `if let Some(ip)`, a caller passing `None` would bypass
+/// the policy entirely, and a test that installed no policy would pass
+/// whether or not the gate ran. The four cases below are the whole truth
+/// table.
 mod tenant_ip_policy {
     use super::*;
     use axess_core::authn::types::IpPolicy;
 
     fn service_with_policy(policy: IpPolicy) -> AuthnService<MockIdentityStore, MockFactorStore> {
+        let clock = common::test_clock();
         let identity = MockIdentityStore::new()
+            .with_clock(clock.clone())
             .with_tenant(test_tenant())
             .with_user(test_user("u1", "alice"))
             .with_ip_policy(&test_tenant().id, policy);
         let factors = MockFactorStore::new()
-            .with_factor(user_scope(), password_config("Gnomes2+"))
+            .with_factor(user_scope(), password_config("Sample2+"))
             .with_method(&uid("u1"), password_method());
-        AuthnService::new(identity, factors)
+        AuthnService::builder(identity, factors)
+            .with_clock(clock.clone())
+            .build()
     }
 
     fn allowlist(cidr: &str) -> IpPolicy {
@@ -730,9 +806,9 @@ mod tenant_ip_policy {
         );
     }
 
-    /// The case the old shape got wrong. A policy that restricts and no
-    /// address to test against it cannot be satisfied, so the login fails
-    /// closed. Before 0.7.0 this combination sailed through the gate.
+    /// A policy that restricts and no address to test against it cannot
+    /// be satisfied, so the login fails closed rather than passing the
+    /// gate.
     #[tokio::test]
     async fn a_restricting_policy_with_no_address_fails_closed() {
         let outcome = service_with_policy(allowlist("192.168.1.0/24"))
@@ -787,7 +863,9 @@ mod tenant_ip_policy {
 /// stay in cooldown.
 #[tokio::test]
 async fn email_otp_cooldown_boundary_at_until_refreshes_not_alreadysent() {
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let email_method =
@@ -797,13 +875,12 @@ async fn email_otp_cooldown_boundary_at_until_refreshes_not_alreadysent() {
             user_scope(),
             FactorConfig::EmailOtp(EmailOtpConfig {
                 email: "alice@example.com".into(),
-                ttl_secs: 300,
+                ttl: std::time::Duration::from_secs(300),
                 ..EmailOtpConfig::default()
             }),
         )
         .with_method(&uid("u1"), email_method);
 
-    let clock = MockClock::now();
     let service = AuthnService::builder(identity, factors)
         .with_clock(clock.clone())
         .with_rng(MockRng::new(42))
@@ -820,7 +897,7 @@ async fn email_otp_cooldown_boundary_at_until_refreshes_not_alreadysent() {
         PrepareOutcome::SendOtp { .. }
     ));
 
-    // Advance to EXACTLY ttl_secs. `now == pending_until`. The strict `<`
+    // Advance to EXACTLY ttl. `now == pending_until`. The strict `<`
     // guard is false → SendOtp again. A `<=` mutation would still report
     // cooldown.
     clock.advance_secs(300);
@@ -839,11 +916,15 @@ async fn email_otp_cooldown_boundary_at_until_refreshes_not_alreadysent() {
 #[cfg(feature = "oauth")]
 #[tokio::test]
 async fn oauth_providers_accessor_returns_live_registry() {
+    let clock = common::test_clock();
     use axess_factors::oauth::MockOAuthProvider;
 
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let mock = MockOAuthProvider::new("mock-oauth");
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant());
+    let mock = MockOAuthProvider::new("mock-oauth").with_clock(std::sync::Arc::new(clock.clone()));
     let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_oauth_provider(mock)
         .build()
         .with_audit_context(AuditContext::default());

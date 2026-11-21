@@ -1,7 +1,7 @@
 //! Refreshing a session only while the device the token was issued to is
 //! still trusted.
 
-use super::rotation::{DeviceGate, DeviceRefusal, Refresh};
+use super::rotation::{DeviceCheckDecided, DeviceGate, DeviceRefusal, Keyed, Refresh};
 // Named by the doc links below.
 #[cfg(doc)]
 use super::types::RefreshError;
@@ -21,13 +21,15 @@ impl<D: DeviceStore> DeviceGate for CheckedAgainst<'_, D> {
         tenant: &'a TenantId,
         device: &'a DeviceId,
         user: &'a UserId,
-    ) -> Pin<Box<dyn Future<Output = Result<(), DeviceRefusal>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Keyed, DeviceRefusal>> + Send + 'a>> {
         Box::pin(async move {
             match self.0.load_fresh(tenant, device).await {
                 Ok(Some(device)) if device.trust_level != DeviceTrustLevel::Revoked => {
                     match device.user_id.as_ref() {
                         Some(owner) if owner != user => Err(DeviceRefusal::OtherOwner),
-                        _ => Ok(()),
+                        _ => Ok(Keyed(device.bindings.iter().any(|binding| {
+                            matches!(binding, crate::device::DeviceBinding::Key { .. })
+                        }))),
                     }
                 }
                 Ok(_) => Err(DeviceRefusal::Revoked),
@@ -69,7 +71,10 @@ impl<'a, F> Refresh<'a, F> {
     /// same device id, so `revoke_device` revokes it when its insert landed
     /// before the revocation's statement, and the next device-checked
     /// refresh refuses it otherwise.
-    pub fn device_store<D: DeviceStore>(self, devices: &'a D) -> Self {
+    pub fn device_store<D: DeviceStore>(
+        self,
+        devices: &'a D,
+    ) -> Refresh<'a, F, DeviceCheckDecided> {
         self.device_gate(Box::new(CheckedAgainst(devices)))
     }
 }

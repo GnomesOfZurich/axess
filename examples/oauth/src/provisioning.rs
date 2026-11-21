@@ -190,7 +190,7 @@ where
     /// the tenant's policy provisions just in time.
     pub async fn resolve(&self, claims: &OAuthClaims) -> Result<Resolution, ResolveError> {
         let issuer = issuer_of(claims).ok_or(ResolveError::NoIssuer)?;
-        let _one_at_a_time = self.gate.lock().await;
+        let one_at_a_time = self.gate.lock().await;
 
         if let Some(id) = self.identities.find(issuer, &claims.subject).await {
             return match self.identity.get_user(&id).await {
@@ -212,9 +212,12 @@ where
             .as_deref()
             .or(claims.email.as_deref())
             .unwrap_or(&claims.subject);
-        self.create_and_link(issuer, &claims.subject, name)
+        let created = self
+            .create_and_link(issuer, &claims.subject, name)
             .await
-            .map(Resolution::Created)
+            .map(Resolution::Created);
+        drop(one_at_a_time);
+        created
     }
 
     /// Create a user for an outside identity and link them, without waiting for
@@ -226,13 +229,15 @@ where
         subject: &str,
         display_name: &str,
     ) -> Result<User, ResolveError> {
-        let _one_at_a_time = self.gate.lock().await;
+        let one_at_a_time = self.gate.lock().await;
         if self.identities.find(issuer, subject).await.is_some() {
             return Err(ResolveError::Invalid(
                 "the identity is linked already".into(),
             ));
         }
-        self.create_and_link(issuer, subject, display_name).await
+        let created = self.create_and_link(issuer, subject, display_name).await;
+        drop(one_at_a_time);
+        created
     }
 
     async fn create_and_link(

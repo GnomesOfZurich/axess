@@ -3,29 +3,24 @@
 A factor is a single credential check: a password, a TOTP code, a
 WebAuthn assertion, an LDAP bind, an OAuth token exchange. A method is
 a sequence of factors that together count as a successful login.
-Composing factors into methods, and scoping methods to apply per-user
-or per-tenant rather than globally, is the day-to-day surface adopters
-work with.
+Adopters work day to day with two things: composing factors into methods, and scoping a method to a tenant or a user rather than globally.
 
 ## Vocabulary
 
-The four words that recur are factor, step, method, and scope. They
-sound interchangeable in casual writing, and they are not in the code.
+Four words recur: factor, step, method, and scope. They sound interchangeable in casual writing; in the code they are not.
 
 A *factor* is one credential verifier, identified by a `FactorKind`
 variant: `Password`, `Totp`, `Hotp`, `EmailOtp`, `Fido2`, `LdapBind`,
-or `Federated(FederatedProvider)`. Each factor has a config struct
-(`PasswordConfig`, `TotpConfig`, and so on) that the relevant adopter
+`RecoveryCode`, or `Federated(FederatedProvider)`. Each factor has a config struct
+(`PasswordConfig`, `TotpConfig`, and so on) that the adopter
 seeds at provisioning time and the service reads at verification time.
 
 A *step* is one node in a method. A step is either a `Required(kind)`
 demand for a specific factor, or an `AnyOf(vec![kind1, kind2, ...])`
 disjunction that lets the user choose among several factors at that
-position. The step is the unit of authoring; a method is a sequence
-of steps.
+position. The step is the unit of authoring.
 
-A *method* is an ordered sequence of steps with a stable name. Examples
-in the wild: "password-only" (one step, `Required(Password)`),
+A *method* is an ordered sequence of steps with a stable name. Examples: "password-only" (one step, `Required(Password)`),
 "password-then-TOTP" (two steps, `Required(Password)` then
 `Required(Totp)`), "password-then-second-factor"
 (two steps, `Required(Password)` then `AnyOf(vec![Totp, Fido2,
@@ -35,14 +30,14 @@ recording success or failure.
 
 A *scope* is the tier at which a method is configured. There are three
 tiers (`System`, `Tenant`, `User`), covered in detail in *Scope
-hierarchy*. The short version: a system default applies everywhere; a
-tenant can override it; a user can override the tenant. Resolution is
-the simple inversion of authority: user override beats tenant override
-beats system default.
+hierarchy*. The short version: the system tier holds templates that a tenant
+adopts explicitly; a tenant's configuration applies to its users; a user can
+override the tenant. When a factor's config is looked up, the narrowest tier
+that holds one wins: a user's beats the tenant's, which beats the system's.
 
 ## The factor list
 
-The current `FactorKind` enum and its companion config sum-type live in
+The `FactorKind` enum and its companion config sum-type live in
 [`axess-core/src/authn/factor.rs`](https://github.com/GnomesOfZurich/axess/blob/main/axess-core/src/authn/factor.rs).
 
 ```rust,ignore
@@ -53,6 +48,7 @@ pub enum FactorKind {
     EmailOtp,
     Fido2,
     LdapBind,
+    RecoveryCode,
     Federated(FederatedProvider),
 }
 
@@ -70,6 +66,7 @@ pub enum FactorConfig {
     EmailOtp(EmailOtpConfig),
     Fido2(Fido2Config),
     LdapBind(LdapBindFactorConfig),
+    RecoveryCodes(RecoveryCodesConfig),
     // Federated configs live with their provider's verifier crate.
 }
 ```
@@ -90,12 +87,25 @@ enough that flattening them into one enum would require a discriminator
 inside the config. Parameterising the kind itself makes the config
 sum-type smaller and the type system honest about the variation.
 
-`Custom(String)` is the extension point for IdPs the upstream library
-does not name explicitly. Adopters who federate against Okta, Auth0,
-Azure AD as a generic OIDC provider, or an in-house IdP plug in with
-the OAuth-RS resolver and a custom string identifier; the workload
-identity chapter (*Workload identity overview*) describes the same
-pattern from the inbound-resolver side.
+The kind a login records is part of the provider's configuration, never
+read from its issuer URL. A provider registered with
+`AuthnServiceBuilder::with_oauth_provider_of_kind(provider,
+FederatedProvider::Google)` records `Federated(Google)` on every login
+through it: in the session's assurance and on the finish's, the login's,
+a refused callback's, the refresh's and the revocation's audit rows. A
+tenant's provider names its kind in the `kind` field of its
+`TenantOAuthProviderRecord`. The named variants mean those identity
+providers because a deployment says so when it registers them.
+
+`Custom(String)` is the default and the extension point for IdPs that axess
+does not name. Adopters who federate against Okta, Auth0, Azure AD as a
+generic OIDC provider, or an in-house IdP register it as an OAuth/OIDC
+provider under a stable name (`AuthnServiceBuilder::with_oauth_provider`,
+or per tenant through `with_tenant_oauth_providers` with no `kind` in the
+record), and a login through it records `Federated(Custom(name))`. A
+method step or a policy that names a provider names the kind it records. The workload identity chapter (*Workload
+identity overview*) describes `WorkloadResolver`, the generic resolver that
+verifies such an IdP's bearer tokens when they come from inbound workloads.
 
 ## Composing and verifying
 
@@ -103,8 +113,9 @@ How a method becomes a chain, and what one step does.
 
 ### How factors compose
 
-The composition primitives are `FactorStep` and `Method`. A `FactorStep`
-is one node in a method. A `Method` is a vector of steps plus a name.
+The composition primitives are `FactorStep` and `AuthMethod`. A `FactorStep`
+is one node in a method. An `AuthMethod` is a vector of steps, a name and
+the scope it is defined at.
 
 ```rust,ignore
 pub enum FactorStep {
@@ -112,15 +123,16 @@ pub enum FactorStep {
     AnyOf(Vec<FactorKind>),
 }
 
-pub struct Method {
+pub struct AuthMethod {
     pub name: Arc<str>,
     pub steps: Vec<FactorStep>,
+    pub scope: AuthnScope,
 }
 ```
 
 The two-step `Required(Password)` then `AnyOf(vec![Totp, Fido2])`
 method handles a common shape: the user enters their password, then
-completes one of two second factors, and which one is their choice.
+chooses one of two second factors and completes it.
 They may not have registered a passkey yet, or their phone may be at
 home and only the hardware key with them. The state machine's
 `Authenticating::remaining` field carries the residue of steps yet to
@@ -132,8 +144,8 @@ remembers it for that step, and `verify_factor` then checks the submitted
 code as that factor, not as the first one the step lists. A step prepared
 without a choice checks a code as the first listed factor it fits.
 
-`Required(kind)` is shorthand for a one-element `AnyOf(vec![kind])`,
-but the distinction matters for audit clarity. A successful login that
+`Required(kind)` behaves like a one-element `AnyOf(vec![kind])`,
+but the two read differently in the audit log. A successful login that
 went `password + totp` reads cleanly when the audit log records
 "completed `Required(Totp)`"; the same login through an `AnyOf` step
 records "completed `AnyOf::Totp`" and a reviewer asks why the choice
@@ -141,10 +153,9 @@ was offered at all. Use `Required` when there is no choice.
 
 The orchestrator does not support arbitrary expression trees of
 factors (you cannot say "two of these three" with a single step). The
-omission is on purpose. Real authentication methods are short sequences
-with at most one decision point per step, and admitting arbitrary
-expressions would invite policies that pass formal review but defeat
-operational understanding.
+omission is deliberate. Real authentication methods are short sequences
+with at most one decision point per step, and arbitrary expressions
+would invite policies that pass formal review but that operators cannot follow.
 
 ### The verify_factor path
 
@@ -166,6 +177,7 @@ with `FactorCredential` the runtime credential value:
 pub enum FactorCredential {
     Password(ZeroizedString),
     OtpCode(Arc<str>),
+    RecoveryCode(Arc<str>),
     Fido2Assertion(serde_json::Value),
 }
 ```
@@ -177,12 +189,20 @@ pub enum FactorOutcome {
     Authenticated,
     FactorRequired(FactorKind),
     InvalidCredential,
-    Locked { until: Option<DateTime<Utc>> },
+    Locked { until: Option<Until> },
+    Throttled { retry_after: std::time::Duration },
 }
 ```
 
+`Locked { until }` carries an end only for the attempt counter's lockout and for a
+suspension a store keeps with `StatusCause::Lockout`. An administrative
+hold, a pending verification or a closure met on a later step answers
+`Locked { until: None }`, as an indefinite lockout does, so a caller who
+has passed one factor does not learn that an operator holds the account,
+or until when. The audit row records which it was.
+
 The handler in your application takes the credential off the request
-(form body, JSON, header, whatever), wraps it in the right
+(form body, JSON, header or elsewhere), wraps it in the right
 `FactorCredential` variant, and calls `verify_factor`. Three things
 then happen inside the service.
 
@@ -215,11 +235,11 @@ with the next expected kind). A failed verification increments
 attempt policy.
 
 The `Locked` outcome is the lockout decision in band. The
-`until: Option<DateTime<Utc>>` field carries the unlock time when one
-is scheduled (a five-minute exponential backoff after three attempts,
-for instance) or `None` when the lockout requires administrative
-intervention. The application surfaces this to the user with the right
-copy; the audit log records the lockout regardless.
+`until: Option<Until>` field carries the unlock time when one is
+scheduled (`Until::At`; under the default policy, fifteen minutes after
+the fifth failure), `Until::Forever` for a lockout too long to
+hold, or `None` when the lockout requires administrative
+intervention. The application chooses what to tell the user; the audit log records the lockout either way.
 
 The lock is per account, so anyone who knows a username can lock it.
 `AuthnServiceBuilder::with_device_store` narrows that: a login from a
@@ -234,21 +254,42 @@ consecutive wrong guesses under one key, a guess before
 `Err(AuthnError::Throttled { retry_after })`). The default waits one
 second after the first failure and doubles per failure to sixty-four
 seconds: 1, 2, 4, 8, 16, 32, 64, 64. The key is
-`ThrottleKey::AccountAndAddress`, the tenant, the user and the client
-address `client_ip::layer` resolved, so a guesser on one address does not
+`ThrottleKey::AccountAndAddress`: the tenant, the user and the client
+address that `client_ip::layer` resolved, so a guesser on one address does not
 delay the account's owner on another; `ThrottleKey::Account` shares one
 delay across every address. A request with no resolved address is keyed
 on the account alone, and when the layer is not installed the service
-logs an error once saying so. The refusal is a refusal, never a sleep: it
+logs an error once saying so. The service refuses rather than sleeps: the refusal
 runs before the guess is reserved, so a throttled request costs no counter
-write and no hash. A right guess clears the key; a session on a device the
-account has used is not throttled, for the reason it is not locked. The
+write and no hash. A correct guess clears the key. A session on a device the
+account has used is not throttled, for the same reason it is not locked. The
 per-account lock stays the ceiling: a guesser cycling addresses still
-meets `max_attempts`. Answer `Throttled` to the person as a wrong password
-and send `retry_after` as `Retry-After` where the client reads headers;
-the default `IntoResponse` maps it to 429. `LockoutPolicy::without_throttle()`
-is the opt-out, for a deployment whose limiter in front of the route
-already slows a guesser down.
+meets `max_attempts`. On a password step, answer `Throttled` as a wrong
+password: run the one password check the throttle skipped
+(`burn_password_check`) and log `retry_after` on the server. Only an
+account that exists can be throttled, so a 429 or a `Retry-After` header
+reveals which usernames exist. `login_with_password` answers that way in
+one call. Once the first factor has passed (on a second factor, or on `prepare_factor`
+later in the flow), the delay may be shown, and the default
+`IntoResponse` maps `AuthnError::Throttled` to 429 with `Retry-After`.
+`LockoutPolicy::without_throttle()` is the opt-out, for a deployment
+whose limiter in front of the route already slows a guesser down.
+
+The policy's fields are public so a store can build one from a tenant
+row, and each has a bound. `duration` may not exceed
+`LockoutPolicy::MAX_DURATION` (one hundred years): a lockout meant to
+last until an administrator acts is `duration: None`, which says so by
+name. `LockoutPolicy::validate` refuses a policy past a bound with a
+`LockoutPolicyError` that names the field and the bound; call it where
+the policy is loaded. The service reads every tenant's policy through
+`LockoutPolicy::bounded`, which clamps a value past its bound to the
+bound and reports the clamp once per service at error level, so a stored
+value an operator mistyped never panics a login or disables the lock.
+`LockoutPolicy::lockout_until` gives the end of a lockout that starts now,
+`now + duration`; `LockoutPolicy::derived_lockout` gives the end of one
+already counted, the last failure plus `duration`. Both are `Until::after` their start, so a sum past the
+range of a reading is `Until::Forever`, a lockout that never ends, and
+the default response to it carries no `Retry-After`.
 
 ### Begin and complete
 
@@ -289,14 +330,26 @@ they return with it, `complete_signup(&session, secret)` compares it in
 constant time, refuses a wrong or expired one (24 hours by default,
 `with_signup_verification_ttl` changes it), and transitions the session
 from `PendingWorkflow { kind: Signup, ... }` to `Authenticated`. A taken
-identifier answers `Started(None)`: nothing to mail. Submitting the
-signup again from the same session replaces the secret. After a signup
-ceremony completes (email verified, KYC checks
-passed, terms accepted), the orchestrator transitions the session
-from `PendingWorkflow { kind: Signup, ... }` to `Authenticated`. The
-factor list on the resulting `Authenticated` variant is the list that
-was used during the signup, which is what the audit trail wants and
-what subsequent policy evaluation reads.
+identifier answers `Started(None)`: there is nothing to mail. Its session is left
+as a free identifier's is: pending a signup under a user id that names no
+stored account, with a secret nobody is sent. `complete_signup` therefore refuses
+any secret on both alike, and a resubmission begins the signup again on
+both. Only the outcome, which the application alone sees, says that no
+secret was issued. Submitting the
+signup again from the same session replaces the secret. The
+`Authenticated` session a signup leaves lists no completed factors
+(`factors_completed` is empty): the verified secret shows control of the
+address and is not a factor, so a check that asks for one
+(`has_completed_factor`, a policy that asks `context.assurance has fido2`) is not
+met until the user completes a factor in a login or a step-up.
+
+The session is registered with the session registry before the account is
+activated. When the registry does not register it, `complete_signup`
+answers `AuthnError::ExternalService`, writes a failed `SignupCompleted`
+row (`session_not_registered`), and leaves the account as it was and the
+session pending the same signup, so the person can follow the same link
+again; a store that cannot activate the account leaves the same state
+with `AuthnError::Store`.
 
 ## Extending it
 
@@ -304,9 +357,10 @@ Your own factor, and asking for another when risk rises.
 
 ### Adding a custom factor
 
-The pattern for adding a factor that axess does not ship is the same
-pattern that produced the factors that axess does ship. There are
-four moving parts.
+A factor that axess does not ship is added to axess itself, the same way
+as the factors it does ship: `FactorKind`, `FactorConfig` and
+`FactorCredential` are enums in `axess-core`, and a crate outside it
+cannot add a variant to them. There are four parts.
 
 The first part is the verifier itself. It lives in `axess-factors`
 (or in a separate crate that depends on `axess-factors`) and exposes
@@ -317,11 +371,10 @@ compare); for a ceremony-based factor (FIDO2, OAuth) the verifier
 threads through the session-side challenge and the response.
 
 The second part is the `FactorKind` variant. Adding a variant is a
-breaking change to the public surface, which is what you want: any
+deliberate breaking change to the public surface: any
 match on `FactorKind` in adopter code now flags a missing arm, and the
 adopter chooses to handle the new factor or to reject it with an
-explicit pattern. There is no "add a variant silently" mechanism in
-axess, and that omission is intentional.
+explicit pattern. Nothing in axess adds a variant silently, by design.
 
 The third part is the `FactorConfig` variant and the storage adapter
 that loads it. The factor config goes into the configured factor
@@ -335,10 +388,10 @@ that maps to one of the existing variants (a password-like factor
 reuses `Password`, a code-based factor reuses `OtpCode`) avoids the
 addition.
 
-The work is small. The factors that axess ships today each take fewer
-than a thousand lines of Rust including tests. The reason the work
-stays small is that the orchestration and the state machine do not
-change; the verifier is doing one job, behind a fixed contract.
+The work is small: each factor axess ships takes fewer than a thousand
+lines of Rust, tests included. It stays small because the orchestration
+and the state machine do not change; the verifier does one job behind a
+fixed contract.
 
 ### Step-up authentication
 
@@ -353,7 +406,9 @@ already completed are remembered. From there `prepare_factor` and
 code is counted, audited and subject to the lockout, and the right one
 returns `FactorOutcome::Authenticated`. The resulting session holds the
 earlier factors plus the new one in `factors_completed`, carries a fresh
-`authn_time`, and has a rotated id. Until the step is finished the session
+`authn_time` (what recency checks read) and the login's `signed_in_at`
+(what the absolute age cap counts from, so a step-up does not extend the
+session's life), and has a rotated id. Until the step is finished the session
 is not authenticated, so show the prompt on a page of its own.
 
 Two small gates decide when to ask. `AuthSession::authenticated_within`
@@ -364,12 +419,12 @@ ones) both answer from the session; when one says no, call
 
 A third gate, `AuthSession::completed_factor_within(kind, max_age, now)`,
 answers for one factor by its own time. The session's `authn_time` is the
-moment the most recent factor completed, so after a step-up with TOTP
-`authenticated_within` is true for the TOTP's age, and `has_completed_factor`
-for the password is still true although the password was entered at the
+moment the most recent factor completed, so after a step-up with TOTP,
+`authenticated_within` measures the TOTP's age, and `has_completed_factor`
+is still true for the password although it was entered at the
 original login. `completed_factor_within(&FactorKind::Password, ..)` reports
 the password's own age. Each entry of `factors_completed` is a
-`(FactorKind, DateTime<Utc>)` pair.
+`(FactorKind, Timestamp)` pair.
 
 There is no `require_step_up` orchestrator that decides for you, and the
 device decision is separate: `decide_step_up_for_user` is a free function
@@ -392,17 +447,17 @@ the session on the original method's steps. The call that enforces is
 withhold what the login would have granted until that step has ended too.
 
 The application controls when step-up is required. The Cedar policy
-engine can express "this action requires `Fido2` in
-`factors_completed`" (see *Cedar policy fundamentals*), or the
+engine can express "this action requires `fido2` in
+`context.assurance`", the record of the session's verified factors a
+request context carries (see *Authentication assurance and ceremonies*), or the
 handler can demand it directly. The state machine does not impose a
 policy; it provides the shape that lets the policy be enforced.
 
 ## How far two steps get you
 
 A method composed of a `Required(Password)` followed by an
-`AnyOf(vec![Totp, Fido2, EmailOtp])` covers an enormous share of real
-deployments without any further structure. A per-tenant override for
-a specific tenant that requires `Required(Fido2)` instead of the
+`AnyOf(vec![Totp, Fido2, EmailOtp])` covers a large share of real
+deployments without any further structure. A tenant override that requires `Required(Fido2)` instead of the
 disjunction covers the rare case where one tenant must be stricter.
 A per-user override that adds `Required(EmailOtp)` for a flagged user
 covers the regulatory case where one user is on a watch list.
@@ -414,10 +469,11 @@ chapter, *Scope hierarchy*, covers the configuration tier in detail.
 
 ## Further reading
 
-*Scope hierarchy* covers Global, Tenant, and User configuration tiers
-and how `begin_login` resolves them at runtime. *Cedar policy
-fundamentals* covers how the policy engine reads
-`factors_completed` and authorises against it. Part III, *Factor
+*Scope hierarchy* covers the System, Tenant, and User configuration tiers
+and how `begin_login` resolves them at runtime. *Authentication
+assurance and ceremonies* covers how a policy reads the session's
+verified factors through `context.assurance` and authorises against
+them. Part III, *Factor
 cookbooks*, has a chapter per real-world factor (*Password and TOTP*,
 *FIDO2 and WebAuthn passkeys*, *OAuth 2.0 and OIDC*, and so on) that
 walks through the integration details one factor at a time.

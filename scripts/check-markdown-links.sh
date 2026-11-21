@@ -26,7 +26,7 @@
 set -uo pipefail
 
 AXESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$AXESS_DIR"
+cd "$AXESS_DIR" || exit 1
 
 python3 - "$AXESS_DIR" <<'PY'
 import os, re, subprocess, sys
@@ -34,10 +34,11 @@ import os, re, subprocess, sys
 root = sys.argv[1]
 os.chdir(root)
 
-# Tracked files only: `docs/book/` is generated output, and a packaged copy
-# under target/ would contribute phantom hits.
+# Tracked files and untracked ones git does not ignore, so a file not yet
+# added is checked as well; `docs/book/` is generated output, and a packaged
+# copy under target/ (ignored) would contribute phantom hits.
 tracked = subprocess.run(
-    ["git", "ls-files", "-z", "*.md"],
+    ["git", "ls-files", "--cached", "--others", "--exclude-standard", "--deduplicate", "-z", "*.md"],
     capture_output=True, text=True, check=True,
 ).stdout.split("\0")
 files = [f for f in tracked if f and not f.startswith("docs/book/")]

@@ -6,6 +6,7 @@
 
 #![cfg(all(feature = "testing", feature = "oauth"))]
 
+use axess_clock::testing::MockClock;
 use axess_factors::oauth::{OAuthError, OAuthProvider, OAuthProviderBuilder, OAuthProviderConfig};
 use axess_testing::oauth_wiremock::{oauth_discovery_document, oauth_generate_rsa_keypair};
 use serde_json::json;
@@ -35,15 +36,20 @@ async fn idp_with(extra: serde_json::Value) -> MockServer {
     server
 }
 
-async fn discover(server: &MockServer) -> Result<OAuthProviderBuilder, OAuthError> {
-    OAuthProviderConfig::discover(
+async fn discover(
+    clock: &MockClock,
+    server: &MockServer,
+) -> Result<OAuthProviderBuilder, OAuthError> {
+    OAuthProviderConfig::discover_screened(
         "test",
         &server.uri(),
         "test-client-id",
         "test-secret",
         "http://localhost:3000/callback",
+        axess_factors::egress::EgressPolicy::screened_allowing_loopback_http(),
     )
     .await
+    .map(|b| b.with_clock(std::sync::Arc::new(clock.clone())))
 }
 
 /// Discovery reads the endpoints outside the standard metadata set. The typed
@@ -52,6 +58,7 @@ async fn discover(server: &MockServer) -> Result<OAuthProviderBuilder, OAuthErro
 /// and PAR and revocation were never configured by discovery.
 #[tokio::test]
 async fn discovery_reads_the_optional_endpoints_from_the_raw_document() {
+    let clock = MockClock::at_reference();
     let server = idp_with(json!({
         "end_session_endpoint": format!("{}/logout", "http://localhost:9"),
         "revocation_endpoint": "http://localhost:9/revoke",
@@ -59,7 +66,7 @@ async fn discovery_reads_the_optional_endpoints_from_the_raw_document() {
         "authorization_response_iss_parameter_supported": true,
     }))
     .await;
-    let provider = discover(&server)
+    let provider = discover(&clock, &server)
         .await
         .unwrap()
         .with_allowed_post_logout_redirect_uris(["https://app.example/after"])
@@ -77,8 +84,9 @@ async fn discovery_reads_the_optional_endpoints_from_the_raw_document() {
 /// pass one.
 #[tokio::test]
 async fn iss_parameter_is_required_only_when_advertised() {
+    let clock = MockClock::at_reference();
     let server = idp_with(json!({})).await;
-    let provider = discover(&server).await.unwrap().build().unwrap();
+    let provider = discover(&clock, &server).await.unwrap().build().unwrap();
     assert!(!provider.authorization_response_iss_required());
 }
 
@@ -86,8 +94,9 @@ async fn iss_parameter_is_required_only_when_advertised() {
 /// destination is forwarded, an unlisted one dropped.
 #[tokio::test]
 async fn an_empty_post_logout_allowlist_forwards_no_redirect() {
+    let clock = MockClock::at_reference();
     let server = idp_with(json!({ "end_session_endpoint": "http://localhost:9/logout" })).await;
-    let bare = discover(&server).await.unwrap().build().unwrap();
+    let bare = discover(&clock, &server).await.unwrap().build().unwrap();
 
     let url = bare
         .build_end_session_url(None, Some("https://evil.example"), None)
@@ -98,7 +107,7 @@ async fn an_empty_post_logout_allowlist_forwards_no_redirect() {
         "no allowlist configured, so nothing is forwarded: {url}"
     );
 
-    let listed = discover(&server)
+    let listed = discover(&clock, &server)
         .await
         .unwrap()
         .with_allowed_post_logout_redirect_uris(["https://app/after"])
@@ -122,9 +131,10 @@ async fn an_empty_post_logout_allowlist_forwards_no_redirect() {
 /// provider exists to send anything.
 #[tokio::test]
 async fn plain_http_endpoints_to_remote_hosts_are_refused() {
+    let clock = MockClock::at_reference();
     // Discovery: a plain-HTTP token endpoint on a remote host.
     let server = idp_with(json!({ "token_endpoint": "http://idp.example.net/token" })).await;
-    let err = match discover(&server).await {
+    let err = match discover(&clock, &server).await {
         Err(e) => e,
         Ok(_) => panic!("a plain-HTTP remote token endpoint must be refused"),
     };
@@ -155,7 +165,7 @@ async fn plain_http_endpoints_to_remote_hosts_are_refused() {
         ),
     ];
     for (set, what) in cases {
-        let insecure = set(discover(&server).await.unwrap());
+        let insecure = set(discover(&clock, &server).await.unwrap());
         let err = insecure.build().err().expect(what);
         assert!(
             matches!(&err, OAuthError::Config(m) if m.contains(what)),
@@ -164,7 +174,7 @@ async fn plain_http_endpoints_to_remote_hosts_are_refused() {
     }
     // The same settings over loopback HTTP build.
     assert!(
-        discover(&server)
+        discover(&clock, &server)
             .await
             .unwrap()
             .with_revocation_endpoint("http://localhost:9/revoke")

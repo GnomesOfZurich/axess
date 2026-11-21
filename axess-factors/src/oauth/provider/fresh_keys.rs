@@ -24,9 +24,14 @@ pub(super) fn claims_error(e: ClaimsVerificationError) -> OAuthError {
             SignatureVerificationError::NoMatchingKey,
         ) => OAuthError::UnknownKid(ID_TOKEN_KID.to_string()),
         ClaimsVerificationError::SignatureVerification(reason) => {
-            OAuthError::IdTokenValidation(format!("signature verification failed: {reason}"))
+            OAuthError::IdTokenValidation(format!(
+                "signature verification failed: {}",
+                crate::remote_text::error_text(&reason)
+            ))
         }
-        other => OAuthError::IdTokenValidation(format!("{other}")),
+        // The library's text quotes the token's own claims (an issuer, an
+        // audience): escaped and cut as every other remote text.
+        other => OAuthError::IdTokenValidation(crate::remote_text::error_text(&other)),
     }
 }
 
@@ -42,8 +47,12 @@ impl OAuthProviderConfig {
             serde_json::to_value(&*guard)
         }
         .map_err(|e| OAuthError::Discovery(format!("cached JWKS is not serialisable: {e}")))?;
-        let keys: CoreJsonWebKeySet = serde_json::from_value(value)
-            .map_err(|e| OAuthError::Discovery(format!("cached JWKS is not a key set: {e}")))?;
+        let keys: CoreJsonWebKeySet = serde_json::from_value(value).map_err(|e| {
+            OAuthError::Discovery(format!(
+                "cached JWKS is not a key set: {}",
+                crate::remote_text::parse_error(&e)
+            ))
+        })?;
         Ok(openidconnect::core::CoreClient::from_provider_metadata(
             self.metadata.clone().set_jwks(keys),
             self.client_id.clone(),

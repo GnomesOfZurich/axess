@@ -69,8 +69,8 @@
 //! and the caller decides what to do with the sessions.
 
 use crate::authn::ids::{TenantId, UserId};
-use crate::session::id::SessionId;
-use chrono::{DateTime, Utc};
+use crate::session::id::SessionKey;
+use axess_clock::Timestamp;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -82,9 +82,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 /// through another provider with a colliding `sid`.
 pub type SidKey = (String, String);
 
-/// What a `sid` maps to: the local user, their session, and when the mapping
+/// What a `sid` maps to: the local user, their session named by its
+/// [`SessionKey`] (never by the id a cookie carries), and when the mapping
 /// was inserted.
-pub type SidEntry = (UserId, SessionId, DateTime<Utc>);
+pub type SidEntry = (UserId, SessionKey, Timestamp);
 
 /// What an [`insert`](SidMap::insert_displacing) took out of the map: a `sid`
 /// mapping in full, so the caller can put it back if the login that displaced
@@ -97,10 +98,10 @@ pub struct DisplacedSid {
     pub tenant: Option<TenantId>,
     /// The local user of the displaced session.
     pub user: UserId,
-    /// The displaced session.
-    pub session: SessionId,
+    /// The displaced session, by its key.
+    pub session: SessionKey,
     /// When the displaced mapping was inserted.
-    pub inserted_at: DateTime<Utc>,
+    pub inserted_at: Timestamp,
 }
 
 /// Shared map from `(issuer, sid)` to the local session.
@@ -117,8 +118,8 @@ struct Stored {
     subject: String,
     tenant: Option<TenantId>,
     user: UserId,
-    session: SessionId,
-    at: DateTime<Utc>,
+    session: SessionKey,
+    at: Timestamp,
 }
 
 impl Stored {
@@ -140,21 +141,21 @@ struct SidState {
     entries: HashMap<SidKey, Stored>,
     /// Session -> the keys that map to it, so unwinding one login costs its
     /// own entries and not a scan of the map.
-    keys_of_session: HashMap<SessionId, HashSet<SidKey>>,
+    keys_of_session: HashMap<SessionKey, HashSet<SidKey>>,
     /// `(issuer, subject)` -> the `sid`s of that subject under that issuer.
     by_subject: HashMap<(String, String), HashSet<String>>,
     /// One item per entry, ordered by the entry's insertion time, oldest
     /// first (ties by key).
-    order: BTreeSet<(DateTime<Utc>, SidKey)>,
+    order: BTreeSet<(Timestamp, SidKey)>,
     /// `(issuer, subject)` -> sessions their OAuth logins established, each
     /// with the local user it belongs to.
-    subjects: HashMap<(String, String), HashSet<(UserId, SessionId)>>,
+    subjects: HashMap<(String, String), HashSet<(UserId, SessionKey)>>,
     /// Session -> the subject registry record that holds it. One login
     /// establishes one session, so a session has at most one record.
-    subject_of: HashMap<SessionId, SubjectOf>,
+    subject_of: HashMap<SessionKey, SubjectOf>,
     /// Rotation queue over the subject triples, for the bounded sweep. May
     /// hold items whose triple has since been forgotten.
-    subject_order: VecDeque<(String, UserId, SessionId)>,
+    subject_order: VecDeque<(String, UserId, SessionKey)>,
 }
 
 /// Compact the subject sweep queue once it exceeds this many items beyond
@@ -192,7 +193,7 @@ impl SidState {
         subject: &str,
         tenant: Option<TenantId>,
         user: UserId,
-        session: SessionId,
+        session: SessionKey,
     ) {
         if let Some(held) = self.subject_of.get(&session) {
             if held.issuer == issuer
@@ -234,7 +235,7 @@ impl SidState {
 
     /// Drop `session` from the subject registry when the record names this
     /// issuer and user.
-    fn forget_subject(&mut self, issuer: &str, user: &UserId, session: &SessionId) -> bool {
+    fn forget_subject(&mut self, issuer: &str, user: &UserId, session: &SessionKey) -> bool {
         let matches = self
             .subject_of
             .get(session)
@@ -255,7 +256,7 @@ impl SidState {
         true
     }
 
-    fn unlink_session(&mut self, session: &SessionId, key: &SidKey) {
+    fn unlink_session(&mut self, session: &SessionKey, key: &SidKey) {
         if let Some(keys) = self.keys_of_session.get_mut(session) {
             keys.remove(key);
             if keys.is_empty() {
@@ -288,7 +289,7 @@ impl SidState {
     fn evict_front(
         &mut self,
         max: usize,
-        due: impl Fn(DateTime<Utc>) -> bool,
+        due: impl Fn(Timestamp) -> bool,
     ) -> Vec<(SidKey, SidEntry)> {
         let mut evicted = Vec::new();
         while evicted.len() < max {
@@ -343,8 +344,8 @@ impl SidMap {
         subject: &str,
         tenant: Option<TenantId>,
         user: UserId,
-        session: SessionId,
-        inserted_at: DateTime<Utc>,
+        session: SessionKey,
+        inserted_at: Timestamp,
     ) -> Option<SidEntry> {
         self.insert_displacing(key, subject, tenant, user, session, inserted_at)
             .map(|old| (old.user, old.session, old.inserted_at))
@@ -359,8 +360,8 @@ impl SidMap {
         subject: &str,
         tenant: Option<TenantId>,
         user: UserId,
-        session: SessionId,
-        inserted_at: DateTime<Utc>,
+        session: SessionKey,
+        inserted_at: Timestamp,
     ) -> Option<DisplacedSid> {
         self.lock()
             .insert(
@@ -457,7 +458,7 @@ impl SidMap {
         subject: &str,
         tenant: Option<TenantId>,
         user: UserId,
-        session: SessionId,
+        session: SessionKey,
     ) {
         self.lock()
             .register_subject(issuer, subject, tenant, user, session);
@@ -465,7 +466,12 @@ impl SidMap {
 
     /// Drop one session from the subject registry; returns whether it was
     /// there. Called once the session is known to have ended.
-    pub fn forget_subject_session(&self, issuer: &str, user: &UserId, session: &SessionId) -> bool {
+    pub fn forget_subject_session(
+        &self,
+        issuer: &str,
+        user: &UserId,
+        session: &SessionKey,
+    ) -> bool {
         self.lock().forget_subject(issuer, user, session)
     }
 
@@ -476,7 +482,7 @@ impl SidMap {
     /// A caller ends each session in the session registry first and then
     /// calls [`remove_session`](Self::remove_session) for it, so a session
     /// the registry could not end stays reachable for a retry.
-    pub fn subject_sessions(&self, issuer: &str, subject: &str) -> Vec<(UserId, SessionId)> {
+    pub fn subject_sessions(&self, issuer: &str, subject: &str) -> Vec<(UserId, SessionKey)> {
         self.subject_sessions_in(issuer, subject, None)
     }
 
@@ -488,10 +494,10 @@ impl SidMap {
         issuer: &str,
         subject: &str,
         scope: Option<&TenantId>,
-    ) -> Vec<(UserId, SessionId)> {
+    ) -> Vec<(UserId, SessionKey)> {
         let state = self.lock();
         let slot = (issuer.to_string(), subject.to_string());
-        let mut out: Vec<(UserId, SessionId)> = state
+        let mut out: Vec<(UserId, SessionKey)> = state
             .subjects
             .get(&slot)
             .map(|set| {
@@ -528,10 +534,10 @@ impl SidMap {
     /// Up to `max` subject triples to check for liveness, rotated to the back
     /// of the sweep queue so repeated calls cover the whole registry. Items
     /// whose triple was forgotten are dropped on the way.
-    pub fn sweep_subject_candidates(&self, max: usize) -> Vec<(String, UserId, SessionId)> {
+    pub fn sweep_subject_candidates(&self, max: usize) -> Vec<(String, UserId, SessionKey)> {
         let mut state = self.lock();
-        let mut out: Vec<(String, UserId, SessionId)> = Vec::new();
-        let mut named: std::collections::HashSet<SessionId> = std::collections::HashSet::new();
+        let mut out: Vec<(String, UserId, SessionKey)> = Vec::new();
+        let mut named: std::collections::HashSet<SessionKey> = std::collections::HashSet::new();
         for _ in 0..max.min(state.subject_order.len()) {
             let Some((iss, user, session)) = state.subject_order.pop_front() else {
                 break;
@@ -560,7 +566,7 @@ impl SidMap {
     ///
     /// Costs the session's own entries, through an index; the rare path that
     /// unwinds one login calls it.
-    pub fn remove_session(&self, session: &SessionId) -> usize {
+    pub fn remove_session(&self, session: &SessionKey) -> usize {
         let mut state = self.lock();
         let keys: Vec<SidKey> = state
             .keys_of_session
@@ -576,11 +582,7 @@ impl SidMap {
     }
 
     /// Remove up to `max` entries inserted before `cutoff`, oldest first.
-    pub fn evict_inserted_before(
-        &self,
-        cutoff: DateTime<Utc>,
-        max: usize,
-    ) -> Vec<(SidKey, SidEntry)> {
+    pub fn evict_inserted_before(&self, cutoff: Timestamp, max: usize) -> Vec<(SidKey, SidEntry)> {
         self.lock().evict_front(max, |at| at < cutoff)
     }
 

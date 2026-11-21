@@ -18,7 +18,7 @@ impl DeviceSql for SqliteSql {
 
     async fn begin_create<'c>(
         conn: &'c mut SqliteConnection,
-        _device: &Device,
+        _: &Device,
     ) -> Result<Transaction<'c, Sqlite>, SqlDeviceStoreError> {
         // An immediate transaction takes the database's single write lock
         // before the read, so two creates of one key run one after the
@@ -26,7 +26,7 @@ impl DeviceSql for SqliteSql {
         Ok(conn.begin_with("BEGIN IMMEDIATE").await?)
     }
 
-    async fn end_create(_conn: &mut SqliteConnection, _device: &Device) -> Result<(), sqlx::Error> {
+    async fn end_create(_: &mut SqliteConnection, _: &Device) -> Result<(), sqlx::Error> {
         Ok(())
     }
 

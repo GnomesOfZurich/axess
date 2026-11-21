@@ -4,9 +4,280 @@ All notable changes to this project are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
+The sections of earlier releases read as published, except that an entry which misstated its change ends in "(corrected in 0.20.0)" where 0.20.0 corrected it. A copy of the 0.18.0 `PolicyStore::digest()` entry stood in fourteen earlier sections, 0.3.1 to 0.16.0, under a `### Changed (breaking)` heading of its own, and 0.20.0 removed each copy.
+
 ---
 
 ## [Unreleased]
+
+## [0.20.0] - 2026-11-21
+
+### Upgrade
+
+- Sessions: Upgrade every node together: a 0.19.0 and a 0.20.0 node do not see each other's sessions or revocations, every session is signed out once, a rollback finds none that 0.20.0 stored, and refresh tokens still work.
+- Sessions: `SessionLayer::new`, `new_unchecked`, `try_new` and `without_registry_insecure` take a `SessionEndAudit` sink last: `AuthnService::session_end_audit`, or `UnrecordedSessionEnds::insecure()` to record no endings.
+- Audit: Let the audit archive drain finish on 0.19.0 first (`AuditRetentionLoop::drain` until `RetentionTickReport::archived` is 0), or a batch it had not yet marked is archived a second time after the upgrade.
+- Time: Every time axess takes, returns or stores is an `axess-clock` type (`Timestamp`, `SignedDuration`, `Until`, `UtcDate`) or a `std::time::Duration`, no public signature names chrono, and stored times keep the form 0.19.0 wrote.
+- Tenant OAuth: `SqliteTenantOAuthProviderStore::init_schema` adds a `client_id` column and a unique `(issuer, client_id)` index and refuses to start while two records hold one pair, naming each such pair, so remove or re-point all but one record of each pair first.
+- Egress: `OAuthProviderConfig::discover`, `discover_with_private_key_jwt`, `SocialProvider::new` and `OutboundOAuthClient::new` use `EgressPolicy::screened()` by default, so reach a provider on the deployment's network or loopback through `discover_screened` or `new_screened`.
+- Authz: `require_authz!` reads one `AuthzInstallation` layer, built by `AuthzInstallation::new(store, entities, context)`, in place of the separate `Extension` layers, and a gate that finds none answers 500.
+- Docs: The migration page, [0.19.0 to 0.20.0](docs/production/migrating/0.19.0-to-0.20.0.md), lists the compile breaks, behaviour changes and changed defaults of this release, in that order, with what to write for each.
+
+### Security
+
+- Sessions: Stores, the registry, the sid store, audit records and handlers name a session by a digest of its id (`SessionKey`), logs by the key's first eight characters, and only the cookie holds the id.
+- Sessions: A stored session is read only in this release's sealed form (`axess.session.v2`) and shape, whatever `LegacyBlobs` says, and an older row runs as a guest, is counted and is left to expire.
+- Sessions: A rotation moves a session's registry entry in one step while the registry holds it, so no revocation is lost or undone, and `rotate_session` with a registry no longer signs the user out.
+- Sessions: A key a session held before a rotation still ends it (`SessionRegistry::invalidate_session` follows the move), so neither the session limit's eviction nor an administrator's kick misses it.
+- Sessions: The session layer records each session it ends (`SessionExpired`, `SessionInvalidated`) before removing it, and a session whose audit row cannot be written is refused but stays stored.
+- Sessions: Concurrent requests meeting one ended session write one audit row, as the layer first claims the ending on the stored row (`SessionData::ending`), and a write under way merges onto the claimed row and keeps the claim.
+- Sessions: A session claimed to end is never served again, and a request finding a claim older than thirty seconds finishes the ending for the claim's reason, so an ending recorded twice names the same session and reason.
+- Sessions: After a rotation the store could not make, the layer deletes the new id's row as well as the old one's, so no live session stays behind the response's cookie.
+- Sessions: Every session ended while a rotation settles, or found revoked by `rotate_session` or a step-up's completion, goes through the ending protocol with its audit record before its row is removed.
+- Sessions: A session the validator (`require_valid_session`, `require_authn!`) finds revoked or its tenant unconfirmed ends with its audit row, `session_not_registered` or `SessionEndReason::TenantNotConfirmed` (`session_tenant_not_confirmed`).
+- Sessions: When a login step's audit row cannot be written, the step ends at once the registry entry the session is held under (`AuthSession::registered_key`), a step-up's included.
+- Sessions: Cutting off a user's other sessions after another request rotated the one to keep ends them all (`OtherSessionsError::CallerEnded`), so a copied cookie cannot survive a credential change.
+- Sessions: Completing a step-up no longer counts the session twice against the per-user session limit.
+- Sessions: The layer drops the registry entry of a session it ends or leaves signed out, telling a watching socket, and hands it to a new person signing in on it, so the earlier person's list and count drop it.
+- Sessions: The Valkey session registry removes orphaned registration times without dropping a session registered meanwhile, and keeps a session's first registration time.
+- Sessions: A failed impersonation whose end the registry did not confirm names the anchor in its error, and a call dropped before the impersonation stands ends the anchor and its registered target session.
+- Sessions: `CsrfConfig::require_origin` panics on an empty list, which previously left the Origin check off and turned off a check an earlier call had turned on.
+- Audit: A row an audit query cannot read is counted by its reason, never dropped in silence or allowed to fail the query, and its text is neither returned nor logged.
+- Audit: An `axess-events` reader refuses an event sealed under the first AAD tag unless `FirstTag` (default `Reject`) is `Accept` or `AcceptUntil`, and pre-0.18.0 events need the migration page's re-seal.
+- Devices: Only a request that presents the device token proves the device, so a session cookie alone yields neither `AuthSession::proven_device` nor the lockout exemption.
+- Devices: The new `device-keys` feature binds a session to a P-256 key the client cannot export (`DeviceKeyService`, `SessionLayer::with_device_keys`), served only with a proof against that key: a short-lived proof cookie or a request proof.
+- Devices: A trust write lands only on a device the request proved for the signed-in user (`AuthSession::user_device`), so a row matched by fingerprint or another account's is no longer promoted or trusted.
+- Devices: `LifecycleDeviceResolver` fails the resolution of an authenticated request whose `tenant_fn` finds no tenant (`LifecycleResolveError::TenantMissing`) and logs it once at `error`, so the session keeps its device.
+- Devices: `LifecycleDeviceResolver` resolves an authenticated request it cannot fingerprint, as one with no `User-Agent`, by its device token, its key or its session's device and creates no device for it, where it answered no device and the session lost its own.
+- Devices: A device-key registration offer rides on one response per login that no shared cache keeps and expires with its window, so copied session and device cookies fetch no offer and a step-up gets none.
+- Devices: A layer that cannot check a device key runs a key-bound session's request as a guest and logs why, and `KeyBindingPolicy::Off` is the one way to serve bound sessions as bearer sessions.
+- Devices: An impersonated session never creates, claims, promotes or trusts a device for the user it runs as: a device key it binds is the administrator's and a refresh token it is issued names no device.
+- Devices: A sign-in binds the new session to the key-proven device only when the device row is live, still holds that key and is owned by, or claimed for, the signed-in user.
+- Devices: A refresh given the device store but not the device-key service refuses a keyed device's token (`RefreshError::KeyCheckMissing`), so it is not refreshed into an unbound session by omission.
+- Devices: Under `KeyBindingPolicy::Require` a step-up is held to the registration window counted from the login, and a session the policy ends is recorded (`key_binding_required`) before it is removed.
+- Devices: A key binding belongs to the person it was made for (`SessionKeyBinding::owner`) and lapses at once when another person signs in, a new login begins or the session signs out.
+- Devices: Another person signing in on a signed-in session leaves `AuthSession::device_id`, `proven_device` and `user_device` at `None` for that request, while the same person's new login keeps the device.
+- Devices: A session with nobody signed in no longer keeps its device when the resolver fails or is missing, so one person's device cannot pass to another whose login completes on that request.
+- Devices: A row merged with a concurrent write is not proven by this request's device or key proof when the merge took the stored device or key binding (`proven_device`, `key_bound`).
+- Devices: A rotation that changes the authentication state no longer carries into the new session a device that a concurrent request stamped on the retired session.
+- Passwords: A password over `MAX_PASSWORD_BYTES` runs no Argon2 when no hash is stored, as a stored hash refuses it before Argon2 too, so the length check cannot tell a known user from an unknown one.
+- Passwords: Every refusal on the password form spends one Argon2 run at each cost in use, so a dormant account whose hash predates a cost change answers like an unknown identifier.
+- Passwords: With conflicts hidden, a signup for a taken identifier leaves the session as one for a free identifier does, and the minimal example answers a throttled password guess as a wrong password.
+- Passwords: The login throttle, rate limiter and default device fingerprint read a NAT64, IPv4-translated, IPv4-compatible, 6to4 or Teredo address as its IPv4 client, so one translator's clients share none of them.
+- Passwords: `AuthnError::Locked` carries an end time, and the default response a `Retry-After` header, only for a lockout, never for an administrative hold, a pending verification or a closure.
+- Passwords: A `LockoutPolicy.duration` too long for a date no longer panics.
+- Passwords: `AuthnServiceBuilder::try_build` refuses a default password reset lifetime above the cap (`PasswordResetTtlAboveCap`) and `build` panics, where every such reset was refused at request time.
+- Passkeys: Passkey credential-id claims stay consistent across a failed credential write, a deleted credential and a deleted user, so a concurrent registration cannot hold a credential without its claim.
+- Passkeys: `Fido2Provider::on_credential_used` is handed the device the request proved, and not called if none, so a ceremony with a copied session cookie is not recorded against the session's device.
+- Profiles: Applying a security profile never lowers a stronger value, as each `ProfileValues` method keeps the tighter of the two, and never leaves a default password reset lifetime above the cap.
+- Profiles: `AuthnServiceBuilder::try_build` refuses an Argon2id cost, reset lifetime or cap, impersonation recency or passkey recency looser than the profile's (`AuthnBuildError::BelowProfileFloor`), whichever setter wrote it.
+- Profiles: `AuthnServiceBuilder::waive_profile_floor` names a setting that may stay below the profile, and `AuthnService::security_profile` and `profile_deviations` read back the profile and the waived settings below it.
+- OAuth: `finish_oauth_login` and `finish_oauth_login_jarm` refuse, before any code exchange, a callback route (`OAuthCallbackRoute`) other than that of the login's registration, another tenant's included.
+- OAuth: A delegated grant refuses a `redirect_uri` that is not HTTPS or loopback HTTP, or that carries userinfo.
+- OAuth: A delegated grant or stored credential is used only with its own registration (`complete_grant`, `get_access_token`), and one of another registration or of none is refused as `DelegatedError::RegistrationMismatch` before a send.
+- OAuth: A session's OAuth refresh, userinfo, end-session and DPoP helpers (`ScopedOAuth`) use the provider it logged in through, so a tenant's refresh token never reaches a global provider of the same name.
+- OAuth: Provider reloads and removals (the `_as` methods), a follower's provider changes and token revocations write audit rows, and without its row a change is undone and a revocation not sent.
+- OAuth: A back-channel logout cancelled after its `jti` was spent can no longer be replayed.
+- OAuth: `ValkeySidStore` keeps its records in one cluster slot under any prefix, so a provider's logout is no longer lost on a cluster whose sid store prefix held no hash tag.
+- OAuth: An OAuth login whose subject record or `sid` mapping the sid store could not write is refused and its session ended.
+- OAuth: A provider's back-channel logout by `sid` or `sub`, or front-channel by `sid`, now ends a session whose key rotated after the login (a step-up, `rotate_session` or `regenerate`).
+- Tenant OAuth: A record is stored only with proof the tenant owns its client (`OwnershipProofs`: a `TokenEndpointProbe` or an operator's attestation), and only an operator attests a client or reassigns a pair.
+- Tenant OAuth: One `(issuer, client_id)` pair belongs to one record across processes, and a reload whose pair another tenant's or a global provider holds is refused (`ProviderReloadError::PairHeld`).
+- Tenant OAuth: A credential is sealed to every field that decides where and how it is presented, `StoredTenantOAuthProviders::started` re-seals older ones once, and 0.19.0 cannot open the new seal.
+- Egress: A screened provider's mTLS, PAR, revocation, end-session and device-authorization calls keep its discovery's policy, and discovery and key-set fetches take a `ScreenedClient` and refuse redirects.
+- Egress: `SocialProvider::new_screened` and `OutboundOAuthClient::new_screened` build their HTTP client through an `EgressPolicy` and check their endpoints against it (`OAuthClientError::EgressRefused`).
+- Egress: The SSRF screen judges an IPv4-translated address by the IPv4 address it carries and refuses every Teredo address.
+- Egress: Caller HTTP settings reach outbound clients only as `ClientSettings` (`with_client_settings`, `EgressPolicy::build_client`), and no `reqwest::ClientBuilder` that could undo the screen is handed out.
+- Egress: A delegated grant exchanges its code through a client the library built (`grant_client`), so a token endpoint's redirect is not followed with the code, PKCE verifier and client credentials.
+- Tokens: `cascade_revoke_by_refresh_family_and_tokens` also revokes the refresh tokens of the devices' other families.
+- Tokens: A `jti` can be recorded in a store all nodes share (`ValkeyJtiReplayStore`, through `with_replay_store` and `verify_dpop_proof_with_store`), so a fleet no longer accepts a token or proof once per node.
+- Tokens: `ValkeyJtiReplayStore::checked` refuses a server whose `maxmemory-policy` is not `noeviction` (`EvictionPolicyError`), asking every node of a cluster, so a live `jti` is not evicted and its token accepted twice.
+- Tokens: `verify_dpop_proof` and the device-key proof verifier refuse a header that carries `crit`, and `P256Key::from_jwk` refuses coordinates that are not a point of the curve.
+- Tokens: With `jwt-aws-lc` and without `client-assertion-rsa`, an RSA `ClientAssertionSigner` signs only under the aws-lc `jsonwebtoken` provider axess installed, else it answers `RsaNotChosen`.
+- Keys: Session, signing, factor-secret and delegated-credential keys, local IdP key bytes and the device token sit in `Zeroizing` buffers, and `ZeroizedString` implements `ZeroizeOnDrop`.
+- Keys: A derived sub-key leaves its derivation in a `Zeroizing` buffer, and a constructor that takes a 32-byte key zeroes the copy it was handed, while the caller's own copy is the caller's to wipe.
+- Keys: A sealed session, device, factor-secret or delegated-credential value shorter than its nonce or salt plus a tag is refused before a key is tried.
+- Keys: AES-GCM key schedules and the keyed SHA states inside an HMAC wipe themselves on drop through the `zeroize` features of `aes-gcm`, `sha1` and `sha2`.
+- Keys: Token, userinfo, discovery and STS bodies, success (`http_body::BoundedBody`) or error (`ErrorBody::read`), are read into memory that wipes each buffer it outgrows and itself when dropped.
+- Keys: `p256` 0.14 under `local-idp` and `oauth` keeps `crypto-bigint` 0.5 (RUSTSEC-2026-0387) out of a `jwt-aws-lc` build, and only `jsonwebtoken`'s `rust_crypto` backend still pulls it in.
+- Authz: A `require_authz!` template with one placeholder refuses `/` and `:` in its value, and a template with an unclosed placeholder is refused.
+- Authz: The Valkey authz cache escapes the tenant in its key, keeps an entry indexed through a racing invalidation, drops one whose index write failed and stores nothing on an untagged cluster prefix, and an entry 0.19.0 wrote for a tenant misses once.
+- Authz: Policies that read `context` deny a session begun without one (`AuthzStore::for_user_id`, `for_user_in_tenant`, `NoContext`), after a reload too, where a `forbid` guarded by `context has` did not apply.
+- Logs: The refusal lines of `CsrfLayer` and the WebSocket Origin check in `SessionLayer`, and `NoopDeviceResolver`'s trace line, name the matched `route`, never the request's path or query.
+- Logs: Upstream error text, identity-provider error values, parser messages, provider names, tenant ids and passkey names are escaped and capped before an error, span or log line, and `JarmResponse`'s `Debug` redacts the code and `state`.
+- Logs: `log_safe` escapes bidirectional controls, zero-width characters, the byte order mark and Hangul fillers, the logout endpoints' issuer included, so a logged value cannot reorder or hide a line.
+- Logs: A DPoP proof refused for `htm` or `htu` quotes the claim and the request's method or URL escaped and cut at 64 bytes, and `DpopProofRequest`'s `Debug` output escapes and cuts the method too.
+- Logs: Unverified `kid`s and bearer issuers, a logout token's `typ`, discovery's `issuer` and `jwks_uri`, LDAP errors, and OAuth log lines' provider names, issuers, client ids and `sid`s are escaped and cut.
+- Logs: A SPIFFE identifier a workload resolver or `axess-identity` refuses reaches errors and log lines cut, with every character class `log_text::escapes` names escaped.
+- Logs: A replayed `jti` reaches errors and the `NoReplay` trace line escaped and cut at `MAX_JTI_ECHO_BYTES` (128), and a replay store's text reaches `DeviceKeyError::ReplayStore` escaped and cut at 256 bytes.
+- Logs: A user or tenant identifier holding a character `log_text::escapes` names, zero width joiner and non-joiner included, is refused at signup, provisioning, sign-in and reset (`User::validate`).
+- Logs: Tenant provisioning validates a new tenant before any line logs its identifier.
+- Stores: The new `sqlite-unbundled` feature builds the SQLite stores against the system's SQLite library, so a deployment can leave the bundled library's advisory (RUSTSEC-2026-0459) behind.
+- Toolchain: `Cargo.lock` resolves `rustix` 1.1.6 (RUSTSEC-2026-0486).
+- Toolchain: Before publishing, the release workflow runs cargo-audit, the pin check and the supply-chain gate on the tagged commit in secretless jobs, and Hardening runs on `main`, release branches and release tags.
+- Toolchain: Publishing uses crates.io trusted publishing and a short-lived token revoked when cargo returns or the run stops, builds nothing (`--no-verify`), runs no third-party action and stops on a checksum mismatch.
+- Toolchain: `scripts/check-workflow-pins.sh` reads workflows as YAML and scripts as the shell does, and refuses what it cannot read, an unlocked or unpinned install, a floating toolchain beside a secret and a workflow-wide OIDC permission.
+- Toolchain: Under the workflow pin check a job with a secret, an OIDC permission or a write token installs nothing and runs only named programs, root-read scripts, cargo's own subcommands with `--locked` and listed actions.
+- Toolchain: A job the workflow pin check holds writes no file into the checkout, does no arithmetic on a value it did not make, and runs, sources or builds nothing an unheld job made.
+- Toolchain: The workflow pin check refuses pasted expressions, unread program paths, uninstalled cargo subcommands and unlisted actions, and beside a secret, any host but crates.io and GitHub and a variable that redirects a host or its trust.
+- Toolchain: In every job the workflow pin check refuses a download run or unpacked before a SHA-256 in the workflow or script checks it, an archive or program never checked, a stream unpacked as it arrives and an action handed a URL.
+- Toolchain: The workflow pin check lets a job run a program the repository does not hold only when a checked download brought it.
+
+### Changed (breaking)
+
+- Sessions: `SessionStore`, its `Store<SessionKey, SessionData>` bridges, `SessionRegistry`, `SessionRegistryHandle`, `SessionRevoker`, `Impersonation::registry_anchor` and `RevocationAwareSocket` take and return `SessionKey` where they named `SessionId` (see the migration page).
+- Sessions: A session is sealed to its key under `axess.session.v2` and read as MessagePack only (`SqlStoreError::Decode`), and CSRF tokens, key registration offers and OAuth claim locks are bound to the key, so earlier ones are void.
+- Sessions: `SessionRegistry` requires `invalidate_other_sessions` (answering a `CutOff`), `move_session` and `current_key`, and `SessionRegistryHandle::move_session` and `SessionRevoker::current_key` are required too.
+- Sessions: The Valkey session registry keeps a user's keys in one slot (`<prefix>:reg:{<user>}`, `reg-at`, `fwd`, `fwd-at`), and `ValkeySessionRegistry::new` and `with_options` are `async`, return a `Result` and need scripts, and its health check sends one (see the migration page).
+- Sessions: `AuthState::Authenticating` has `flow: AuthFlow` (`Login` or `StepUp`), `AuthState::Authenticated` and `AuthSnapshot` have `signed_in_at`, and `SessionData` has `key_binding`, `device_key`, `key_proven` and `ending` (`SESSION_DATA_VERSION` 3) (see the migration page).
+- Sessions: A rotated session keeps its eviction place, an entry the registry cannot move ends as `session_not_tracked`, and `AuthnService::check_session` and `SessionValidator::is_valid` ask for `AuthSession::registered_key` (see the migration page).
+- Sessions: `AuthSnapshot::session_id` is `AuthSnapshot::session_key`, `ValkeySessionRegistry::active_sessions` fails on a member that is not a session key, and the layer moves a registry entry from the key it loaded, the service registered or the request arrived with, and from no other.
+- Audit: `AuthEvent.session_id`, `AuditContext.session_id` and `AuthEventBuilder::with_session` take a `SessionKey`, `EventSubject` gains a `SessionKey` variant, and a recorded id reads as `SessionKey::from_recorded` or `RecordedSessionId` (see the migration page).
+- Audit: `AuditQuery::query_events` answers an `AuditTrail` (`UnreadableRows` by `UnreadableReason`), `EventSubjectResolver` has no public path, and an archived `EventSubject` is 36 bytes where it was 20, so rkyv archives of 0.19.0's events and `AuthEvent`s need 0.19.0's types.
+- Audit: `axess_events::envelope_aad` (seal under `envelope_aad_for`) and `open_aads_for_with` are removed, and `open_aads_for` takes the `FirstTag` policy and the reader's clock as a `SystemTime`, as `FirstTag::AcceptUntil` holds one, and returns a `Vec`.
+- Time: `Clock::now` and `MockClock` read and step in `Timestamp` and `SignedDuration`, `SystemTime` converts with `TryFrom`, an end that may never come is an `Until` (`Until::Forever`), and a lock that never ends sends no `Retry-After` (see the migration page).
+- Time: Configured lifetimes, windows, skews and bounds are `std::time::Duration`s, a name ending `_secs` loses the suffix (`MAX_IAT_AGE`), a fraction of a second is refused where whole seconds count, and `with_assertion_ttl` and `with_duration` return a `Result` (see the migration page).
+- Time: `OidcError::JwksExpired` holds `age` and `max_age` as `Duration`s, `LifetimeFault::NonPositiveCap` is `ZeroCap`, and `RefreshTokenConfig::validate` refuses a `ttl` or `max_lifetime` of zero (see the migration page).
+- Devices: `DeviceStore::load_fresh`, `replace_bindings`, `set_trust_level_if` and `claim_owner` are required methods, the last three each one conditional write, where the provided bodies since 0.11.0 let two concurrent callers both succeed.
+- Devices: On a Valkey cluster `ValkeyDeviceStore::with_prefix` refuses a prefix without a hash tag (`try_with_prefix` answers `ValkeyDeviceStoreError::PrefixWithoutHashTag`), as does every write under the default prefix, and the health check reports it.
+- Devices: `DeviceStore::sweep` states what one call does and allows no stand-in `Err`, `SweepCounts` gains `skipped`, and `SweepConfig`'s windows are read through `trusted_idle()`, `seen_idle()` and `revoked_grace()` past `SweepConfigBuilder::build` (see the migration page).
+- Devices: Device keys add `DeviceBinding::Key`, three `AuthEventType`s, `DeviceRequest::keys`, `RefreshError` variants, `DeviceKeyMetrics` on `AxessMetrics` and a `StandardRequestContext::key_bound` field (see the migration page).
+- Devices: `DeviceRequest::presented` is a slice of the cookie's entries, `DeviceRequest::fingerprint` an `Option` whose `None` creates no device, and `promote_on_authn` changes shape (see the migration page).
+- Passwords: The lockout policy is bounded (`LockoutPolicy::MAX_DURATION`, 100 years; `LockoutPolicy::MAX_ATTEMPTS`, 1000; a non-zero `attempt_window`): `LockoutPolicy::validate` refuses a value outside by name and the service clamps it.
+- Passwords: `login_with_password` ends the login it began on every answer but `Authenticated` or `FactorRequired`, clearing the session and rotating its id, so a wrong password and an unknown identifier leave the same session.
+- Passkeys: `Fido2Options::max_authn_age` defaults to five minutes and `Fido2Options` gains `discoverable_credential`, `finish_discoverable_login` refuses a user handle other than `User::webauthn_id`, and a FIDO2 begin retires the session's earlier ceremony of its kind (see the migration page).
+- Passkeys: `FactorStore::claim_fido2_credential` and `release_fido2_credential` are required, the claim answers a `Fido2CredentialClaim` that names the holder it lost to, and `fido2_credential_holder` is removed from the trait.
+- Factors: An OTP factor's `max_attempts` is capped at ten, and an HOTP look-ahead above 100, an e-mail OTP lifetime outside 60 to 1800 s, a JWT clock skew above 300 s and a refresh-token pepper shorter than 32 bytes are refused.
+- Profiles: The strict profile's Argon2 cost no longer falls back to the default, `SecurityProfile::Standard` screens egress, and `ProfileValues::jwt_verifier` gives way to `access_token_verifier`, which also sets the access-token `typ`, and `jwt_leeway_only` (see the migration page).
+- Profiles: `ProfileValues` gains the public fields `device_key_proof_ttl` and `device_key_challenge_ttl` and a private field for the profile it came from, so it is built from `SecurityProfile::values()` and no longer by a struct literal (see the migration page).
+- OAuth: `finish_oauth_login` takes the route (`OAuthCallbackRoute::global(provider)` or `OAuthCallbackRoute::of_tenant(&tenant, provider)`) first and the `iss` parameter fourth, `finish_oauth_login_jarm` takes the route first, and `finish_oauth_login_with_iss` is removed.
+- OAuth: The provider reload and removal methods, `revoke_oauth_token`, `refresh_oauth_token`, `fetch_userinfo`, `build_end_session_url` and `generate_dpop_proof` move from `AuthnService` to the `_as` methods and the `ScopedOAuth` scopes (see the migration page).
+- OAuth: `BuiltProvider::OAuth` is a struct variant (`{ provider, kind }`), `ScopedOAuth::as_user` is renamed `attributed_to`, and `BoundFrontChannelLogoutHandler::new` replaces `FrontChannelLogoutHandler::new` (see the migration page).
+- OAuth: `StoredDelegation` and `GrantContext` carry a `registration` (`GrantRegistration`) to persist, `EncryptedDelegatedCredentialStore` writes envelope `v4` and re-seals `v3`, and `DelegatedError::RegistrationMismatch` refuses a credential stored before 0.20.0 (see the migration page).
+- OAuth: `SidStore`, `SidEntry`, `DisplacedSid`, `SidMap` and `IdpSessionEnded.session_id` name a session by `SessionKey`, and `ValkeySidStore` writes under `{<prefix>}:v2:...` and refuses an empty prefix or one beginning with `}`.
+- Tenant OAuth: `StoredTenantOAuthProviders::new` and `new_unencrypted` take `OwnershipProofs` and its `store` answers `TenantOAuthRecords` read-only, and `TenantOAuthProviderStore` requires `put_if_revision`, `list_all` and `reassign_pair` (see the migration page).
+- Tenant OAuth: `TenantOAuthProviderRecord` has a `kind` field (`None` records `Custom(name)`), `ProviderReloadError` gains `PairHeld`, and it, `ServiceSecretError` and `ArchivedEventSubject` declare new variants first, so an `as` cast can change (see the migration page).
+- Tenant OAuth: `FactorSecretCipher::with_earlier_tenant_binding` defaults to `LegacyBlobs::Reject`, so a credential still sealed under the 0.15 to 0.19 binding is refused, and `Accept` is the opt-in for a rolling upgrade.
+- Egress: `DiscoveryDocument::fetch`, `Discovery::fetch`, `JwksCache::fetch` and `JwksCache::from_parts` take a `ScreenedClient` from `EgressPolicy::build_client`, `from_parts` returns a `Result`, plain HTTP off loopback is `OidcError::NonHttpsIssuer`, and `fetch_screened` is gone.
+- Egress: The `with_http_client` setters give way to `with_client_settings`, `complete_grant` takes a `ScreenedClient` from `grant_client`, `EgressPolicy::client_builder` gives way to `build_client`, and `OAuthClientError` gains `EgressRefused` (see the migration page).
+- Tokens: On `jwt-rust-crypto` without `jwt-aws-lc` an RSA `ClientAssertionSigner` (`RS*`, `PS*`) is refused when built (`ClientAssertionError::RsaNotChosen`), and the new `client-assertion-rsa` feature opts in to RSA through rsa 0.9 (RUSTSEC-2023-0071).
+- Tokens: A `Refresh` runs only after `device_store` or `without_device_check`, `cascade_revoke_by_refresh_family` gives way to `cascade_revoke_by_refresh_family_and_tokens`, and a `JtiReplayStore` returns `JtiReplayError::already_used(&key)` (see the migration page).
+- Keys: The local IdP's RSA keys need the new `local-idp-rsa` feature, so `local-idp` alone compiles no `rsa` (RUSTSEC-2023-0071) or `LocalIdpSigningKey::generate_rsa*`, and `generate_es256_with_rng` draws a seeded key as `p256` 0.14 does, with another key id (see the migration page).
+- Keys: `ServiceSecret::from_env` refuses a value that is not UTF-8 (`ServiceSecretError::NotUnicode`), the STS requests hold their tokens as `ZeroizedString`, and `http_body::read_limited` and `read_for_status` return `Zeroizing<Vec<u8>>` (see the migration page).
+- Principals: `HumanPrincipal.session_id` and the Cedar attribute `session_id` carry a `SessionKey`, and a principal serialised by an earlier release reads its session id as the key of that id.
+- Authz: `AuthzInstallation::new` refuses policies that read `context` with no context provider (`AuthzError::ContextProviderRequired`), and `AuthzStore::for_user_id`, `for_user_in_tenant` and the with-context forms handed `NoContext` return `AuthzError::ContextRequired` under them.
+- Authz: `PolicyEvaluator` requires `mentions_context` (`PolicyStore` and `MockPolicyEvaluator` implement it), and `AuthzStore::role_uid`, `tenant_uid`, `platform_uid` and `entity_uid` are removed for `make_entity_uid`, as nothing on the store takes a UID.
+- Logs: The W3C Trace Context middleware module is `axess_core::middleware::trace_context` (`axess::trace_context`) and its feature `trace-context`, where they were `trace_id` and `trace-id`, and `TraceContext` and `TraceContextLayer` stay at the roots.
+- Testing: `axess-identity` and `axess` refuse a release build with `testing` unless `allow-testing-in-release` is set, three examples refuse one, and `axess_testing::stall::Gate` fails after `Gate::DEFAULT_BOUND` (`Gate::with_bound`) (see the migration page).
+
+### Removed
+
+- Sessions: `SessionData::migrate`, `ValkeySessionStore::with_legacy_blobs`, `SqlStoreError::Serialization` (now `SqlStoreError::Decode`), the SQL stores' legacy text column read and the `session_data_json` fuzz target are removed, as no stored session is carried over.
+- Sessions: `AuthSession::session_id` is removed for `AuthSession::session_key`, and the Valkey registry's sequenced orphan cleanup goes with its once-only warning, a server that stops running scripts skipping the cleanup with a `warn` line.
+- Logs: `TraceIdLayer` and `TraceIdMiddleware` are removed: they were other names for `TraceContextLayer` and `TraceContextMiddleware`, which take their place unchanged.
+
+### Added
+
+- Sessions: `RequestAuthnService::invalidate_other_sessions` ends a user's other sessions in one registry step, revokes their refresh tokens and writes one audit row (`OtherSessionsError`), and `invalidate_other_sessions_keeping_refresh_tokens` keeps the tokens.
+- Sessions: `SessionKey` (from a `SessionId` by `SessionKey::of` alone), `SessionKeyPrefix`, `SessionKeyError` and `SESSION_KEY_DOMAIN` name a stored session, read as `AuthSession::session_key` and `registered_key`, and `MoveOutcome`, `CutOff` and `MAX_MOVE_RECORDS_PER_USER` the registry's moves.
+- Sessions: `AuthnServiceBuilder::without_impersonation_max_authn_age`, `AuthSession::step_up_pending` and `SessionMetrics::session_row_refused` are new, and `ValkeySessionRegistry` names its revocation subscriber connection `axess-revocations:` and its prefix where the server allows.
+- Audit: `axess::authn` re-exports the audit archive types with every feature set (`AuditArchiver`, `AuditRetentionLoop`, `AuditRetentionPolicy`, `ArchiveBatchId`), and `FilesystemAuditArchiver` and `FilesystemArchiveError` with the forwarded `audit-archive-fs`.
+- Audit: `RecordedSessionId` (`ArchivedRecordedSessionId` under `rkyv`, with `RecordedSessionId::key`) holds the id an older event recorded, and `AuditTrail`, `UnreadableRows` and `UnreadableReason` answer `AuditQuery::query_events`.
+- Time: The new `axess-clock` crate holds `Timestamp`, `SignedDuration`, `Until`, `UtcDate` and `TimeError` on the standard library alone, with checked arithmetic, RFC 3339 text and `serde` behind a feature, re-exported by `axess` and `axess-core`, and `Shift` by `axess::testing`.
+- Time: Golden tests, `axess-clock/tests/chrono_agreement.rs`, the `timestamp_rfc3339` fuzz target and Miri hold the time types, and `scripts/check-chrono-edges.sh` refuses chrono-tz and chrono in a public item or, outside Cedar, a published crate's default tree.
+- Devices: `axess_factors::key_proof` (`key-proof`, `axess::device_key::key_proof`) verifies device-key proofs in RFC 9449's shape and the browser draft's (`key_proof::browser_draft`), and `key_proof::testing::SoftwareKey` signs both.
+- Devices: `DeviceKeyConfig` and `KeyBindingPolicy` (`Off`, `Prefer`, `Require`) set how device keys are offered and enforced, `DeviceKeyService::router` answers the key paths, and `ProfileValues::device_key_config` applies the profile's proof and challenge lifetimes.
+- Devices: `AuthnServiceBuilder::with_key_proven_device_store` exempts a device from lockout only when proven by its key, `ProvenDevice::proof` says how, and `Refresh::device_key` holds a keyed device's refresh token to a key proof (`RefreshError::KeyProofRequired`, `KeyProofInvalid`).
+- Devices: `DeviceKeyService::with_request_proofs` lets an app prove its device key on any request with an RFC 9449 proof, so a bound session needs no proof cookie, and `DeviceKeyConfig::with_origins` and `with_origin_fn` serve keys at a host per tenant (`RequestHead`) (see the migration page).
+- Devices: A request proof is checked before any store read, held to the device row's key and recorded once, reads a bound session's row past any cache, so a revocation ends the session at its next request on every node, and binds nothing on a bare identifier until sign-in (`RequestProofSender`).
+- Devices: The device-key browser front-end follows the W3C editor's draft of 9 November 2026, reads `Secure-Session-Response` and `Sec-Secure-Session-Id` quoted or bare, refuses a key path a quoted string cannot carry and marks the key paths' answers as not embeddable.
+- Devices: `DeviceKeyMetrics` and `MetricSinks::with_device_keys` (fed by `DeviceKeyService::with_metrics`) count offers, registrations, proofs, guest-run bound requests and unbound sessions `Require` ended, and `StandardRequestContext::with_key_bound` gives Cedar `context.key_bound`.
+- Devices: `axess::device` re-exports `DeviceCookieConfig`, `UserDevice`, `LifecycleResolveError` and `IdentityStoreEventSink`, and the SQLite example's `device-keys` feature offers keys under `Prefer` and tests a copied cookie.
+- Devices: `DeviceLifecycleService::grant_trust` trusts an `Unknown` or `Seen` `UserDevice` in one conditional write with a `DeviceTrustGranted` row, `SessionKeyBound` is written once a binding lands, and `SessionKeyBinding::in_force_for` and `SessionData::key_binding_in_force` read it.
+- Passwords: `AuthnServiceBuilder::with_previous_argon2_cost` names the Argon2 cost stored hashes may still carry, and `without_previous_argon2_cost` is the opt-out.
+- Passkeys: `AuthnService::begin_discoverable_login_with(session, DiscoverableLogin)` takes the tenant and a `DiscoverablePrompt` (`Autofill`, `Modal` or `CrossDevice`), while `begin_discoverable_login` and `begin_discoverable_login_in_tenant` still send the challenge as the provider issued it.
+- Passkeys: `Fido2Options::discoverable_credential` (`DiscoverableCredential::Discouraged`, `Preferred` or `Required`, by default what `webauthn-rs` requests) decides whether a registration stores the credential, and `axess::federation::fido2` exports the FIDO2 types (see the migration page).
+- Passkeys: `examples/fido2/` (`axess-example-fido2`) is a runnable FIDO2 application with browser JavaScript: passkey, security-key and attested registration, username-first and passwordless sign-in, another device, and a step-up on `step_up_required`.
+- Factors: `axess::authn` exports `StepUp`, `StepUpParseError`, `FactorAssurance` and `CredentialBinding`.
+- Profiles: `AuthnServiceBuilder::validate` and its getters (`argon2_cost` and more), `OAuthProviderBuilder::requires_logout_typ`, `CsrfConfig::allowed_origins`, `Argon2Cost::is_at_least` and `raised_to` read back what a profile applies, and `axess::profile` re-exports it (see the migration page).
+- OAuth: `AuthnServiceBuilder::with_oauth_provider_of_kind` and `TenantOAuthProviderRecord::kind` set the `FederatedProvider` a provider's logins record, read with `provider_kind`, and the `_as` reloads take the kind after the name (see the migration page).
+- OAuth: `FederatedProvider`, `ResponseMode` and `DevicePiiCategory` implement `Display`, each as the string its `as_str` returns.
+- Tenant OAuth: `RequestAuthnService::reassign_tenant_oauth_pair_as` hands a pair to its owner in one audited write, `holder_of` names the holder, `reprove` reruns the proofs, and `attest_tenant_oauth_client_as` takes the record it attests (`ReassignedPair::removed`).
+- Egress: `ClientSettings` gains `connect_timeout`, `user_agent` and `root_certificate`, so a discovery or key-set client can trust a private certificate authority and name its `User-Agent`.
+- Tokens: `DPOP_SIGNING_ALG` names `ES256`, the one DPoP algorithm, and `axess_core::replay::MemoryJtiReplayStore` (`axess::backends::memory::JtiReplayStore`) and `MemoryJtiCache` serve `JtiReplayStore` in one process, with `JtiReplayStore::records`.
+- Tokens: `axess_factors::jwt::encode`, `decode`, `sign` and `verify`, re-exported with `ensure_crypto_provider` by `axess::jwt`, settle the `jsonwebtoken` crypto provider before they sign or verify, and every signature and verification of axess goes through them.
+- Principals: Every step of `PrincipalResolverChain`, the ordered resolvers of `AuthPrincipal`, `AuthHumanPrincipal` and `AuthWorkloadPrincipal`, runs for every request, a refused credential refuses it, and two resolving different principals answer `PrincipalRejection::ConflictingCredentials` (401).
+- Principals: The new `spire` feature adds `SpireClient`, a Workload API client of a local SPIRE agent over the locked `h2`, which refuses off-loopback TCP unless `Endpoint::tcp_clear_text`, applies its `SvidSelector` and checks each X.509 SVID's key.
+- Principals: `X509Source`, `JwtSvidSource`, `X509BundleSource` and `JwtBundleSource` keep what the agent serves current on the injected clock, never serve an expired SVID, stop serving what it withdraws (`SpireError::Withdrawn`), let unconfirmed bundles go stale and report a partner's unreadable one.
+- Principals: A SPIRE source stops asking after `INVALID_ARGUMENT` or `UNIMPLEMENTED` and reopens a broken stream at once, `JwtBundleSource::key_set` keeps a `JwtVerifier`'s keys as the agent rotates them, and `AgentJwtSvidResolver` takes a JWT-SVID the agent validated.
+- Principals: `SpireClientBuilder::with_withdrawal_grace` lets a source serve a `PERMISSION_DENIED` refusal's credentials for a set time, never past expiry, reported as `WorkloadApiEvent::WithdrawalDeferred` and `RotationMetrics::workload_credential_withdrawal_deferred`.
+- Principals: With `outbound-mtls`, an X.509 SVID becomes an `OutboundMtlsClient`, and `X509Source` builds rustls configurations from `SvidCertResolver`, `SpiffeServerCertVerifier` and `SpiffeClientCertVerifier` that check each peer per trust domain.
+- Principals: `JwtSvidResolver` accepts a verifier whose issuer was waived by name, which `JwtVerifier::allows_any_issuer` reports, and verifies a JWT-SVID without a `kid` against each key of a set of at most 32, where `JwtVerifier::verify` answers `JwtError::MissingKid`.
+- Principals: `RotationMetrics` gains `workload_credential_rotated`, `workload_credential_refresh_failed`, `workload_credential_expired` and `workload_bundle_skipped`, labelled by `WorkloadCredentialKind`, and a `WorkloadApiListener` receives each watcher event.
+- Principals: `axess_core::testing::spire_agent::FakeSpireAgent` serves the Workload API inside the test process, and `WorkloadId::components` and `WorkloadId::trust_domain` split a SPIFFE ID for the resolvers.
+- Authz: `AuthzInstallation` (`axess::authz`) is the gates' policy store and providers as one layer, `AuthzStore::for_user_in_tenant_with_context` is new, `BuildRequestContext::supplies_context` is `false` for `NoContext`, and decisions gain `context_required`.
+- Authz: `AuthzStore::for_principal` and `for_principal_with_context` begin a session for a human or workload as the entity `ToCedarEntity` makes, with no parents: groups come from the provider, read as `principal in Group::"g".members`.
+- Logs: `axess_identity::log_text` (`escapes`, `log_safe`) is the one predicate for text bound for a log or an error, re-exported by `axess_factors::log_text` beside `http_body::log_safe_snippet` and `log_safe_parse_error`, and `axess_factors::egress` has a feature.
+- Testing: Six checks join `testing::store_contract` (`assert_key_binding_contract` and more), `testing::registry_contract::assert_registry_contract` holds a session registry to the move, and `testing::registry_double` (`RegistryDouble`) records a registry's calls (see the migration page).
+- Testing: Tests can build on a given clock: `MockClock::at_reference`, the examples' `build_router_on`, `app::build_on`, `ProviderSettings::discover_on` and `bounce_routes_on`, `LocalIdpFixture::with_clock`, `make_password_service_on` and `oauth_setup_provider_on`.
+- Testing: `MockIdentityStore::arm_activate_user_failure`, `disarm_activate_user_failure`, `axess-testing`'s `readiness::Unready`, `poll_ready_once`, `stopwatch::Stopwatch`, `mock_tracing::LineCapture`, `PrintedLines` and `ipv6_forms::local_use_nat64`, and `axess_core::testing::valkey_sweep` are new.
+- Toolchain: `scripts/check-docsrs-build.sh`, `check-shellcheck.sh` (ShellCheck 0.11.0), `check-log-text-sites.sh`, `check-changelog.sh`, `check-lint-allowances.sh`, `check-member-lints.sh`, `check-pipe-readers.sh`, `check-underscore-names.sh` and `check-owner-names.sh` are new.
+- Toolchain: A release publishes only after Hardening passed on its commit, and one dated nightly is pinned (`nightly-toolchain.toml`, `.github/actions/pinned-nightly`), the pin check refusing another or an undated one in a workflow run on a change.
+- Toolchain: Cargo resolves no crates.io version under seven days old (`registry.global-min-publish-age = "7 days"` in `.cargo/config.toml`), and `scripts/check-lock-age.sh` refuses such an entry new to a tracked lockfile unless its commit ends with `Cooldown-Exempt: <advisory id> <crate>`.
+
+### Fixed
+
+- Sessions: Valkey session rotation works across cluster slots, a zero-TTL rotation included, and a session in a step-up is checked on every load as the signed-in session it began from, whose absolute age cap a step-up no longer renews (`signed_in_at`).
+- Sessions: `RequestAuthnService::logout` ends the registry entry the session is held under (`AuthSession::registered_key`), and a `RevocationAwareSocket` follows its session across a rotation (`SessionRegistry::current_key`) instead of closing with `4001 session_revoked`.
+- Time: The authz decision latency, the Valkey device create round and the rate limiter's log throttle read tokio's clock, which a paused runtime moves.
+- Devices: The device cookie holds one entry per device (`PresentedDevice::parse_all`, `MAX_DEVICE_COOKIE_ENTRIES`), so switching accounts reuses devices, and a step-up keeps its device, key proof and lockout exemption (`SessionUser`, `SessionTenant`, `SessionDevice`).
+- Passwords: The account status read after registration matches the check before the factor step, `AuthnError::lockout_expiry` reads only a lockout's end, and `complete_signup` registers the session before it activates the account (see the migration page).
+- Passkeys: `delete_fido2_credential` releases a removed passkey's claim even when its audit row fails, and a registration refused over another user's pending claim is audited as `credential_held_by_another_user` from the claim's answer.
+- Factors: The SQLite example's factor swap compares the stored configuration as a value under a version guard, so older rows swap and their codes do not read as replays, and answers `false`, writing nothing, for a factor disabled meanwhile.
+- Profiles: `ProfileValues::authn_service_builder` keeps the FIDO2 options already set and changes only `max_authn_age`.
+- OAuth: A back-channel logout for a session already ended hands `LogoutAudit` no `IdpSessionEnded`, writes no `SessionInvalidated` and counts in `SessionMetrics::back_channel_logout_unmatched`, and the sid store's sweep keeps a rotated session findable by `sub`.
+- Tokens: Token, device, revocation, delegated refresh and STS refusals keep their error code with a description up to 64 KiB, `issue_refresh_token_from_login` reads a future `authenticated_at` as now, and `JwtSvidResolver` and back-channel logout check token length first.
+- Principals: `TrustDomain::new` accepts every name the SPIFFE-ID standard allows and a path segment no longer takes `~`, `peek_spiffe` and `MtlsResolver` refuse more than one URI SAN, and `JwtSvidResolver` refuses an algorithm the JWT-SVID standard does not list.
+- Authz: `PolicyStore::mentions_context` reads Cedar's syntax tree, so the word `context` in a comment, string or attribute name no longer makes `require_authz!` answer 500, and every handler of the authorization example passes the request context.
+- Logs: The documentation of the public error fields that carry remote text names every class `log_text::escapes` escapes, where it named only some.
+- Stores: `axess-core`'s `sqlx` feature enables the `sqlx` dependency its id derives expand to, so a build that names `sqlx` alone compiles.
+- Testing: `MockIdentityStore::reserve_attempt` treats an attempt window too long for a date as covering every failure, and integration tests on the fixtures declare `testing`, so an all-targets build under one store feature compiles.
+- Docs: The feature tables of `axess-core`, the README and `AGENTS.md` name exactly their crate's features, `accept-client-id` is spelled as the manifest does, and the `axess-events` and `SessionLayer::new` examples are doctests only under their feature.
+- Toolchain: The rustdoc of `axess-core` builds on docs.rs's nightly and with `testing` and `oauth`, seven check scripts stop when they cannot enter the repository, the pin and advisory-watch cases are reliable, and a mutation sweep reruns a lost shard once and fails on one lost twice.
+
+### Changed
+
+- Sessions: The Valkey store's rotation warning names only its prefix for a hash tag, the registry ends a session by key when scripts stop, `active_sessions` sets no order among sessions registered at once, `session_data_msgpack` needs a round trip and UI tests pin `Issuer::Custom`.
+- Sessions: The `SessionInvalidated` row of a kick (`RequestAuthnService::invalidate_session`) and the `LogoutAttempt` row of `RequestAuthnService::logout` name the key the session ended under (`AuthSession::registered_key`).
+- Audit: The SQLite example's `AuditQuery::query_events` answers the rows it read, counts by reason those it could not, and logs the counts and no text of such a row.
+- Time: The Hardening workflow runs `axess-clock` under Miri with every feature, and tests and doc examples read no clock but the test's or a `Clock`, which `scripts/check-clock-usage.sh` holds against an empty baseline.
+- Devices: Four fuzz targets (`key_proof_parse`, `device_proof_cookie`, `device_key_offer`, `device_identifier_header`) hold the device-key decoders to an independent statement, and `key_proof_parse` runs parsed proofs through the three verifications.
+- Passwords: The fuzz target `throttle_math_props` holds the throttle to its /64 rule outside the IPv4-carrying ranges and to one subject per NAT64 client, and the minimal example compares refusals' Argon2 parameters, not elapsed time.
+- Factors: The rustdoc of `FactorStore::compare_and_save_factor` says a lost swap answers `Ok(false)`, a store matches `prior` as a value under a version guard and never swaps a factor it would not load, and runs `assert_compare_and_save_factor_contract`.
+- Principals: The ignored tests of `axess-core/tests/spire_live.rs` run `SpireClient` against a real SPIRE agent, which `scripts/spire-live.sh` starts and CI's SPIRE Workload API job runs.
+- Authz: The error line of a `require_authz!` gate whose policies read `context` while its `AuthzInstallation` holds no context provider names the installation and can appear only after a policy reload.
+- Logs: The debug lines of the Valkey session store print the first eight characters of the session's key in `session_id`, `old_session_id` and `new_session_id`.
+- Stores: `scripts/check-live-stores.sh` needs a passing test from every store and cluster suite (`VALKEY_CLUSTER_URL`) and no key left behind, `ValkeyDeviceStore` is tested on a cluster, and `scripts/check-live-sweeps.sh` requires each live test's sweep (`KeySweep`, `Swept`).
+- Testing: Shared test helpers are public in `axess_core::testing::fixtures` with no `allow(dead_code)`, `assert_update_if_revision_contract` runs the key-addressing and stored-state checks too, and samples use `example.org`, `acme` and `example-api`.
+- Docs: The device, session, identity-store, tenancy and delegated-access chapters, the runbook, the stored session formats page and the rustdoc under `device/` and `session/` describe what the code does.
+- Docs: `docs/sessions/backends.md`, `RateLimitLayer`, `PrepareOutcome::Fido2Challenge`, `cloud_sts`, `ClockTtlCache` and the defaults of `OAuthProvider` and `PolicyEvaluator::step_up_for`, by plain parameter names (`id_token_hint`, `token`, `dpop`), are documented as the code is.
+- Docs: The demo accounts sign in with `Sample2+` (minimal, FIDO2, README) and `Sample2+Example` (the SQLite example's `alice` and `bob`), and the SQLite example's pages are its handlers' HTML, with `templates/` removed.
+- Toolchain: The development toolchain is 1.100.0 (`rust-toolchain.toml`, MSRV still 1.95.0), which CI installs through `.github/actions/pinned-toolchain`, and the pin check refuses a written-out toolchain other than it in a workflow run on a push, a pull request or a release.
+- Toolchain: Every crate takes the workspace lint table (`[lints] workspace = true`) denying `unused_dependencies`, which `scripts/check-unused-dependency-lint.sh` proves fires, cargo-machete is gone, `scripts/unused-dependencies.sh` (cargo-udeps) covers dev-dependencies, and `homepage` is dropped.
+- Toolchain: The feature matrix checks every target and doctest per profile and eight once-failing sets, `scripts/check-docsrs-features.sh` holds every feature table and named feature to its manifest, and docs.rs builds all features but `sqlite-unbundled`.
+- Toolchain: The script gates read untracked files and skip test code, literals and comments, compile-fail examples name their error code, and `scripts/check-doc-links.sh` and `check-prose-style.sh` check more.
+- Toolchain: Workflows pass every expression to their scripts through `env:`, release jobs write only temporary files and spell out their `git push`, and a weekly `advisory-fix-watch` opens an issue when an upstream takes the release that fixes an accepted advisory.
+- Toolchain: In `scripts/supply-chain.sh` a crate cargo geiger did not count fails the step, informational unless `STRICT=1`, and one named cargo-deny error is waived, `deny.toml` denies `unused-ignored-advisory`, and `scripts/check-semver.sh` needs every reported break on the migration page.
+- Toolchain: The mutation sweep runs live-store modules with a store, 16 shards at a time on a release push and 10 weekly (`mutants.yml`), every `#[ignore]` gives its reason and marks a live-server test, and `tests/postgres_store.rs` fails without `POSTGRES_URL`.
+- Toolchain: The mutation sweep tests each mutant with cargo-nextest under the `mutants` profile of `.config/nextest.toml`, which stops at the first failing test and ends a test that hangs, and its baseline job runs the unmutated suite the same way.
+- Toolchain: The release workflow reports the full Mutants sweep on the release commit, its address and ending, without waiting for it, and the sweep plans 48 mutants to a shard, a provisional size inside GitHub's matrix cap of 256.
+- Toolchain: The fuzz crate's lock is held to the workspace (`scripts/check-fuzz-lock.sh`), `Fuzz Smoke` and the preflight run every fuzz target, and the conformance runner's crafted cases run offline, its verdicts dated from `scripts/conformance/results.json`.
+
+### Dependencies
+
+- Time: Only two crates depend on chrono: `axess-factors`, privately under `oauth` where `openidconnect` hands it a time, and `axess-clock`, for its tests; chrono still reaches a build through `cedar-policy-core`, `oauth2` and `openidconnect`.
+- Logs: `tracing` is optional in `axess-factors` (`password`, `totp`, `fido2`, `mtls`, `jwt`; `jwt` no longer enables `tokio`), which always depends on `axess-identity`, and `axess-identity` depends on `sha2` for a session's key.
+- Toolchain: The `oauth` feature of `axess-factors` drops `axum`, `axess-core` drops `tokio-test` and gates `arc-swap` and `axess-cache`, lock files take updates at least seven days old, the workspace drops an unused `axess-events` dependency, and `rsa` 0.9, `reqwest` 0.12 and `jsonwebtoken` 11 stay.
 
 ## [0.19.0] - 2026-11-09
 
@@ -238,10 +509,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 - `hash_new_password(password, &PasswordRules)` refuses an over-long or rule-failing password before hashing (`NewPasswordError`); `PasswordRules::accepts` is the one check, and `MAX_PASSWORD_BYTES` lives in `axess-factors`.
 - A breached-password check at password choice: `AuthnServiceBuilder::with_breached_password_check` takes a `BreachedPasswordCheck`, after which a password reset, and an application's own signup or change through `AuthnService::check_chosen_password` and `hash_chosen_password`, refuse a password the check knows (`NewPasswordError::Breached`, audit reason `password_breached`) and by default one it could not screen (`BreachCheckUnavailable`, opt-out `allow_unchecked_when_breach_check_unavailable()`); `PasswordRules::breached_check` exempts a tenant; `range_prefix` and `count_in_range` are the k-anonymity range protocol's pure halves, `hash_new_password_checked` the free-function form, and `BreachedPasswordList` (under `testing`) a fixed list for tests and examples.
 
-### Changed (breaking)
-
-- `PolicyStore::digest()` returns a `String` and `PolicyStore::schema()` a `Schema`, because both follow a policy reload; `original_digest()` and `original_schema()` borrow the text the object was built from.
-
 ### Fixed
 
 - A session rotation no longer loses a write that lands while it runs; a conflict is merged and retried, then fails closed.
@@ -406,10 +673,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 - The sqlite example's key file is never rewritten: a valid key only narrows
   the mode, a new file is linked into place whole, a file with no key stops
   the start.
-
-### Changed (breaking)
-
-- `PolicyStore::digest()` returns a `String` and `PolicyStore::schema()` a `Schema`, because both follow a policy reload; `original_digest()` and `original_schema()` borrow the text the object was built from.
 
 ### Fixed
 
@@ -711,10 +974,6 @@ Behaviour:
 - **Testing**: `AuthSessionTestExt::set_impersonator`, `CallLog::on`,
   `arm_record_event_hang`, `arm_get_user_failure`.
 
-### Changed (breaking)
-
-- `PolicyStore::digest()` returns a `String` and `PolicyStore::schema()` a `Schema`, because both follow a policy reload; `original_digest()` and `original_schema()` borrow the text the object was built from.
-
 ### Fixed
 
 - **A one-shot session value cannot be handed out twice or written back**:
@@ -764,10 +1023,11 @@ Behaviour:
   proxies it names; the overflow bucket withholds `x-ratelimit-remaining`.
 - **Clock steps and stalls**: the service-secret warn throttle re-arms, the
   Valkey revocation subscriber reconnects, the JWKS refresh and session
-  cleanup tickers run once, and the audit archiver archives no batch twice.
+  cleanup tickers fire once after a stall instead of once per missed tick, and the audit archiver archives no batch twice. (corrected in 0.20.0)
 - **`logout` clears the session before awaiting the audit write**; the sqlite
   example costs the same for an unknown identifier and its decoders return an
-  error for a malformed row; `TracingCapture` sees a sibling test's events.
+  error for a malformed row; `TracingCapture` no longer misses an event because a
+  sibling test without a subscriber hit its callsite first. (corrected in 0.20.0)
 
 ### Documentation
 
@@ -806,7 +1066,7 @@ Logins and factors:
   `secret.plain()`. Stored rows load unchanged.
 - `StepUpPolicy::default()` asks for a factor at every trust level, since a
   fingerprint is client-controlled. `PrepareOutcome::AlreadySent` carries a
-  masked address; the HOTP attempt limit restarts the count.
+  masked address, and each new email OTP code starts a fresh attempt count. (corrected in 0.20.0)
 - `begin_impersonation` is the tenant-scoped form and requires an
   authenticated admin session. `suspend_user`, `activate_user`,
   `invalidate_user_sessions` and `invalidate_session` take an `Actor` and the
@@ -870,12 +1130,12 @@ Federation, workload identity and network:
 - `refresh_oauth_token` takes `original_nonce` and returns `RefreshOutcome`
   (the ID token is optional and the rotated refresh token is never lost with
   the error); `fetch_userinfo` takes `expected_subject`.
-  `OAuthProviderConfig::with_fapi` works and no longer needs the `fapi`
-  feature; `FapiConfig` gains `allowed_id_token_algs`; `OAuthClaims` gains
+  A provider set up with `OAuthProviderConfig::with_fapi` makes its DPoP
+  proofs without the `fapi` feature of `axess-factors`; `FapiConfig` gains `allowed_id_token_algs`; `OAuthClaims` gains
   `dpop_key`; DPoP proofs take a `DpopKey`. An empty `post_logout_redirect_uri`
   allowlist forwards nothing. A back-channel logout token with both `sid` and
   `sub` ends only the `sid` session; `iss` is pinned, `typ` checked, and a
-  full `jti` log answers 503.
+  full `jti` log answers 503. (corrected in 0.20.0)
 - `JwtVerifier::verify` fails without an audience pin unless
   `allow_any_audience()` was called; `JwtSvidResolver` and `WorkloadResolver`
   refuse a verifier that pins no `iss` or `aud`; `verify_jwt` refuses
@@ -955,10 +1215,6 @@ and, unconditionally, on `aes-gcm`; `webauthn-rs` is pinned `=0.6.0-dev`;
   and decision events for denials made before Cedar is asked.
 - The example crates gain a pinned Kubernetes mapper, the local IdP's key
   retirement route, a logout route and a sealing key for TOTP enrolments.
-
-### Changed (breaking)
-
-- `PolicyStore::digest()` returns a `String` and `PolicyStore::schema()` a `Schema`, because both follow a policy reload; `original_digest()` and `original_schema()` borrow the text the object was built from.
 
 ### Fixed
 
@@ -1073,10 +1329,6 @@ and, unconditionally, on `aes-gcm`; `webauthn-rs` is pinned `=0.6.0-dev`;
 - Live Postgres and MySQL suites for the session and device stores, run by
   CI's ignored-test step.
 
-### Changed (breaking)
-
-- `PolicyStore::digest()` returns a `String` and `PolicyStore::schema()` a `Schema`, because both follow a policy reload; `original_digest()` and `original_schema()` borrow the text the object was built from.
-
 ### Fixed
 
 - A passkey deleted between ceremony start and finish no longer logs in, and
@@ -1132,10 +1384,13 @@ and, unconditionally, on `aes-gcm`; `webauthn-rs` is pinned `=0.6.0-dev`;
 
 ### Changed (breaking)
 
-- **`DeviceStore` requires `set_trust_level_if`, `replace_bindings`,
-  `claim_owner` and `find_by_fingerprint_for_user`; `save`, `replace_bindings`
-  and `claim_owner` take the time of the write.** All are conditional writes
-  in every backend.
+- **`DeviceStore` gains `set_trust_level_if`, `replace_bindings`,
+  `claim_owner` and `find_by_fingerprint_for_user`; `save`,
+  `set_trust_level_if`, `replace_bindings` and `claim_owner` take the time of
+  the write.** The three writes are conditional writes in every shipped
+  backend; their provided bodies are a load followed by a write, not safe
+  against a concurrent writer, so a store with concurrent writers must
+  override them. (corrected in 0.20.0)
 - **`Device` carries `demoted_at`.** SQL stores need an `ALTER TABLE` and a
   `CREATE INDEX` (module docs); Valkey rows carry it in the blob.
 - **Device sightings are written at most once per `sighting_granularity`**
@@ -1173,7 +1428,8 @@ and, unconditionally, on `aes-gcm`; `webauthn-rs` is pinned `=0.6.0-dev`;
   `(issuer, user)` index; `AuthnService::sid_map()` returns it. Capacity
   eviction drops the mapping without ending the session; TTL pruning ends at
   most 128 sessions per login.
-- **`verify_logout_jwt` requires `exp`.**
+- **`verify_logout_jwt` requires `exp`**, as it already did under 0.10.0,
+  whose default validation requires `exp`. (corrected in 0.20.0)
 - **`RateLimitConfig` has a public `clock` field.** Windows are clock
   milliseconds; one sweep per `max(window / 8, 1 s)`; at 262,144 buckets a new
   key answers 429 with `Retry-After`. The 64K soft cap is gone.
@@ -1270,10 +1526,6 @@ and, unconditionally, on `aes-gcm`; `webauthn-rs` is pinned `=0.6.0-dev`;
 - `SidMap::register_subject_session`, `take_subject_sessions`,
   `forget_subject_session`, `sweep_subject_candidates`, `subject_len`.
 
-### Changed (breaking)
-
-- `PolicyStore::digest()` returns a `String` and `PolicyStore::schema()` a `Schema`, because both follow a policy reload; `original_digest()` and `original_schema()` borrow the text the object was built from.
-
 ### Fixed
 
 - ID-token verification keys refresh: a token signed with a key the IdP
@@ -1366,10 +1618,6 @@ and, unconditionally, on `aes-gcm`; `webauthn-rs` is pinned `=0.6.0-dev`;
 - `EntityState::effective_at(now)`.
 - `Issuer::Custom` serializes as `{"kind":"custom","label":"..."}`.
 
-### Changed (breaking)
-
-- `PolicyStore::digest()` returns a `String` and `PolicyStore::schema()` a `Schema`, because both follow a policy reload; `original_digest()` and `original_schema()` borrow the text the object was built from.
-
 ### Fixed
 
 - **One-time codes replayed in parallel.** Two concurrent requests with the
@@ -1427,10 +1675,6 @@ and, unconditionally, on `aes-gcm`; `webauthn-rs` is pinned `=0.6.0-dev`;
 - **Dependencies**: cedar-policy 4.14.0, lru 0.19.0, parking_lot 0.13.0,
   sha2 0.11.1, proptest 1.12.0, rkyv 0.8.18, zeroize 1.9.1, uuid 1.29.0,
   tokio 1.54.1, serde_json 1.0.154.
-
-### Changed (breaking)
-
-- `PolicyStore::digest()` returns a `String` and `PolicyStore::schema()` a `Schema`, because both follow a policy reload; `original_digest()` and `original_schema()` borrow the text the object was built from.
 
 ### Fixed
 
@@ -1642,10 +1886,6 @@ believed a header the caller writes.
 
 - **`IpPolicy::restricts`** and **`MockIdentityStore::with_ip_policy`**.
 
-### Changed (breaking)
-
-- `PolicyStore::digest()` returns a `String` and `PolicyStore::schema()` a `Schema`, because both follow a policy reload; `original_digest()` and `original_schema()` borrow the text the object was built from.
-
 ### Fixed
 
 - **A tenant IP allowlist could be switched off by the caller.**
@@ -1676,7 +1916,7 @@ believed a header the caller writes.
 
 Breaking: if you use the JWT features you must now pick a crypto backend, and
 several security fixes change behaviour. Rationale for the larger decisions
-lives in the commit log and in `platform/.claude/decisions/`.
+lives in the commit log. (corrected in 0.20.0)
 
 ### Changed
 
@@ -1874,10 +2114,6 @@ lives in the commit log and in `platform/.claude/decisions/`.
   those should prefer ES256 or `jwt-aws-lc`. The exception stands, accurately
   justified.
 
-### Changed (breaking)
-
-- `PolicyStore::digest()` returns a `String` and `PolicyStore::schema()` a `Schema`, because both follow a policy reload; `original_digest()` and `original_schema()` borrow the text the object was built from.
-
 ### Fixed
 
 - **Twenty-three chapters described a library that does not exist.** Worth
@@ -1896,12 +2132,14 @@ lives in the commit log and in `platform/.claude/decisions/`.
 - **The audit-events and audit-pipeline chapters match the implementation.**
   Axess writes one flat `AuthEvent` with `event_status` carrying the outcome
   and `event_time` in epoch microseconds; it awaits one `record_event` call and
-  does not buffer, queue, retry or fan out. The chapters described a different
+  does not buffer, queue or retry; fan-out is the opt-in `AuditLogWithAnalytics`
+  decorator, which hands an enriched copy of each event to an
+  `AuthnAnalyticsSink` in a spawned task. The chapters described a different
   model with per-outcome event types and a buffering config.
   **Re-check SIEM queries built from the old chapters**: event names, status
   handling and column names all differ. Two properties worth knowing before
   choosing a sink: the write is on the login hot path, and it now fails the
-  login (see Security).
+  login (see Security). (corrected in 0.20.0)
 
 ### Dependencies
 
@@ -2035,10 +2273,6 @@ Three breaking changes, all single struct fields; see
   `testing::mock_tracing`, so it is now optional and pulled by the `testing`
   feature.
 
-### Changed (breaking)
-
-- `PolicyStore::digest()` returns a `String` and `PolicyStore::schema()` a `Schema`, because both follow a policy reload; `original_digest()` and `original_schema()` borrow the text the object was built from.
-
 ### Fixed
 
 - **Every intra-doc link in the workspace resolves.** 29 diagnostics under
@@ -2143,10 +2377,6 @@ CSRF, provider registration, session-key rotation.
   functional break: the crate was already present transitively for
   most feature combinations.
 
-### Changed (breaking)
-
-- `PolicyStore::digest()` returns a `String` and `PolicyStore::schema()` a `Schema`, because both follow a policy reload; `original_digest()` and `original_schema()` borrow the text the object was built from.
-
 ### Fixed
 
 - Fingerprint verification under rotation no longer invalidates
@@ -2245,10 +2475,6 @@ CSRF, provider registration, session-key rotation.
 
 ## [0.3.3] - 2026-08-08
 
-### Changed (breaking)
-
-- `PolicyStore::digest()` returns a `String` and `PolicyStore::schema()` a `Schema`, because both follow a policy reload; `original_digest()` and `original_schema()` borrow the text the object was built from.
-
 ### Fixed
 
 - `session` + `csrf`: a fresh guest's session id is now stable across
@@ -2290,10 +2516,6 @@ CSRF, provider registration, session-key rotation.
 ---
 
 ## [0.3.1] - 2026-08-02
-
-### Changed (breaking)
-
-- `PolicyStore::digest()` returns a `String` and `PolicyStore::schema()` a `Schema`, because both follow a policy reload; `original_digest()` and `original_schema()` borrow the text the object was built from.
 
 ### Fixed
 
@@ -2403,7 +2625,7 @@ Adopters depend on the `axess` facade crate. The 0.x line is pre-1.0: the public
 - **Multi-factor authentication.** Sequential and choice-based verification via `FactorStep::AnyOf`. Factors compose into named methods scoped per tenant or per user.
 - **Factor implementations.** Password (Argon2id), TOTP (RFC 6238), HOTP (RFC 4226), email OTP (8-digit, Argon2-hashed, TTL-bound), FIDO2 / WebAuthn (registration, authentication, discoverable / passwordless, clone detection), OAuth 2.0 / OIDC (Authorization Code + PKCE, Client Credentials, Device Code RFC 8628), LDAP bind, mTLS, JWT (incl. JWT-SVID), bearer-token extractors.
 - **DST-friendly verification.** TOTP verification, the FAPI `nbf` validator, and the DPoP `jti` replay cache all consume time through `axess_clock::Clock`. Default is `SystemClock`; swap in a `MockClock` for deterministic simulation. `OAuthProviderConfig::with_clock` and `MemoryJtiCache::with_clock` expose the injection point on the OAuth surfaces; `verify_totp` accepts the `DateTime<Utc>` the application's clock returns.
-- **Plain-OAuth-2.0 social login.** Generic `SocialProvider` (gated on `social`, **off by default**) for IdPs that don't support OIDC (GitHub user login, Twitter/X, Discord, Reddit, Spotify, …). Identity comes from a TLS-trusted userinfo endpoint rather than a signed assertion; the security model is weaker than OIDC. Parallel types (`SocialClaims` vs `IdTokenClaims`, `SocialProvider` vs `OAuthProviderConfig`) make the difference visible at every call site. PKCE on by default; RNG injectable via `Arc<dyn SecureRng>` for DST.
+- **Plain-OAuth-2.0 social login.** Generic `SocialProvider` (gated on `social`, **off by default**) for IdPs that don't support OIDC (GitHub user login, Twitter/X, Discord, Reddit, Spotify, …). Identity comes from a TLS-trusted userinfo endpoint rather than a signed assertion; the security model is weaker than OIDC. Parallel types (`SocialClaims` vs `OAuthClaims`, `SocialProvider` vs `OAuthProviderConfig`) make the difference visible at every call site. PKCE on by default; RNG injectable via `Arc<dyn SecureRng>` for DST. (corrected in 0.20.0)
 - **Session lifecycle.** ID cycling for fixation prevention; HMAC-SHA256 fingerprint binding at completion; registry-backed forced logout; concurrent-session limits with oldest-eviction; versioned session data with auto-migration; refresh-token rotation with family revocation on reuse.
 - **Session revocation API.** `AuthnService::invalidate_user_sessions`, `invalidate_session`, `active_sessions`, `has_session_registry()`. Returns `NoSessionRegistryError` when no registry is attached.
 - **`SessionRevoker` + `SessionRegistryHandle` supertrait pair.** Logout handlers take `Arc<dyn SessionRevoker>` (2 methods); `AuthnService` holds `Arc<dyn SessionRegistryHandle>` (5 methods).

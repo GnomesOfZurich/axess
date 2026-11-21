@@ -128,7 +128,7 @@ CREATE TABLE IF NOT EXISTS auth_events (
 
 -- sessions — managed by SqliteSessionStore.
 CREATE TABLE IF NOT EXISTS sessions (
-    id          TEXT PRIMARY KEY,          -- UUID as string
+    id          TEXT PRIMARY KEY,          -- the session's key: 64 hex characters, a digest of the id
     data        TEXT NOT NULL,             -- legacy text form; empty on saved rows
     data_bin    BLOB,                      -- MessagePack SessionData, sealed when encrypted
     expires_at  INTEGER NOT NULL           -- Unix timestamp (seconds)

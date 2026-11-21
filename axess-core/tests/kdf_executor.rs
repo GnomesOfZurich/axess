@@ -3,8 +3,9 @@
 //! runtime's worker; the salt comes from the injected RNG; a recovery-code
 //! check costs no hash when its rows are keyed.
 
-mod common;
+use axess_core::testing::fixtures as common;
 
+use axess_clock::testing::MockClock;
 use axess_core::authn::AuditContext;
 use axess_core::authn::{
     factor::{EmailOtpConfig, FactorConfig, FactorCredential, FactorKind, ZeroizedString},
@@ -25,16 +26,19 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 fn password_world(
     kdf: Arc<KdfExecutor>,
 ) -> axess_core::authn::service::RequestAuthnService<MockIdentityStore, MockFactorStore> {
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"))
         // What a guess costs is under test, so a right one follows a wrong
         // one at once; the throttle's own cost is tested where it lives.
         .with_lockout_policy(LockoutPolicy::default().without_throttle());
     let factors = MockFactorStore::new()
-        .with_factor(user_scope(), password_config("Gnomes2+"))
+        .with_factor(user_scope(), password_config("Sample2+"))
         .with_method(&uid("u1"), password_method());
     AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
         .with_kdf_executor(kdf)
         .build()
         .with_audit_context(AuditContext::default())
@@ -63,7 +67,7 @@ async fn a_password_check_leaves_the_runtime_free() {
         }
     });
     let out = svc
-        .verify_factor(&password("Gnomes2+"), &session)
+        .verify_factor(&password("Sample2+"), &session)
         .await
         .unwrap();
     ticker.abort();
@@ -91,7 +95,7 @@ async fn a_right_and_a_wrong_password_each_cost_one_job() {
     assert_eq!(kdf.jobs_started(), 1);
 
     let out = svc
-        .verify_factor(&password("Gnomes2+"), &session)
+        .verify_factor(&password("Sample2+"), &session)
         .await
         .unwrap();
     assert!(matches!(out, FactorOutcome::Authenticated), "{out:?}");
@@ -99,6 +103,7 @@ async fn a_right_and_a_wrong_password_each_cost_one_job() {
 }
 
 fn email_otp_world(
+    clock: &MockClock,
     seed: u64,
     kdf: Arc<KdfExecutor>,
 ) -> (
@@ -106,6 +111,7 @@ fn email_otp_world(
     MockFactorStore,
 ) {
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new()
@@ -113,7 +119,7 @@ fn email_otp_world(
             user_scope(),
             FactorConfig::EmailOtp(EmailOtpConfig {
                 email: "alice@example.com".into(),
-                ttl_secs: 300,
+                ttl: std::time::Duration::from_secs(300),
                 ..EmailOtpConfig::default()
             }),
         )
@@ -122,6 +128,7 @@ fn email_otp_world(
             AuthMethod::sequential("email_otp", vec![FactorKind::EmailOtp], user_scope()),
         );
     let svc = AuthnService::builder(identity, factors.clone())
+        .with_clock(clock.clone())
         .with_rng(MockRng::new(seed))
         .with_kdf_executor(kdf)
         .build()
@@ -160,10 +167,11 @@ async fn issue_otp(
 /// differs on every run.
 #[tokio::test]
 async fn the_email_otp_hash_is_reproducible_under_a_seeded_rng() {
+    let clock = common::test_clock();
     let kdf = Arc::new(KdfExecutor::inline());
-    let (a, fa) = email_otp_world(11, kdf.clone());
-    let (b, fb) = email_otp_world(11, kdf.clone());
-    let (c, fc) = email_otp_world(12, kdf.clone());
+    let (a, fa) = email_otp_world(&clock, 11, kdf.clone());
+    let (b, fb) = email_otp_world(&clock, 11, kdf.clone());
+    let (c, fc) = email_otp_world(&clock, 12, kdf.clone());
     let (code_a, hash_a) = issue_otp(&a, &fa).await;
     let (code_b, hash_b) = issue_otp(&b, &fb).await;
     let (code_c, hash_c) = issue_otp(&c, &fc).await;
@@ -181,9 +189,11 @@ async fn the_email_otp_hash_is_reproducible_under_a_seeded_rng() {
 async fn a_reset_checks_history_and_hashes_in_one_job() {
     use axess_core::authn::factor::PasswordRules;
     use axess_core::authn::store::IdentityPasswordHistory;
+    let clock = common::test_clock();
 
     let user = test_user("u1", "alice");
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(user.clone())
         .with_password_rules(
@@ -201,6 +211,7 @@ async fn a_reset_checks_history_and_hashes_in_one_job() {
     }
     let kdf = Arc::new(KdfExecutor::inline());
     let svc = AuthnService::builder(identity.clone(), MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_rng(MockRng::new(5))
         .with_kdf_executor(kdf.clone())
         .build()
@@ -236,8 +247,10 @@ fn recovery_world(
     axess_core::authn::service::RequestAuthnService<MockIdentityStore, MockFactorStore>,
     Vec<String>,
 ) {
+    let clock = common::test_clock();
     let shown: Vec<String> = set.display.iter().map(|c| c.to_string()).collect();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new()
@@ -246,7 +259,9 @@ fn recovery_world(
             &uid("u1"),
             AuthMethod::sequential("rc", vec![FactorKind::RecoveryCode], user_scope()),
         );
-    let mut builder = AuthnService::builder(identity, factors).with_kdf_executor(kdf);
+    let mut builder = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
+        .with_kdf_executor(kdf);
     if let Some(p) = pepper {
         builder = builder.with_recovery_code_pepper(p);
     }

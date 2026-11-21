@@ -43,7 +43,7 @@ WORKTREE_BRANCH="mutants/scratch"
 cd "$AXESS_DIR"
 
 if [ "${1:-}" = "--clean" ]; then
-  if git worktree list --porcelain | grep -q "worktree $WORKTREE_DIR"; then
+  if grep -q "worktree $WORKTREE_DIR" <<<"$(git worktree list --porcelain)"; then
     git worktree remove --force "$WORKTREE_DIR"
     echo "Removed mutants worktree at $WORKTREE_DIR"
   else
@@ -60,7 +60,7 @@ fi
 #    (`mutants/scratch`) so the worktree never shares a branch with
 #    the primary checkout: running two `git worktree`s on the same
 #    branch is rejected by git anyway.
-if ! git worktree list --porcelain | grep -q "worktree $WORKTREE_DIR"; then
+if ! grep -q "worktree $WORKTREE_DIR" <<<"$(git worktree list --porcelain)"; then
   echo "Creating mutants worktree at $WORKTREE_DIR (branch: $WORKTREE_BRANCH)..."
   if git show-ref --verify --quiet "refs/heads/$WORKTREE_BRANCH"; then
     git worktree add "$WORKTREE_DIR" "$WORKTREE_BRANCH"

@@ -4,7 +4,7 @@
 //! a configured token endpoint for a fresh token scoped to a downstream
 //! service. No persistent storage; the input is the user's
 //! authorization. See [`docs/identity/delegated-obo.md`](../../../../docs/identity/delegated-obo.md)
-//! for the use-case taxonomy and the comparison with [`super::stored`](crate::delegated::stored).
+//! for the use-case taxonomy and the comparison with [the stored module](crate::delegated::stored).
 
 use std::sync::Arc;
 
@@ -41,7 +41,7 @@ const GRANT_TYPE_TOKEN_EXCHANGE: &str = "urn:ietf:params:oauth:grant-type:token-
 ///
 /// ```ignore
 /// let req = TokenExchangeRequest::new(user_session_jwt, token_types::JWT)
-///     .with_audience("https://compute-worker.gnomes")
+///     .with_audience("https://compute-worker.example.org")
 ///     .with_scopes(["compute.read", "compute.write"])
 ///     .with_actor_token(axess_workload_jwt, token_types::JWT);
 /// let resp = exchanger.exchange(&req).await?;
@@ -195,10 +195,9 @@ pub struct TokenExchangeClient {
 impl TokenExchangeClient {
     /// Build a client. The `client_secret` is optional; some AS
     /// flows authenticate axess via mTLS at the transport layer
-    /// instead of a shared secret, in which case pass `None` and
-    /// configure the [`reqwest::Client`] via
-    /// [`with_http_client`](Self::with_http_client) to present the
-    /// client cert.
+    /// instead of a shared secret, in which case pass `None` and name the
+    /// client certificate with
+    /// [`with_client_settings`](Self::with_client_settings).
     ///
     /// The endpoint must be HTTPS (plain HTTP only to a loopback host); any
     /// other endpoint is refused by [`exchange`](Self::exchange) before a
@@ -215,7 +214,7 @@ impl TokenExchangeClient {
         client_id: impl Into<String>,
         client_secret: Option<ZeroizedString>,
     ) -> Result<Self, DelegatedError> {
-        let http = crate::outbound_http::hardened_client()?;
+        let http = crate::outbound_http::hardened_client(|settings| settings)?;
         Ok(Self {
             token_endpoint,
             client_id: client_id.into(),
@@ -224,17 +223,31 @@ impl TokenExchangeClient {
         })
     }
 
-    /// Override the HTTP client; used for outbound mTLS / proxy /
-    /// timeout config.
+    /// Add settings to the HTTP client of the token exchange: a `User-Agent`, a
+    /// trusted root certificate, a client certificate for outbound mTLS,
+    /// timeouts.
     ///
-    /// A replacement client drops the default client's protections: it must
-    /// be built with `redirect(reqwest::redirect::Policy::none())` and a
-    /// connect and request timeout, or a redirect re-sends the subject token
-    /// and client credentials to wherever it points. The endpoint check
-    /// (HTTPS, or HTTP to a loopback host) still applies.
-    pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
-        self.http = http;
-        self
+    /// The client is built again with `configure`'s settings before the
+    /// library's own, so it still follows no redirect: a
+    /// [`ClientSettings`](axess_factors::egress::ClientSettings) offers
+    /// nothing that could change that, and a whole client of the caller's
+    /// own is not taken, since a redirect it followed would carry the
+    /// credentials to wherever it points. A proxy named in the environment
+    /// (`HTTPS_PROXY`) is followed, as before. The endpoint check (HTTPS, or
+    /// HTTP to a loopback host) still applies.
+    ///
+    /// # Errors
+    ///
+    /// [`DelegatedError::ClientBuild`] when the client cannot be built with the
+    /// settings.
+    pub fn with_client_settings(
+        mut self,
+        configure: impl FnOnce(
+            axess_factors::egress::ClientSettings,
+        ) -> axess_factors::egress::ClientSettings,
+    ) -> Result<Self, DelegatedError> {
+        self.http = crate::outbound_http::hardened_client(configure)?;
+        Ok(self)
     }
 
     /// Perform one token exchange. The returned `access_token` is
@@ -292,13 +305,14 @@ impl TokenExchangeClient {
             let body = read_error_body(&mut response).await;
             return Err(DelegatedError::TokenEndpoint {
                 status: status.as_u16(),
-                body,
+                body: crate::delegated::body::log_safe(&body),
             });
         }
 
         let body = read_success_body(&mut response).await?;
-        let parsed: TokenExchangeResponseBody = serde_json::from_slice(&body)
-            .map_err(|e| DelegatedError::MalformedResponse(e.to_string()))?;
+        let parsed: TokenExchangeResponseBody = serde_json::from_slice(&body).map_err(|e| {
+            DelegatedError::MalformedResponse(axess_factors::http_body::log_safe_parse_error(&e))
+        })?;
         if parsed.access_token.is_empty() {
             return Err(DelegatedError::MalformedResponse(
                 "access_token field is empty".into(),

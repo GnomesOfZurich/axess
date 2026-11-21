@@ -27,9 +27,13 @@ where
     F: FactorStore<Error = I::Error>,
 {
     /// Audit and name the refusal of a passkey ceremony for an account that
-    /// may not log in. A lockout carries `Locked` (with its `until`), the
-    /// other non-active states a `Failure` tagged `NotActive`, so a dashboard
-    /// separates brute-force probes from administrative-state mismatches.
+    /// may not log in. A suspension carries `Locked`, the other non-active
+    /// states a `Failure` tagged `NotActive`, so a dashboard separates
+    /// brute-force probes from administrative-state mismatches. The answer
+    /// to the caller carries the end of the suspension only when it is a
+    /// lockout, by the rule every factor step follows: a discoverable login
+    /// reaches this refusal before the assertion is verified, so the end of
+    /// an operator's hold would be told to a caller who has proved nothing.
     /// `event` is the kind of the operation refused: `FactorEnabled` for
     /// beginning an enrolment, `FactorSetup` for finishing one,
     /// `FactorDisabled` for a deletion and `FactorVerified` for a login, so
@@ -51,15 +55,15 @@ where
             .attributed_to(&user.id, &user.tenant_id)
             .with_factor(FactorKind::Fido2);
         if let Some(session) = session {
-            builder = builder.with_session(session.session_id().await);
+            builder = builder.with_session(session.session_key().await);
         }
         if let Err(e) = self.emit_audit(builder).await {
             return e;
         }
-        if let crate::authn::types::EntityState::Suspended(detail) = &status {
+        if status.is_suspended() {
             self.inner.metrics.auth_flow.account_locked();
             return AuthnError::Locked {
-                until: detail.until,
+                until: crate::authn::service::factor_pipeline::shown_suspension_end(&status),
             };
         }
         AuthnError::NotActive(status)
@@ -143,8 +147,9 @@ where
                 .await;
         }
         if let (Some(limit), Some(at)) = (self.inner.fido2_options.max_authn_age, authn_time) {
-            let age = self.inner.clock.now().signed_duration_since(at);
-            let limit = chrono::Duration::from_std(limit).unwrap_or(chrono::Duration::MAX);
+            let age = self.inner.clock.now().since(at);
+            let limit = axess_clock::SignedDuration::try_from(limit)
+                .unwrap_or(axess_clock::SignedDuration::MAX);
             if age > limit {
                 return self
                     .refuse_credential_change(
@@ -180,7 +185,7 @@ where
         let mut builder = AuthEventBuilder::failure(event)
             .attributed_to(&user.id, &user.tenant_id)
             .with_factor(FactorKind::Fido2)
-            .with_session(session.session_id().await)
+            .with_session(session.session_key().await)
             .with_error(reason);
         if let Some(admin) = impersonator {
             builder = builder.with_actor(admin);

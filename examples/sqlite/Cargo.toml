@@ -1,6 +1,6 @@
 [package]
 name = "axess-example-sqlite"
-version = "0.19.0"
+version = "0.20.0"
 edition = "2024"
 rust-version.workspace = true
 publish = false
@@ -12,14 +12,16 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/GnomesOfZurich/axess"
 categories = ["web-programming"]
 
+[lints]
+workspace = true
+
 [dependencies]
 # `sqlite` opts the storage backend in; `device` (used by `--bin device`) is
 # in axess's default features.
-axess = { path = "../../axess", version = "=0.19.0", features = ["sqlite", "memory"] }
+axess = { path = "../../axess", version = "=0.20.0", features = ["sqlite", "memory"] }
 base64 = { version = "0.23.1", default-features = false, features = ["std"] }
 axum = { version = "0.8.9", features = ["macros", "form"] }
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
-chrono = { version = "0.4.45", features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sqlx = { version = "0.9.0", features = ["sqlite", "runtime-tokio"] }
@@ -30,6 +32,12 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.29.0", features = ["v4"] }
 
+[features]
+# Device keys where a person signs in: a session is bound to a key the
+# browser holds, so a copied session cookie opens nothing without it
+# (`src/web/device_keys.rs`).
+device-keys = ["axess/device-keys", "axess/jwt-rust-crypto"]
+
 [dev-dependencies]
 # `tower::ServiceExt::oneshot` lets the smoke test drive the router
 # without binding a real socket: faster, parallel-safe, no port
@@ -39,3 +47,14 @@ tower = { version = "0.5.3", features = ["util"] }
 # library axess verifies with) and posts forms (`serde_urlencoded`).
 serde_urlencoded = "0.7.1"
 totp-rs = "6.0.0"
+# The table of extreme durations, for tests that an operator's "for ever"
+# never panics the store.
+axess-testing = { path = "../../axess-testing", version = "=0.20.0" }
+# `testing::store_contract` holds the store to the rules of the passkey
+# credential-id claim: the check a store outside this repository runs too.
+axess-core = { path = "../../axess-core", version = "=0.20.0", features = ["testing", "allow-testing-in-release"] }
+# The mock clock the tests run the backend on, set to a reproducible instant.
+axess-clock = { path = "../../axess-clock", version = "=0.20.0", features = ["testing", "allow-testing-in-release"] }
+# The software key the device-key test registers and signs with
+# (`axess::device_key::key_proof::testing`), under the facade's `testing`.
+axess = { path = "../../axess", version = "=0.20.0", features = ["testing", "allow-testing-in-release"] }

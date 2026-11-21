@@ -9,7 +9,7 @@
 //! assurance policy.
 
 use crate::authn::factor::FactorKind;
-use chrono::{DateTime, Utc};
+use axess_clock::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -60,7 +60,7 @@ pub struct FactorAssurance {
     /// The factor that was verified.
     pub kind: FactorKind,
     /// When it was verified, from the service's injected clock.
-    pub at: DateTime<Utc>,
+    pub at: Timestamp,
     /// Whether the factor proved the person and not only a device or a
     /// channel: the UV flag of a FIDO2 assertion; `true` for a password or
     /// an LDAP bind (a memorized secret); `false` for one-time codes,
@@ -84,7 +84,7 @@ impl FactorAssurance {
     /// factor recorded this way, without its assertion's flags, claims the
     /// least: not user-verified and synced. The FIDO2 verifier records
     /// [`fido2`](Self::fido2) instead.
-    pub fn for_kind(kind: FactorKind, at: DateTime<Utc>) -> Self {
+    pub fn for_kind(kind: FactorKind, at: Timestamp) -> Self {
         let (user_verified, credential) = match kind {
             FactorKind::Password | FactorKind::LdapBind => (true, CredentialBinding::NotApplicable),
             FactorKind::Totp
@@ -110,7 +110,7 @@ impl FactorAssurance {
         backup_eligible: bool,
         backup_state: bool,
         trust_anchor: Option<Arc<str>>,
-        at: DateTime<Utc>,
+        at: Timestamp,
     ) -> Self {
         Self {
             kind: FactorKind::Fido2,
@@ -126,7 +126,7 @@ impl FactorAssurance {
     pub fn from_fido2_result(
         result: &webauthn_rs::prelude::AuthenticationResult,
         trust_anchor: Option<Arc<str>>,
-        at: DateTime<Utc>,
+        at: Timestamp,
     ) -> Self {
         Self::fido2(
             result.user_verified(),

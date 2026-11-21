@@ -1,6 +1,6 @@
 //! The key schema and the row codec of the Valkey device store.
 
-use chrono::{DateTime, Utc};
+use axess_clock::Timestamp;
 
 use super::policy::ttl_seconds;
 use super::{ValkeyDeviceStore, ValkeyDeviceStoreError};
@@ -12,8 +12,8 @@ pub(super) fn device_key(prefix: &str, tenant: &str, id: &str) -> String {
 }
 
 /// The single-id string key earlier releases pointed at one device with.
-/// It is read when present and removed by the next write of the device it
-/// names; nothing creates it any more.
+/// It is read only by a store built `with_legacy_fingerprint_keys` and
+/// removed by the next write of the device it names; nothing creates it.
 pub(super) fn fingerprint_key(prefix: &str, tenant: &str, hex_hash: &str) -> String {
     format!("{prefix}:dev:fp:{tenant}:{hex_hash}")
 }
@@ -21,7 +21,7 @@ pub(super) fn fingerprint_key(prefix: &str, tenant: &str, hex_hash: &str) -> Str
 /// The set of ids of the devices that carry a fingerprint, as the release
 /// before the sorted set kept it. It is read when the store is told to read
 /// the earlier layouts and emptied by the next write of each device it
-/// lists; nothing adds to it any more.
+/// lists; nothing adds to it.
 pub(super) fn fingerprint_set_key(prefix: &str, tenant: &str, hex_hash: &str) -> String {
     format!("{prefix}:dev:fps:{tenant}:{hex_hash}")
 }
@@ -99,7 +99,7 @@ impl ValkeyDeviceStore {
     }
 
     /// Native TTL for a row; `None` means the row never expires.
-    pub(super) fn ttl_seconds_for(&self, device: &Device, now: DateTime<Utc>) -> Option<i64> {
+    pub(super) fn ttl_seconds_for(&self, device: &Device, now: Timestamp) -> Option<i64> {
         ttl_seconds(&self.sweep_config, device, now)
     }
 
@@ -107,7 +107,9 @@ impl ValkeyDeviceStore {
     /// seal it with AES-256-GCM bound to the row's tenant and device id.
     /// Valkey's binary-safe values store the bytes directly; no base64 hop.
     ///
-    /// A sealed row is `AXR 0x02 || nonce(12) || ciphertext+tag` with AAD
+    /// A sealed row is `AXR 0x82 || salt(16) || ciphertext+tag`, under a
+    /// key derived for the record with a fixed nonce (the earlier layout,
+    /// `AXR 0x02 || nonce(12) || ciphertext+tag`, is a legacy blob), with AAD
     /// `"axess.device-row.v2" || 0x00 || len(tenant_id) || tenant_id ||
     /// len(device_id) || device_id` (each length a big-endian `u32`), so a
     /// row copied under another device's key fails authentication and two

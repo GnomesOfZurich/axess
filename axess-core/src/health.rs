@@ -256,7 +256,7 @@ mod tests {
 
     /// Registering a check with a name that already exists
     /// replaces the prior registration. Pins `!=` → `==` on the
-    /// `retain` predicate at line 126; the mutant flips dedup so the
+    /// `retain` predicate; the mutant flips dedup so the
     /// new entry would *replace everything else* (keep only entries
     /// whose name matches the new one), making the per-name semantics
     /// silently break for any composite that registers more than one

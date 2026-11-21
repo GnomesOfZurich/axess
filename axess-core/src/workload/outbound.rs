@@ -17,6 +17,10 @@
 //!   FIC). Per-cloud flags `aws-sts`, `gcp-wif`, `azure-fic`; umbrella
 //!   `cloud-sts` enables all three.
 //!
+//! With the `spire` feature, the certificate `mtls_client` presents and the
+//! token the cloud exchanges take can come from a local SPIRE agent and be
+//! rotated by it: see `crate::workload::spire`.
+//!
 //! Adopters with market-data vendors, broker REST APIs (PSD2 / FAPI
 //! 2.0), webhook receivers, or any 3rd-party API that wants axess to
 //! authenticate as itself reach for these primitives. For "act on a

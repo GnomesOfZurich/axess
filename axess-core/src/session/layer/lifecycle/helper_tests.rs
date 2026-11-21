@@ -1,8 +1,9 @@
-//! `helper_tests`: extracted from `lifecycle.rs` per the
-//! 200-LoC inline-test rule in AGENTS.md.
+//! `helper_tests`: the unit tests of `lifecycle.rs`, kept beside it per the
+//! 200-line inline-test rule in AGENTS.md.
 
 use super::*;
 use crate::session::data::SessionData;
+use crate::session::id::{SessionId, SessionKey};
 use crate::session::layer::handle::{SessionHandle, SessionInner};
 use crate::session::store::{CycleOutcome, MemorySessionStore};
 use crate::testing::mock_random::MockRng;
@@ -13,16 +14,8 @@ use tokio::sync::RwLock;
 
 fn fresh_inner(id: SessionId) -> SessionInner {
     SessionInner {
-        id,
-        data: SessionData::default(),
-        modified: false,
-        needs_persist: false,
-        regenerate: false,
-        pre_cycle_id: None,
-        rng: std::sync::Arc::new(axess_rng::SystemRng),
-        pending_fingerprint: None,
-        max_custom_bytes: 64 * 1024,
-        consume: None,
+        session: CookieSession::of_id(id),
+        ..SessionInner::detached(std::sync::Arc::new(axess_rng::SystemRng))
     }
 }
 
@@ -57,56 +50,54 @@ impl crate::session::store::SessionStore for CallCountingStore {
         &self,
         _: &crate::authn::ids::UserId,
         _: usize,
-    ) -> Result<Vec<(SessionId, SessionData)>, Self::Error> {
+    ) -> Result<Vec<(SessionKey, SessionData)>, Self::Error> {
         Ok(Vec::new())
     }
-    async fn load(&self, id: &SessionId) -> Result<Option<SessionData>, Self::Error> {
-        self.inner.load(id).await
+    async fn load(&self, key: &SessionKey) -> Result<Option<SessionData>, Self::Error> {
+        self.inner.load(key).await
     }
     async fn save(
         &self,
-        id: &SessionId,
+        key: &SessionKey,
         data: &SessionData,
         ttl: Duration,
     ) -> Result<(), Self::Error> {
         self.save_calls.fetch_add(1, Ordering::SeqCst);
-        self.inner.save(id, data, ttl).await
+        self.inner.save(key, data, ttl).await
     }
-    async fn delete(&self, id: &SessionId) -> Result<(), Self::Error> {
-        self.inner.delete(id).await
+    async fn delete(&self, key: &SessionKey) -> Result<(), Self::Error> {
+        self.inner.delete(key).await
     }
     async fn cycle(
         &self,
-        old_id: &SessionId,
-        new_id: &SessionId,
+        old: &SessionKey,
+        new: &SessionKey,
         data: &SessionData,
         ttl: Duration,
         require_old: bool,
     ) -> Result<CycleOutcome, Self::Error> {
         self.cycle_calls.fetch_add(1, Ordering::SeqCst);
-        self.inner
-            .cycle(old_id, new_id, data, ttl, require_old)
-            .await
+        self.inner.cycle(old, new, data, ttl, require_old).await
     }
     async fn update(
         &self,
-        id: &SessionId,
+        key: &SessionKey,
         data: &SessionData,
         ttl: Duration,
     ) -> Result<bool, Self::Error> {
         self.update_calls.fetch_add(1, Ordering::SeqCst);
-        self.inner.update(id, data, ttl).await
+        self.inner.update(key, data, ttl).await
     }
     async fn update_if_revision(
         &self,
-        id: &SessionId,
+        key: &SessionKey,
         expected_revision: u64,
         data: &SessionData,
         ttl: Duration,
     ) -> Result<crate::session::store::ConditionalUpdate, Self::Error> {
         self.update_calls.fetch_add(1, Ordering::SeqCst);
         self.inner
-            .update_if_revision(id, expected_revision, data, ttl)
+            .update_if_revision(key, expected_revision, data, ttl)
             .await
     }
     async fn prune_expired(&self) -> Result<u64, Self::Error> {
@@ -122,10 +113,10 @@ impl crate::session::store::SessionStore for CallCountingStore {
 /// `HeaderValue::from_str` accepts them.
 #[test]
 fn build_set_cookie_returns_some_for_default_config() {
-    let keys = SigningKeyRing::from_master([0x55; 32]);
+    let keys = SigningKeyRing::from_master(&[0x55; 32]);
     let cfg = SessionConfig::default();
     let id = SessionId::new(&MockRng::new(11));
-    let hv = build_set_cookie(&keys, &cfg, id);
+    let hv = build_set_cookie(&keys, &cfg, &CookieSession::of_id(id));
     assert!(
         hv.is_some(),
         "build_set_cookie must produce a Some(HeaderValue) for default config"
@@ -141,7 +132,7 @@ fn build_set_cookie_returns_some_for_default_config() {
 
 /// `max_custom_bytes == 0` disables the cap. Even with a huge
 /// custom payload AND `modified=true`, the helper must NOT clear
-/// `data.custom`. Kills the `> 0 → ==/</>= 0` family on line 750
+/// `data.custom`. Kills the `> 0 → ==/</>= 0` family
 /// and pins the "unlimited" semantic.
 #[tokio::test]
 async fn finalize_session_cap_disabled_when_max_custom_bytes_is_zero() {
@@ -153,7 +144,7 @@ async fn finalize_session_cap_disabled_when_max_custom_bytes_is_zero() {
     let id = SessionId::new(&MockRng::new(1));
     store
         .inner
-        .save(&id, &SessionData::default(), cfg.ttl)
+        .save(&SessionKey::of(&id), &SessionData::default(), cfg.ttl)
         .await
         .unwrap();
     let big = serde_json::json!({"k": "v".repeat(100_000)});
@@ -166,10 +157,10 @@ async fn finalize_session_cap_disabled_when_max_custom_bytes_is_zero() {
     let _ = finalize_session(
         &store,
         &cfg,
-        None,
-        &axess_clock::SystemClock,
+        Reporting::unrecorded(),
+        &axess_clock::testing::MockClock::at_reference(),
         &handle,
-        Some(id),
+        true,
         &MockRng::new(1),
     )
     .await;
@@ -180,10 +171,10 @@ async fn finalize_session_cap_disabled_when_max_custom_bytes_is_zero() {
     );
 }
 
-/// `&&` on line 750: the cap check requires BOTH a configured
+/// `&&`: the cap check requires BOTH a configured
 /// max AND `guard.modified`. With `modified=false`, the helper
 /// must NOT clear custom even with a huge payload. Kills
-/// `750:36 && → ||`.
+/// `&& → ||` there.
 #[tokio::test]
 async fn finalize_session_cap_skipped_when_session_not_modified() {
     let store = CallCountingStore::new();
@@ -196,7 +187,7 @@ async fn finalize_session_cap_skipped_when_session_not_modified() {
     let mut inner = fresh_inner(id);
     inner.data.custom = big.clone();
     // Recently refreshed, so the idle-expiry refresh does not write it either.
-    inner.data.touched_at = Some(chrono::Utc::now());
+    inner.data.touched_at = Some(axess_clock::testing::MockClock::reference_time());
     inner.modified = false;
     inner.regenerate = false;
     let handle = handle_from(inner);
@@ -204,10 +195,10 @@ async fn finalize_session_cap_skipped_when_session_not_modified() {
     let _ = finalize_session(
         &store,
         &cfg,
-        None,
-        &axess_clock::SystemClock,
+        Reporting::unrecorded(),
+        &axess_clock::testing::MockClock::at_reference(),
         &handle,
-        Some(id),
+        true,
         &MockRng::new(1),
     )
     .await;
@@ -219,7 +210,7 @@ async fn finalize_session_cap_skipped_when_session_not_modified() {
     );
 }
 
-/// Strict-greater boundary on line 754: custom size EXACTLY equal
+/// Strict-greater boundary: custom size EXACTLY equal
 /// to the cap must NOT be cleared; one byte over the cap MUST be
 /// cleared. Kills `> → ==`, `> → >=`, `> → <`.
 #[tokio::test]
@@ -246,7 +237,7 @@ async fn finalize_session_cap_uses_strict_greater_at_exact_boundary() {
         let id = SessionId::new(&MockRng::new(3));
         store
             .inner
-            .save(&id, &SessionData::default(), cfg.ttl)
+            .save(&SessionKey::of(&id), &SessionData::default(), cfg.ttl)
             .await
             .unwrap();
         let mut inner = fresh_inner(id);
@@ -256,10 +247,10 @@ async fn finalize_session_cap_uses_strict_greater_at_exact_boundary() {
         let _ = finalize_session(
             &store,
             &cfg,
-            None,
-            &axess_clock::SystemClock,
+            Reporting::unrecorded(),
+            &axess_clock::testing::MockClock::at_reference(),
             &handle,
-            Some(id),
+            true,
             &MockRng::new(1),
         )
         .await;
@@ -276,7 +267,7 @@ async fn finalize_session_cap_uses_strict_greater_at_exact_boundary() {
         let id = SessionId::new(&MockRng::new(4));
         store
             .inner
-            .save(&id, &SessionData::default(), cfg.ttl)
+            .save(&SessionKey::of(&id), &SessionData::default(), cfg.ttl)
             .await
             .unwrap();
         let mut inner = fresh_inner(id);
@@ -286,10 +277,10 @@ async fn finalize_session_cap_uses_strict_greater_at_exact_boundary() {
         let _ = finalize_session(
             &store,
             &cfg,
-            None,
-            &axess_clock::SystemClock,
+            Reporting::unrecorded(),
+            &axess_clock::testing::MockClock::at_reference(),
             &handle,
-            Some(id),
+            true,
             &MockRng::new(1),
         )
         .await;
@@ -320,7 +311,7 @@ async fn finalize_session_session_changed_or_over_modified_alone() {
     let id = SessionId::new(&MockRng::new(5));
     store
         .inner
-        .save(&id, &SessionData::default(), cfg.ttl)
+        .save(&SessionKey::of(&id), &SessionData::default(), cfg.ttl)
         .await
         .unwrap();
     let mut inner = fresh_inner(id);
@@ -330,10 +321,10 @@ async fn finalize_session_session_changed_or_over_modified_alone() {
     let outcome = finalize_session(
         &store,
         &cfg,
-        None,
-        &axess_clock::SystemClock,
+        Reporting::unrecorded(),
+        &axess_clock::testing::MockClock::at_reference(),
         &handle,
-        Some(id),
+        true,
         &MockRng::new(1),
     )
     .await;
@@ -372,54 +363,54 @@ impl crate::session::store::SessionStore for FailingCycleStore {
         &self,
         _: &crate::authn::ids::UserId,
         _: usize,
-    ) -> Result<Vec<(SessionId, SessionData)>, Self::Error> {
+    ) -> Result<Vec<(SessionKey, SessionData)>, Self::Error> {
         Ok(Vec::new())
     }
-    async fn load(&self, id: &SessionId) -> Result<Option<SessionData>, Self::Error> {
-        Ok(self.inner.load(id).await.unwrap())
+    async fn load(&self, key: &SessionKey) -> Result<Option<SessionData>, Self::Error> {
+        Ok(self.inner.load(key).await.unwrap())
     }
     async fn save(
         &self,
-        id: &SessionId,
+        key: &SessionKey,
         data: &SessionData,
         ttl: Duration,
     ) -> Result<(), Self::Error> {
-        self.inner.save(id, data, ttl).await.unwrap();
+        self.inner.save(key, data, ttl).await.unwrap();
         Ok(())
     }
-    async fn delete(&self, id: &SessionId) -> Result<(), Self::Error> {
+    async fn delete(&self, key: &SessionKey) -> Result<(), Self::Error> {
         self.delete_calls.fetch_add(1, Ordering::SeqCst);
-        self.inner.delete(id).await.unwrap();
+        self.inner.delete(key).await.unwrap();
         Ok(())
     }
     async fn cycle(
         &self,
-        _old_id: &SessionId,
-        _new_id: &SessionId,
-        _data: &SessionData,
-        _ttl: Duration,
-        _require_old: bool,
+        _: &SessionKey,
+        _: &SessionKey,
+        _: &SessionData,
+        _: Duration,
+        _: bool,
     ) -> Result<CycleOutcome, Self::Error> {
         Err(std::io::Error::other("store unavailable"))
     }
     async fn update(
         &self,
-        id: &SessionId,
+        key: &SessionKey,
         data: &SessionData,
         ttl: Duration,
     ) -> Result<bool, Self::Error> {
-        Ok(self.inner.update(id, data, ttl).await.unwrap())
+        Ok(self.inner.update(key, data, ttl).await.unwrap())
     }
     async fn update_if_revision(
         &self,
-        id: &SessionId,
+        key: &SessionKey,
         expected_revision: u64,
         data: &SessionData,
         ttl: Duration,
     ) -> Result<crate::session::store::ConditionalUpdate, Self::Error> {
         Ok(self
             .inner
-            .update_if_revision(id, expected_revision, data, ttl)
+            .update_if_revision(key, expected_revision, data, ttl)
             .await
             .unwrap())
     }
@@ -430,8 +421,9 @@ impl crate::session::store::SessionStore for FailingCycleStore {
 
 /// Logout (`regenerate`) while the store's cycle fails: the old id is deleted
 /// from the store and is NOT the id the response carries, so the old cookie
-/// no longer authenticates. Before this, the old id was re-issued with its
-/// Authenticated row still in the store.
+/// does not authenticate and is not re-issued with its Authenticated row
+/// still in the store. The new id is deleted as well: a
+/// store that reports an error may have written it all the same.
 #[tokio::test]
 async fn finalize_session_failed_cycle_deletes_old_id_and_does_not_reissue_it() {
     let store = FailingCycleStore {
@@ -444,7 +436,7 @@ async fn finalize_session_failed_cycle_deletes_old_id_and_does_not_reissue_it() 
     inner.regenerate = true;
     store
         .inner
-        .save(&id, &SessionData::default(), cfg.ttl)
+        .save(&SessionKey::of(&id), &SessionData::default(), cfg.ttl)
         .await
         .expect("seed");
     let handle = handle_from(inner);
@@ -452,24 +444,39 @@ async fn finalize_session_failed_cycle_deletes_old_id_and_does_not_reissue_it() 
     let outcome = finalize_session(
         &store,
         &cfg,
-        None,
-        &axess_clock::SystemClock,
+        Reporting::unrecorded(),
+        &axess_clock::testing::MockClock::at_reference(),
         &handle,
-        Some(id),
+        true,
         &MockRng::new(1),
     )
     .await;
     assert_ne!(
-        outcome.final_id, id,
+        *outcome.session.key(),
+        SessionKey::of(&id),
         "the old id must never be re-issued after a failed cycle"
     );
     assert_eq!(
         store.delete_calls.load(Ordering::SeqCst),
-        1,
-        "the old id must be deleted from the store"
+        2,
+        "the rows under both ids must be deleted from the store"
     );
     assert!(
-        store.inner.load(&id).await.unwrap().is_none(),
+        store
+            .inner
+            .load(outcome.session.key())
+            .await
+            .unwrap()
+            .is_none(),
+        "no row backs the id the response carries"
+    );
+    assert!(
+        store
+            .inner
+            .load(&SessionKey::of(&id))
+            .await
+            .unwrap()
+            .is_none(),
         "the old id's row must be gone so the old cookie is a guest"
     );
 }
@@ -479,9 +486,9 @@ async fn finalize_session_failed_cycle_deletes_old_id_and_does_not_reissue_it() 
 /// still treat session_changed=true and take the cycle path.
 ///
 /// Discriminating fixture: `modified=false, regenerate=true,
-/// existing_id=Some(id)`. Original line 764:
+/// existing_id=Some(id)`. As written:
 /// `false || true || false = true` → cycle.
-/// Mutant 764:62 (`||→&&` on second `||`):
+/// With the second `||` written `&&`:
 /// `false || (true && false) = false` → no store call. Kills it.
 #[tokio::test]
 async fn finalize_session_session_changed_or_over_regenerate_alone() {
@@ -494,7 +501,7 @@ async fn finalize_session_session_changed_or_over_regenerate_alone() {
     // Pre-seed the store with `id` so cycle's "delete old" finds a row.
     store
         .inner
-        .save(&id, &SessionData::default(), cfg.ttl)
+        .save(&SessionKey::of(&id), &SessionData::default(), cfg.ttl)
         .await
         .expect("seed");
     let handle = handle_from(inner);
@@ -502,10 +509,10 @@ async fn finalize_session_session_changed_or_over_regenerate_alone() {
     let outcome = finalize_session(
         &store,
         &cfg,
-        None,
-        &axess_clock::SystemClock,
+        Reporting::unrecorded(),
+        &axess_clock::testing::MockClock::at_reference(),
         &handle,
-        Some(id),
+        true,
         &MockRng::new(1),
     )
     .await;
@@ -521,12 +528,12 @@ async fn finalize_session_session_changed_or_over_regenerate_alone() {
     assert_eq!(store.save_calls.load(Ordering::SeqCst), 0);
 }
 
-/// Metrics-emission gate on line 766: `if session_changed &&
+/// Metrics-emission gate: `if session_changed &&
 /// (guard.regenerate || existing_id.is_none())`. The inner `||`
 /// drives the `session_created` emission.
 ///
-/// Fixture: `regenerate=true, existing_id=Some(id)`. Original:
-/// `true && (true || false) = true` → emit. Mutant 766:30 (`||→&&`):
+/// Fixture: `regenerate=true, existing_id=Some(id)`. As written:
+/// `true && (true || false) = true` → emit. With the inner `||` written `&&`:
 /// `true && (true && false) = false` → no emit. Discriminate via
 /// a `SessionMetrics` recorder that counts `session_created` calls.
 #[tokio::test]
@@ -551,7 +558,7 @@ async fn finalize_session_emits_session_created_on_regenerate() {
     inner.regenerate = true;
     store
         .inner
-        .save(&id, &SessionData::default(), cfg.ttl)
+        .save(&SessionKey::of(&id), &SessionData::default(), cfg.ttl)
         .await
         .expect("seed");
     let handle = handle_from(inner);
@@ -559,10 +566,13 @@ async fn finalize_session_emits_session_created_on_regenerate() {
     let _ = finalize_session(
         &store,
         &cfg,
-        Some(&metrics),
-        &axess_clock::SystemClock,
+        Reporting {
+            metrics: Some(&metrics),
+            ..Reporting::unrecorded()
+        },
+        &axess_clock::testing::MockClock::at_reference(),
         &handle,
-        Some(id),
+        true,
         &MockRng::new(1),
     )
     .await;
@@ -595,10 +605,10 @@ async fn finalize_session_fresh_guest_saves_under_load_minted_id() {
     let outcome = finalize_session(
         &store,
         &cfg,
-        None,
-        &axess_clock::SystemClock,
+        Reporting::unrecorded(),
+        &axess_clock::testing::MockClock::at_reference(),
         &handle,
-        None,
+        false,
         &MockRng::new(1),
     )
     .await;
@@ -613,7 +623,8 @@ async fn finalize_session_fresh_guest_saves_under_load_minted_id() {
         "fresh guest must NOT mint a second id (would invalidate this request's CSRF token)"
     );
     assert_eq!(
-        outcome.final_id, id,
+        *outcome.session.key(),
+        SessionKey::of(&id),
         "the response cookie must carry the same id the request ran under, \
              so a CSRF token bound to it validates on the next request"
     );
@@ -621,7 +632,7 @@ async fn finalize_session_fresh_guest_saves_under_load_minted_id() {
 
 // ── load_session: fingerprint binding ──────────────────────────────
 
-/// `load_session` line 690: `&& !ct_eq(stored, current)`. The `!`
+/// `load_session`'s `&& !ct_eq(stored, current)`. The `!`
 /// must remain: invalidate ONLY when the fingerprints DIFFER.
 /// Kills `delete !` (which would invert the check and invalidate
 /// every legitimately matching session, i.e., logging out every
@@ -629,7 +640,7 @@ async fn finalize_session_fresh_guest_saves_under_load_minted_id() {
 #[tokio::test]
 async fn load_session_keeps_session_when_fingerprint_matches() {
     let store = MemorySessionStore::new();
-    let keys = SigningKeyRing::from_master([0xCC; 32]);
+    let keys = SigningKeyRing::from_master(&[0xCC; 32]);
     let cfg = SessionConfig::default();
 
     let stored_fp = "match-me".to_string();
@@ -638,13 +649,15 @@ async fn load_session_keeps_session_when_fingerprint_matches() {
         fingerprint: Some(stored_fp.clone()),
         ..SessionData::default()
     };
-    // Mutate so migrate() doesn't bump the version inside load_session.
-    store.save(&id, &data, cfg.ttl).await.expect("seed store");
+    store
+        .save(&SessionKey::of(&id), &data, cfg.ttl)
+        .await
+        .expect("seed store");
 
     // Build a cookie carrying the seed id, signed under the ring's
     // current key: mirrors what `build_set_cookie` produces in
     // production so `load_session` sees a real-shaped input.
-    let cookie_value = keys.sign_cookie(id);
+    let cookie_value = keys.sign_cookie(&CookieSession::of_id(id));
     let mut headers = axum::http::HeaderMap::new();
     let header = format!("{}={}", cfg.cookie_name.as_ref(), cookie_value);
     headers.insert(
@@ -670,9 +683,8 @@ async fn load_session_keeps_session_when_fingerprint_matches() {
         !outcome.binding_invalidated,
         "matching fingerprint must NOT invalidate binding (kills `delete !` on line 690)"
     );
-    assert_eq!(
-        outcome.existing_id,
-        Some(id),
+    assert!(
+        outcome.stored && *outcome.session.key() == SessionKey::of(&id),
         "trusted id must survive a matching-fingerprint load"
     );
     assert_eq!(
@@ -688,15 +700,18 @@ async fn load_session_keeps_session_when_fingerprint_matches() {
 #[tokio::test]
 async fn load_session_invalidates_a_bound_session_presented_without_a_fingerprint() {
     let store = MemorySessionStore::new();
-    let keys = SigningKeyRing::from_master([0xCC; 32]);
+    let keys = SigningKeyRing::from_master(&[0xCC; 32]);
     let cfg = SessionConfig::default();
     let id = SessionId::new(&MockRng::new(31));
     let data = SessionData {
         fingerprint: Some("bound-to-a-device".to_string()),
         ..SessionData::default()
     };
-    store.save(&id, &data, cfg.ttl).await.expect("seed store");
-    let cookie_value = keys.sign_cookie(id);
+    store
+        .save(&SessionKey::of(&id), &data, cfg.ttl)
+        .await
+        .expect("seed store");
+    let cookie_value = keys.sign_cookie(&CookieSession::of_id(id));
     let mut headers = axum::http::HeaderMap::new();
     headers.insert(
         axum::http::header::COOKIE,
@@ -722,9 +737,8 @@ async fn load_session_invalidates_a_bound_session_presented_without_a_fingerprin
         outcome.binding_invalidated,
         "no binding material against a bound session must invalidate it"
     );
-    assert_ne!(
-        outcome.existing_id,
-        Some(id),
+    assert!(
+        !outcome.stored && *outcome.session.key() != SessionKey::of(&id),
         "the bound id must not be kept"
     );
 }
@@ -735,7 +749,7 @@ async fn load_session_invalidates_a_bound_session_presented_without_a_fingerprin
 #[tokio::test]
 async fn load_session_mints_the_fresh_id_from_the_supplied_rng() {
     let store = MemorySessionStore::new();
-    let keys = SigningKeyRing::from_master([0xCC; 32]);
+    let keys = SigningKeyRing::from_master(&[0xCC; 32]);
     let cfg = SessionConfig::default();
     let headers = axum::http::HeaderMap::new();
 
@@ -750,8 +764,79 @@ async fn load_session_mints_the_fresh_id_from_the_supplied_rng() {
     )
     .await;
 
-    assert_eq!(outcome.id, SessionId::new(&MockRng::new(77)));
-    assert_eq!(outcome.existing_id, None);
+    assert_eq!(
+        *outcome.session.key(),
+        SessionKey::of(&SessionId::new(&MockRng::new(77)))
+    );
+    assert!(!outcome.stored);
+}
+
+/// A valid cookie whose row the store does not hold (expired, deleted, or a
+/// fixation attempt with a cookie from elsewhere) names nothing: the request
+/// runs under a freshly minted session, and what it stores goes under that
+/// session's key, never under the cookie's.
+#[tokio::test]
+async fn a_cookie_without_a_row_runs_under_a_fresh_session_and_stores_nothing_under_its_key() {
+    let store = MemorySessionStore::new();
+    let keys = SigningKeyRing::from_master(&[0xCC; 32]);
+    let cfg = SessionConfig::default();
+    let cookie = CookieSession::of_id(SessionId::new(&MockRng::new(41)));
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::COOKIE,
+        axum::http::HeaderValue::from_str(&format!(
+            "{}={}",
+            cfg.cookie_name.as_ref(),
+            keys.sign_cookie(&cookie)
+        ))
+        .unwrap(),
+    );
+
+    let outcome = load_session(
+        &store,
+        &keys,
+        &cfg,
+        &headers,
+        Fingerprints::default(),
+        &MockRng::new(42),
+        &LoadPolicy::bare(),
+    )
+    .await;
+
+    assert!(!outcome.stored);
+    assert!(outcome.loaded_row.is_none());
+    let session = outcome.session;
+    assert_eq!(
+        *session.key(),
+        SessionKey::of(&SessionId::new(&MockRng::new(42)))
+    );
+    assert_ne!(session.key(), cookie.key());
+
+    // The handler changes the session, and the finish stores it.
+    let handle = handle_from(SessionInner {
+        session,
+        data: outcome.data,
+        modified: true,
+        ..SessionInner::detached(Arc::new(MockRng::new(43)))
+    });
+    let finalized = finalize_session(
+        &store,
+        &cfg,
+        Reporting::unrecorded(),
+        &axess_clock::testing::MockClock::at_reference(),
+        &handle,
+        outcome.stored,
+        &MockRng::new(44),
+    )
+    .await;
+
+    assert!(finalized.session_changed);
+    assert_eq!(finalized.session.key(), session.key());
+    assert!(store.load(session.key()).await.unwrap().is_some());
+    assert!(
+        store.load(cookie.key()).await.unwrap().is_none(),
+        "nothing is stored under the key of a cookie that named no row"
+    );
 }
 
 /// A regenerate with no stashed pre-rotation id replaces the id from the
@@ -768,15 +853,18 @@ async fn finalize_session_replacement_id_comes_from_the_supplied_rng() {
     let outcome = finalize_session(
         &store,
         &cfg,
-        None,
-        &axess_clock::SystemClock,
+        Reporting::unrecorded(),
+        &axess_clock::testing::MockClock::at_reference(),
         &handle,
-        Some(id),
+        true,
         &MockRng::new(78),
     )
     .await;
 
-    assert_eq!(outcome.final_id, SessionId::new(&MockRng::new(78)));
+    assert_eq!(
+        *outcome.session.key(),
+        SessionKey::of(&SessionId::new(&MockRng::new(78)))
+    );
 }
 
 /// The id a handler-side rotation mints is the layer RNG's next draw.
@@ -788,8 +876,11 @@ async fn rotate_id_draws_from_the_inner_rng() {
 
     inner.rotate_id();
 
-    assert_eq!(inner.id, SessionId::new(&MockRng::new(79)));
-    assert_eq!(inner.pre_cycle_id, Some(id));
+    assert_eq!(
+        *inner.session.key(),
+        SessionKey::of(&SessionId::new(&MockRng::new(79)))
+    );
+    assert_eq!(inner.pre_cycle, Some(SessionKey::of(&id)));
 }
 
 /// A request that ran under a stored session and modified it, while the
@@ -801,7 +892,7 @@ async fn finalize_session_does_not_revive_a_session_deleted_mid_request() {
     let cfg = SessionConfig::default();
     let id = SessionId::new(&MockRng::new(31));
     store
-        .save(&id, &SessionData::default(), cfg.ttl)
+        .save(&SessionKey::of(&id), &SessionData::default(), cfg.ttl)
         .await
         .unwrap();
     let mut inner = fresh_inner(id);
@@ -809,20 +900,20 @@ async fn finalize_session_does_not_revive_a_session_deleted_mid_request() {
     inner.data.custom = serde_json::json!({"cart": 1});
     let handle = handle_from(inner);
 
-    store.delete(&id).await.unwrap();
+    store.delete(&SessionKey::of(&id)).await.unwrap();
     let outcome = finalize_session(
         &store,
         &cfg,
-        None,
-        &axess_clock::SystemClock,
+        Reporting::unrecorded(),
+        &axess_clock::testing::MockClock::at_reference(),
         &handle,
-        Some(id),
+        true,
         &MockRng::new(1),
     )
     .await;
 
     assert!(
-        store.load(&id).await.unwrap().is_none(),
+        store.load(&SessionKey::of(&id)).await.unwrap().is_none(),
         "a deleted session must stay deleted"
     );
     assert!(
@@ -844,30 +935,30 @@ async fn finalize_session_rotation_of_a_deleted_session_yields_a_guest() {
     let old = SessionId::new(&MockRng::new(41));
     let new = SessionId::new(&MockRng::new(42));
     store
-        .save(&old, &SessionData::default(), cfg.ttl)
+        .save(&SessionKey::of(&old), &SessionData::default(), cfg.ttl)
         .await
         .unwrap();
     let mut inner = fresh_inner(new);
     inner.regenerate = true;
-    inner.pre_cycle_id = Some(old);
+    inner.pre_cycle = Some(SessionKey::of(&old));
     inner.data.custom = serde_json::json!({"authenticated": true});
     let handle = handle_from(inner);
 
-    store.delete(&old).await.unwrap();
+    store.delete(&SessionKey::of(&old)).await.unwrap();
     let outcome = finalize_session(
         &store,
         &cfg,
-        None,
-        &axess_clock::SystemClock,
+        Reporting::unrecorded(),
+        &axess_clock::testing::MockClock::at_reference(),
         &handle,
-        Some(old),
+        true,
         &MockRng::new(1),
     )
     .await;
 
-    assert_eq!(outcome.final_id, new);
+    assert_eq!(*outcome.session.key(), SessionKey::of(&new));
     assert!(
-        store.load(&new).await.unwrap().is_none(),
+        store.load(&SessionKey::of(&new)).await.unwrap().is_none(),
         "the rotated id must not hold the data of an ended session"
     );
     assert_eq!(
@@ -886,23 +977,23 @@ async fn finalize_session_rotation_without_a_stored_session_still_writes() {
     let new = SessionId::new(&MockRng::new(52));
     let mut inner = fresh_inner(new);
     inner.regenerate = true;
-    inner.pre_cycle_id = Some(old);
+    inner.pre_cycle = Some(SessionKey::of(&old));
     inner.data.custom = serde_json::json!({"authenticated": true});
     let handle = handle_from(inner);
 
     let outcome = finalize_session(
         &store,
         &cfg,
-        None,
-        &axess_clock::SystemClock,
+        Reporting::unrecorded(),
+        &axess_clock::testing::MockClock::at_reference(),
         &handle,
-        None,
+        false,
         &MockRng::new(1),
     )
     .await;
 
-    assert_eq!(outcome.final_id, new);
-    assert!(store.load(&new).await.unwrap().is_some());
+    assert_eq!(*outcome.session.key(), SessionKey::of(&new));
+    assert!(store.load(&SessionKey::of(&new)).await.unwrap().is_some());
 }
 
 fn cache_control_after_marking(handler_set: &[&'static str]) -> Vec<String> {

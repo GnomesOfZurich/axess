@@ -1,12 +1,13 @@
-//! `verification_tests`: extracted from `verification.rs` per the
-//! 200-LoC inline-test rule in AGENTS.md.
+//! `verification_tests`: the unit tests of `verification.rs`, kept beside it per the
+//! 200-line inline-test rule in AGENTS.md.
 
 use super::*;
 use crate::authn::factor::{
     EmailOtpConfig, HotpConfig, OtpAlgorithm, PasswordConfig, ZeroizedString,
 };
 use crate::validation::MAX_PASSWORD_BYTES;
-use chrono::Utc;
+use axess_clock::testing::Shift;
+use axess_clock::{Timestamp, Until};
 use std::sync::Arc;
 
 /// RFC 4226 Appendix D shared test secret in base32 form
@@ -18,7 +19,7 @@ const RFC_4226_SECRET_B32: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
 
 #[test]
 fn apply_hotp_failure_zero_max_attempts_applies_default_limit() {
-    let now = Utc::now();
+    let now = axess_clock::testing::MockClock::reference_time();
     let prior = HotpConfig {
         counter: 7,
         attempt_count: 4,
@@ -37,7 +38,7 @@ fn apply_hotp_failure_zero_max_attempts_applies_default_limit() {
 
 #[test]
 fn apply_hotp_failure_below_max_increments_without_locking() {
-    let now = Utc::now();
+    let now = axess_clock::testing::MockClock::reference_time();
     let prior = HotpConfig {
         counter: 7,
         attempt_count: 2,
@@ -52,7 +53,7 @@ fn apply_hotp_failure_below_max_increments_without_locking() {
 
 #[test]
 fn apply_hotp_failure_at_max_locks_with_doubling_backoff_and_keeps_the_counter() {
-    let t0 = Utc::now();
+    let t0 = axess_clock::testing::MockClock::reference_time();
     let prior = HotpConfig {
         counter: 100,
         attempt_count: 4,
@@ -66,15 +67,15 @@ fn apply_hotp_failure_at_max_locks_with_doubling_backoff_and_keeps_the_counter()
     assert_eq!(first.lockouts(), 1);
     assert_eq!(
         first.locked_until(),
-        Some(t0 + chrono::Duration::from_std(HotpConfig::lock_duration_after(0)).unwrap())
+        Some(Until::after(t0, HotpConfig::lock_duration_after(0)))
     );
     // A guess while locked changes nothing.
     assert_eq!(
-        apply_hotp_failure(&first, t0 + chrono::Duration::seconds(1)).locked_until(),
+        apply_hotp_failure(&first, t0.plus(axess_clock::SignedDuration::seconds(1))).locked_until(),
         first.locked_until()
     );
     // After the lock, another run of wrong codes earns twice the lock.
-    let after = first.locked_until().unwrap();
+    let after = first.locked_until().unwrap().at().unwrap();
     let mut cfg = first;
     for _ in 0..5 {
         cfg = apply_hotp_failure(&cfg, after);
@@ -82,7 +83,7 @@ fn apply_hotp_failure_at_max_locks_with_doubling_backoff_and_keeps_the_counter()
     assert_eq!(cfg.lockouts(), 2);
     assert_eq!(
         cfg.locked_until(),
-        Some(after + chrono::Duration::from_std(HotpConfig::lock_duration_after(1)).unwrap())
+        Some(Until::after(after, HotpConfig::lock_duration_after(1)))
     );
     assert_eq!(cfg.counter, 100);
 }
@@ -94,7 +95,9 @@ fn apply_email_otp_failure_zero_max_attempts_applies_default_limit() {
     let prior = EmailOtpConfig {
         email: "test@example.com".into(),
         pending_hash: Some(ZeroizedString::new("hash")),
-        pending_until: Some(Utc::now()),
+        pending_until: Some(axess_clock::Until::At(
+            axess_clock::testing::MockClock::reference_time(),
+        )),
         attempt_count: 5,
         max_attempts: 0,
         ..Default::default()
@@ -110,7 +113,7 @@ fn apply_email_otp_failure_zero_max_attempts_applies_default_limit() {
 fn hotp_attempt_limit_locks_without_moving_the_counter() {
     // A row at the limit with no lock yet (written before the lock
     // existed) is locked on its next use rather than checked.
-    let now = Utc::now();
+    let now = axess_clock::testing::MockClock::reference_time();
     let cfg = FactorConfig::Hotp(HotpConfig {
         secret: ZeroizedString::new(RFC_4226_SECRET_B32).into(),
         counter: 100,
@@ -139,7 +142,7 @@ fn hotp_attempt_limit_locks_without_moving_the_counter() {
 
 #[test]
 fn hotp_zero_max_attempts_locks_at_default_limit_and_refuses_while_locked() {
-    let now = Utc::now();
+    let now = axess_clock::testing::MockClock::reference_time();
     let cfg = FactorConfig::Hotp(HotpConfig {
         secret: ZeroizedString::new(RFC_4226_SECRET_B32).into(),
         counter: 0,
@@ -182,7 +185,7 @@ fn hotp_zero_max_attempts_locks_at_default_limit_and_refuses_while_locked() {
     );
     // Once the lock has run out the same code, at the same counter, passes
     // and the throttle state is forgotten.
-    let later = locked.locked_until().unwrap();
+    let later = locked.locked_until().unwrap().at().unwrap();
     match verify_credential(
         &cred,
         &cfg,
@@ -217,7 +220,7 @@ fn hotp_success_advances_counter_by_one() {
         &cred,
         &cfg,
         &FactorKind::Hotp,
-        Utc::now(),
+        axess_clock::testing::MockClock::reference_time(),
         &RecoveryPeppers::default(),
     );
     match outcome {
@@ -234,11 +237,12 @@ fn hotp_success_advances_counter_by_one() {
 #[test]
 fn email_otp_zero_max_attempts_burns_at_default_limit() {
     let hash = axess_factors::generate_password_hash("12345678");
-    let future = Utc::now() + chrono::Duration::seconds(300);
+    let future = axess_clock::testing::MockClock::reference_time()
+        .plus(axess_clock::SignedDuration::seconds(300));
     let cfg = FactorConfig::EmailOtp(EmailOtpConfig {
         email: "test@example.com".into(),
         pending_hash: Some(ZeroizedString::new(&hash)),
-        pending_until: Some(future),
+        pending_until: Some(axess_clock::Until::At(future)),
         attempt_count: 5,
         max_attempts: 0,
         ..Default::default()
@@ -248,7 +252,7 @@ fn email_otp_zero_max_attempts_burns_at_default_limit() {
         &cred,
         &cfg,
         &FactorKind::EmailOtp,
-        Utc::now(),
+        axess_clock::testing::MockClock::reference_time(),
         &RecoveryPeppers::default(),
     ) {
         VerifyOutcome::FailWithUpdate(FactorConfig::EmailOtp(updated)) => {
@@ -273,7 +277,7 @@ fn email_otp_without_expiry_is_rejected() {
         &cred,
         &cfg,
         &FactorKind::EmailOtp,
-        Utc::now(),
+        axess_clock::testing::MockClock::reference_time(),
         &RecoveryPeppers::default(),
     );
     assert!(matches!(outcome, VerifyOutcome::Fail));
@@ -294,11 +298,11 @@ fn generate_otp_code_handles_long_lengths() {
 fn email_otp_at_expiry_boundary_still_valid() {
     let code = "12345678";
     let hash = axess_factors::generate_password_hash(code);
-    let now = Utc::now();
+    let now = axess_clock::testing::MockClock::reference_time();
     let cfg = FactorConfig::EmailOtp(EmailOtpConfig {
         email: "test@example.com".into(),
         pending_hash: Some(ZeroizedString::new(&hash)),
-        pending_until: Some(now),
+        pending_until: Some(axess_clock::Until::At(now)),
         attempt_count: 0,
         max_attempts: 5,
         ..Default::default()
@@ -330,7 +334,7 @@ fn password_at_max_length_succeeds() {
         &cred,
         &cfg,
         &FactorKind::Password,
-        Utc::now(),
+        axess_clock::testing::MockClock::reference_time(),
         &RecoveryPeppers::default(),
     );
     assert!(matches!(outcome, VerifyOutcome::Pass));
@@ -342,26 +346,26 @@ fn password_at_max_length_succeeds() {
 /// and the standard ASCII secret "12345678901234567890", the
 /// 8-digit SHA-1 TOTP is "94287082" and the step index is 59/30=1.
 ///
-/// Kills line 95 delete-match-arm (TOTP arm returns PassWithUpdate,
-/// fallthrough would return Fail) and line 123 `<= → >` (with
+/// Kills the delete-match-arm (TOTP arm returns PassWithUpdate,
+/// fallthrough would return Fail) and the replay guard's `<= → >` (with
 /// cfg.last_step=Some(0), step(1) <= 0 is false so we proceed;
 /// mutation makes step(1) > 0 true and rejects valid code).
 #[test]
 fn totp_success_passes_replay_guard_and_returns_update() {
     use crate::authn::factor::TotpConfig;
-    use chrono::TimeZone;
+    use axess_clock::Timestamp;
 
     let cfg = FactorConfig::Totp(TotpConfig {
         secret: ZeroizedString::new(RFC_4226_SECRET_B32).into(),
         digits: 8,
-        period_secs: 30,
+        period: std::time::Duration::from_secs(30),
         algorithm: OtpAlgorithm::Sha1,
         past_window: 0,
         future_window: 0,
         last_step: Some(0),
     });
     let cred = FactorCredential::OtpCode(Arc::from("94287082"));
-    let now = Utc.timestamp_opt(59, 0).unwrap();
+    let now = Timestamp::from_unix_seconds(59).unwrap();
     let outcome = verify_credential(
         &cred,
         &cfg,
@@ -379,7 +383,7 @@ fn totp_success_passes_replay_guard_and_returns_update() {
 
 // ── verify_credential: HOTP code-length boundary ─────────────────
 
-/// Kills line 134 `> → ==/>=` on HOTP code-length guard. A code at
+/// Kills the mutant `> → ==/>=` on HOTP code-length guard. A code at
 /// exactly MAX_OTP_CODE_BYTES bytes must NOT take the early-Fail
 /// path; it continues to verify_hotp, which rejects (returning
 /// `None`) and yields FailWithUpdate(attempt_count+1). The early
@@ -400,7 +404,7 @@ fn hotp_code_at_max_length_continues_to_verify_with_update() {
         &cred,
         &cfg,
         &FactorKind::Hotp,
-        Utc::now(),
+        axess_clock::testing::MockClock::reference_time(),
         &RecoveryPeppers::default(),
     );
     match outcome {
@@ -413,7 +417,7 @@ fn hotp_code_at_max_length_continues_to_verify_with_update() {
 
 // ── verify_credential: Email OTP code-length boundary ────────────
 
-// Kills line 182 `> → ==/>=` on Email OTP code-length guard. At
+// Kills the mutant `> → ==/>=` on Email OTP code-length guard. At
 // exactly MAX_OTP_CODE_BYTES bytes the continuing path runs Argon2
 // verify, fails, and yields FailWithUpdate(increment). The
 // mutations short-circuit to Fail with no state update.
@@ -440,7 +444,7 @@ impl axess_rng::SecureRng for FixedBytesRng {
     }
 }
 
-/// Kills line 249 `- → /` and `% → /` on `max_fair` computation.
+/// Kills the mutant `- → /` and `% → /` on `max_fair` computation.
 ///
 /// For length=6, modulus = 10^6 and:
 ///   - max_fair_original = u64::MAX - (u64::MAX % 10^6) ≈ 1.844674e19
@@ -462,7 +466,7 @@ fn generate_otp_code_accepts_value_just_under_original_max_fair() {
     assert_eq!(code, "000000");
 }
 
-/// Kills line 254 `<` → `<=` on the rejection-sampling guard.
+/// Kills the mutant `<` → `<=` on the rejection-sampling guard.
 ///
 /// At `V == max_fair`, the original strict `<` rejects (loops); the
 /// mutated `<=` accepts. Crafting V1 = max_fair gives outputs that
@@ -484,11 +488,12 @@ fn generate_otp_code_rejects_value_equal_to_max_fair() {
 fn email_otp_code_at_max_length_continues_to_verify_with_update() {
     use crate::validation::MAX_OTP_CODE_BYTES;
     let hash = axess_factors::generate_password_hash("12345678");
-    let future = Utc::now() + chrono::Duration::seconds(300);
+    let future = axess_clock::testing::MockClock::reference_time()
+        .plus(axess_clock::SignedDuration::seconds(300));
     let cfg = FactorConfig::EmailOtp(EmailOtpConfig {
         email: "test@example.com".into(),
         pending_hash: Some(ZeroizedString::new(&hash)),
-        pending_until: Some(future),
+        pending_until: Some(axess_clock::Until::At(future)),
         attempt_count: 0,
         max_attempts: 5,
         ..Default::default()
@@ -499,7 +504,7 @@ fn email_otp_code_at_max_length_continues_to_verify_with_update() {
         &cred,
         &cfg,
         &FactorKind::EmailOtp,
-        Utc::now(),
+        axess_clock::testing::MockClock::reference_time(),
         &RecoveryPeppers::default(),
     );
     match outcome {
@@ -515,10 +520,11 @@ fn email_otp_code_at_max_length_continues_to_verify_with_update() {
 
 #[test]
 fn email_otp_burn_clears_the_code_but_keeps_pending_until() {
-    let until = Utc::now() + chrono::Duration::minutes(5);
+    let until = axess_clock::testing::MockClock::reference_time()
+        .plus(axess_clock::SignedDuration::minutes(5));
     let prior = EmailOtpConfig {
         pending_hash: Some(ZeroizedString::new("hash")),
-        pending_until: Some(until),
+        pending_until: Some(axess_clock::Until::At(until)),
         attempt_count: 5,
         max_attempts: 5,
         ..Default::default()
@@ -528,7 +534,7 @@ fn email_otp_burn_clears_the_code_but_keeps_pending_until() {
     assert_eq!(next.attempt_count, 0);
     assert_eq!(
         next.pending_until,
-        Some(until),
+        Some(axess_clock::Until::At(until)),
         "the cooldown survives the burn"
     );
 }
@@ -537,11 +543,7 @@ fn email_otp_burn_clears_the_code_but_keeps_pending_until() {
 
 /// Feed `code` through `verify_credential` and return the config the
 /// outcome leaves behind (the input one when nothing changed).
-fn hotp_after(
-    cfg: HotpConfig,
-    code: &str,
-    now: chrono::DateTime<Utc>,
-) -> (VerifyOutcome, HotpConfig) {
+fn hotp_after(cfg: HotpConfig, code: &str, now: Timestamp) -> (VerifyOutcome, HotpConfig) {
     let cred = FactorCredential::OtpCode(Arc::from(code));
     let outcome = verify_credential(
         &cred,
@@ -561,9 +563,9 @@ fn hotp_after(
 #[test]
 fn the_legitimate_code_still_verifies_after_the_attempt_limit_and_its_lock() {
     // Anyone who knows the password could otherwise lock the user out of
-    // their own token: reaching the limit used to advance the counter past
-    // the lookahead window, so the token's next code never matched again.
-    let t0 = Utc::now();
+    // their own token: a limit that advanced the counter past the
+    // lookahead window would leave the token's next code never matching.
+    let t0 = axess_clock::testing::MockClock::reference_time();
     let mut cfg = HotpConfig {
         secret: ZeroizedString::new(RFC_4226_SECRET_B32).into(),
         counter: 0,
@@ -584,7 +586,7 @@ fn the_legitimate_code_still_verifies_after_the_attempt_limit_and_its_lock() {
     }
     assert_eq!(cfg.counter, 0, "the counter must not move on failures");
     // Well past any throttle: the token's next code is the one at counter 0.
-    let later = t0 + chrono::Duration::hours(2);
+    let later = t0.plus(axess_clock::SignedDuration::hours(2));
     let (outcome, next) = hotp_after(cfg, "755224", later);
     assert!(
         matches!(outcome, VerifyOutcome::PassWithUpdate(_)),
@@ -592,6 +594,33 @@ fn the_legitimate_code_still_verifies_after_the_attempt_limit_and_its_lock() {
     );
     assert_eq!(next.counter, 1);
     assert_eq!(next.attempt_count, 0);
+}
+
+#[test]
+fn a_lookahead_window_at_the_bound_verifies_and_one_past_it_is_refused() {
+    let t0 = axess_clock::testing::MockClock::reference_time();
+    let at_bound = HotpConfig {
+        secret: ZeroizedString::new(RFC_4226_SECRET_B32).into(),
+        counter: 0,
+        lookahead_window: axess_factors::MAX_HOTP_LOOKAHEAD,
+        max_attempts: 3,
+        ..Default::default()
+    };
+    let (outcome, next) = hotp_after(at_bound.clone(), "755224", t0);
+    assert!(
+        matches!(outcome, VerifyOutcome::PassWithUpdate(_)),
+        "a window at the bound is a valid config and its code verifies"
+    );
+    assert_eq!(next.counter, 1);
+    let past_bound = HotpConfig {
+        lookahead_window: axess_factors::MAX_HOTP_LOOKAHEAD + 1,
+        ..at_bound
+    };
+    let (outcome, _) = hotp_after(past_bound, "755224", t0);
+    assert!(
+        matches!(outcome, VerifyOutcome::Fail),
+        "a window past the bound verifies nothing and changes nothing"
+    );
 }
 
 // ── verify_credential: recovery codes across a pepper rotation ───
@@ -629,7 +658,7 @@ mod recovery_pepper_rotation {
             &FactorCredential::RecoveryCode(Arc::from(code)),
             &FactorConfig::RecoveryCodes(cfg.clone()),
             &FactorKind::RecoveryCode,
-            Utc::now(),
+            axess_clock::testing::MockClock::reference_time(),
             peppers,
         )
     }
@@ -711,16 +740,16 @@ async fn a_second_verify_on_a_saturated_executor_is_busy() {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     let config = FactorConfig::Password(PasswordConfig {
-        hash: ZeroizedString::new(axess_factors::generate_password_hash("Gnomes2+")),
+        hash: ZeroizedString::new(axess_factors::generate_password_hash("Sample2+")),
         rules: PasswordRules::default(),
         password_id: None,
     });
     let refused = verify_credential_blocking(
         &kdf,
-        &FactorCredential::Password(ZeroizedString::new("Gnomes2+")),
+        &FactorCredential::Password(ZeroizedString::new("Sample2+")),
         &config,
         &FactorKind::Password,
-        Utc::now(),
+        axess_clock::testing::MockClock::reference_time(),
         &RecoveryPeppers::default(),
     )
     .await;
@@ -735,4 +764,19 @@ async fn a_second_verify_on_a_saturated_executor_is_busy() {
     );
     release.wait();
     holder.await.unwrap().unwrap();
+}
+
+/// The OTP attempt limit is floored and capped: zero reads as the default,
+/// a value above the cap as the cap, so a config can neither turn the limit
+/// off nor hand a guesser most of a code's entropy per lock.
+#[test]
+fn the_otp_attempt_limit_is_floored_and_capped() {
+    assert_eq!(effective_max_attempts(0), DEFAULT_MAX_OTP_ATTEMPTS);
+    assert_eq!(effective_max_attempts(3), 3);
+    assert_eq!(effective_max_attempts(MAX_OTP_ATTEMPTS), MAX_OTP_ATTEMPTS);
+    assert_eq!(
+        effective_max_attempts(MAX_OTP_ATTEMPTS + 1),
+        MAX_OTP_ATTEMPTS
+    );
+    assert_eq!(effective_max_attempts(u8::MAX), MAX_OTP_ATTEMPTS);
 }

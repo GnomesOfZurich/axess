@@ -6,14 +6,14 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 documentation = "https://docs.rs/axess-clock"
 readme = "README.md"
 description = """
-Injectable Clock trait for deterministic simulation testing (DST). Foundational
-primitive used by axess and adjacent crates: production code depends on the
-`Clock` trait, tests inject `MockClock` to make time-dependent behaviour
-reproducible.
+Injectable Clock trait for deterministic simulation testing (DST), and the base
+time types on the standard library alone: Timestamp, SignedDuration, Until and
+UtcDate, with RFC 3339 text. Foundational primitive used by axess and adjacent
+crates: production code depends on the `Clock` trait, tests inject `MockClock`
+to make time-dependent behaviour reproducible.
 """
 keywords = ["clock", "time", "simulation", "deterministic", "testing"]
 categories = ["date-and-time", "development-tools::testing"]
@@ -22,6 +22,9 @@ exclude = ["tests/", "benches/"]
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
 
 [features]
 # Always-on test fixtures (`MockClock`) live under [`testing`]. Adopters
@@ -33,6 +36,16 @@ testing = []
 # ships test doubles in a production binary. Enable this only for a build
 # that means it (a benchmark, a release-mode test run).
 allow-testing-in-release = []
+# serde for the time types: `Timestamp`, `Until` and `UtcDate` are written as
+# their text and read back through their readers.
+serde = ["dep:serde"]
 
 [dependencies]
-chrono = { workspace = true, features = ["clock", "serde"] }
+serde = { version = "1.0.229", optional = true, default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+# The oracle of `tests/chrono_agreement.rs`, which holds the time types to
+# the values and texts earlier releases computed with chrono, and the other
+# library of `tests/other_time_library.rs`, the conversions at an adopter's
+# boundary that the migration page quotes. No library code names it.
+chrono = { workspace = true }

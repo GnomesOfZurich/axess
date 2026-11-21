@@ -16,6 +16,8 @@ pub(crate) mod device_flow;
 pub(crate) mod dpop_key;
 pub(crate) mod error;
 pub(crate) mod fapi;
+#[cfg(test)]
+mod fapi_tests;
 pub(crate) mod jwks_refresh;
 pub(crate) mod login_options;
 pub(crate) mod provider;

@@ -1,8 +1,8 @@
 error[E0433]: cannot find `testing` in `axess`
- --> tests/ui/testing_unreachable.rs:4:23
+ --> tests/ui/testing_unreachable.rs:4:22
   |
-4 |     let _key = axess::testing::test_key;
-  |                       ^^^^^^^ could not find `testing` in `axess`
+4 |     let key = axess::testing::test_key;
+  |                      ^^^^^^^ could not find `testing` in `axess`
   |
 note: found an item that was configured out
  --> src/lib.rs

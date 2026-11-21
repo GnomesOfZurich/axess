@@ -1,12 +1,14 @@
 //! An adopter whose tenant lives in the session, not in a `TenantId` request
 //! extension, still gets a device cookie with the default resolver.
 
-#![cfg(all(feature = "memory", feature = "device"))]
+#![cfg(all(feature = "memory", feature = "device", feature = "testing"))]
+
+use axess_core::testing::fixtures as common;
 
 use axess_core::testing::AuthSessionTestExt;
 use std::sync::Arc;
 
-use axess_clock::SystemClock;
+use axess_clock::testing::MockClock;
 use axess_core::authn::ids::{TenantId, testing};
 use axess_core::session::{extractor::AuthSession, layer::SessionLayer, store::MemorySessionStore};
 use axess_core::{
@@ -21,7 +23,6 @@ use axum::{
     middleware::{self, Next},
     routing::get,
 };
-use chrono::Utc;
 use tower::ServiceExt;
 
 const UA: &str = "Mozilla/5.0 (session tenant browser)";
@@ -35,19 +36,20 @@ fn extension_tenant() -> TenantId {
 }
 
 fn resolver(
+    clock: &MockClock,
     store: &MemoryDeviceStore,
-) -> LifecycleDeviceResolver<DefaultFingerprintExtractor, MemoryDeviceStore, SystemClock> {
+) -> LifecycleDeviceResolver<DefaultFingerprintExtractor, MemoryDeviceStore, MockClock> {
     // No `with_tenant_fn`: the default must find the tenant itself.
     LifecycleDeviceResolver::new(
         DefaultFingerprintExtractor::new(Arc::new(|_: &TenantId| [9u8; 32])),
         DeviceLifecycleService::new(store.clone()),
-        SystemClock,
+        clock.clone(),
     )
 }
 
 async fn login(session: AuthSession, Path(user): Path<String>) -> &'static str {
     session
-        .set_authenticated(testing::user(&user), session_tenant(), Utc::now())
+        .set_authenticated(testing::user(&user), session_tenant(), common::start())
         .await;
     "ok"
 }
@@ -58,12 +60,15 @@ async fn whoami(session: AuthSession) -> &'static str {
 }
 
 fn session_layer(store: &MemoryDeviceStore) -> SessionLayer<MemorySessionStore> {
+    let clock = common::test_clock();
     SessionLayer::without_registry_insecure(
-        MemorySessionStore::new(),
+        MemorySessionStore::new().with_clock(std::sync::Arc::new(clock.clone())),
         axess_core::testing::test_key(42),
+        std::sync::Arc::new(axess_core::session::UnrecordedSessionEnds),
     )
+    .with_clock(clock.clone())
     .with_secure(false)
-    .with_device_resolver(resolver(store))
+    .with_device_resolver(resolver(&clock, store))
 }
 
 /// No `TenantId` extension anywhere: the tenant is only in the session.

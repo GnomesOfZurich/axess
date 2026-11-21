@@ -1,25 +1,24 @@
 //! A read that finds a device row in an older sealed format writes it back
 //! in the current one, conditional on the bytes it read and keeping the
 //! key's expiry. Live-server tests, ignored by default
-//! (`VALKEY_URL=redis://127.0.0.1:56381`).
+//! (`VALKEY_URL=redis://127.0.0.1:56381`); each removes what it wrote, also
+//! when it fails.
 
 use super::*;
 use crate::session::crypto::{BoundFormat, device_row_id_v1};
+use axess_clock::testing::Shift;
 
-async fn sealing_store(tag: &str) -> ValkeyDeviceStore {
-    let url = std::env::var("VALKEY_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
-    let client = Client::new(Config::from_url(&url).expect("url"), None, None, None);
-    client.init().await.expect("connect");
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
+/// An encrypting store under a fresh prefix, held with the sweep that
+/// removes its keys when the test ends, also when it fails.
+async fn sealing_store(tag: &str) -> Swept<ValkeyDeviceStore> {
+    let sweep = crate::testing::valkey_sweep::on_node(&format!("reseal_{tag}"));
     // These tests read rows of the earlier formats on purpose, so the store
     // runs inside the accepting window; the default refuses them, which the
     // offline tests in `super` cover.
-    ValkeyDeviceStore::new(client, crate::testing::test_key(7))
-        .with_prefix(format!("axr_{tag}_{nanos}"))
-        .with_legacy_blobs(crate::session::crypto::LegacyBlobs::Accept)
+    let store = ValkeyDeviceStore::new(live_client().await, crate::testing::test_key(7))
+        .with_prefix(sweep.prefix().to_owned())
+        .with_legacy_blobs(crate::session::crypto::LegacyBlobs::Accept);
+    sweep.hold(store)
 }
 
 fn unbound_row(s: &ValkeyDeviceStore, d: &Device) -> Vec<u8> {
@@ -79,15 +78,18 @@ fn is_current(bytes: &[u8]) -> bool {
 async fn seeded(
     tag: &str,
     old: fn(&ValkeyDeviceStore, &Device) -> Vec<u8>,
-) -> (ValkeyDeviceStore, Device, i64) {
+) -> (Swept<ValkeyDeviceStore>, Device, i64) {
     let s = sealing_store(tag).await;
     let d = device(
         DeviceTrustLevel::Seen,
-        crate::device::store::whole_second(Utc::now()),
+        crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time()),
     );
-    s.save(&d, crate::device::store::whole_second(Utc::now()))
-        .await
-        .unwrap();
+    s.save(
+        &d,
+        crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time()),
+    )
+    .await
+    .unwrap();
     let before = ttl(&s, &d).await;
     assert!(before > 0, "a Seen row carries an expiry");
     let bytes = old(&s, &d);
@@ -141,9 +143,12 @@ async fn the_finders_and_the_sweep_reseal() {
     assert!(is_current(&stored(&s, &d).await));
 
     overwrite(&s, &d, unbound_row(&s, &d)).await;
-    s.sweep(&d.tenant_id, crate::device::store::whole_second(Utc::now()))
-        .await
-        .unwrap();
+    s.sweep(
+        &d.tenant_id,
+        crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time()),
+    )
+    .await
+    .unwrap();
     assert!(is_current(&stored(&s, &d).await));
     kept(before, ttl(&s, &d).await);
 }
@@ -154,11 +159,14 @@ async fn a_current_row_is_left_alone_by_a_read() {
     let s = sealing_store("cur").await;
     let d = device(
         DeviceTrustLevel::Seen,
-        crate::device::store::whole_second(Utc::now()),
+        crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time()),
     );
-    s.save(&d, crate::device::store::whole_second(Utc::now()))
-        .await
-        .unwrap();
+    s.save(
+        &d,
+        crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time()),
+    )
+    .await
+    .unwrap();
     let before = stored(&s, &d).await;
     s.load(&d.tenant_id, &d.id).await.unwrap().unwrap();
     assert_eq!(stored(&s, &d).await, before);
@@ -175,10 +183,13 @@ async fn a_reseal_never_overwrites_a_save_that_landed_meanwhile() {
     assert!(stale);
 
     let mut newer = d.clone();
-    newer.last_seen_at = d.last_seen_at + Duration::seconds(30);
-    s.save(&newer, crate::device::store::whole_second(Utc::now()))
-        .await
-        .unwrap();
+    newer.last_seen_at = d.last_seen_at.plus(SignedDuration::seconds(30));
+    s.save(
+        &newer,
+        crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time()),
+    )
+    .await
+    .unwrap();
     let saved = stored(&s, &d).await;
 
     s.reseal_row(&read, &raw).await;
@@ -195,11 +206,14 @@ async fn a_store_with_a_previous_key_reads_and_reseals_rows_of_the_old_key() {
     let old = sealing_store("rot").await;
     let d = device(
         DeviceTrustLevel::Seen,
-        crate::device::store::whole_second(Utc::now()),
+        crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time()),
     );
-    old.save(&d, crate::device::store::whole_second(Utc::now()))
-        .await
-        .unwrap();
+    old.save(
+        &d,
+        crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time()),
+    )
+    .await
+    .unwrap();
     let before = stored(&old, &d).await;
 
     let rotated = ValkeyDeviceStore::with_crypto(
@@ -226,7 +240,7 @@ async fn a_store_with_a_previous_key_reads_and_reseals_rows_of_the_old_key() {
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn a_save_does_not_replace_a_row_that_cannot_be_decoded() {
     let s = sealing_store("undec").await;
-    let now = crate::device::store::whole_second(Utc::now());
+    let now = crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time());
     let d = device(DeviceTrustLevel::Seen, now);
     s.save(&d, now).await.unwrap();
     s.set_trust_level(&d.tenant_id, &d.id, DeviceTrustLevel::Revoked, now)
@@ -250,7 +264,7 @@ async fn a_save_does_not_replace_a_row_that_cannot_be_decoded() {
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn a_revoking_save_replaces_a_row_that_cannot_be_decoded() {
     let s = sealing_store("undecrev").await;
-    let now = crate::device::store::whole_second(Utc::now());
+    let now = crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time());
     let d = device(DeviceTrustLevel::Seen, now);
     s.save(&d, now).await.unwrap();
     overwrite(&s, &d, b"not a sealed row at all, but long enough".to_vec()).await;
@@ -268,7 +282,8 @@ async fn a_revoking_save_replaces_a_row_that_cannot_be_decoded() {
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn the_sweep_skips_a_damaged_row_and_finishes_the_tenant() {
     let s = sealing_store("sweepdmg").await;
-    let t0 = crate::device::store::whole_second(Utc::now()) - chrono::Duration::days(200);
+    let t0 = crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time())
+        .minus(axess_clock::SignedDuration::days(200));
     let mut bad = device(DeviceTrustLevel::Trusted, t0);
     bad.id = axess_identity::testing::device("damaged");
     let mut good = device(DeviceTrustLevel::Trusted, t0);
@@ -281,7 +296,7 @@ async fn the_sweep_skips_a_damaged_row_and_finishes_the_tenant() {
     let counts = s
         .sweep(
             &good.tenant_id,
-            crate::device::store::whole_second(Utc::now()),
+            crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time()),
         )
         .await
         .unwrap();
@@ -293,12 +308,13 @@ async fn the_sweep_skips_a_damaged_row_and_finishes_the_tenant() {
 #[tokio::test]
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn a_lookup_removes_a_legacy_fingerprint_key_whose_row_expired() {
-    let s = sealing_store("legacyfp")
-        .await
-        .with_legacy_fingerprint_keys();
+    let s = Swept::map(
+        sealing_store("legacyfp").await,
+        ValkeyDeviceStore::with_legacy_fingerprint_keys,
+    );
     let d = device(
         DeviceTrustLevel::Seen,
-        crate::device::store::whole_second(Utc::now()),
+        crate::device::store::whole_second(axess_clock::testing::MockClock::reference_time()),
     );
     let (tenant, id) = (d.tenant_id.to_string(), d.id.to_string());
     let legacy = fingerprint_key(&s.prefix, &tenant, &fingerprint_hex(&d.fingerprint_hash));

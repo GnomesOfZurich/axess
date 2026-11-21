@@ -19,10 +19,10 @@
 //! constant, so the digest is unkeyed: a reader of the store can confirm a
 //! guessed device string against a row, which a `User-Agent` of little
 //! entropy makes cheap. That bounds what the digest hides, never what it
-//! checks: a caller still has to present the matching string. It is not
-//! refused, because the default configuration has no pepper and device
-//! binding has to keep working there; set `hash_pepper` wherever the device
-//! string is worth hiding.
+//! checks: a caller still has to present the matching string. The
+//! configuration refuses a device string without a pepper for that reason,
+//! unless it says `allow_unkeyed_hashes()`; set `hash_pepper` wherever
+//! tokens are bound to a device string.
 //!
 //! The digest is keyed by the pepper the token's hash was computed under. A
 //! token found under `previous_hash_pepper` after a pepper rotation is

@@ -1,17 +1,16 @@
 //! The per-(tenant, fingerprint, user) set: a user's lookup by fingerprint
 //! reads only the devices it lists. Live-server tests, ignored by default
-//! (`VALKEY_URL=redis://127.0.0.1:56382`).
+//! (`VALKEY_URL=redis://127.0.0.1:56382`); each removes what it wrote, also
+//! when it fails.
 
 use super::super::row::fingerprint_user_key;
 use super::*;
 use crate::device::store::consistency::{self as shared, at, tenant};
 
-async fn store(tag: &str) -> ValkeyDeviceStore {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    live_store(&format!("axo_{tag}_{nanos}")).await
+/// A store under a fresh prefix, held with the sweep that removes its keys
+/// when the test ends, also when it fails.
+async fn store(tag: &str) -> Swept<ValkeyDeviceStore> {
+    live_store(&format!("owner_{tag}")).await
 }
 
 fn owned_key(s: &ValkeyDeviceStore, d: &Device) -> String {
@@ -123,7 +122,10 @@ async fn a_miss_reads_the_users_index_only_when_asked_to_read_earlier_layouts() 
 #[tokio::test]
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn a_row_the_set_does_not_list_is_found_and_backfilled() {
-    let s = store("backfill").await.with_legacy_fingerprint_keys();
+    let s = Swept::map(
+        store("backfill").await,
+        ValkeyDeviceStore::with_legacy_fingerprint_keys,
+    );
     let d = shared::device("old", 0x33, DeviceTrustLevel::Trusted, at(0));
     s.save(&d, at(0)).await.unwrap();
     let key = owned_key(&s, &d);

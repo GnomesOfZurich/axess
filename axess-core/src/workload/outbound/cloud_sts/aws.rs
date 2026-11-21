@@ -17,8 +17,10 @@
 //!   itself is the credential: AWS validates it against the OIDC
 //!   provider it has been pre-configured to trust (via an IAM Identity
 //!   Provider in the target AWS account).
-//! - **XML response body.** The historical AWS Query API shape. We
-//!   parse it via `quick-xml`'s serde adapter.
+//! - **XML response body.** The historical AWS Query API shape. A
+//!   success document is parsed via `quick-xml`'s serde adapter; an
+//!   error document is read element by element, so a document cut at the
+//!   read bound still names a code that came before the cut.
 //!
 //! # Token sources
 //!
@@ -30,9 +32,6 @@
 //! - **Kubernetes**: a projected service-account token with the
 //!   target AWS account's STS URL as the audience and IAM-IRSA
 //!   wiring at the cluster.
-//! - **axess `LocalIdP`**: once shipped, axess-issued workload JWTs
-//!   can be terminated at an IAM identity provider in the adopter's
-//!   account, identifying axess workloads to AWS.
 //!
 //! # Endpoint choice
 //!
@@ -54,7 +53,7 @@
 //!     "axess-session-001",
 //!     web_identity_token,
 //! )
-//! .with_duration_seconds(900);
+//! .with_duration(std::time::Duration::from_secs(900))?;
 //! let resp = client.assume_role_with_web_identity(&req).await?;
 //! // resp.credentials.{access_key_id, secret_access_key, session_token}
 //! ```
@@ -63,15 +62,19 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use axess_clock::Timestamp;
 use reqwest::header::CONTENT_TYPE;
 use serde::Deserialize;
 use url::Url;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 /// Time allowed for one request from send to last response byte, unless
 /// `with_timeout` on the client says otherwise.
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The most bytes of the XML parser's error, which can quote the body, that
+/// a refusal keeps.
+const XML_ERROR_LOG_BYTES: usize = 256;
 
 use crate::authn::factor::ZeroizedString;
 
@@ -92,9 +95,14 @@ fn default_endpoint() -> Url {
 /// let req = AssumeRoleWithWebIdentityRequest::new(
 ///     "arn:aws:iam::123:role/r", "session-name", token,
 /// )
-/// .with_duration_seconds(900)
+/// .with_duration(Duration::from_secs(900))?
 /// .with_policy(r#"{"Version":"2012-10-17","Statement":[…]}"#);
 /// ```
+///
+/// The web-identity token is held in a [`ZeroizedString`], whose buffer is
+/// zeroed when the request is dropped. Copies made by `Clone` are each zeroed
+/// when they drop; the form body reqwest builds from the token is beyond this
+/// type's reach.
 #[derive(Clone)]
 pub struct AssumeRoleWithWebIdentityRequest {
     /// The IAM role's full ARN to assume.
@@ -104,12 +112,14 @@ pub struct AssumeRoleWithWebIdentityRequest {
     /// `[\w+=,.@-]*` per AWS spec.
     pub role_session_name: String,
     /// The federated OIDC / JWT token. AWS validates it against the
-    /// IAM identity provider it was configured against.
-    pub web_identity_token: String,
-    /// Lifetime of the issued credentials, in seconds. AWS clamps to
-    /// `900..43200`; the role's `MaxSessionDuration` clamps further.
-    /// `None` defers to AWS's default (3600 = 1h).
-    pub duration_seconds: Option<u32>,
+    /// IAM identity provider it was configured against. Zeroed on drop.
+    pub web_identity_token: ZeroizedString,
+    /// Lifetime of the issued credentials, sent as `DurationSeconds`. Set
+    /// only through [`with_duration`](Self::with_duration), which refuses a
+    /// value AWS does not take, and read with
+    /// [`duration`](Self::duration). `None` defers to AWS's default (one
+    /// hour).
+    duration: Option<Duration>,
     /// Optional inline session policy (JSON). Restricts the
     /// resulting session's permissions to the intersection of the
     /// role's policies and this policy.
@@ -124,15 +134,6 @@ pub struct AssumeRoleWithWebIdentityRequest {
     pub provider_id: Option<String>,
 }
 
-impl Drop for AssumeRoleWithWebIdentityRequest {
-    /// Zeroes the web-identity token's buffer. Copies made by `Clone` are
-    /// each zeroed when they drop; the form body reqwest builds from the
-    /// token is beyond this type's reach.
-    fn drop(&mut self) {
-        self.web_identity_token.zeroize();
-    }
-}
-
 impl std::fmt::Debug for AssumeRoleWithWebIdentityRequest {
     /// Redacts `web_identity_token`: it is a bearer credential and
     /// `Debug` output ends up in logs and panic messages.
@@ -141,7 +142,7 @@ impl std::fmt::Debug for AssumeRoleWithWebIdentityRequest {
             .field("role_arn", &self.role_arn)
             .field("role_session_name", &self.role_session_name)
             .field("web_identity_token", &"[redacted]")
-            .field("duration_seconds", &self.duration_seconds)
+            .field("duration", &self.duration)
             .field("policy", &self.policy)
             .field("policy_arns", &self.policy_arns)
             .field("provider_id", &self.provider_id)
@@ -150,6 +151,11 @@ impl std::fmt::Debug for AssumeRoleWithWebIdentityRequest {
 }
 
 impl AssumeRoleWithWebIdentityRequest {
+    /// The shortest `DurationSeconds` AWS takes: fifteen minutes.
+    pub const MIN_DURATION: Duration = Duration::from_secs(900);
+    /// The longest `DurationSeconds` AWS takes: twelve hours.
+    pub const MAX_DURATION: Duration = Duration::from_secs(43_200);
+
     /// Build with the three required fields. Optional fields default
     /// to `None` / empty.
     pub fn new(
@@ -160,19 +166,36 @@ impl AssumeRoleWithWebIdentityRequest {
         Self {
             role_arn: role_arn.into(),
             role_session_name: role_session_name.into(),
-            web_identity_token: web_identity_token.into(),
-            duration_seconds: None,
+            web_identity_token: ZeroizedString::new(web_identity_token),
+            duration: None,
             policy: None,
             policy_arns: Vec::new(),
             provider_id: None,
         }
     }
 
-    /// Set the requested credential lifetime in seconds (AWS clamps
-    /// to 900..43200).
-    pub fn with_duration_seconds(mut self, duration: u32) -> Self {
-        self.duration_seconds = Some(duration);
-        self
+    /// Set the requested credential lifetime, sent as `DurationSeconds`.
+    /// The role's `MaxSessionDuration` may bound it further, on AWS's side.
+    ///
+    /// # Errors
+    ///
+    /// [`AwsStsError::InvalidDuration`] for a duration that is not a whole
+    /// number of seconds from [`MIN_DURATION`](Self::MIN_DURATION) to
+    /// [`MAX_DURATION`](Self::MAX_DURATION), the range AWS takes: it is
+    /// refused here, where it is configured, and never rounded.
+    pub fn with_duration(mut self, duration: Duration) -> Result<Self, AwsStsError> {
+        if duration.subsec_nanos() != 0
+            || !(Self::MIN_DURATION..=Self::MAX_DURATION).contains(&duration)
+        {
+            return Err(AwsStsError::InvalidDuration(duration));
+        }
+        self.duration = Some(duration);
+        Ok(self)
+    }
+
+    /// The requested credential lifetime, `None` for AWS's default.
+    pub fn duration(&self) -> Option<Duration> {
+        self.duration
     }
 
     /// Set an inline session policy (JSON).
@@ -210,7 +233,7 @@ pub struct AwsCredentials {
     pub session_token: ZeroizedString,
     /// When the credentials become invalid. AWS guarantees ISO-8601
     /// UTC timestamps in the response.
-    pub expiration: DateTime<Utc>,
+    pub expiration: Timestamp,
 }
 
 /// Successful response from `AssumeRoleWithWebIdentity`.
@@ -264,6 +287,17 @@ pub enum AwsStsError {
     /// [`ClientBuildError`](crate::ClientBuildError).
     #[error(transparent)]
     ClientBuild(#[from] crate::ClientBuildError),
+    /// The duration handed to
+    /// [`with_duration`](AssumeRoleWithWebIdentityRequest::with_duration) is
+    /// not a whole number of seconds from
+    /// [`MIN_DURATION`](AssumeRoleWithWebIdentityRequest::MIN_DURATION) to
+    /// [`MAX_DURATION`](AssumeRoleWithWebIdentityRequest::MAX_DURATION), so
+    /// AWS's `DurationSeconds` cannot carry it.
+    #[error(
+        "the requested `duration` of {0:?} is refused: AWS takes `DurationSeconds` as a whole \
+         number of seconds from 900 to 43200"
+    )]
+    InvalidDuration(Duration),
 }
 
 // ── Client ───────────────────────────────────────────────────────────────────
@@ -296,12 +330,7 @@ impl AwsStsClient {
     /// TLS backend failed to initialise). No client with the protections
     /// missing is built in its place.
     pub fn new() -> Result<Self, AwsStsError> {
-        Self::from_builder(reqwest::Client::builder())
-    }
-
-    /// [`new`](Self::new) on a builder the caller started.
-    fn from_builder(builder: reqwest::ClientBuilder) -> Result<Self, AwsStsError> {
-        let http = crate::outbound_http::harden(builder)?;
+        let http = crate::outbound_http::hardened_client(|settings| settings)?;
         Ok(Self {
             endpoint: Arc::new(default_endpoint()),
             http,
@@ -318,17 +347,31 @@ impl AwsStsClient {
         self
     }
 
-    /// Override the HTTP client: useful for proxy or outbound mTLS
-    /// configuration. The request timeout applies whichever client is used.
+    /// Add settings to the HTTP client of the STS call: a `User-Agent`, a
+    /// trusted root certificate, a client certificate for outbound mTLS,
+    /// timeouts.
     ///
-    /// A replacement client drops the default client's protections: it must
-    /// be built with `redirect(reqwest::redirect::Policy::none())` and a
-    /// connect timeout, or a redirect carries the credential-bearing request
-    /// to wherever it points. The endpoint check (HTTPS, or HTTP to a
-    /// loopback host) still applies.
-    pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
-        self.http = http;
-        self
+    /// The client is built again with `configure`'s settings before the
+    /// library's own, so it still follows no redirect: a
+    /// [`ClientSettings`](axess_factors::egress::ClientSettings) offers
+    /// nothing that could change that, and a whole client of the caller's
+    /// own is not taken, since a redirect it followed would carry the
+    /// credentials to wherever it points. A proxy named in the environment
+    /// (`HTTPS_PROXY`) is followed, as before. The endpoint check (HTTPS, or
+    /// HTTP to a loopback host) still applies.
+    ///
+    /// # Errors
+    ///
+    /// [`AwsStsError::ClientBuild`] when the client cannot be built with the
+    /// settings.
+    pub fn with_client_settings(
+        mut self,
+        configure: impl FnOnce(
+            axess_factors::egress::ClientSettings,
+        ) -> axess_factors::egress::ClientSettings,
+    ) -> Result<Self, AwsStsError> {
+        self.http = crate::outbound_http::hardened_client(configure)?;
+        Ok(self)
     }
 
     /// Bound each call to `timeout` (default 30 seconds). The bound applies
@@ -352,7 +395,7 @@ impl AwsStsClient {
     ) -> Result<AssumeRoleWithWebIdentityResponse, AwsStsError> {
         crate::outbound_http::require_https_or_loopback(&self.endpoint)
             .map_err(|reason| AwsStsError::Transport(reason.to_string()))?;
-        let form = build_form(request);
+        let form = build_form(request, request.duration.map(|d| d.as_secs()));
 
         let mut response = self
             .http
@@ -365,31 +408,34 @@ impl AwsStsClient {
             .map_err(|e| AwsStsError::Transport(e.to_string()))?;
 
         let status = response.status();
-        // The STS answer is a small XML document; error bodies are cut to
-        // 1 KiB, which holds the error code and message. The success body
-        // carries the secret key and session token, so both the bytes and
-        // the text made from them are zeroed on drop.
-        let body = Zeroizing::new(
-            axess_factors::http_body::read_for_status(
-                &mut response,
-                axess_factors::http_body::MAX_TOKEN_BODY_BYTES,
-            )
-            .await
-            .map_err(|e| AwsStsError::Transport(e.to_string()))?,
-        );
-        let body = Zeroizing::new(String::from_utf8_lossy(&body).into_owned());
-
         if !status.is_success() {
+            // The error document is read to 64 KiB and its fields element
+            // by element, so a long message does not cost the code; what
+            // reaches the error is still cut.
+            let body = axess_factors::http_body::ErrorBody::read(&mut response).await;
             return Err(parse_error(status.as_u16(), &body));
         }
+        // The success body carries the secret key and session token, so
+        // both the bytes and the text made from them are zeroed on drop.
+        let body = axess_factors::http_body::read_limited(
+            &mut response,
+            axess_factors::http_body::MAX_TOKEN_BODY_BYTES,
+        )
+        .await
+        .map_err(|e| AwsStsError::Transport(e.to_string()))?;
+        let body = Zeroizing::new(String::from_utf8_lossy(&body).into_owned());
 
         parse_success(&body)
     }
 }
 
-fn build_form(request: &AssumeRoleWithWebIdentityRequest) -> Vec<(Cow<'_, str>, Cow<'_, str>)> {
+fn build_form(
+    request: &AssumeRoleWithWebIdentityRequest,
+    duration_seconds: Option<u64>,
+) -> Vec<(Cow<'_, str>, Cow<'_, str>)> {
     // Borrowed from the request wherever possible, so the token is not
     // copied into a second buffer this function cannot zero.
+    let token: &str = &request.web_identity_token;
     let mut form: Vec<(Cow<'_, str>, Cow<'_, str>)> = vec![
         ("Action".into(), "AssumeRoleWithWebIdentity".into()),
         ("Version".into(), STS_API_VERSION.into()),
@@ -398,13 +444,10 @@ fn build_form(request: &AssumeRoleWithWebIdentityRequest) -> Vec<(Cow<'_, str>, 
             "RoleSessionName".into(),
             request.role_session_name.as_str().into(),
         ),
-        (
-            "WebIdentityToken".into(),
-            request.web_identity_token.as_str().into(),
-        ),
+        ("WebIdentityToken".into(), token.into()),
     ];
-    if let Some(d) = request.duration_seconds {
-        form.push(("DurationSeconds".into(), d.to_string().into()));
+    if let Some(seconds) = duration_seconds {
+        form.push(("DurationSeconds".into(), seconds.to_string().into()));
     }
     if let Some(policy) = &request.policy {
         form.push(("Policy".into(), policy.as_str().into()));
@@ -468,13 +511,16 @@ struct StsAssumedRoleUserXml {
 }
 
 fn parse_success(body: &str) -> Result<AssumeRoleWithWebIdentityResponse, AwsStsError> {
-    let parsed: StsSuccessEnvelope = quick_xml::de::from_str(body)
-        .map_err(|e| AwsStsError::MalformedResponse(format!("XML decode: {e}")))?;
+    let parsed: StsSuccessEnvelope = quick_xml::de::from_str(body).map_err(|e| {
+        AwsStsError::MalformedResponse(format!(
+            "XML decode: {}",
+            axess_factors::http_body::log_safe(&e.to_string(), XML_ERROR_LOG_BYTES)
+        ))
+    })?;
 
     let creds = parsed.result.credentials;
-    let expiration = DateTime::parse_from_rfc3339(&creds.expiration)
-        .map_err(|e| AwsStsError::MalformedResponse(format!("Expiration not RFC3339: {e}")))?
-        .with_timezone(&Utc);
+    let expiration = Timestamp::parse_rfc3339(&creds.expiration)
+        .map_err(|e| AwsStsError::MalformedResponse(format!("Expiration not RFC3339: {e}")))?;
 
     if creds.access_key_id.is_empty()
         || creds.secret_access_key.is_empty()
@@ -501,37 +547,153 @@ fn parse_success(body: &str) -> Result<AssumeRoleWithWebIdentityResponse, AwsSts
     })
 }
 
-#[derive(Debug, Deserialize)]
-struct StsErrorEnvelope {
-    #[serde(rename = "Error")]
-    error: StsErrorBody,
-    #[serde(rename = "RequestId", default)]
+/// The fields of an STS error document: `Type`, `Code` and `Message` inside
+/// the root's `Error`, and the root's `RequestId`. Raw: each passes through
+/// `log_safe` before it reaches an error.
+#[derive(Debug, Default)]
+struct StsErrorFields {
+    fault_type: Option<String>,
+    code: Option<String>,
+    message: Option<String>,
     request_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct StsErrorBody {
-    #[serde(rename = "Type", default)]
-    fault_type: Option<String>,
-    #[serde(rename = "Code")]
-    code: String,
-    #[serde(rename = "Message")]
-    message: String,
+/// An element the reader is inside: its local name and the text read in it
+/// so far, the text of the elements inside it included.
+type OpenElement = (String, String);
+
+impl StsErrorFields {
+    /// Read `body` element by element, the first element of each name
+    /// counting, and the text of an element taken as written, with the text
+    /// of any element inside it. Reading stops at the end of the body or at
+    /// the first thing that is not well-formed XML, a reference XML does not
+    /// define included, and keeps the fields whose end tag came before, so a
+    /// body cut at the read bound still names a code that came before the
+    /// cut. A `Code`, `Type` or `RequestId` the stop fell inside is not kept,
+    /// since its start is not the value; a `Message` keeps its text up to
+    /// the stop.
+    fn read(body: &str) -> Self {
+        use quick_xml::events::Event;
+
+        let mut reader = quick_xml::Reader::from_str(body);
+        let mut fields = Self::default();
+        let mut open: Vec<OpenElement> = Vec::new();
+        loop {
+            match reader.read_event() {
+                Ok(Event::Start(element)) => open.push((local_name(&element), String::new())),
+                Ok(Event::Empty(element)) => fields.keep(&open, &local_name(&element), ""),
+                Ok(Event::End(_)) => {
+                    if let Some((name, text)) = open.pop() {
+                        fields.keep(&open, &name, &text);
+                        append_to_parent(&mut open, &text);
+                    }
+                }
+                Ok(Event::Text(chunk)) => append_to_parent(&mut open, &chunk.xml10_content()),
+                Ok(Event::CData(chunk)) => append_to_parent(&mut open, &chunk.xml10_content()),
+                Ok(Event::GeneralRef(reference)) => match resolve_reference(&reference) {
+                    Some(resolved) => append_to_parent(&mut open, &resolved),
+                    None => break,
+                },
+                Ok(Event::Eof) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+        fields.keep_cut(open);
+        fields
+    }
+
+    /// The field an element named `name` inside `open` is, if it is one.
+    fn slot(&mut self, open: &[OpenElement], name: &str) -> Option<&mut Option<String>> {
+        match open {
+            [_, (error, _)] if error == "Error" => match name {
+                "Type" => Some(&mut self.fault_type),
+                "Code" => Some(&mut self.code),
+                "Message" => Some(&mut self.message),
+                _ => None,
+            },
+            [_] if name == "RequestId" => Some(&mut self.request_id),
+            _ => None,
+        }
+    }
+
+    /// Keep `text` as the field an element named `name` inside `open` is,
+    /// unless an element of that name came first.
+    fn keep(&mut self, open: &[OpenElement], name: &str, text: &str) {
+        if let Some(slot @ None) = self.slot(open, name) {
+            *slot = Some(text.to_owned());
+        }
+    }
+
+    /// Close the elements open where reading stopped, innermost first,
+    /// keeping only a `Message` among them.
+    fn keep_cut(&mut self, mut open: Vec<OpenElement>) {
+        while let Some((name, text)) = open.pop() {
+            if name == "Message" {
+                self.keep(&open, &name, &text);
+            }
+            append_to_parent(&mut open, &text);
+        }
+    }
 }
 
-fn parse_error(http_status: u16, body: &str) -> AwsStsError {
-    match quick_xml::de::from_str::<StsErrorEnvelope>(body) {
-        Ok(env) => AwsStsError::StsError {
+/// The local name of `element`, its namespace prefix dropped.
+fn local_name(element: &quick_xml::events::BytesStart<'_>) -> String {
+    element.local_name().as_ref().to_owned()
+}
+
+/// Add `text` to the text of the innermost open element; text outside every
+/// element is dropped.
+fn append_to_parent(open: &mut [OpenElement], text: &str) {
+    if let Some((_, parent)) = open.last_mut() {
+        parent.push_str(text);
+    }
+}
+
+/// What a character reference or a predefined entity reference stands for;
+/// `None` for a reference XML does not define, which stops the read.
+fn resolve_reference(reference: &quick_xml::events::BytesRef<'_>) -> Option<String> {
+    match reference.resolve_char_ref() {
+        Ok(Some(c)) => Some(c.to_string()),
+        Ok(None) => quick_xml::escape::resolve_predefined_entity(reference).map(str::to_owned),
+        Err(_) => None,
+    }
+}
+
+/// Longest error message kept from an STS response, and longest code, fault
+/// type and request id: the rest is cut. Every one of them is copied from the
+/// response with every character `escapes` names (control characters, the
+/// line and paragraph separators, bidirectional controls, zero-width
+/// characters, the byte order mark, the Hangul fillers) escaped, so the
+/// endpoint cannot forge a log line through the error's text.
+const MAX_MESSAGE_BYTES: usize = 512;
+const MAX_CODE_BYTES: usize = 128;
+
+/// What starts the message of a refusal that names no code, before the
+/// start of its body.
+const NO_CODE_MESSAGE: &str = "error body with no code: ";
+
+/// The error for a refusal: the document's fields when it names a code,
+/// read from as much of the body as was read, so a long message before or
+/// after the code does not cost it; otherwise `Unknown` with the start of
+/// the body as the message, after [`NO_CODE_MESSAGE`].
+fn parse_error(http_status: u16, body: &axess_factors::http_body::ErrorBody) -> AwsStsError {
+    use axess_factors::http_body::log_safe;
+    let fields = StsErrorFields::read(&String::from_utf8_lossy(body.as_bytes()));
+    match fields.code {
+        Some(code) => AwsStsError::StsError {
             http_status,
-            code: env.error.code,
-            message: env.error.message,
-            fault_type: env.error.fault_type,
-            request_id: env.request_id,
+            code: log_safe(&code, MAX_CODE_BYTES),
+            message: log_safe(&fields.message.unwrap_or_default(), MAX_MESSAGE_BYTES),
+            fault_type: fields.fault_type.map(|t| log_safe(&t, MAX_CODE_BYTES)),
+            request_id: fields.request_id.map(|id| log_safe(&id, MAX_CODE_BYTES)),
         },
-        Err(_) => AwsStsError::StsError {
+        None => AwsStsError::StsError {
             http_status,
             code: "Unknown".to_string(),
-            message: format!("non-XML error body: {body}"),
+            message: format!(
+                "{NO_CODE_MESSAGE}{}",
+                log_safe(&body.snippet(), MAX_MESSAGE_BYTES)
+            ),
             fault_type: None,
             request_id: None,
         },

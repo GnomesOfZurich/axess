@@ -3,7 +3,8 @@
 //! tokens).
 //!
 //! State handling is the adopter's job: `begin_grant` returns a
-//! [`GrantContext`] containing the `state` + PKCE `code_verifier`;
+//! [`GrantContext`] containing the `state`, the PKCE `code_verifier` and
+//! the registration the grant began with;
 //! the adopter persists this somewhere (signed cookie, short-lived
 //! server-side store, encrypted session bag) and replays it into
 //! `complete_grant` once the IdP redirects back. axess does not
@@ -12,10 +13,10 @@
 //! workers, …).
 
 use axess_clock::Clock;
+use axess_clock::Timestamp;
 use axess_rng::SecureRng;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use chrono::{DateTime, Utc};
 use reqwest::header::AUTHORIZATION;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -25,6 +26,7 @@ use zeroize::Zeroizing;
 
 use crate::delegated::error::DelegatedError;
 use axess_factors::ZeroizedString;
+use axess_factors::egress::{ClientSettings, ScreenedClient};
 
 use crate::delegated::body::{read_error_body, read_success_body};
 
@@ -43,6 +45,9 @@ use super::provider::DelegatedProvider;
 /// - `requested_scopes`: recorded for adopter audit / debugging;
 ///   the IdP's granted scopes are what land on the resulting
 ///   `StoredDelegation`.
+/// - `registration`: which registration the grant began with.
+///   `complete_grant` refuses any other, so a code is never sent to a
+///   provider that shares only the name.
 #[derive(Debug, Clone)]
 pub struct GrantContext {
     /// OAuth2 `state` value. Random, single-use.
@@ -55,6 +60,71 @@ pub struct GrantContext {
     /// can compare against the granted scopes on the returned
     /// `StoredDelegation` to detect partial consent.
     pub requested_scopes: Vec<String>,
+    /// The registration `begin_grant` was called with. Persist it with the
+    /// rest: [`complete_grant`] compares it with the provider it is handed.
+    pub registration: GrantRegistration,
+}
+
+/// The registration a grant began with: what [`complete_grant`] compares
+/// with the provider it is handed.
+///
+/// A provider's `name` is the application's label, and two registrations
+/// may share it (one for each tenant, or a tenant's own beside a shared
+/// one), so the name does not say which client the IdP issued the code to.
+/// The `fingerprint` covers what makes a registration: the name, the client
+/// id, the authorization endpoint, the token endpoint and the
+/// `redirect_uri`. It holds no secret and is persisted with the rest of the
+/// [`GrantContext`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantRegistration {
+    /// The provider's `name`.
+    pub provider: String,
+    /// `BASE64URL(SHA-256(..))` over the five values, each preceded by its
+    /// length, so no two lists of values share a digest by their joining.
+    pub fingerprint: String,
+}
+
+impl GrantRegistration {
+    /// The registration `provider` is.
+    #[must_use]
+    pub fn of(provider: &DelegatedProvider) -> Self {
+        let mut hasher = Sha256::new();
+        for part in [
+            provider.name.as_str(),
+            provider.client_id.as_str(),
+            provider.authorization_endpoint.as_str(),
+            provider.token_endpoint.as_str(),
+            provider.redirect_uri.as_str(),
+        ] {
+            hasher.update(u64::try_from(part.len()).unwrap_or(u64::MAX).to_be_bytes());
+            hasher.update(part.as_bytes());
+        }
+        Self {
+            provider: provider.name.clone(),
+            fingerprint: URL_SAFE_NO_PAD.encode(hasher.finalize()),
+        }
+    }
+}
+
+/// The HTTP client [`complete_grant`] sends the code exchange with.
+///
+/// The library builds it, so it follows no redirect: the exchange carries
+/// the code, the PKCE verifier and the client credentials, and a client
+/// that followed a 307 or 308 would repeat them to wherever the answer
+/// points. A 10-second connect timeout and a 30-second request timeout are
+/// set first and `configure`'s settings after them (a `User-Agent`, a
+/// trusted root certificate, a client certificate, other timeouts); a
+/// [`ClientSettings`] offers nothing that restores redirects. Build one at
+/// startup and share it: it holds a connection pool.
+///
+/// # Errors
+///
+/// [`DelegatedError::ClientBuild`] when the client cannot be built with the
+/// settings.
+pub fn grant_client(
+    configure: impl FnOnce(ClientSettings) -> ClientSettings,
+) -> Result<ScreenedClient, DelegatedError> {
+    Ok(crate::outbound_http::hardened_screened_client(configure)?)
 }
 
 /// Begin an authorization-code grant against `provider`. Returns
@@ -63,9 +133,12 @@ pub struct GrantContext {
 /// `GrantContext` somewhere it can be retrieved when the IdP
 /// redirects back to the adopter's callback handler.
 ///
-/// The authorization endpoint must be HTTPS (or HTTP to a loopback host,
-/// for a local IdP in development): any other is refused with
-/// [`DelegatedError::Transport`] before the URL is built.
+/// The authorization endpoint and the `redirect_uri` must be HTTPS (or
+/// HTTP to a loopback host, for local development): any other is refused
+/// with [`DelegatedError::Transport`], naming the setting, before the URL
+/// is built. The IdP sends the browser back to `redirect_uri` with the
+/// code and the `state`, so it is as much a secret-bearing endpoint as
+/// the other two.
 ///
 /// `scopes_override`: pass an empty slice to use the provider's
 /// `default_scopes`; pass a non-empty slice to override.
@@ -83,6 +156,7 @@ pub fn begin_grant(
     // state in the URL: refused before any of them is drawn.
     crate::outbound_http::require_https_or_loopback(&provider.authorization_endpoint)
         .map_err(|reason| DelegatedError::Transport(reason.to_string()))?;
+    require_secure_redirect_uri(provider)?;
     let verifier = random_token(rng);
     let state = random_token(rng);
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
@@ -112,9 +186,18 @@ pub fn begin_grant(
         state: (*state).clone(),
         code_verifier: ZeroizedString::from((*verifier).clone()),
         requested_scopes: scopes,
+        registration: GrantRegistration::of(provider),
     };
 
     Ok((auth_url, context))
+}
+
+/// The `redirect_uri` the IdP sends the browser back to, with the code and
+/// the `state`: HTTPS, or HTTP to a loopback host, and nothing else. The
+/// refusal names the setting and not the URL.
+fn require_secure_redirect_uri(provider: &DelegatedProvider) -> Result<(), DelegatedError> {
+    crate::outbound_http::require_https_or_loopback(&provider.redirect_uri)
+        .map_err(|reason| DelegatedError::Transport(format!("redirect_uri: {reason}")))
 }
 
 /// 32 random bytes from `rng`, base64url-encoded without padding. The
@@ -132,6 +215,13 @@ fn random_token(rng: &dyn SecureRng) -> Zeroizing<String> {
 /// `StoredDelegation` ready to hand to a
 /// [`DelegatedCredentialStore`](super::credential::DelegatedCredentialStore).
 ///
+/// `provider` must be the registration the grant began with
+/// ([`GrantContext::registration`]): any other, one of the same name
+/// included, is refused with [`DelegatedError::RegistrationMismatch`]
+/// before anything is sent. `http` is a client the library built
+/// ([`grant_client`], or any [`ScreenedClient`]), never one of the caller's
+/// own, so no redirect carries the code and the client credentials on.
+///
 /// Token expiry is measured from `clock`, so a simulated clock gives a
 /// deterministic `expires_at`; use [`complete_grant_at`] to supply the
 /// instant itself.
@@ -140,7 +230,7 @@ pub async fn complete_grant(
     context: &GrantContext,
     code: &str,
     state_from_callback: &str,
-    http: &reqwest::Client,
+    http: &ScreenedClient,
     clock: &dyn Clock,
 ) -> Result<StoredDelegation, DelegatedError> {
     complete_grant_at(
@@ -161,8 +251,8 @@ pub async fn complete_grant_at(
     context: &GrantContext,
     code: &str,
     state_from_callback: &str,
-    http: &reqwest::Client,
-    now: DateTime<Utc>,
+    http: &ScreenedClient,
+    now: Timestamp,
 ) -> Result<StoredDelegation, DelegatedError> {
     // The state is compared in constant time: it is the secret that
     // binds the callback to the browser that started the flow.
@@ -180,6 +270,17 @@ pub async fn complete_grant_at(
     if !axess_factors::pkce::is_valid_verifier(&context.code_verifier) {
         return Err(DelegatedError::PkceVerifier);
     }
+    // The IdP issued the code to the registration the grant began with. Any
+    // other would be sent the code and the verifier with its own client
+    // credentials: refused before any request, whatever its name.
+    if GrantRegistration::of(provider) != context.registration {
+        return Err(DelegatedError::RegistrationMismatch {
+            provider: provider.name.clone(),
+        });
+    }
+    // The grant could not have begun with this provider; refused before any
+    // request, as `begin_grant` refuses it before any redirect.
+    require_secure_redirect_uri(provider)?;
 
     // Borrowed throughout: the verifier and code are never copied into
     // buffers of this function's own.
@@ -194,7 +295,7 @@ pub async fn complete_grant_at(
         ("client_id", &provider.client_id),
     ];
 
-    let response = post_token_endpoint(http, provider, &form).await?;
+    let response = post_token_endpoint(http.inner(), provider, &form).await?;
     let grant = parse_token_response(provider, response, now, TokenRequest::CodeExchange).await?;
     // RFC 6749 §5.1: an omitted `scope` means the granted scope is the one
     // requested.
@@ -236,17 +337,6 @@ pub(super) async fn refresh_token_grant(
 enum TokenRequest {
     CodeExchange,
     Refresh,
-}
-
-/// The RFC 6749 §5.2 `error` member of an error body, when the body is the
-/// JSON object the RFC specifies. Exact: `error_description` text that
-/// mentions `invalid_grant` is not the error.
-fn oauth_error_code(body: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(body)
-        .ok()?
-        .get("error")?
-        .as_str()
-        .map(str::to_string)
 }
 
 /// A parsed token response: the credential it describes, and the scope the
@@ -307,7 +397,7 @@ struct TokenResponse {
 async fn parse_token_response(
     provider: &DelegatedProvider,
     mut response: reqwest::Response,
-    now: DateTime<Utc>,
+    now: Timestamp,
     request: TokenRequest,
 ) -> Result<TokenGrant, DelegatedError> {
     let status = response.status();
@@ -319,19 +409,20 @@ async fn parse_token_response(
         // compared exactly, and only on the refresh grant.
         if request == TokenRequest::Refresh
             && status.as_u16() == 400
-            && oauth_error_code(&body).as_deref() == Some("invalid_grant")
+            && body.string_member("error").as_deref() == Some("invalid_grant")
         {
             return Err(DelegatedError::RefreshRejected);
         }
         return Err(DelegatedError::TokenEndpoint {
             status: status.as_u16(),
-            body,
+            body: crate::delegated::body::log_safe(&body),
         });
     }
 
     let body = read_success_body(&mut response).await?;
-    let parsed: TokenResponse = serde_json::from_slice(&body)
-        .map_err(|e| DelegatedError::MalformedResponse(e.to_string()))?;
+    let parsed: TokenResponse = serde_json::from_slice(&body).map_err(|e| {
+        DelegatedError::MalformedResponse(axess_factors::http_body::log_safe_parse_error(&e))
+    })?;
 
     if parsed.access_token.is_empty() {
         return Err(DelegatedError::MalformedResponse(
@@ -355,6 +446,7 @@ async fn parse_token_response(
     Ok(TokenGrant {
         credential: StoredDelegation {
             provider: provider.name.clone(),
+            registration: Some(GrantRegistration::of(provider)),
             access_token: parsed.access_token,
             refresh_token: parsed.refresh_token,
             expires_at,

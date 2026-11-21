@@ -1,33 +1,36 @@
 //! Unit tests for the Valkey session backend.
 //!
-//! Pins pure-function behaviour and inherent-method bodies that
-//! cargo-mutants can attack from the test thread without a live
-//! Valkey instance. The body-replacement mutations on the
-//! `SessionStore` / `SessionRegistry` impls (load/save/cycle/…) are
-//! distinguishable from the originals only via an actual Valkey
-//! round-trip, so they remain covered by the `valkey_integration`
-//! `#[ignore]` test below.
+//! Pins the pure functions and the inherent-method bodies that can be
+//! told apart from the test thread without a live Valkey instance. A
+//! wrong body in the `SessionStore` / `SessionRegistry` impls
+//! (load/save/cycle/…) shows only in an actual Valkey round-trip, which
+//! is what the `valkey_integration` `#[ignore]` test below is for.
 
 use super::internal::{
-    CYCLE_SCRIPT, DEFAULT_MAX_PAYLOAD_BYTES, ValkeyStoreError, log_session_id, oldest_first,
-    registry_key, revocation_session_channel, revocation_user_channel, script_unavailable,
-    session_key,
+    CYCLE_SCRIPT, DEFAULT_MAX_PAYLOAD_BYTES, ValkeyStoreError, oldest_first,
+    revocation_session_channel, revocation_user_channel, script_unavailable, session_row_key,
+    user_keys,
 };
 use super::registry::ValkeySessionRegistry;
 use super::store::ValkeySessionStore;
+use super::subscriber::connection_name;
+use super::watch_tests::{connect, eventually, subscriber_connections};
+use crate::authn::ids::UserId;
 use crate::session::crypto::{BoundFormat, SessionCrypto};
 use crate::session::data::SessionData;
-use crate::session::id::SessionId;
+use crate::session::id::{SessionId, SessionKey};
 use crate::session::storage::session_codec::SessionCodec;
-use crate::session::store::{CycleOutcome, SessionRegistry, SessionStore};
+use crate::session::store::{CutOff, CycleOutcome, SessionRegistry, SessionStore};
+use crate::testing::valkey_sweep::Swept;
 use axess_rng::SystemRng;
 use fred::prelude::*;
 use std::time::Duration;
 
-fn test_id() -> SessionId {
-    "00000000-0000-4000-8000-000000000001"
-        .parse()
-        .expect("fixed test id")
+/// A fixed session id, and the key a store names its session by.
+const TEST_ID: &str = "00000000-0000-4000-8000-000000000001";
+
+fn test_id() -> SessionKey {
+    SessionKey::of(&TEST_ID.parse().expect("fixed test id"))
 }
 
 // The previous `encrypt_decrypt_roundtrip` /
@@ -123,11 +126,31 @@ fn unreachable_client() -> Client {
 #[test]
 fn key_helpers_produce_expected_strings() {
     let rng = SystemRng;
-    let id = SessionId::new(&rng);
+    let session = SessionId::new(&rng);
+    let id = SessionKey::of(&session);
     let id_s = id.to_string();
 
-    assert_eq!(session_key("axess", &id), format!("axess:sess:{id_s}"));
-    assert_eq!(registry_key("axess", "u-1"), "axess:reg:u-1");
+    // The name holds the 64 characters of the key and nothing of the id.
+    assert_eq!(id_s.len(), 64);
+    assert_eq!(session_row_key("axess", &id), format!("axess:sess:{id_s}"));
+    assert!(!session_row_key("axess", &id).contains(&session.to_string()));
+    let keys = user_keys("axess", &UserId::NIL).expect("one slot");
+    assert_eq!(
+        keys.registry,
+        "axess:reg:{00000000-0000-0000-0000-000000000000}"
+    );
+    assert_eq!(
+        keys.registered_at,
+        "axess:reg-at:{00000000-0000-0000-0000-000000000000}"
+    );
+    assert_eq!(
+        keys.forward,
+        "axess:fwd:{00000000-0000-0000-0000-000000000000}"
+    );
+    assert_eq!(
+        keys.forward_order,
+        "axess:fwd-at:{00000000-0000-0000-0000-000000000000}"
+    );
     assert_eq!(
         revocation_session_channel("axess", "s-1"),
         "axess:revoked-session:s-1"
@@ -140,9 +163,9 @@ fn key_helpers_produce_expected_strings() {
     // Prefix is interpolated, not hard-coded: discriminates a body
     // replacement that returns a constant ignoring `prefix`.
     assert_eq!(
-        session_key("other", &id),
+        session_row_key("other", &id),
         format!("other:sess:{id_s}"),
-        "session_key must interpolate the prefix argument"
+        "session_row_key must interpolate the prefix argument"
     );
 }
 
@@ -278,7 +301,8 @@ async fn load_propagates_error_against_unreachable_valkey() {
     let store = ValkeySessionStore::plaintext_insecure(unreachable_client());
     let rng = SystemRng;
     let id = SessionId::new(&rng);
-    let result = tokio::time::timeout(Duration::from_secs(3), store.load(&id)).await;
+    let result =
+        tokio::time::timeout(Duration::from_secs(3), store.load(&SessionKey::of(&id))).await;
     assert!(
         matches!(result, Ok(Err(_))),
         "load must return Err quickly against unreachable Valkey: {result:?}"
@@ -292,7 +316,11 @@ async fn save_propagates_error_against_unreachable_valkey() {
     let id = SessionId::new(&rng);
     let result = tokio::time::timeout(
         Duration::from_secs(3),
-        store.save(&id, &SessionData::default(), Duration::from_secs(60)),
+        store.save(
+            &SessionKey::of(&id),
+            &SessionData::default(),
+            Duration::from_secs(60),
+        ),
     )
     .await;
     assert!(
@@ -306,7 +334,8 @@ async fn delete_propagates_error_against_unreachable_valkey() {
     let store = ValkeySessionStore::plaintext_insecure(unreachable_client());
     let rng = SystemRng;
     let id = SessionId::new(&rng);
-    let result = tokio::time::timeout(Duration::from_secs(3), store.delete(&id)).await;
+    let result =
+        tokio::time::timeout(Duration::from_secs(3), store.delete(&SessionKey::of(&id))).await;
     assert!(
         matches!(result, Ok(Err(_))),
         "delete must return Err: {result:?}"
@@ -322,8 +351,8 @@ async fn cycle_propagates_error_against_unreachable_valkey() {
     let result = tokio::time::timeout(
         Duration::from_secs(3),
         store.cycle(
-            &old,
-            &new,
+            &SessionKey::of(&old),
+            &SessionKey::of(&new),
             &SessionData::default(),
             Duration::from_secs(60),
             true,
@@ -336,8 +365,14 @@ async fn cycle_propagates_error_against_unreachable_valkey() {
     );
 }
 
+/// A registry on a client that cannot connect, built past the constructors'
+/// checks (which would refuse it), so each method's own error is seen.
 fn unreachable_registry() -> ValkeySessionRegistry {
-    ValkeySessionRegistry::new(unreachable_client())
+    ValkeySessionRegistry::assembled(
+        unreachable_client(),
+        "axess".into(),
+        Duration::from_secs(60),
+    )
 }
 
 #[tokio::test]
@@ -345,7 +380,7 @@ async fn register_propagates_error_against_unreachable_valkey() {
     let registry = unreachable_registry();
     let user = axess_identity::testing::user("u");
     let rng = SystemRng;
-    let sid = SessionId::new(&rng);
+    let sid = SessionKey::of(&SessionId::new(&rng));
     let result = tokio::time::timeout(Duration::from_secs(3), registry.register(&user, &sid)).await;
     assert!(
         matches!(result, Ok(Err(_))),
@@ -358,7 +393,7 @@ async fn is_valid_propagates_error_against_unreachable_valkey() {
     let registry = unreachable_registry();
     let user = axess_identity::testing::user("u");
     let rng = SystemRng;
-    let sid = SessionId::new(&rng);
+    let sid = SessionKey::of(&SessionId::new(&rng));
     let result = tokio::time::timeout(Duration::from_secs(3), registry.is_valid(&user, &sid)).await;
     assert!(
         matches!(result, Ok(Err(_))),
@@ -383,7 +418,7 @@ async fn invalidate_session_propagates_error_against_unreachable_valkey() {
     let registry = unreachable_registry();
     let user = axess_identity::testing::user("u");
     let rng = SystemRng;
-    let sid = SessionId::new(&rng);
+    let sid = SessionKey::of(&SessionId::new(&rng));
     let result = tokio::time::timeout(
         Duration::from_secs(3),
         registry.invalidate_session(&user, &sid),
@@ -409,22 +444,12 @@ async fn active_sessions_propagates_error_against_unreachable_valkey() {
     );
 }
 
-// Note on `watch_revocation`: the mutation replaces the
-// entire body with `()`. Because the original body itself only
-// performs side effects (subscribing, awaiting a message) and
-// returns `()`, the mutation produces the same return value. Any
-// distinguishing behaviour would have to be observable through
-// a separate channel: but the production path opens a new
-// subscriber connection, which is impossible to mock under the
-// current `fred::Client` surface. This mutant is documented as
-// equivalent at the public API level; it would only matter if a
-// future refactor moves `watch_revocation` to a return-value
-// contract.
-//
-// The historical `decrypt` size-guard mutant note was deleted:
-// the `decrypt` helper now lives in
-// `session::crypto::SessionCrypto` and its mutant surface is
-// pinned by the tests there.
+// `watch_revocation` has no test in this file. Its body only performs
+// side effects (subscribing, awaiting a message) and returns `()`, so an
+// empty body returns the same value; what tells them apart is the
+// subscriber connection the production path opens, which the
+// `fred::Client` surface gives no way to mock. The live tests in
+// `watch_tests.rs` observe that connection.
 
 /// Pin `prune_expired` against the `Ok(1)` mutation:
 /// the Valkey trait surface explicitly returns `Ok(0)` because
@@ -455,17 +480,23 @@ async fn prune_expired_returns_zero_per_native_expiry_contract() {
 /// Requires a running Valkey instance at `127.0.0.1:6379`.
 /// Run with: `cargo test --features valkey -- --ignored valkey_integration`
 #[tokio::test]
-#[ignore = "requires a running Valkey (VALKEY_URL, default 127.0.0.1:6379)"]
+#[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn valkey_integration() {
     let config = Config::from_url(&live_client_url()).expect("parse redis URL");
     let client = Client::new(config, None, None, None);
     client.init().await.expect("connect to Valkey");
+    let sweep = crate::testing::valkey_sweep::on_node("integration");
 
     let encryption_key = crate::testing::test_key(77);
     let store =
-        ValkeySessionStore::encrypted(client.clone(), encryption_key).with_prefix("axess_test");
-    let registry =
-        ValkeySessionRegistry::with_options(client.clone(), "axess_test", Duration::from_secs(60));
+        ValkeySessionStore::encrypted(client.clone(), encryption_key).with_prefix(sweep.prefix());
+    let registry = ValkeySessionRegistry::with_options(
+        client.clone(),
+        sweep.prefix(),
+        Duration::from_secs(60),
+    )
+    .await
+    .expect("a registry");
 
     let rng = SystemRng;
     let sid = SessionId::new(&rng);
@@ -473,37 +504,67 @@ async fn valkey_integration() {
     let ttl = Duration::from_secs(30);
 
     // Store: save -> load -> matches.
-    store.save(&sid, &data, ttl).await.expect("save");
-    let loaded = store.load(&sid).await.expect("load");
+    store
+        .save(&SessionKey::of(&sid), &data, ttl)
+        .await
+        .expect("save");
+    let loaded = store.load(&SessionKey::of(&sid)).await.expect("load");
     assert!(loaded.is_some(), "session should exist after save");
 
     // Store: cycle -> old gone, new exists.
     let new_sid = SessionId::new(&rng);
     assert_eq!(
         store
-            .cycle(&sid, &new_sid, &data, ttl, true)
+            .cycle(
+                &SessionKey::of(&sid),
+                &SessionKey::of(&new_sid),
+                &data,
+                ttl,
+                true
+            )
             .await
             .expect("cycle"),
         CycleOutcome::Rotated
     );
-    assert!(store.load(&sid).await.expect("load old").is_none());
-    assert!(store.load(&new_sid).await.expect("load new").is_some());
+    assert!(
+        store
+            .load(&SessionKey::of(&sid))
+            .await
+            .expect("load old")
+            .is_none()
+    );
+    assert!(
+        store
+            .load(&SessionKey::of(&new_sid))
+            .await
+            .expect("load new")
+            .is_some()
+    );
 
     // Store: delete -> gone.
-    store.delete(&new_sid).await.expect("delete");
-    assert!(store.load(&new_sid).await.expect("load deleted").is_none());
+    store
+        .delete(&SessionKey::of(&new_sid))
+        .await
+        .expect("delete");
+    assert!(
+        store
+            .load(&SessionKey::of(&new_sid))
+            .await
+            .expect("load deleted")
+            .is_none()
+    );
 
     // Registry: register -> is_valid -> invalidate.
     let user_id = axess_identity::testing::user("test-user-integration");
     let user_id = &user_id;
     let reg_sid = SessionId::new(&rng);
     registry
-        .register(user_id, &reg_sid)
+        .register(user_id, &SessionKey::of(&reg_sid))
         .await
         .expect("register");
     assert!(
         registry
-            .is_valid(user_id, &reg_sid)
+            .is_valid(user_id, &SessionKey::of(&reg_sid))
             .await
             .expect("is_valid"),
         "session should be valid after register"
@@ -511,12 +572,12 @@ async fn valkey_integration() {
 
     // Registry: invalidate single session.
     registry
-        .invalidate_session(user_id, &reg_sid)
+        .invalidate_session(user_id, &SessionKey::of(&reg_sid))
         .await
         .expect("invalidate_session");
     assert!(
         !registry
-            .is_valid(user_id, &reg_sid)
+            .is_valid(user_id, &SessionKey::of(&reg_sid))
             .await
             .expect("is_valid after invalidate"),
     );
@@ -524,31 +585,47 @@ async fn valkey_integration() {
     // Registry: invalidate all sessions for user.
     let sid_a = SessionId::new(&rng);
     let sid_b = SessionId::new(&rng);
-    registry.register(user_id, &sid_a).await.expect("reg a");
-    registry.register(user_id, &sid_b).await.expect("reg b");
+    registry
+        .register(user_id, &SessionKey::of(&sid_a))
+        .await
+        .expect("reg a");
+    registry
+        .register(user_id, &SessionKey::of(&sid_b))
+        .await
+        .expect("reg b");
     registry
         .invalidate_user(user_id)
         .await
         .expect("invalidate_user");
-    assert!(!registry.is_valid(user_id, &sid_a).await.expect("a"));
-    assert!(!registry.is_valid(user_id, &sid_b).await.expect("b"));
+    assert!(
+        !registry
+            .is_valid(user_id, &SessionKey::of(&sid_a))
+            .await
+            .expect("a")
+    );
+    assert!(
+        !registry
+            .is_valid(user_id, &SessionKey::of(&sid_b))
+            .await
+            .expect("b")
+    );
 
     // Key rotation: save with old key, load with new key + old as fallback.
     let old_key = crate::testing::test_key(77);
     let new_key = crate::testing::test_key(88);
     let old_store =
-        ValkeySessionStore::encrypted(client.clone(), old_key).with_prefix("axess_test");
+        ValkeySessionStore::encrypted(client.clone(), old_key).with_prefix(sweep.prefix());
     let rotation_store =
         ValkeySessionStore::encrypted_with_rotation(client.clone(), new_key, old_key)
-            .with_prefix("axess_test");
+            .with_prefix(sweep.prefix());
 
     let rot_sid = SessionId::new(&rng);
     old_store
-        .save(&rot_sid, &data, ttl)
+        .save(&SessionKey::of(&rot_sid), &data, ttl)
         .await
         .expect("save with old key");
     let loaded = rotation_store
-        .load(&rot_sid)
+        .load(&SessionKey::of(&rot_sid))
         .await
         .expect("load with rotation");
     assert!(
@@ -557,7 +634,10 @@ async fn valkey_integration() {
     );
 
     // Cleanup.
-    old_store.delete(&rot_sid).await.expect("cleanup");
+    old_store
+        .delete(&SessionKey::of(&rot_sid))
+        .await
+        .expect("cleanup");
 
     client.quit().await.expect("disconnect");
 }
@@ -576,8 +656,8 @@ fn cycle_script_checks_then_sets_then_deletes_and_spares_a_same_key_cycle() {
     assert!(check < set && set < guard && guard < del);
 }
 
-/// Only "this deployment cannot run the script" errors take the SET then
-/// DEL fallback; a failed write or a dead connection does not.
+/// Only "this deployment cannot run the script" errors take the sequenced
+/// fallback; a failed write or a dead connection does not.
 #[test]
 fn only_script_unavailability_selects_the_fallback() {
     use fred::error::{Error, ErrorKind};
@@ -592,6 +672,18 @@ fn only_script_unavailability_selects_the_fallback() {
             "{text}"
         );
     }
+    // A cluster error from the client is not the script being unavailable:
+    // keys on two nodes never reach the client's own check, because the
+    // route is decided from their slots before a script is sent.
+    for text in [
+        "Missing server for hash slot 42",
+        "All keys must belong to the same cluster node.",
+    ] {
+        assert!(
+            !script_unavailable(&Error::new(ErrorKind::Cluster, text)),
+            "{text}"
+        );
+    }
     for text in [
         "ERR invalid expire time in 'set' command",
         "connection reset",
@@ -601,6 +693,25 @@ fn only_script_unavailability_selects_the_fallback() {
             "{text}"
         );
     }
+}
+
+/// On a cluster, keys in two hash slots take the sequenced form before
+/// anything is sent, whatever a client would answer; keys under one hash tag,
+/// and any keys on a single node, run the script.
+#[test]
+fn the_script_route_is_decided_by_the_key_slots() {
+    use super::internal::{ScriptRoute, script_route};
+    use fred::util::redis_keyslot;
+    let old = "axess:sess:old-id";
+    let new = "axess:sess:new-id";
+    assert_ne!(redis_keyslot(old.as_bytes()), redis_keyslot(new.as_bytes()));
+    assert_eq!(script_route(true, [old, new]), ScriptRoute::Sequenced);
+    assert_eq!(script_route(false, [old, new]), ScriptRoute::Script);
+    assert_eq!(
+        script_route(true, ["{axess}:sess:old-id", "{axess}:sess:new-id"]),
+        ScriptRoute::Script
+    );
+    assert_eq!(script_route(true, [old, old]), ScriptRoute::Script);
 }
 
 fn live_client_url() -> String {
@@ -619,77 +730,74 @@ async fn valkey_session_cycle_is_atomic() {
         None,
     );
     client.init().await.expect("connect");
-    let store = ValkeySessionStore::plaintext_insecure(client.clone()).with_prefix("axt_cycle");
+    let sweep = crate::testing::valkey_sweep::on_node("cycle");
+    let store = ValkeySessionStore::plaintext_insecure(client.clone()).with_prefix(sweep.prefix());
     let rng = SystemRng;
     let (old, new) = (SessionId::new(&rng), SessionId::new(&rng));
     let data = SessionData::default();
     store
-        .save(&old, &data, Duration::from_secs(60))
+        .save(&SessionKey::of(&old), &data, Duration::from_secs(60))
         .await
         .unwrap();
 
-    // A client that may not SET makes the SET inside the script fail.
-    let acl =
-        || fred::types::CustomCommand::new_static("ACL", fred::types::ClusterHash::FirstKey, false);
-    let _: String = client
-        .custom(
-            acl(),
-            vec![
-                "SETUSER",
-                "axt_noset",
-                "on",
-                ">pw",
-                "~*",
-                "&*",
-                "+@all",
-                "-set",
-            ],
-        )
-        .await
-        .expect("ACL SETUSER");
-    let url = live_client_url().replacen("redis://", "redis://axt_noset:pw@", 1);
-    let restricted = Client::new(Config::from_url(&url).unwrap(), None, None, None);
-    restricted
-        .init()
-        .await
-        .expect("connect as the restricted user");
+    // A client that may not SET makes the SET inside the script fail. Its
+    // user is named for this run, so two runs at once do not share it, and
+    // is removed when the test ends, also when it fails.
+    let (noset, restricted) =
+        super::registry_tests::client_denied(&client, &format!("{}_noset", sweep.prefix()), "-set")
+            .await;
     let failed = ValkeySessionStore::plaintext_insecure(restricted)
-        .with_prefix("axt_cycle")
-        .cycle(&old, &new, &data, Duration::from_secs(60), true)
+        .with_prefix(sweep.prefix())
+        .cycle(
+            &SessionKey::of(&old),
+            &SessionKey::of(&new),
+            &data,
+            Duration::from_secs(60),
+            true,
+        )
         .await;
-    let _: i64 = client
-        .custom(acl(), vec!["DELUSER", "axt_noset"])
-        .await
-        .unwrap();
+    noset.remove(&client).await;
     assert!(failed.is_err());
     assert!(
-        store.load(&old).await.unwrap().is_some(),
+        store.load(&SessionKey::of(&old)).await.unwrap().is_some(),
         "old row survives a failed SET"
     );
-    assert!(store.load(&new).await.unwrap().is_none());
+    assert!(store.load(&SessionKey::of(&new)).await.unwrap().is_none());
 
     assert_eq!(
         store
-            .cycle(&old, &new, &data, Duration::from_secs(60), true)
+            .cycle(
+                &SessionKey::of(&old),
+                &SessionKey::of(&new),
+                &data,
+                Duration::from_secs(60),
+                true
+            )
             .await
             .unwrap(),
         CycleOutcome::Rotated
     );
-    assert!(store.load(&old).await.unwrap().is_none());
-    assert!(store.load(&new).await.unwrap().is_some());
+    assert!(store.load(&SessionKey::of(&old)).await.unwrap().is_none());
+    assert!(store.load(&SessionKey::of(&new)).await.unwrap().is_some());
 
     assert_eq!(
         store
-            .cycle(&new, &new, &data, Duration::from_secs(60), true)
+            .cycle(
+                &SessionKey::of(&new),
+                &SessionKey::of(&new),
+                &data,
+                Duration::from_secs(60),
+                true
+            )
             .await
             .unwrap(),
         CycleOutcome::Rotated
     );
     assert!(
-        store.load(&new).await.unwrap().is_some(),
+        store.load(&SessionKey::of(&new)).await.unwrap().is_some(),
         "same-id cycle keeps the session"
     );
-    store.delete(&new).await.unwrap();
+    store.delete(&SessionKey::of(&new)).await.unwrap();
 }
 
 /// The shared "an ended session stays ended" checks against a live Valkey,
@@ -704,7 +812,8 @@ async fn valkey_store_never_revives_an_ended_session() {
         None,
     );
     client.init().await.expect("connect");
-    let store = ValkeySessionStore::plaintext_insecure(client).with_prefix("axt_revival");
+    let sweep = crate::testing::valkey_sweep::on_node("revival");
+    let store = ValkeySessionStore::plaintext_insecure(client).with_prefix(sweep.prefix());
     crate::session::store::revival_tests::run_all(&store).await;
 }
 
@@ -719,18 +828,18 @@ async fn valkey_encrypted_store_never_revives_an_ended_session() {
         None,
     );
     client.init().await.expect("connect");
-    let store = ValkeySessionStore::new(client, crate::testing::test_key(11))
-        .with_prefix("axt_revival_enc");
+    let sweep = crate::testing::valkey_sweep::on_node("revival_enc");
+    let store =
+        ValkeySessionStore::new(client, crate::testing::test_key(11)).with_prefix(sweep.prefix());
     crate::session::store::revival_tests::run_all(&store).await;
 }
 
-/// A load reads a blob that carries no row binding and leaves it as it is
-/// (it proves nothing about the key it sits under); the next save writes the
-/// bound form and keeps the key's expiry. With legacy blobs rejected the
-/// unbound blob is refused instead.
+/// A blob that carries no row binding is refused and left as it is, whatever
+/// legacy policy the crypto of the store carries; the next save of the
+/// session writes the current form and gives the key its expiry.
 #[tokio::test]
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
-async fn valkey_load_reads_an_unbound_blob_without_resealing_it_and_reject_refuses_it() {
+async fn valkey_refuses_an_unbound_blob_and_the_next_save_seals_the_current_form() {
     let client = Client::new(
         Config::from_url(&live_client_url()).unwrap(),
         None,
@@ -739,11 +848,11 @@ async fn valkey_load_reads_an_unbound_blob_without_resealing_it_and_reject_refus
     );
     client.init().await.expect("connect");
     let key = crate::testing::test_key(13);
-    let store = ValkeySessionStore::new(client.clone(), key)
-        .with_prefix("axt_reseal")
-        .with_legacy_blobs(crate::session::crypto::LegacyBlobs::Accept);
-    let id = SessionId::new(&SystemRng);
-    let redis_key = format!("axt_reseal:sess:{id}");
+    let sweep = crate::testing::valkey_sweep::on_node("unbound");
+    let prefix = sweep.prefix().to_owned();
+    let store = ValkeySessionStore::new(client.clone(), key).with_prefix(prefix.clone());
+    let id = SessionKey::of(&SessionId::new(&SystemRng));
+    let redis_key = format!("{prefix}:sess:{id}");
     let unbound = SessionCrypto::new(key)
         .encrypt_unbound(&rmp_serde::to_vec_named(&SessionData::default()).unwrap())
         .unwrap();
@@ -758,29 +867,23 @@ async fn valkey_load_reads_an_unbound_blob_without_resealing_it_and_reject_refus
         .await
         .unwrap();
 
-    let strict = ValkeySessionStore::new(client.clone(), key)
-        .with_prefix("axt_reseal")
-        .with_legacy_blobs(crate::session::crypto::LegacyBlobs::Reject);
-    assert!(strict.load(&id).await.is_err(), "reject refuses the blob");
+    assert!(
+        store.load(&id).await.is_err(),
+        "the unbound blob is refused"
+    );
     let untouched: Vec<u8> = client.get(&redis_key).await.unwrap();
     assert_eq!(untouched, unbound, "a refused blob is left as it is");
 
-    let loaded = store
-        .load(&id)
-        .await
-        .unwrap()
-        .expect("accept reads the blob");
-    let after: Vec<u8> = client.get(&redis_key).await.unwrap();
-    assert_eq!(after, unbound, "left as it was by the read");
     store
-        .save(&id, &loaded, Duration::from_secs(600))
+        .save(&id, &SessionData::default(), Duration::from_secs(600))
         .await
         .unwrap();
     let after: Vec<u8> = client.get(&redis_key).await.unwrap();
-    assert!(BoundFormat::SESSION.marks(&after), "bound by the save");
+    assert!(BoundFormat::SESSION.marks(&after), "sealed by the save");
+    assert_eq!(after[..4], [0x41, 0x58, 0x53, 0x82]);
     let ttl: i64 = client.ttl(&redis_key).await.unwrap();
-    assert!((1..=600).contains(&ttl), "the expiry is kept: {ttl}");
-    assert!(strict.load(&id).await.unwrap().is_some(), "now bound");
+    assert!((1..=600).contains(&ttl), "the key has its expiry: {ttl}");
+    assert!(store.load(&id).await.unwrap().is_some());
     store.delete(&id).await.unwrap();
 }
 
@@ -791,10 +894,12 @@ async fn valkey_update_if_revision_keeps_the_contract() {
     let config = Config::from_url(&live_client_url()).expect("parse redis URL");
     let client = Client::new(config, None, None, None);
     client.init().await.expect("connect to Valkey");
+    let sweep = crate::testing::valkey_sweep::on_node("cas");
     let encrypted = ValkeySessionStore::encrypted(client.clone(), crate::testing::test_key(5))
-        .with_prefix("axess_cas");
+        .with_prefix(format!("{}_sealed", sweep.prefix()));
     crate::testing::store_contract::assert_update_if_revision_contract(&encrypted).await;
-    let plain = ValkeySessionStore::plaintext_insecure(client).with_prefix("axess_cas_plain");
+    let plain = ValkeySessionStore::plaintext_insecure(client)
+        .with_prefix(format!("{}_plain", sweep.prefix()));
     crate::testing::store_contract::assert_update_if_revision_contract(&plain).await;
 }
 
@@ -813,14 +918,15 @@ async fn valkey_zero_ttl_writes_store_nothing() {
         None,
     );
     client.init().await.expect("connect");
-    let prefix = format!("axt_zero_{}", SessionId::new(&SystemRng));
+    let sweep = crate::testing::valkey_sweep::on_node("zero");
+    let prefix = sweep.prefix().to_owned();
     let store = ValkeySessionStore::plaintext_insecure(client.clone()).with_prefix(prefix.clone());
-    let exists = |id: SessionId| {
+    let exists = |id: SessionKey| {
         let client = client.clone();
         let prefix = prefix.clone();
         async move {
             client
-                .exists::<i64, _>(session_key(&prefix, &id))
+                .exists::<i64, _>(session_row_key(&prefix, &id))
                 .await
                 .unwrap()
                 == 1
@@ -832,7 +938,7 @@ async fn valkey_zero_ttl_writes_store_nothing() {
     };
     let ttl = Duration::from_secs(60);
 
-    let id = SessionId::new(&SystemRng);
+    let id = SessionKey::of(&SessionId::new(&SystemRng));
     store.save(&id, &data, ttl).await.unwrap();
     assert_eq!(
         store
@@ -855,7 +961,10 @@ async fn valkey_zero_ttl_writes_store_nothing() {
     );
 
     for require_old in [false, true] {
-        let (old, new) = (SessionId::new(&SystemRng), SessionId::new(&SystemRng));
+        let (old, new) = (
+            SessionKey::of(&SessionId::new(&SystemRng)),
+            SessionKey::of(&SessionId::new(&SystemRng)),
+        );
         store.save(&old, &data, ttl).await.unwrap();
         assert_eq!(
             store
@@ -869,6 +978,34 @@ async fn valkey_zero_ttl_writes_store_nothing() {
             !exists(old).await && !exists(new).await,
             "cycle: no key is left behind"
         );
+
+        // A key already stored under the new id goes too, and a rotation
+        // onto the same id removes its one key.
+        store.save(&old, &data, ttl).await.unwrap();
+        store.save(&new, &data, ttl).await.unwrap();
+        assert_eq!(
+            store
+                .cycle(&old, &new, &data, Duration::ZERO, require_old)
+                .await
+                .unwrap(),
+            CycleOutcome::SessionGone
+        );
+        assert!(
+            !exists(old).await && !exists(new).await,
+            "cycle: a stored new key is not left behind"
+        );
+        store.save(&old, &data, ttl).await.unwrap();
+        assert_eq!(
+            store
+                .cycle(&old, &old, &data, Duration::ZERO, require_old)
+                .await
+                .unwrap(),
+            CycleOutcome::SessionGone
+        );
+        assert!(
+            !exists(old).await,
+            "cycle onto the same id: the key is gone"
+        );
     }
 }
 
@@ -877,13 +1014,15 @@ async fn valkey_zero_ttl_writes_store_nothing() {
 #[tokio::test]
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn valkey_save_with_an_enormous_ttl_still_stores() {
-    let url = std::env::var("VALKEY_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
-    let client = Client::new(Config::from_url(&url).unwrap(), None, None, None);
+    let client = Client::new(
+        Config::from_url(&live_client_url()).unwrap(),
+        None,
+        None,
+        None,
+    );
     client.init().await.expect("connect");
-    let store = ValkeySessionStore::plaintext_insecure(client).with_prefix(format!(
-        "axt_hugettl_{}",
-        crate::authn::ids::UserId::new(&axess_rng::SystemRng)
-    ));
+    let sweep = crate::testing::valkey_sweep::on_node("hugettl");
+    let store = ValkeySessionStore::plaintext_insecure(client).with_prefix(sweep.prefix());
     let id = test_id();
     store
         .save(&id, &SessionData::default(), Duration::MAX)
@@ -892,13 +1031,68 @@ async fn valkey_save_with_an_enormous_ttl_still_stores() {
     assert!(store.load(&id).await.unwrap().is_some());
 }
 
-/// A debug log line names a session by a short prefix, never the whole id.
-#[test]
-fn a_logged_session_id_is_a_truncated_prefix() {
-    let id = test_id();
-    let logged = log_session_id(&id);
-    assert_eq!(logged, "00000000...");
-    assert!(!logged.contains(&id.to_string()));
+/// A debug log line of the store names a session by the first eight
+/// characters of its key, never by the whole key and never by the id.
+#[tokio::test]
+#[ignore = "requires a running Valkey (VALKEY_URL)"]
+async fn a_logged_session_is_the_first_eight_characters_of_its_key() {
+    let capture = axess_testing::mock_tracing::TracingCapture::install();
+    let client = Client::new(
+        Config::from_url(&live_client_url()).unwrap(),
+        None,
+        None,
+        None,
+    );
+    client.init().await.expect("connect");
+    let sweep = crate::testing::valkey_sweep::on_node("logform");
+    let store = ValkeySessionStore::plaintext_insecure(client).with_prefix(sweep.prefix());
+    let ids = [SessionId::new(&SystemRng), SessionId::new(&SystemRng)];
+    let [key, next] = ids.map(|id| SessionKey::of(&id));
+    let data = SessionData::default();
+    let ttl = Duration::from_secs(60);
+
+    // Every line of the store that names a session: saved, loaded, not
+    // found, cycled (old and new), deleted.
+    store.save(&key, &data, ttl).await.unwrap();
+    assert!(store.load(&key).await.unwrap().is_some());
+    assert!(store.load(&next).await.unwrap().is_none());
+    assert_eq!(
+        store.cycle(&key, &next, &data, ttl, true).await.unwrap(),
+        CycleOutcome::Rotated
+    );
+    store.delete(&next).await.unwrap();
+
+    // The store's own lines, each with its fields as `name=value`.
+    let lines: Vec<String> = capture
+        .events()
+        .into_iter()
+        .filter(|event| event.target.ends_with("valkey::store"))
+        .map(|event| event.message)
+        .collect();
+    for message in [
+        "session saved to valkey",
+        "session loaded from valkey",
+        "session not found in valkey",
+        "session cycled in valkey",
+        "session deleted from valkey",
+    ] {
+        assert!(
+            lines.iter().any(|line| line.contains(message)),
+            "no line says {message:?}: {lines:#?}"
+        );
+    }
+    let logged = lines.join("\n");
+    for (key, id) in [(key, ids[0]), (next, ids[1])] {
+        let text = key.to_string();
+        assert_eq!(key.prefix().to_string(), format!("{}...", &text[..8]));
+        assert!(logged.contains(&key.prefix().to_string()));
+        assert!(!logged.contains(&text[..9]), "more than eight characters");
+        assert!(!logged.contains(&id.to_string()), "the session id");
+        assert!(
+            !logged.contains(&id.to_string()[..8]),
+            "the start of the id"
+        );
+    }
 }
 
 /// An encrypted Valkey store returns a session's assurance record as it
@@ -913,17 +1107,22 @@ async fn a_session_carrying_assurance_round_trips() {
         None,
     );
     client.init().await.expect("connect");
+    let sweep = crate::testing::valkey_sweep::on_node("assured");
     let store =
-        ValkeySessionStore::new(client, crate::testing::test_key(9)).with_prefix("axt_assured");
+        ValkeySessionStore::new(client, crate::testing::test_key(9)).with_prefix(sweep.prefix());
     let id = SessionId::new(&SystemRng);
     let data = crate::session::data::assured_fixture::assured_session();
     store
-        .save(&id, &data, Duration::from_secs(60))
+        .save(&SessionKey::of(&id), &data, Duration::from_secs(60))
         .await
         .unwrap();
-    let back = store.load(&id).await.unwrap().expect("stored");
+    let back = store
+        .load(&SessionKey::of(&id))
+        .await
+        .unwrap()
+        .expect("stored");
     assert_eq!(back.auth_state, data.auth_state);
-    store.delete(&id).await.unwrap();
+    store.delete(&SessionKey::of(&id)).await.unwrap();
 }
 
 /// The eviction order is the order of registration: a session used since
@@ -950,4 +1149,212 @@ fn oldest_first_falls_back_to_the_score_and_breaks_ties_on_the_member() {
         vec!["a", "b", "c"]
     );
     assert!(oldest_first(Vec::new(), &[]).is_empty());
+}
+
+/// A registry on the live server under a prefix no other run has used,
+/// held with the sweep that removes its keys when the test ends, also when
+/// it fails.
+async fn live_registry(tag: &str, ttl: Duration) -> Swept<ValkeySessionRegistry> {
+    let sweep = crate::testing::valkey_sweep::on_node(tag);
+    let registry = live_registry_under(sweep.prefix().to_owned(), ttl).await;
+    sweep.hold(registry)
+}
+
+/// A registry on the live server under `prefix`.
+async fn live_registry_under(prefix: String, ttl: Duration) -> ValkeySessionRegistry {
+    let client = Client::new(
+        Config::from_url(&live_client_url()).unwrap(),
+        None,
+        None,
+        None,
+    );
+    client.init().await.expect("connect");
+    ValkeySessionRegistry::with_options(client, prefix, ttl)
+        .await
+        .expect("a registry")
+}
+
+/// Ending the other sessions keeps the one named, returns the rest, leaves
+/// another user alone, and ends nothing around a session the registry does
+/// not hold for the user.
+#[tokio::test]
+#[ignore = "requires a running Valkey (VALKEY_URL)"]
+async fn valkey_registry_ends_every_session_but_the_one_kept() {
+    let registry = live_registry("keepone", Duration::from_secs(60)).await;
+    let (alice, bob) = (
+        axess_identity::testing::user("keep-one-alice"),
+        axess_identity::testing::user("keep-one-bob"),
+    );
+    let rng = SystemRng;
+    let sessions: Vec<SessionKey> = (0..4)
+        .map(|_| SessionKey::of(&SessionId::new(&rng)))
+        .collect();
+    for s in &sessions {
+        registry.register(&alice, s).await.unwrap();
+    }
+    let bobs = SessionKey::of(&SessionId::new(&rng));
+    registry.register(&bob, &bobs).await.unwrap();
+
+    // Another user's session, and one never registered, are not Alice's to
+    // keep: nothing is ended around them.
+    for keep in [bobs, SessionKey::of(&SessionId::new(&rng))] {
+        assert_eq!(
+            registry
+                .invalidate_other_sessions(&alice, &keep)
+                .await
+                .unwrap(),
+            CutOff::NotHeld
+        );
+        assert_eq!(registry.active_sessions(&alice).await.unwrap().len(), 4);
+    }
+
+    let CutOff::KeptOne(mut ended) = registry
+        .invalidate_other_sessions(&alice, &sessions[1])
+        .await
+        .unwrap()
+    else {
+        panic!("the session to keep is held");
+    };
+    ended.sort_by_key(ToString::to_string);
+    let mut others = vec![sessions[0], sessions[2], sessions[3]];
+    others.sort_by_key(ToString::to_string);
+    assert_eq!(ended, others);
+    assert_eq!(
+        registry.active_sessions(&alice).await.unwrap(),
+        vec![sessions[1]]
+    );
+    for s in &others {
+        assert!(!registry.is_valid(&alice, s).await.unwrap());
+    }
+    assert!(registry.is_valid(&alice, &sessions[1]).await.unwrap());
+    assert_eq!(registry.active_sessions(&bob).await.unwrap(), vec![bobs]);
+
+    // The one kept is alone now, and a session registered afterwards is a
+    // later sign-in the step did not touch.
+    assert_eq!(
+        registry
+            .invalidate_other_sessions(&alice, &sessions[1])
+            .await
+            .unwrap(),
+        CutOff::KeptOne(Vec::new())
+    );
+    let later = SessionKey::of(&SessionId::new(&rng));
+    registry.register(&alice, &later).await.unwrap();
+    assert!(registry.is_valid(&alice, &later).await.unwrap());
+}
+
+/// A session to keep whose member has lapsed is not held: nothing is ended
+/// around it.
+#[tokio::test]
+#[ignore = "requires a running Valkey (VALKEY_URL)"]
+async fn valkey_registry_ends_nothing_around_a_lapsed_session() {
+    let clock = axess_clock::testing::MockClock::at_reference();
+    let registry = Swept::map(
+        live_registry("keeplapsed", Duration::from_secs(60)).await,
+        |registry| registry.with_clock(std::sync::Arc::new(clock.clone())),
+    );
+    let alice = axess_identity::testing::user("keep-lapsed-alice");
+    let rng = SystemRng;
+    let (lapsed, other) = (
+        SessionKey::of(&SessionId::new(&rng)),
+        SessionKey::of(&SessionId::new(&rng)),
+    );
+    registry.register(&alice, &lapsed).await.unwrap();
+    registry.register(&alice, &other).await.unwrap();
+    assert_eq!(
+        registry
+            .invalidate_other_sessions(&alice, &lapsed)
+            .await
+            .unwrap(),
+        CutOff::KeptOne(vec![other]),
+        "the control: while it is live, the session is kept and the other ended"
+    );
+    registry.register(&alice, &other).await.unwrap();
+    clock.advance_secs(61);
+
+    assert_eq!(
+        registry
+            .invalidate_other_sessions(&alice, &lapsed)
+            .await
+            .unwrap(),
+        CutOff::NotHeld
+    );
+}
+
+/// The watchers of an ended session are told, and the kept session's are
+/// not.
+#[tokio::test]
+#[ignore = "requires a running Valkey (VALKEY_URL)"]
+async fn valkey_registry_tells_the_watchers_of_the_ended_sessions_only() {
+    let serial = super::SUBSCRIBER_TESTS.lock().await;
+    let sweep = crate::testing::valkey_sweep::on_node("keepwatch");
+    let prefix = sweep.prefix().to_owned();
+    let connection = connection_name(&prefix);
+    let registry = live_registry_under(prefix.clone(), Duration::from_secs(60)).await;
+    let admin = connect().await;
+    let alice = axess_identity::testing::user("keep-watch-alice");
+    let bob = axess_identity::testing::user("keep-watch-bob");
+    let rng = SystemRng;
+    let (keep, other, last) = (
+        SessionKey::of(&SessionId::new(&rng)),
+        SessionKey::of(&SessionId::new(&rng)),
+        SessionKey::of(&SessionId::new(&rng)),
+    );
+    registry.register(&alice, &keep).await.unwrap();
+    registry.register(&alice, &other).await.unwrap();
+    registry.register(&bob, &last).await.unwrap();
+    let watch = |user, session| {
+        let registry = registry.clone();
+        tokio::spawn(async move { registry.watch_revocation(&user, &session).await })
+    };
+    let watching_other = watch(alice, other);
+    let watching_keep = watch(alice, keep);
+    let watching_last = watch(bob, last);
+    // The watchers hold their places and their one connection is subscribed
+    // before the step runs, so what the step publishes is routed to them.
+    eventually("the three watchers joined", || async {
+        registry.subscriber.watcher_count() == 3
+    })
+    .await;
+    eventually("the watchers' connection is subscribed", || async {
+        subscriber_connections(&admin, &connection).await == 1
+    })
+    .await;
+
+    assert!(matches!(
+        registry
+            .invalidate_other_sessions(&alice, &keep)
+            .await
+            .unwrap(),
+        CutOff::KeptOne(_)
+    ));
+
+    tokio::time::timeout(Duration::from_secs(5), watching_other)
+        .await
+        .expect("the ended session's watcher is told")
+        .unwrap();
+    // A revocation of another user's session is published by hand after
+    // the step, and its registry entry stays: that watcher's own check of
+    // the registry answers "live", so only the message can wake it. The one
+    // connection the watchers share delivers in order: once its watcher is
+    // told, a message for the kept session would have been routed to the
+    // kept session's watcher already.
+    let _: i64 = admin
+        .publish(revocation_session_channel(&prefix, &last.to_string()), "1")
+        .await
+        .expect("PUBLISH");
+    tokio::time::timeout(Duration::from_secs(5), watching_last)
+        .await
+        .expect("the watcher is told")
+        .unwrap();
+    assert!(
+        registry.is_valid(&bob, &last).await.unwrap(),
+        "the entry of the session published for stays"
+    );
+    assert!(
+        !watching_keep.is_finished(),
+        "the kept session's watcher was told its session ended"
+    );
+    watching_keep.abort();
+    drop(serial);
 }

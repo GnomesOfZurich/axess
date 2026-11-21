@@ -1,7 +1,7 @@
 //! CSRF token nonces come from the config's RNG.
 
 use super::*;
-use crate::session::id::SessionId;
+use crate::session::id::{SessionId, SessionKey};
 use crate::session::layer::SessionLayer;
 use crate::session::store::MemorySessionStore;
 use axess_rng::testing::MockRng;
@@ -45,6 +45,7 @@ async fn the_minted_token_is_the_seeded_rngs_nonce_bound_to_the_session() {
                 MemorySessionStore::new(),
                 crate::testing::test_key(42),
                 crate::MemorySessionRegistry::new().handle(),
+                std::sync::Arc::new(crate::session::UnrecordedSessionEnds),
             )
             .with_secure(false)
             .with_rng(MockRng::new(1)),
@@ -55,7 +56,8 @@ async fn the_minted_token_is_the_seeded_rngs_nonce_bound_to_the_session() {
         .await
         .unwrap();
 
-    let session_id = SessionId::new(&MockRng::new(1));
-    let expected = mint_token(session_id.as_bytes(), &[7u8; 32], &MockRng::new(2));
+    // The token binds the key of the session the layer minted, not its id.
+    let session = SessionKey::of(&SessionId::new(&MockRng::new(1)));
+    let expected = mint_token(session.as_bytes(), &[7u8; 32], &MockRng::new(2));
     assert_eq!(csrf_cookie(&resp), expected);
 }

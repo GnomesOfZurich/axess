@@ -1,0 +1,7 @@
+error[E0046]: not all trait items implemented, missing: `replace_bindings`
+  --> tests/ui/device_store_without_replace_bindings.rs:17:1
+   |
+17 | impl DeviceStore for Wrapped {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `replace_bindings` in implementation
+   |
+   = help: implement the missing item: `fn replace_bindings(&self, _: &axess_core::TenantId, _: &DeviceId, _: &[DeviceBinding], _: &[DeviceBinding], _: Timestamp) -> impl Future<Output = Result<BindingsUpdate, <Self as axess_core::DeviceStore>::Error>> + Send { todo!() }`

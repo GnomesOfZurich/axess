@@ -5,7 +5,7 @@ use super::tests::{bid, make_event, tempdir};
 use super::*;
 
 fn day_file(archiver: &FilesystemAuditArchiver) -> PathBuf {
-    archiver.path_for_date(chrono::NaiveDate::from_ymd_opt(2026, 5, 19).unwrap())
+    archiver.path_for_date(axess_clock::UtcDate::new(2026, 5, 19).unwrap())
 }
 
 /// Every line of the day file is a whole event, and there are `n` of them.

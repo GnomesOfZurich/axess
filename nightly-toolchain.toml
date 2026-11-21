@@ -1,0 +1,20 @@
+# The dated nightly of the jobs that need what only a nightly has: the fuzz
+# targets (cargo-fuzz), Miri, cargo-udeps and the documentation as docs.rs
+# builds it (`doc_cfg`).
+#
+# rust-toolchain.toml pins the stable release a checkout and CI build with.
+# A few jobs need a nightly compiler, and `nightly` alone is whatever
+# nightly the runner installs that day: a job that reads it can turn red, or
+# green, with no commit responsible. They install the nightly named here
+# instead, through .github/actions/pinned-nightly, and
+# scripts/release-preflight.sh, scripts/unused-dependencies.sh and
+# scripts/check-docsrs-build.sh read it from here too.
+# scripts/check-workflow-pins.sh holds every nightly a workflow names to
+# this one, and refuses an undated nightly in a workflow that runs on a
+# push, a pull request or a release.
+#
+# To move: pick the newest nightly that is at least seven days old and has
+# every component the jobs install (miri and rust-src) for
+# x86_64-unknown-linux-gnu, write its date here, and run the jobs.
+[toolchain]
+channel = "nightly-2026-11-10"

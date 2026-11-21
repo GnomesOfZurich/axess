@@ -2,7 +2,7 @@
 //! The email-OTP cooldown is claimed atomically before the hash is computed,
 //! so parallel requests send one code, not one each.
 
-mod common;
+use axess_core::testing::fixtures as common;
 
 use axess_core::authn::AuditContext;
 use axess_core::authn::{
@@ -22,8 +22,10 @@ use std::sync::Arc;
 
 type Svc = RequestAuthnService<MockIdentityStore, MockFactorStore>;
 
-fn world(ttl_secs: u32, kdf: Arc<KdfExecutor>) -> (Svc, MockFactorStore) {
+fn world(ttl: std::time::Duration, kdf: Arc<KdfExecutor>) -> (Svc, MockFactorStore) {
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new()
@@ -31,7 +33,7 @@ fn world(ttl_secs: u32, kdf: Arc<KdfExecutor>) -> (Svc, MockFactorStore) {
             user_scope(),
             FactorConfig::EmailOtp(EmailOtpConfig {
                 email: "alice@example.com".into(),
-                ttl_secs,
+                ttl,
                 ..EmailOtpConfig::default()
             }),
         )
@@ -40,6 +42,7 @@ fn world(ttl_secs: u32, kdf: Arc<KdfExecutor>) -> (Svc, MockFactorStore) {
             AuthMethod::sequential("email_otp", vec![FactorKind::EmailOtp], user_scope()),
         );
     let svc = AuthnService::builder(identity, factors.clone())
+        .with_clock(clock.clone())
         .with_rng(MockRng::new(7))
         .with_kdf_executor(kdf)
         .build()
@@ -65,7 +68,7 @@ async fn stored(factors: &MockFactorStore) -> EmailOtpConfig {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parallel_requests_send_one_code() {
     let kdf = Arc::new(KdfExecutor::pool());
-    let (svc, factors) = world(300, kdf.clone());
+    let (svc, factors) = world(std::time::Duration::from_secs(300), kdf.clone());
     let mut tasks = Vec::new();
     for _ in 0..10 {
         let svc = svc.clone();
@@ -89,9 +92,14 @@ async fn parallel_requests_send_one_code() {
     assert!(stored(&factors).await.pending_hash.is_some());
 }
 
+/// The largest TTL the config accepts issues a code; a larger one is refused
+/// before a code is issued (covered beside the bounds in `email_otp_round`).
 #[tokio::test]
-async fn the_largest_ttl_issues_a_code_without_overflow() {
-    let (svc, factors) = world(u32::MAX, Arc::new(KdfExecutor::inline()));
+async fn the_largest_accepted_ttl_issues_a_code() {
+    let (svc, factors) = world(
+        axess_factors::MAX_EMAIL_OTP_TTL,
+        Arc::new(KdfExecutor::inline()),
+    );
     let session = test_session();
     svc.begin_login("alice", "default", &session).await.unwrap();
     let outcome = svc.prepare_factor(&session).await.unwrap();
@@ -105,7 +113,7 @@ async fn the_largest_ttl_issues_a_code_without_overflow() {
 #[tokio::test]
 async fn a_lost_claim_sends_nothing_and_hashes_nothing() {
     let kdf = Arc::new(KdfExecutor::inline());
-    let (svc, factors) = world(300, kdf.clone());
+    let (svc, factors) = world(std::time::Duration::from_secs(300), kdf.clone());
     factors.arm_cas_failures(1);
     let session = test_session();
     svc.begin_login("alice", "default", &session).await.unwrap();

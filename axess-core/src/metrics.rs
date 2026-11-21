@@ -11,15 +11,16 @@
 //! | [`AuthFlowMetrics`] | logins and lockouts | `AuthnService` |
 //! | [`FactorMetrics`] | factor verification, throttle, lockout store | `AuthnService` |
 //! | [`SessionMetrics`] | session lifecycle, binding, the `sid` map | `AuthnService`, `SessionLayer` |
-//! | [`RotationMetrics`] | previous-key use during a rotation | `SessionCrypto`, `SessionLayer` |
+//! | [`RotationMetrics`] | previous-key use during a rotation; SVID and bundle rotation from a SPIRE agent | `SessionCrypto`, `SessionLayer`, `SpireClient` |
 //! | [`ProviderRegistryMetrics`] | duplicate provider registrations, live provider reloads | `AuthnService` |
 //! | [`RequestGuardMetrics`] | rate limiting and CSRF | `RateLimitLayer`, `CsrfLayer` |
 //! | [`AuthzCacheMetrics`] | entity-cache hits and misses | `EntityCache::flush_metrics` |
 //! | [`AuditMetrics`] | audit store outage and shedding | `AuthnService` |
+//! | [`DeviceKeyMetrics`] | device-key registrations, proofs, bound sessions | `DeviceKeyService`, `SessionLayer` |
 //!
 //! # One exporter for every concern
 //!
-//! A type that implements all eight traits satisfies [`AxessMetrics`], and
+//! A type that implements all nine traits satisfies [`AxessMetrics`], and
 //! [`MetricSinks::all`] wires it to every concern at once. A type that
 //! implements some wires them one by one:
 //!
@@ -55,7 +56,8 @@
 //! let authn = AuthnService::builder(identity, factors)
 //!     .with_metrics(sinks.clone())
 //!     .build();
-//! let sessions = SessionLayer::new(store, key, registry).with_metrics(sinks);
+//! let sessions =
+//!     SessionLayer::new(store, key, registry, authn.session_end_audit()).with_metrics(sinks);
 //! ```
 //!
 //! The rules for what is a metric, the naming scheme and the labels an
@@ -64,6 +66,7 @@
 mod audit;
 mod auth_flow;
 mod authz_cache;
+mod device_keys;
 mod factors;
 mod guard;
 mod registry;
@@ -74,10 +77,11 @@ mod sinks;
 pub use audit::AuditMetrics;
 pub use auth_flow::AuthFlowMetrics;
 pub use authz_cache::AuthzCacheMetrics;
+pub use device_keys::DeviceKeyMetrics;
 pub use factors::FactorMetrics;
 pub use guard::{CsrfRefusal, RequestGuardMetrics};
 pub use registry::{ProviderCategory, ProviderRegistryMetrics};
-pub use rotation::RotationMetrics;
+pub use rotation::{RotationMetrics, WorkloadCredentialKind};
 pub use session::SessionMetrics;
 pub use sinks::{AxessMetrics, MetricSinks};
 
@@ -94,3 +98,4 @@ impl ProviderRegistryMetrics for NoopMetrics {}
 impl RequestGuardMetrics for NoopMetrics {}
 impl AuthzCacheMetrics for NoopMetrics {}
 impl AuditMetrics for NoopMetrics {}
+impl DeviceKeyMetrics for NoopMetrics {}

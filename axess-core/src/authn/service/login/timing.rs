@@ -11,6 +11,11 @@ where
     F: FactorStore<Error = I::Error>,
 {
     /// Check whether the current session is valid (consults the registry if installed).
+    ///
+    /// The registry is asked about the key it holds the session under
+    /// ([`AuthSession::registered_key`]): after a rotation in the same
+    /// handler (`rotate_session`, `regenerate`, a completed step-up) it
+    /// still holds the key it held before, until the response is written.
     #[tracing::instrument(skip(self, session))]
     pub async fn check_session(&self, session: &AuthSession) -> bool {
         if !session.is_authenticated().await {
@@ -20,7 +25,7 @@ where
             Some(id) => id,
             None => return false,
         };
-        let sid = session.session_id().await;
+        let sid = session.registered_key().await;
         if let Some(reg) = &self.inner.registry {
             reg.is_valid(&user_id, &sid).await
         } else {

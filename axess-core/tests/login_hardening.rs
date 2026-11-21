@@ -1,39 +1,41 @@
 #![cfg(feature = "testing")]
 //! Login hardening: a password hash made under old Argon2 parameters is
 //! replaced on a successful login, parallel guesses cannot pass the attempt
-//! limit, a taken signup identifier can be answered like a free one, and a
-//! password reset request has a per-identifier cooldown.
+//! limit, and a wrong password costs the same Argon2 work on every path. The
+//! signup and password reset hardening is in `signup_reset_hardening.rs`.
 
-mod common;
+mod hotp_code;
+mod totp_code;
+use axess_core::testing::fixtures as common;
+use totp_code::generate_totp_code;
 
 use axess_clock::{Clock, testing::MockClock};
 use axess_core::authn::AuditContext;
 use axess_core::authn::error::AuthnError;
-use axess_core::authn::event::{AuthEventStatus, AuthEventType};
 use axess_core::authn::factor::{
     FactorConfig, FactorCredential, FactorKind, PasswordConfig, PasswordRules, ZeroizedString,
 };
-use axess_core::authn::service::{AuthnService, FactorOutcome, RequestAuthnService, SignupOutcome};
-use axess_core::authn::store::{FactorStore, IdentityLookup};
-use axess_core::authn::types::{CounterUnavailable, EntityState, LockoutPolicy};
+use axess_core::authn::service::{AuthnService, FactorOutcome, RequestAuthnService};
+use axess_core::authn::store::FactorStore;
+use axess_core::authn::types::{CounterUnavailable, LockoutPolicy};
 use axess_core::blocking::KdfExecutor;
 use axess_core::testing::{
     mock_authn::{MockFactorStore, MockIdentityStore},
     test_session,
 };
 use common::{
-    generate_totp_code, password_method, password_totp_method, test_tenant, test_user, totp_config,
-    uid, user_scope,
+    password_method, password_totp_method, start, test_tenant, test_user, totp_config, uid,
+    user_scope,
 };
 use std::sync::Arc;
 use std::time::Duration;
 
 const SECRET: &str = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
 
-/// `Gnomes2+` under Argon2id version 19 with m=8, t=1, p=1: weaker than the
+/// `Sample2+` under Argon2id version 19 with m=8, t=1, p=1: weaker than the
 /// pinned parameters, so a login with it is the moment to rehash.
 const OLD_PARAMETERS: &str =
-    "$argon2id$v=19$m=8,t=1,p=1$c29tZXNhbHRzb21lc2FsdA$MqIhMSj5Frink9coqITn+DRhryB/VmDRYGbeJ3sTqRc";
+    "$argon2id$v=19$m=8,t=1,p=1$c29tZXNhbHRzb21lc2FsdA$oybFowQtTE9kuoK7zFTnTK3zH1OGJ92nz/nj6AoKJj8";
 
 fn config_with(hash: &str) -> FactorConfig {
     FactorConfig::Password(PasswordConfig {
@@ -56,7 +58,7 @@ struct Rig {
 }
 
 fn rig(hash: &str, totp: bool, kdf: KdfExecutor, policy: LockoutPolicy) -> Rig {
-    let clock = MockClock::now();
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
         .with_clock(clock.clone())
         .with_tenant(test_tenant())
@@ -118,7 +120,7 @@ async fn a_hash_under_old_parameters_is_replaced_on_login() {
     let session = test_session();
     let outcome = r
         .svc
-        .login_with_password("alice", "default", "Gnomes2+", &session)
+        .login_with_password("alice", "default", "Sample2+", &session)
         .await
         .unwrap();
     assert!(
@@ -129,7 +131,7 @@ async fn a_hash_under_old_parameters_is_replaced_on_login() {
     let now = stored_hash(&r).await;
     assert_ne!(now, OLD_PARAMETERS, "the hash was replaced");
     assert!(!axess_factors::password_needs_rehash(&now));
-    assert!(axess_factors::verify_password("Gnomes2+", &now).is_ok());
+    assert!(axess_factors::verify_password("Sample2+", &now).is_ok());
 }
 
 #[tokio::test]
@@ -140,7 +142,7 @@ async fn a_rehash_does_not_drop_the_login_that_caused_it() {
     let session = test_session();
     let first = r
         .svc
-        .login_with_password("alice", "default", "Gnomes2+", &session)
+        .login_with_password("alice", "default", "Sample2+", &session)
         .await
         .unwrap();
     assert!(
@@ -149,7 +151,7 @@ async fn a_rehash_does_not_drop_the_login_that_caused_it() {
     );
     assert_ne!(stored_hash(&r).await, OLD_PARAMETERS);
 
-    let code = generate_totp_code(SECRET, r.clock.now().into());
+    let code = generate_totp_code(SECRET, r.clock.now().try_into().unwrap());
     let second = r
         .svc
         .verify_factor(&FactorCredential::OtpCode(code.into()), &session)
@@ -159,8 +161,8 @@ async fn a_rehash_does_not_drop_the_login_that_caused_it() {
 }
 
 /// Two logins of the same user are in flight; the first to verify the
-/// password rehashes it. The second, stamped against the old hash, used to
-/// be dropped at its next step as if the password had been changed.
+/// password rehashes it. The second, stamped against the old hash, is not
+/// dropped at its next step as if the password had been changed.
 #[tokio::test]
 async fn a_rehash_does_not_drop_another_login_of_the_same_user() {
     let r = rig(OLD_PARAMETERS, true, KdfExecutor::inline(), policy(5));
@@ -172,7 +174,7 @@ async fn a_rehash_does_not_drop_another_login_of_the_same_user() {
         .await
         .unwrap();
 
-    let outcome = r.svc.verify_factor(&pw("Gnomes2+"), &first).await.unwrap();
+    let outcome = r.svc.verify_factor(&pw("Sample2+"), &first).await.unwrap();
     assert!(
         matches!(outcome, FactorOutcome::FactorRequired(FactorKind::Totp)),
         "{outcome:?}"
@@ -183,12 +185,12 @@ async fn a_rehash_does_not_drop_another_login_of_the_same_user() {
         "the first login rehashed"
     );
 
-    let outcome = r.svc.verify_factor(&pw("Gnomes2+"), &second).await;
+    let outcome = r.svc.verify_factor(&pw("Sample2+"), &second).await;
     assert!(
         matches!(outcome, Ok(FactorOutcome::FactorRequired(FactorKind::Totp))),
         "the second login goes on under the rehashed password: {outcome:?}"
     );
-    let code = generate_totp_code(SECRET, r.clock.now().into());
+    let code = generate_totp_code(SECRET, r.clock.now().try_into().unwrap());
     let done = r
         .svc
         .verify_factor(&FactorCredential::OtpCode(code.into()), &second)
@@ -216,14 +218,14 @@ async fn a_rehash_does_not_drop_a_login_on_another_instance() {
         .begin_login("alice", "default", &second)
         .await
         .unwrap();
-    r.svc.verify_factor(&pw("Gnomes2+"), &first).await.unwrap();
+    r.svc.verify_factor(&pw("Sample2+"), &first).await.unwrap();
     assert_ne!(
         stored_hash(&r).await,
         OLD_PARAMETERS,
         "the first login rehashed"
     );
 
-    let outcome = other.verify_factor(&pw("Gnomes2+"), &second).await;
+    let outcome = other.verify_factor(&pw("Sample2+"), &second).await;
     assert!(
         matches!(outcome, Ok(FactorOutcome::FactorRequired(FactorKind::Totp))),
         "the login on the other instance goes on: {outcome:?}"
@@ -242,7 +244,7 @@ async fn a_replaced_password_still_drops_a_flow_begun_before_it() {
         .begin_login("alice", "default", &second)
         .await
         .unwrap();
-    r.svc.verify_factor(&pw("Gnomes2+"), &first).await.unwrap();
+    r.svc.verify_factor(&pw("Sample2+"), &first).await.unwrap();
     let rehashed = stored_hash(&r).await;
     assert_ne!(rehashed, OLD_PARAMETERS);
 
@@ -276,11 +278,11 @@ async fn a_wrong_password_leaves_an_old_hash_alone() {
 
 #[tokio::test]
 async fn a_current_hash_is_not_rewritten() {
-    let current = axess_factors::generate_password_hash("Gnomes2+");
+    let current = axess_factors::generate_password_hash("Sample2+");
     let r = rig(&current, false, KdfExecutor::inline(), policy(5));
     let session = test_session();
     r.svc
-        .login_with_password("alice", "default", "Gnomes2+", &session)
+        .login_with_password("alice", "default", "Sample2+", &session)
         .await
         .unwrap();
     assert_eq!(stored_hash(&r).await, current);
@@ -291,7 +293,7 @@ async fn a_current_hash_is_not_rewritten() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parallel_guesses_cannot_pass_the_attempt_limit() {
     let r = rig(
-        &axess_factors::generate_password_hash("Gnomes2+"),
+        &axess_factors::generate_password_hash("Sample2+"),
         false,
         KdfExecutor::pool(),
         policy(3),
@@ -335,7 +337,7 @@ async fn parallel_guesses_cannot_pass_the_attempt_limit() {
 #[tokio::test]
 async fn a_verified_guess_gives_its_reservation_back() {
     let r = rig(
-        &axess_factors::generate_password_hash("Gnomes2+"),
+        &axess_factors::generate_password_hash("Sample2+"),
         true,
         KdfExecutor::inline(),
         policy(3),
@@ -353,10 +355,10 @@ async fn a_verified_guess_gives_its_reservation_back() {
     assert_eq!(r.identity.failed_attempts_for("u1"), 1);
 
     // Past the delay the wrong guess earned this address.
-    r.clock.advance(chrono::Duration::seconds(1));
+    r.clock.advance(axess_clock::SignedDuration::seconds(1));
     let outcome = r
         .svc
-        .verify_factor(&pw("Gnomes2+"), &session)
+        .verify_factor(&pw("Sample2+"), &session)
         .await
         .unwrap();
     assert!(
@@ -373,7 +375,7 @@ async fn a_verified_guess_gives_its_reservation_back() {
 #[tokio::test]
 async fn a_counter_outage_refuses_a_guess_when_the_policy_fails_closed() {
     let r = rig(
-        &axess_factors::generate_password_hash("Gnomes2+"),
+        &axess_factors::generate_password_hash("Sample2+"),
         false,
         KdfExecutor::inline(),
         policy(3),
@@ -387,7 +389,7 @@ async fn a_counter_outage_refuses_a_guess_when_the_policy_fails_closed() {
     let jobs = r.kdf.jobs_started();
     let outcome = r
         .svc
-        .verify_factor(&pw("Gnomes2+"), &session)
+        .verify_factor(&pw("Sample2+"), &session)
         .await
         .unwrap();
     assert!(
@@ -404,7 +406,7 @@ async fn a_counter_outage_lets_a_guess_through_when_the_policy_allows() {
         ..policy(3)
     };
     let r = rig(
-        &axess_factors::generate_password_hash("Gnomes2+"),
+        &axess_factors::generate_password_hash("Sample2+"),
         false,
         KdfExecutor::inline(),
         allow,
@@ -417,7 +419,7 @@ async fn a_counter_outage_lets_a_guess_through_when_the_policy_allows() {
     r.identity.arm_record_failed_attempt_failure();
     let outcome = r
         .svc
-        .verify_factor(&pw("Gnomes2+"), &session)
+        .verify_factor(&pw("Sample2+"), &session)
         .await
         .unwrap();
     assert!(
@@ -426,319 +428,116 @@ async fn a_counter_outage_lets_a_guess_through_when_the_policy_allows() {
     );
 }
 
-// ── Hidden signup conflicts ──────────────────────────────────────────────────
-
-fn signup_service(
-    reveal: bool,
-) -> (
-    RequestAuthnService<MockIdentityStore, MockFactorStore>,
-    MockIdentityStore,
-) {
-    let mut existing = test_user("u1", "alice@example.com");
-    existing.status = EntityState::Active;
-    let identity = MockIdentityStore::new()
-        .with_tenant(test_tenant())
-        .with_user(existing);
-    let mut builder = AuthnService::builder(identity.clone(), MockFactorStore::new());
-    if reveal {
-        builder = builder.with_signup_conflicts_revealed();
-    }
-    let svc = builder.build().with_audit_context(AuditContext::default());
-    (svc, identity)
-}
-
-fn newcomer() -> axess_core::authn::types::User {
-    let mut user = test_user("u2", "alice@example.com");
-    user.status = EntityState::Candidate;
-    user
-}
-
+/// A wrong password against a hash made under old parameters spends an
+/// Argon2 operation at the current parameters, as a wrong password for an
+/// unknown identifier and for a current hash do, so a dormant account whose
+/// hash predates a cost change is not cheaper to probe than any other
+/// answer. The old verification itself still runs: it is the only way to
+/// know the password was wrong.
 #[tokio::test]
-async fn a_taken_identifier_answers_as_a_free_one_by_default() {
-    let (svc, identity) = signup_service(false);
-    let taken = test_session();
-    let outcome = svc
-        .begin_signup(newcomer(), "default", &taken)
+async fn a_wrong_password_against_an_old_hash_costs_the_current_parameters_too() {
+    use axess_factors::password::recording::take_runs;
+    let r = rig(
+        OLD_PARAMETERS,
+        false,
+        KdfExecutor::inline(),
+        LockoutPolicy::default().without_throttle(),
+    );
+    let current = axess_factors::Argon2Cost::default();
+    let current = (current.m_cost_kib(), current.t_cost(), current.p_cost());
+    // The dummy hash is made once per service; make it before measuring.
+    r.svc.burn_password_check("warm").await.unwrap();
+    take_runs();
+
+    let unknown = r
+        .svc
+        .login_with_password("nobody", "default", "not the password", &test_session())
         .await
         .unwrap();
-    assert!(
-        matches!(outcome, SignupOutcome::Started(None)),
-        "{outcome:?}"
-    );
-    // The caller sees `Started`; the application sees an anonymous session.
-    assert!(taken.auth_state().await.is_guest());
-    assert!(taken.user_id().await.is_none());
-    // Nothing was created.
-    assert!(identity.get_user(&uid("u2")).await.unwrap().is_none());
-    assert!(
-        identity.events().iter().any(|e| {
-            e.event_type == AuthEventType::SignupStarted
-                && e.event_status == AuthEventStatus::Failure
-                && e.error.as_ref().map(ToString::to_string).as_deref() == Some("already_exists")
-        }),
-        "the refusal is audited with its reason"
-    );
+    assert!(matches!(unknown, FactorOutcome::InvalidCredential));
+    let unknown_runs = take_runs();
+    assert_eq!(unknown_runs, vec![current], "an unknown identifier");
 
-    let mut free = newcomer();
-    free.identifier = "bob@example.com".into();
-    let fresh = test_session();
-    let outcome = svc.begin_signup(free, "default", &fresh).await.unwrap();
-    assert!(
-        matches!(outcome, SignupOutcome::Started(Some(_))),
-        "{outcome:?}"
-    );
-    assert!(
-        fresh.pending_user_id().await.is_some(),
-        "a free identifier is created and the signup is pending for it"
-    );
-}
-
-#[tokio::test]
-async fn a_taken_identifier_is_reported_only_when_revealed() {
-    let (svc, _) = signup_service(true);
-    let outcome = svc
-        .begin_signup(newcomer(), "default", &test_session())
+    let old = r
+        .svc
+        .login_with_password("alice", "default", "not the password", &test_session())
         .await
         .unwrap();
+    assert!(matches!(old, FactorOutcome::InvalidCredential));
+    let old_runs = take_runs();
     assert!(
-        matches!(outcome, SignupOutcome::AlreadyExists),
-        "{outcome:?}"
+        old_runs.contains(&(8, 1, 1)),
+        "the old hash is verified under its own parameters: {old_runs:?}"
+    );
+    assert!(
+        old_runs.contains(&current),
+        "a wrong password against an old hash spends an operation at the current parameters \
+         as every other refusal does: {old_runs:?}"
     );
 }
 
-/// The session already pending signup for a user may submit again; the
-/// resumption leaves a row saying so, where it used to leave none.
+/// An account closed between `begin_login` and the password is refused by
+/// the check before the step, which runs no hash of its own; the refusal
+/// spends the Argon2 work an unknown identifier spends, so the two answers
+/// cost the same.
 #[tokio::test]
-async fn resuming_ones_own_signup_is_audited() {
-    let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let svc = AuthnService::builder(identity.clone(), MockFactorStore::new())
-        .allow_plaintext_factor_secrets()
-        .build()
-        .with_audit_context(AuditContext::default());
-    let session = test_session();
-    let mut user = newcomer();
-    user.identifier = "dave@example.com".into();
-    let first = svc
-        .begin_signup(user.clone(), "default", &session)
-        .await
-        .unwrap();
-    assert!(matches!(first, SignupOutcome::Started(_)), "{first:?}");
-    let again = svc.begin_signup(user, "default", &session).await.unwrap();
-    assert!(matches!(again, SignupOutcome::Started(_)), "{again:?}");
-
-    let rows: Vec<_> = identity
-        .events()
-        .into_iter()
-        .filter(|e| {
-            matches!(
-                e.event_type,
-                AuthEventType::SignupStarted | AuthEventType::SignupResumed
-            )
-        })
-        .collect();
-    assert_eq!(rows.len(), 2, "one row per submit: {rows:?}");
-    assert_eq!(rows[0].event_type, AuthEventType::SignupStarted);
-    assert_eq!(rows[1].event_type, AuthEventType::SignupResumed);
-    assert_eq!(rows[1].event_status, AuthEventStatus::Success);
-    assert_eq!(rows[1].user_id, Some(uid("u2")));
-    assert_eq!(
-        rows[1].error, None,
-        "a success row carries no failure reason"
-    );
-}
-
-// ── Password reset cooldown ──────────────────────────────────────────────────
-
-fn reset_service(
-    cooldown: Option<Duration>,
-) -> (
-    RequestAuthnService<MockIdentityStore, MockFactorStore>,
-    MockClock,
-) {
-    let clock = MockClock::now();
-    let identity = MockIdentityStore::new()
-        .with_clock(clock.clone())
-        .with_tenant(test_tenant())
-        .with_user(test_user("u1", "alice"));
-    let builder = AuthnService::builder(identity, MockFactorStore::new()).with_clock(clock.clone());
-    let builder = match cooldown {
-        Some(cooldown) => builder.with_password_reset_cooldown(cooldown),
-        None => builder.without_password_reset_cooldown(),
-    };
-    (
-        builder.build().with_audit_context(AuditContext::default()),
-        clock,
-    )
-}
-
-const TTL: Duration = Duration::from_secs(300);
-
-#[tokio::test]
-async fn a_second_reset_request_inside_the_cooldown_is_refused() {
-    let (svc, clock) = reset_service(Some(Duration::from_secs(60)));
-    assert!(
-        svc.begin_password_reset("alice", "default", TTL)
-            .await
-            .unwrap()
-            .is_some()
-    );
-    assert!(
-        svc.begin_password_reset("alice", "default", TTL)
-            .await
-            .unwrap()
-            .is_none(),
-        "inside the cooldown"
-    );
-    clock.advance(chrono::Duration::seconds(61));
-    assert!(
-        svc.begin_password_reset("alice", "default", TTL)
-            .await
-            .unwrap()
-            .is_some(),
-        "after the cooldown"
-    );
-}
-
-#[tokio::test]
-async fn the_cooldown_treats_an_unknown_identifier_like_a_known_one() {
-    let (svc, clock) = reset_service(Some(Duration::from_secs(60)));
-    // An unknown identifier answers None before and during the cooldown, so
-    // the cooldown tells a caller nothing about which identifiers exist.
-    for _ in 0..2 {
-        assert!(
-            svc.begin_password_reset("nobody", "default", TTL)
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-    clock.advance(chrono::Duration::seconds(61));
-    assert!(
-        svc.begin_password_reset("nobody", "default", TTL)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    // Another identifier is not held up by the first one's cooldown.
-    assert!(
-        svc.begin_password_reset("alice", "default", TTL)
-            .await
-            .unwrap()
-            .is_some()
-    );
-}
-
-/// The cooldown keys on the identifier as a person reads it: case folded,
-/// invisible format characters dropped, surrounding whitespace trimmed.
-#[tokio::test]
-async fn the_cooldown_keys_on_the_normalised_identifier() {
+async fn an_account_closed_before_the_password_spends_what_an_unknown_identifier_spends() {
+    let clock = common::test_clock();
+    use axess_core::authn::types::{EntityState, StatusDetail};
     use axess_core::testing::mock_authn::CallLog;
+    use axess_factors::password::recording::take_runs;
     let log = CallLog::new();
-    let clock = MockClock::now();
     let identity = MockIdentityStore::new()
         .with_clock(clock.clone())
+        .with_call_log(&log)
         .with_tenant(test_tenant())
-        .with_user(test_user("u1", "alice@x.com"))
-        .with_call_log(&log);
-    let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_user(test_user("u1", "alice"))
+        .with_lockout_policy(LockoutPolicy::default().without_throttle());
+    let factors = MockFactorStore::new()
+        .with_call_log(&log)
+        .with_factor(user_scope(), common::password_config("Sample2+"))
+        .with_method(&uid("u1"), password_method());
+    let kdf = Arc::new(KdfExecutor::inline());
+    let svc = AuthnService::builder(identity.clone(), factors)
         .with_clock(clock.clone())
-        .with_password_reset_cooldown(Duration::from_secs(60))
+        .with_kdf_executor(kdf.clone())
         .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());
-
-    assert!(
-        svc.begin_password_reset("alice@x.com", "default", TTL)
+    svc.burn_password_check("warm").await.unwrap();
+    let measure = async |identifier: &str| {
+        take_runs();
+        let jobs = kdf.jobs_started();
+        let outcome = svc
+            .login_with_password(identifier, "default", "Sample2+", &test_session())
             .await
-            .unwrap()
-            .is_some()
+            .unwrap();
+        let mut runs = take_runs();
+        runs.sort_unstable();
+        (outcome, runs, kdf.jobs_started() - jobs)
+    };
+    let (_, unknown_runs, unknown_jobs) = measure("nobody").await;
+
+    // `begin_login` reads the status and then the methods; the account is
+    // closed at that read, after the status said `Active`.
+    let closing = identity.clone();
+    log.on("available_methods", move || {
+        let mut closed = test_user("u1", "alice");
+        closed.status = EntityState::Terminated(StatusDetail::closure("closed", start()));
+        let _ = closing.clone().with_user(closed);
+    });
+    let (outcome, runs, jobs) = measure("alice").await;
+    assert!(
+        matches!(outcome, FactorOutcome::InvalidCredential),
+        "a closed account answers as a wrong password: {outcome:?}"
     );
-    for variant in ["ALICE@x.com\u{200B}", " alice@X.COM ", "Alice@x.com"] {
-        assert!(
-            svc.begin_password_reset(variant, "default", TTL)
-                .await
-                .unwrap()
-                .is_none(),
-            "{variant:?} is the same identifier inside the cooldown"
-        );
-    }
+    assert!(
+        !unknown_runs.is_empty(),
+        "an unknown identifier spends work"
+    );
     assert_eq!(
-        log.calls()
-            .iter()
-            .filter(|c| **c == "store_reset_token")
-            .count(),
-        1,
-        "exactly one token was written: {:?}",
-        log.calls()
-    );
-}
-
-/// A builder nobody configured holds a minute's cooldown.
-#[tokio::test]
-async fn a_new_builder_has_a_minute_of_cooldown() {
-    let clock = MockClock::now();
-    let identity = MockIdentityStore::new()
-        .with_clock(clock.clone())
-        .with_tenant(test_tenant())
-        .with_user(test_user("u1", "alice"));
-    let svc = AuthnService::builder(identity, MockFactorStore::new())
-        .with_clock(clock.clone())
-        .allow_plaintext_factor_secrets()
-        .build()
-        .with_audit_context(AuditContext::default());
-    assert!(
-        svc.begin_password_reset("alice", "default", TTL)
-            .await
-            .unwrap()
-            .is_some()
-    );
-    assert!(
-        svc.begin_password_reset("alice", "default", TTL)
-            .await
-            .unwrap()
-            .is_none(),
-        "a second request inside the default cooldown"
-    );
-    clock.advance(chrono::Duration::seconds(61));
-    assert!(
-        svc.begin_password_reset("alice", "default", TTL)
-            .await
-            .unwrap()
-            .is_some()
-    );
-}
-
-#[tokio::test]
-async fn without_a_cooldown_repeated_requests_each_get_a_token() {
-    let (svc, _) = reset_service(None);
-    for _ in 0..3 {
-        assert!(
-            svc.begin_password_reset("alice", "default", TTL)
-                .await
-                .unwrap()
-                .is_some()
-        );
-    }
-}
-
-/// A refusal whose reason is one of the tags axess names is recorded as that
-/// tag, not as `Other` carrying the same text: a dashboard that groups by
-/// reason, and a row read back from the store, must agree on what it was.
-#[tokio::test]
-async fn a_signup_into_an_unknown_tenant_is_audited_as_the_named_reason() {
-    let (svc, identity) = signup_service(false);
-    let session = test_session();
-    svc.begin_signup(newcomer(), "no-such-tenant", &session)
-        .await
-        .unwrap();
-    let reasons: Vec<_> = identity
-        .events()
-        .iter()
-        .filter(|e| e.event_type == AuthEventType::SignupStarted)
-        .filter_map(|e| e.error.clone())
-        .collect();
-    assert_eq!(
-        reasons,
-        vec![axess_core::authn::event::AuthFailureReason::UnknownTenant]
+        (runs, jobs),
+        (unknown_runs, unknown_jobs),
+        "an account closed before the password"
     );
 }

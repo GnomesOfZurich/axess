@@ -1,12 +1,11 @@
 # Live provider reload
 
 A running `AuthnService` can replace, add and remove its OAuth/OIDC, FIDO2
-and LDAP providers without a restart. Before this, providers were attached at
-construction (`with_oauth_provider`, `with_fido2`, `with_ldap`) and could not
-be swapped, so a rotated client secret, a moved IdP or a tenant that started
-federating meant rebuilding the service and rewiring Axum state. This page is
-the design: what holds, the API, the invariants, how it fails, and what an
-adopter changes.
+and LDAP providers without a restart, so a rotated client secret, a moved IdP
+or a tenant that starts federating does not mean rebuilding the service and
+rewiring Axum state. This page describes
+the design: the slots that hold the providers, the API, the invariants,
+the failure modes and what an adopter changes.
 
 It reuses the machinery of [live policy reload](../authorization/live-policy-reload.md):
 a lock-free swap slot, validation before the swap, a refusal that leaves the
@@ -15,19 +14,33 @@ hint and never a payload.
 
 ## What you get
 
-- `reload_oauth_provider(name, candidate)` makes a validated provider the one
-  that `begin_oauth_login(name, ..)` uses from the next call on, and
-  `remove_oauth_provider(name)` takes a provider out.
-- `reload_tenant_oauth_provider(tenant, name, candidate)` and
-  `remove_tenant_oauth_provider(tenant, name)` do the same for a provider a
-  tenant brought, in a registry keyed by `(tenant, name)`.
-- `reload_fido2(candidate)` and `reload_ldap(candidate)` replace the single
-  FIDO2 and LDAP provider, and `remove_fido2()` and `remove_ldap()` take it
-  out: the FIDO2 ceremony steps then answer `AuthnError::NoFlow`, a factor
-  chain with `LdapBind` answers `InvalidCredential`, and registered passkeys
-  stay in the store.
+Every change an administrator makes goes through the request-scoped service
+(`authn.with_audit_context(audit)`) in that administrator's name, whose
+id is the first argument of each method, and is recorded; see [Who changed it](#who-changed-it).
+A change that a `ProviderSource` drives has no administrator and is recorded
+without one; see [Across instances](#across-instances).
+
+- `reload_oauth_provider_as(actor, name, kind, candidate)` makes a validated
+  provider the one that `begin_oauth_login(name, ..)` uses from the next call
+  on, and `remove_oauth_provider_as(actor, name)` takes a provider out.
+- `reload_tenant_oauth_provider_as(actor, tenant, name, kind, candidate)` and
+  `remove_tenant_oauth_provider_as(actor, tenant, name)` do the same for a
+  provider a tenant brought, in a registry keyed by `(tenant, name)`.
+- `kind` is the `FederatedProvider` every login through the new provider
+  records, as `AuthnServiceBuilder::with_oauth_provider_of_kind` names it at
+  construction: `FederatedProvider::Google` for a provider that is Google's,
+  `FederatedProvider::Custom(name)` for one of no named kind. Every way a
+  provider arrives names its kind: at construction, by a reload, and from a
+  `ProviderSource` (`BuiltProvider::OAuth { provider, kind }`). The kind is
+  configured, never read from the issuer URL, and a reload replaces the kind
+  the name had along with the provider.
+- `reload_fido2_as(actor, candidate)` and `reload_ldap_as(actor, candidate)`
+  replace the single FIDO2 provider and the single LDAP provider, and
+  `remove_fido2_as(actor)` and `remove_ldap_as(actor)` take them out: the FIDO2 ceremony steps then
+  answer `AuthnError::NoFlow`, a factor chain with `LdapBind` answers
+  `InvalidCredential`, and registered passkeys stay in the store.
 - A reload that fails leaves the previous provider in force and answers with
-  a named `ProviderReloadError`.
+  a named `ProviderReloadError`, inside `ProviderChangeError::Refused`.
 - With a coordinator and a `ProviderSource`, one change reaches every
   instance. A receiving instance re-reads its source and builds the provider
   itself; the notice carries nothing it applies.
@@ -46,8 +59,8 @@ hint and never a payload.
 A request takes a snapshot (a read that takes no lock and does not wait on a reload) and keeps
 it for the one step it is doing. A reload builds the next map off to the side
 and installs it with `rcu`, so two concurrent reloads of different names both
-land. `arc-swap` is the dependency live policy reload already added; nothing
-new enters the tree.
+land. Live policy reload already depends on `arc-swap`, so no new dependency
+enters the tree.
 
 A map snapshot is immutable. `AuthnService::oauth_providers()` therefore
 returns an `Arc<OAuthProviderRegistry>` (the registry as of the call) and not
@@ -64,21 +77,21 @@ and only then swaps:
   yields, so the discovery fetch, the issuer check that binds the document to
   the issuer it was fetched from, the HTTPS rule and the key-set transport
   check all run inside the candidate. An unreachable or inconsistent discovery
-  document is a `Build` refusal. The service adds that the provider's
-  `name()` equals the `name` argument (`NameMismatch`), since a provider
+  document is a `Build` refusal. The service also checks that the provider's
+  `name()` equals the `name` argument (`NameMismatch` otherwise), since a provider
   swapped in under the wrong key would answer logins meant for another IdP.
 - **FIDO2.** The candidate parses the relying party (`WebauthnBuilder::build`),
   so an invalid RP id or origin is a `Build` refusal. Changing the RP id
   orphans every registered credential, because a passkey is bound to its RP
-  id, so `Fido2Provider::relying_party_id()` is a required method and a
+  id. `Fido2Provider::relying_party_id()` is therefore a required method, and a
   candidate whose id differs from the provider in force is refused as
   `RpIdChanged`. The caller who means it passes
-  `reload_fido2_with(candidate, ReloadFido2::allow_rp_id_change())`; the
+  `reload_fido2_with_as(actor, candidate, ReloadFido2::allow_rp_id_change())`; the
   change is counted (`ProviderRegistryMetrics::fido2_rp_id_changed`) and logged with both ids. A source states
   the same intent by building `BuiltProvider::Fido2AllowingRpIdChange`; the
   plain `BuiltProvider::Fido2` with another id is refused at every follower.
-  Why a required trait method and not a field of a config: `Webauthn` does not
-  expose its id, and a provider is the only value every reload path (a direct
+  The id comes from a required trait method rather than a config field
+  because `Webauthn` does not expose its id, and a provider is the only value every reload path (a direct
   call, a source) holds, so the comparison needs the id from the provider
   itself. `DefaultFido2Provider::new` reads it from the instance it wraps
   (the challenge a discoverable authentication would send names it), so it
@@ -89,11 +102,13 @@ and only then swaps:
   (TLS or StartTLS, and the cleartext refusal) and an unbind, with no
   credential sent. A provider that does not override the method answers a
   configuration error, so a custom provider is refused by name rather than
-  swapped unchecked; an adopter who wants that writes the override.
+  swapped unchecked; an adopter who wants to reload a custom provider writes the override.
 
 Every refusal is a `ProviderReloadError` naming the step: `Build`,
 `TimedOut`, `NameMismatch`, `Unreachable`, `RpIdChanged`, `NotFound` (remove),
-`NoTenantRegistry`.
+`NoTenantRegistry`, `PairHeld` (a tenant provider whose issuer and client id
+another provider or a global one holds) and `WrongCategory` (a source built a provider of
+another category than its key names).
 Each increments `provider_reload_refused(category)` and logs a `warn!` on
 `axess::authn::provider_reload` with the category and the error, and the
 previous provider keeps serving.
@@ -101,11 +116,11 @@ previous provider keeps serving.
 ## A login in flight across a swap
 
 The ceremony state lives in the session: the CSRF state, the nonce, the PKCE
-verifier and the issuer of the provider that began it. Decision: **a login
+verifier and the issuer of the provider that began it. The rule: **a login
 begun against the old provider finishes against the new one only when the
-issuer is the same; otherwise it is refused by name.** This is the rail that
-already existed (`verify_provider_issuer_matches`, audited as
-`ProviderMismatch`), and the reload relies on it instead of adding a second.
+issuer is the same; otherwise it is refused by name.** The reload relies on the existing issuer check
+(`verify_provider_issuer_matches`, audited as `ProviderMismatch`) instead
+of adding a second.
 
 Why not honour the old provider's state to the end? The authorization code
 the IdP issues is for the old authorization endpoint and the old client.
@@ -114,15 +129,16 @@ shape (a code from IdP A sent to IdP B), and no verifier minted by the old
 provider makes that safe. The same issuer with a rotated client secret or new
 scopes is the ordinary case, and the code is still good: the token request
 uses the new credentials, the IdP validates the code against the client id,
-and a changed client id fails at the IdP with `invalid_grant`, closed. The
+and a changed client id fails closed at the IdP with `invalid_grant`. The
 user restarts the login either way; nothing stays half-open because the
 failure clears the ceremony.
 
 A provider removed mid-ceremony fails the callback with `UnknownProvider`
 (audited `ProviderUnavailable`), as before. FIDO2 and LDAP hold no state
 across a swap that the new provider would honour wrongly: a FIDO2 ceremony
-state finished by a provider with a different RP id fails webauthn's origin
-check, and an LDAP bind is one request.
+state finished by a provider with a different RP id fails verification (the
+origin check if the new provider no longer allows the origin, otherwise the
+RP id hash in the authenticator data), and an LDAP bind is one request.
 
 ## The tenant-supplied IdP
 
@@ -130,11 +146,17 @@ check, and an LDAP bind is one request.
 `(TenantId, name)`. Hand it to
 `AuthnServiceBuilder::with_live_tenant_oauth_providers` (which also installs
 it as the service's tenant source) and call
-`reload_tenant_oauth_provider(tenant, name, ..)`. The key includes the
+`reload_tenant_oauth_provider_as(actor, tenant, name, kind, ..)`. The key includes the
 tenant, so a reload for tenant A replaces exactly `(A, name)`: tenant B's
 provider of the same name is a different map entry and is never rebuilt or
 read. `providers_for_issuer` serves the back-channel logout path from the same
-snapshot. `StoredTenantOAuthProviders` (a store, rebuilt when a record's
+snapshot. One `(issuer, client_id)` pair belongs to one provider: a reload
+whose pair another `(tenant, name)` or a global provider holds is refused as
+`ProviderReloadError::PairHeld`, from an administrator or a follower alike,
+since two providers of one client make its logout tokens ambiguous. The
+registry asks for no proof of ownership: the operator who installs a provider
+through `reload_tenant_oauth_provider_as` is responsible for checking it, and
+the audit row names that operator. `StoredTenantOAuthProviders` (a store, rebuilt when a record's
 revision moves) is unchanged and is the choice when the configuration lives in
 a database that the service reads on demand; the live registry is for an
 adopter that pushes a built provider, or that follows a `ProviderSource`.
@@ -150,16 +172,18 @@ for Valkey, on the channel `{prefix}:provider-reloaded`). The two channels do no
 reaches a second service and that a policy notice is not a provider notice.
 The coordinator types
 moved to `axess::reload` and are still re-exported from `axess::authz::reload`.
-After a local reload or removal the service announces a label of the key (`oauth:tenant:name`, `fido2`, `ldap`)
+After a local reload or removal, the service announces a label of the key (`oauth:tenant:name`, `fido2`, `ldap`)
 for logs.
 
 `follow_provider_reloads(source, poll_every)` starts the receiving side. The
 adopter supplies a `ProviderSource`:
 
-- `desired()` lists `ProviderEntry { key, revision }`, cheap and with no
-  network: the keys the instance should run and an opaque revision per key;
-- `build(key)` builds one provider (discovery included), only called for a
-  key whose revision differs from the one the follower last applied.
+- `desired()` lists `ProviderEntry { key, revision }`: the keys the instance
+  should run and an opaque revision per key. It is cheap and makes no network call;
+- `build(key)` builds one provider (discovery included), and is called only for a
+  key whose revision differs from the one the follower last applied. An OAuth
+  provider is built as `BuiltProvider::OAuth { provider, kind }`, with the
+  kind its configuration names, as a direct reload names it.
 
 `ProviderFollower::reads(ReadCause)` counts the reads by why they happened
 (`Start`, `Notice`, `Lagged`, `Poll`), so a deployment can see whether notices
@@ -168,11 +192,19 @@ reach it or only the poll does.
 On a notice, a lagged receiver, and every `poll_every`, the follower calls
 `desired()`, builds and installs what moved, and removes a provider of any
 category that it installed earlier and that the source no longer lists. It applies
-nothing from a notice, never removes a provider the source never named (the
-ones registered at construction stay), and a build or validation failure is
-counted and logged and retried at the next notice or poll. An entry the source stops listing
-is removed only if the follower installed it, so a FIDO2 or LDAP provider
-attached at construction stays even when the source never names it.
+nothing from a notice and never removes a provider the source never named:
+providers registered at construction, FIDO2 and LDAP included, stay. A build
+or validation failure is counted, logged and retried at the next notice or poll.
+
+Each change the follower makes writes an audit row, as an administrator's
+`_as` change does: `MethodEnabled` for an install, `MethodDisabled` for a
+removal, naming the provider (an OAuth provider by the kind the source
+built it with, or for a removal the kind it was installed with) and, for a
+tenant's, the tenant. No
+administrator made it, so the row has no `actor_id` and carries the reason
+`PROVIDER_SOURCE_REASON` (`provider_source`). A change whose row cannot be
+written is undone, the previous provider keeps serving, and the follower
+tries it again at the next notice or poll.
 
 ## Metrics
 
@@ -183,6 +215,39 @@ exported as `axess_provider_reloads_total`, `axess_provider_removals_total`
 and `axess_provider_reload_refusals_total`, with `category` as the only label.
 The provider name and the tenant are not labels; they are in the event.
 
+## Who changed it
+
+Changing a provider is the most powerful administrative act in a
+multi-tenant deployment: a tenant's logins go wherever the new provider
+points. So there is no way to change one without saying who did: the `_as`
+methods on the request-scoped service
+(`reload_oauth_provider_as`, `remove_oauth_provider_as`,
+`reload_tenant_oauth_provider_as`, `remove_tenant_oauth_provider_as`,
+`reload_fido2_as`, `reload_fido2_with_as`, `remove_fido2_as`,
+`reload_ldap_as`, `remove_ldap_as`) take the administrator's `UserId` first
+and write one audit row per change: `MethodEnabled` for a reload,
+`MethodDisabled` for a removal, naming the administrator, the provider and
+the tenant, with the request's client address and user agent from the audit
+context. An OAuth provider is named by its kind (`factor_kind`): the kind
+the reload configures, or for a removal the kind of the provider it took
+out. A refused change writes a failure row with the refusal. When the
+row cannot be written the swap is undone and the method returns
+`ProviderChangeError::Audit`: a provider change nobody can account for does
+not stand.
+
+```rust,ignore
+let request = authn.with_audit_context(audit);
+request
+    .reload_tenant_oauth_provider_as(
+        &admin.id,
+        &tenant,
+        "sso",
+        FederatedProvider::Microsoft,
+        candidate,
+    )
+    .await?;
+```
+
 ## Invariants
 
 1. A provider is in a slot only after its candidate built, its name matched
@@ -192,6 +257,7 @@ The provider name and the tenant are not labels; they are in the event.
 4. A tenant's reload touches that tenant's entry only.
 5. A notice never installs anything; the receiver builds from its source.
 6. A login in flight across a swap finishes only against the same issuer.
+7. A change made through an `_as` method stands only with its audit row.
 
 ## Failure modes
 
@@ -203,6 +269,8 @@ The provider name and the tenant are not labels; they are in the event.
 | name differs from the provider's | `NameMismatch` |
 | FIDO2 candidate with another relying-party id, not acknowledged | `RpIdChanged`; previous provider serves |
 | tenant method with no live registry | `NoTenantRegistry` |
+| tenant provider whose issuer and client id another provider or a global one holds | `PairHeld`; previous provider serves |
+| source built a provider of another category than its key | `WrongCategory`; previous provider serves |
 | coordinator down at announce | reload stands, `announced` is false, the followers' poll covers it |
 | notice lost or receiver lagged | the follower re-reads the source; convergence by poll |
 | source unreadable | warn, previous providers serve |
@@ -210,10 +278,10 @@ The provider name and the tenant are not labels; they are in the event.
 
 ## Migration
 
-For an adopter that never reloads, behaviour is unchanged. The compile
-breaks: `AuthnService::oauth_providers()` returns `Arc<OAuthProviderRegistry>`
+Behaviour is unchanged for an adopter that never reloads. These changes
+break compilation: `AuthnService::oauth_providers()` returns `Arc<OAuthProviderRegistry>`
 and `OAuthProviderRegistry::provider_names()` returns `Vec<Arc<str>>`;
 `ProviderRegistryMetrics` gains three defaulted methods; `LdapProvider` gains
-`check_reachable`, defaulted to a refusal that only `reload_ldap` consults; and
+`check_reachable`, defaulted to a refusal that only an LDAP reload consults; and
 `Fido2Provider` gains the required `relying_party_id()`.
-The 0.16.0-to-0.17.0 page carries the bullets.
+The 0.16.0-to-0.17.0 migration page lists them.

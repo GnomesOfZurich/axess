@@ -2,8 +2,8 @@
 //! for a user's methods in one tenant never lists a row saved for the same
 //! user id in another tenant.
 
-use axess::SystemClock;
 use axess::authn::{AuthMethod, AuthnScope, FactorKind, FactorStore, TenantId, UserId};
+use axess_clock::testing::MockClock;
 use axess_example_sqlite::models::backend::{OurBackend, seed};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::str::FromStr;
@@ -12,7 +12,7 @@ const TENANT: &str = "00000000-0000-0000-0000-000000000001";
 const OTHER_TENANT: &str = "00000000-0000-0000-0000-000000000000";
 const ALICE: &str = "00000000-0000-0000-0000-000000000010";
 
-async fn pool() -> sqlx::SqlitePool {
+async fn pool(clock: &MockClock) -> sqlx::SqlitePool {
     let opts = SqliteConnectOptions::from_str("sqlite::memory:")
         .expect("in-memory url")
         .create_if_missing(true);
@@ -23,9 +23,10 @@ async fn pool() -> sqlx::SqlitePool {
         .expect("connect in-memory sqlite");
     sqlx::migrate!().run(&pool).await.expect("migrations");
     seed(
-        &SystemClock,
+        clock,
         &pool,
-        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF"),
+        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF")
+            .with_clock(std::sync::Arc::new(clock.clone())),
     )
     .await
     .expect("seed");
@@ -34,7 +35,9 @@ async fn pool() -> sqlx::SqlitePool {
 
 #[tokio::test]
 async fn a_users_method_in_another_tenant_is_not_listed() {
-    let backend = OurBackend::new(pool().await);
+    let clock = MockClock::at_reference();
+    let backend =
+        OurBackend::new(pool(&clock).await).with_clock(std::sync::Arc::new(clock.clone()));
     let alice = UserId::try_new(ALICE).expect("user");
     let other = TenantId::try_new(OTHER_TENANT).expect("tenant");
     backend

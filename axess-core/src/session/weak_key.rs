@@ -6,7 +6,7 @@
 /// Whether `key` is a single byte repeated 32 times (all zeros included).
 ///
 /// No random key looks like this, so one is a placeholder that reached
-/// production: the README example used to show an all-zero key. The check
+/// production, such as an all-zero key copied from an example. The check
 /// cannot prove a key is strong, only that this one is not.
 pub fn is_constant_key(key: &[u8; 32]) -> bool {
     key.iter().all(|byte| *byte == key[0])

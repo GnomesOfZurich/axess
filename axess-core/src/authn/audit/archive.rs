@@ -242,7 +242,7 @@ impl AuditArchiver for NoopAuditArchiver {
 
     async fn archive_batch(
         &self,
-        _batch: &ArchiveBatchId,
+        _: &ArchiveBatchId,
         events: &[AuthEvent],
     ) -> Result<(), Self::Error> {
         tracing::trace!(
@@ -272,14 +272,13 @@ impl AuditArchiver for NoopAuditArchiver {
 ///
 /// A retention age of `Duration::MAX` means "never": it must yield a cutoff
 /// that matches no row, not one that falls back to `now` and matches all.
-fn cutoff_before(
-    now: chrono::DateTime<chrono::Utc>,
-    age: Duration,
-) -> chrono::DateTime<chrono::Utc> {
-    chrono::Duration::from_std(age)
+fn cutoff_before(now: axess_clock::Timestamp, age: Duration) -> axess_clock::Timestamp {
+    axess_clock::SignedDuration::try_from(age)
         .ok()
-        .and_then(|d| now.checked_sub_signed(d))
-        .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC)
+        .and_then(|d| now.checked_sub(d))
+        // An age longer than the range reaches back before every reading:
+        // no row is older than the earliest one.
+        .unwrap_or(axess_clock::Timestamp::MIN)
 }
 
 /// Adopter-implemented data-access primitive for the retention loop.
@@ -314,7 +313,7 @@ pub trait AuditRetentionSource: Send + Sync + 'static {
     /// `event_time` ascending so retries make forward progress.
     fn select_unarchived_before(
         &self,
-        cutoff: chrono::DateTime<chrono::Utc>,
+        cutoff: axess_clock::Timestamp,
         limit: usize,
     ) -> impl std::future::Future<Output = Result<Vec<(Self::EventId, AuthEvent)>, Self::Error>> + Send;
 
@@ -324,14 +323,14 @@ pub trait AuditRetentionSource: Send + Sync + 'static {
     fn mark_archived(
         &self,
         ids: &[Self::EventId],
-        at: chrono::DateTime<chrono::Utc>,
+        at: axess_clock::Timestamp,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send;
 
     /// Delete hot-table rows whose `archived_at < cutoff`. Returns
     /// the number of rows deleted.
     fn purge_hot_archived_before(
         &self,
-        cutoff: chrono::DateTime<chrono::Utc>,
+        cutoff: axess_clock::Timestamp,
     ) -> impl std::future::Future<Output = Result<u64, Self::Error>> + Send;
 }
 
@@ -508,8 +507,8 @@ where
     /// them even when the step ends in an error.
     async fn archive_due(
         &self,
-        now: chrono::DateTime<chrono::Utc>,
-        cutoff: chrono::DateTime<chrono::Utc>,
+        now: axess_clock::Timestamp,
+        cutoff: axess_clock::Timestamp,
         report: &mut RetentionTickReport,
     ) -> Result<(), RetentionError<S::Error, A::Error>> {
         // Rows set aside as refused are asked for on top of the batch size
@@ -636,7 +635,7 @@ where
         }
     }
 
-    fn note_refusals(&self, ids: &[S::EventId], certain: bool, now: chrono::DateTime<chrono::Utc>) {
+    fn note_refusals(&self, ids: &[S::EventId], certain: bool, now: axess_clock::Timestamp) {
         let mut skipped = self.skipped.lock().unwrap_or_else(|e| e.into_inner());
         for id in ids {
             skipped.refused(id.to_string(), certain, now);
@@ -765,6 +764,7 @@ mod pacing;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axess_clock::testing::Shift;
 
     #[tokio::test]
     async fn noop_archiver_accepts_any_batch() {
@@ -797,17 +797,20 @@ mod tests {
 
     #[test]
     fn maximum_age_yields_a_cutoff_that_matches_nothing() {
-        let now = chrono::Utc::now();
+        let now = axess_clock::testing::MockClock::reference_time();
         assert_eq!(
             cutoff_before(now, Duration::MAX),
-            chrono::DateTime::<chrono::Utc>::MIN_UTC
+            axess_clock::Timestamp::MIN
         );
         let day = Duration::from_secs(24 * 60 * 60);
-        assert_eq!(cutoff_before(now, day), now - chrono::Duration::days(1));
+        assert_eq!(
+            cutoff_before(now, day),
+            now.minus(axess_clock::SignedDuration::days(1))
+        );
     }
 
     #[derive(Default)]
-    struct CutoffSource(std::sync::Mutex<Vec<chrono::DateTime<chrono::Utc>>>);
+    struct CutoffSource(std::sync::Mutex<Vec<axess_clock::Timestamp>>);
 
     impl AuditRetentionSource for CutoffSource {
         type EventId = u64;
@@ -815,7 +818,7 @@ mod tests {
 
         async fn select_unarchived_before(
             &self,
-            cutoff: chrono::DateTime<chrono::Utc>,
+            cutoff: axess_clock::Timestamp,
             _: usize,
         ) -> Result<Vec<(u64, AuthEvent)>, Self::Error> {
             self.0.lock().unwrap().push(cutoff);
@@ -824,13 +827,13 @@ mod tests {
         async fn mark_archived(
             &self,
             _: &[u64],
-            _: chrono::DateTime<chrono::Utc>,
+            _: axess_clock::Timestamp,
         ) -> Result<(), Self::Error> {
             Ok(())
         }
         async fn purge_hot_archived_before(
             &self,
-            cutoff: chrono::DateTime<chrono::Utc>,
+            cutoff: axess_clock::Timestamp,
         ) -> Result<u64, Self::Error> {
             self.0.lock().unwrap().push(cutoff);
             Ok(0)
@@ -847,7 +850,7 @@ mod tests {
         let cutoffs = lp.source.0.lock().unwrap().clone();
         assert_eq!(cutoffs.len(), 2);
         for c in cutoffs {
-            assert_eq!(c, chrono::DateTime::<chrono::Utc>::MIN_UTC);
+            assert_eq!(c, axess_clock::Timestamp::MIN);
         }
     }
 }

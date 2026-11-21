@@ -10,24 +10,27 @@ pub struct Impersonation {
     /// The administrator.
     pub admin: UserId,
     /// When `begin_impersonation` made the session.
-    pub since: DateTime<Utc>,
+    pub since: Timestamp,
 }
 
 impl Impersonation {
-    /// The id under which the registry holds this impersonation for the
+    /// The key under which the registry holds this impersonation for the
     /// administrator, beside the session's own entry under the target.
     ///
-    /// The session's id changes on every rotation and its entry is the
+    /// The session's key changes on every rotation and its entry is the
     /// target's, so neither says whether the administrator is still in good
-    /// standing. This id is derived from the administrator, the target and
-    /// the start time, so it survives rotation; `begin_impersonation`
+    /// standing. This key is the SHA-256 of a tag of its own, the
+    /// administrator, the target and the start time, so it survives
+    /// rotation; `begin_impersonation`
     /// registers it under the administrator and the session layer asks the
     /// registry about it on every request. Ending the administrator's
     /// sessions (a suspension, a deletion, a forced logout) removes it, and
     /// the impersonation ends with it. It is a registry key, not a
-    /// credential: knowing it grants nothing.
+    /// credential: knowing it grants nothing. It names no session's row: a
+    /// session's key is a digest under another tag, so the two are equal
+    /// only where SHA-256 collides.
     #[must_use]
-    pub fn registry_anchor(&self, target: &UserId) -> axess_identity::SessionId {
+    pub fn registry_anchor(&self, target: &UserId) -> crate::session::id::SessionKey {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
         h.update(b"axess impersonation anchor v1");
@@ -36,14 +39,15 @@ impl Impersonation {
             h.update(part.as_bytes());
         }
         h.update(
-            self.since
-                .timestamp_nanos_opt()
+            // Nanoseconds in 64 bits, as the anchor has always been hashed:
+            // a start outside what they hold (before 1677 or after 2262)
+            // hashes as the epoch does.
+            i64::try_from(self.since.unix_nanos())
                 .unwrap_or_default()
                 .to_be_bytes(),
         );
-        let digest = h.finalize();
-        let mut id = [0u8; 16];
-        id.copy_from_slice(&digest[..16]);
-        axess_identity::SessionId::from_bytes(id)
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&h.finalize());
+        crate::session::id::SessionKey::from_bytes(key)
     }
 }

@@ -249,10 +249,14 @@ async fn tenant_overrides_reach_the_inner_store_through_the_wrapper() {
     use crate::authn::store::IdentityLookup as _;
     use crate::authn::types::{IpPolicy, LockoutPolicy};
     use crate::testing::mock_authn::CallLog;
-    use crate::testing::{tenant_record, user_record};
+    use crate::testing::{tenant_record_at, user_record_at};
 
-    let tenant = tenant_record("acme");
-    let user = user_record("alice", "acme");
+    let tenant = tenant_record_at("acme", axess_clock::testing::MockClock::reference_time());
+    let user = user_record_at(
+        "alice",
+        "acme",
+        axess_clock::testing::MockClock::reference_time(),
+    );
     let log = CallLog::new();
     let inner = MockIdentityStore::new()
         .with_call_log(&log)
@@ -276,7 +280,7 @@ async fn tenant_overrides_reach_the_inner_store_through_the_wrapper() {
                 ..Default::default()
             },
         );
-    let (wrapped, _worker) =
+    let (wrapped, worker) =
         AuditLogWithAnalytics::new(inner.clone(), RecordingSink::default(), enrich);
 
     let ip = wrapped.ip_policy_for_tenant(&tenant.id).await.unwrap();
@@ -299,7 +303,7 @@ async fn tenant_overrides_reach_the_inner_store_through_the_wrapper() {
         .await
         .unwrap();
     assert_eq!(found.map(|u| u.id), Some(user.id));
-    let at = chrono::Utc::now();
+    let at = axess_clock::testing::MockClock::reference_time();
     wrapped.record_last_login(&user.id, at).await.unwrap();
     assert_eq!(
         inner.last_login(&user.id),
@@ -318,4 +322,5 @@ async fn tenant_overrides_reach_the_inner_store_through_the_wrapper() {
             log.calls()
         );
     }
+    drop(worker);
 }

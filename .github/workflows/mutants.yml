@@ -1,24 +1,42 @@
 name: Mutants
 
 # Mutation testing. On a pull request it mutates only the lines the PR
-# touches (`--in-diff`) and fails on a survivor; on the weekly schedule it
-# mutates the whole workspace, sharded so every shard finishes inside the
-# job limit, and reports the kill rate per file.
+# touches (`--in-diff`) and fails on a survivor; on the weekly schedule and
+# on a push to a release branch it mutates the whole workspace in shards
+# and reports the kill rate per file. The shard size is to keep every shard
+# inside the job limit at a measured per-mutant cost; the size in force is
+# provisional, set to fit GitHub's matrix cap before that cost was measured
+# under cargo-nextest (scripts/mutants-sweep.sh, Sizing).
 #
-# The sweep refuses to be blind. Until this layout every scheduled run
-# since the workflow existed was cancelled at the 6 h job limit with no
-# outcomes, and passed with a warning. Now the summary job fails the run
+# The sweep refuses to be blind. A scheduled run cancelled at the 6 h job
+# limit leaves no outcomes, and a sweep that measured nothing must not pass
+# with a warning: the summary job fails the run
 # when any shard is missing, cancelled, unfinished or short, or when the
 # shards together tested a different number of mutants than the plan
 # listed. `scripts/mutants-sweep.sh` holds the per-shard flags and the
 # sizing arithmetic; `scripts/mutants-summary.py` holds the refusals and
 # proves them with `--self-test` in the plan job.
+#
+# A module whose tests need a running server keeps them behind `#[ignore]`,
+# so the shards, which have no server, would judge its mutants on tests that
+# do not run. The sweep script leaves those files out of the shards
+# (`LIVE_VALKEY_FILES` there) and the `live` job judges them beside a Valkey
+# service, on the lib tests named `valkey` with the ignored ones included.
 
 on:
+  # A push to a release branch is a release commit: those branches receive
+  # one squashed commit per release, and the release workflow reads the
+  # full sweep on that commit and reports its address and ending
+  # (scripts/check-scheduled-runs.sh --mutants-report-only). It does not
+  # wait for the sweep until a full sweep has passed at the shard size
+  # scripts/mutants-sweep.sh plans; then the requirement returns. The sweep
+  # takes days (docs/production/release.md).
+  push:
+    branches: [release/next, 'release/*.x']
   # Pull requests into the working branches, where a change arrives one at a
-  # time. A release pull request into main carries a whole round, already
-  # swept change by change here and whole by the weekly schedule; sweeping it
-  # again planned over a thousand mutants on the first release.
+  # time. A release pull request into main carries every change of the
+  # release, already swept change by change here and whole by the weekly
+  # schedule; sweeping it again plans over a thousand mutants.
   pull_request:
     branches: [release/next, 'release/*.x']
   schedule:
@@ -32,11 +50,30 @@ on:
         type: boolean
         default: false
 
+# Every job that runs cargo-mutants installs it, locked at the same exact
+# version, so every job's token reads and nothing more.
+permissions:
+  contents: read
+
 env:
   RUST_BACKTRACE: 1
   CARGO_TERM_COLOR: always
-  # Bump in lockstep with the local dev environment.
-  CARGO_MUTANTS_VERSION: 27.0.0
+  # How many shards run at a time: the width of the sweep. A free
+  # organisation has 20 concurrent jobs, and every job of every workflow of
+  # the repository shares them, so each shard taken here is one the other
+  # workflows wait for. The sweep a push to a release branch starts is the
+  # one on the release commit, so it takes 16 and leaves 4 for the release
+  # pull request's CI and the Hardening runs on the release commit. The
+  # weekly sweep and a dispatched one take 10, half, so that pull-request
+  # CI is not queued behind them for days. `scripts/mutants-sweep.sh width`
+  # picks the value for the event; the plan job hands it to the shards.
+  MUTANTS_WIDTH_RELEASE: 16
+  MUTANTS_WIDTH_SWEEP: 10
+  # Line tables only, set once here for every job that builds: a backtrace
+  # keeps its files and lines, and each test binary leaves out the rest of
+  # the debug info, the largest part of it. .github/actions/disk-headroom
+  # says why the jobs that build need the room.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   plan:
@@ -48,6 +85,8 @@ jobs:
       total: ${{ steps.plan.outputs.total }}
       shards: ${{ steps.plan.outputs.shards }}
       matrix: ${{ steps.plan.outputs.matrix }}
+      width: ${{ steps.plan.outputs.width }}
+      live_total: ${{ steps.plan.outputs.live_total }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -55,44 +94,67 @@ jobs:
           # `--in-diff` needs the merge base to diff against.
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: stable
+      - uses: ./.github/actions/pinned-toolchain
 
       - name: Prove the summary's refusals
         run: python3 scripts/mutants-summary.py --self-test
 
+      # Bump in lockstep with the local dev environment, here and in the
+      # shard and live jobs together: the plan and the shards must run the
+      # same cargo-mutants. The version is a literal in each because
+      # scripts/check-workflow-pins.sh reads it, and each job installs its
+      # own because the check lets no job run a cargo subcommand it did not
+      # install (a program handed over as an artifact is one nobody pinned).
+      # cargo-nextest, the tool .cargo/mutants.toml tests each mutant with,
+      # is installed the same way, at one version, in every job that runs
+      # tests: the baseline, the shards, their second runs and the live job.
+      # This job only lists mutants, which runs no test tool.
       - name: Install cargo-mutants
-        run: cargo install cargo-mutants --version "$CARGO_MUTANTS_VERSION" --locked
+        run: cargo install cargo-mutants@27.0.0 --locked
 
+      # The event, the input and the name of the base branch reach the script
+      # as variables: a branch name pasted into the script would be read by
+      # the shell as part of it.
       - name: Determine sweep scope
         id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          FULL_SWEEP: ${{ inputs.full_sweep }}
+          BASE_REF: ${{ github.base_ref }}
         run: |
           set -eu
           mkdir -p plan
-          if [ "${{ github.event_name }}" = "schedule" ] || \
-             [ "${{ inputs.full_sweep }}" = "true" ]; then
+          if [ "$EVENT" = "schedule" ] || [ "$EVENT" = "push" ] || [ "$FULL_SWEEP" = "true" ]; then
             echo "mode=full" >> "$GITHUB_OUTPUT"
             : > plan/args
           else
             echo "mode=in-diff" >> "$GITHUB_OUTPUT"
-            git fetch origin "${{ github.base_ref }}"
-            git diff "origin/${{ github.base_ref }}"...HEAD > plan/pr.diff
+            git fetch origin "$BASE_REF"
+            git diff "origin/$BASE_REF"...HEAD > plan/pr.diff
             wc -l plan/pr.diff
             echo "--in-diff plan/pr.diff" > plan/args
           fi
-          cp "$(command -v cargo-mutants)" plan/cargo-mutants
 
       - name: Size the matrix
         id: plan
+        env:
+          MODE: ${{ steps.scope.outputs.mode }}
+          EVENT: ${{ github.event_name }}
         run: |
           set -eu
+          echo "width=$(scripts/mutants-sweep.sh width "$EVENT")" >> "$GITHUB_OUTPUT"
           # shellcheck disable=SC2046
           scripts/mutants-sweep.sh plan $(cat plan/args) > plan/sizing
           cat plan/sizing
           total=$(sed -n 's/^total=//p' plan/sizing)
           shards=$(sed -n 's/^shards=//p' plan/sizing)
-          if [ "${{ steps.scope.outputs.mode }}" = "full" ] && [ "$total" -eq 0 ]; then
+          # The mutants of the live-store modules, which the `live` job runs.
+          # shellcheck disable=SC2046
+          scripts/mutants-sweep.sh live-plan $(cat plan/args) > plan/live-sizing
+          cat plan/live-sizing
+          live_total=$(sed -n 's/^total=//p' plan/live-sizing)
+          echo "live_total=$live_total" >> "$GITHUB_OUTPUT"
+          if [ "$MODE" = "full" ] && [ "$total" -eq 0 ]; then
             echo "::error::the full sweep listed no mutants: the cargo-mutants config selects nothing."
             exit 1
           fi
@@ -110,9 +172,15 @@ jobs:
 
   baseline:
     # The full sweep runs the unmutated suite once, here, in place of a
-    # baseline in each of its shards (`--baseline skip` there). Its cache is
-    # the one the shards restore. A pull request's single shard runs its own
-    # baseline over just the packages its diff touches.
+    # baseline in each of its shards (`--baseline skip` there), with the
+    # test tool and the nextest profile the shards test each mutant with
+    # (.cargo/mutants.toml), so a test that fails only under nextest fails
+    # here and not as a caught mutant in every shard. A pull request's
+    # single shard runs its own baseline over just the packages its diff
+    # touches. The cache this job saves is restored by the baseline of a
+    # later sweep and by no shard: rust-cache keys a cache on every CARGO_
+    # variable, and the shards set CARGO_TARGET_DIR, which this job does
+    # not.
     name: Unmutated baseline
     needs: plan
     if: needs.plan.outputs.mode == 'full'
@@ -122,14 +190,34 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: stable
+      - uses: ./.github/actions/disk-headroom
+      # libclang and the system SQLite header: every feature on switches
+      # `sqlite-unbundled` on, whose bindings bindgen generates.
+      - uses: ./.github/actions/build-prerequisites
+      - uses: ./.github/actions/pinned-toolchain
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: mutants
+      # The version the shards install.
+      - name: Install cargo-nextest
+        run: cargo install cargo-nextest@0.9.151 --locked
+      # The test binaries, in a step of their own so that the free space is
+      # read between the build and the run: nextest builds with this same
+      # `cargo test --no-run`, which then has nothing left to build.
+      - name: Build the tests of the default members with every feature
+        run: cargo test --all-features --no-run
+      # What the run writes after the build, trybuild's target directory
+      # above all, with margin (scripts/check-disk-floor.sh says why).
+      - name: Room for the baseline run
+        run: ./scripts/check-disk-floor.sh "Unmutated baseline, before the tests" 10
       - name: Test the default members with every feature, as each mutant is tested
-        run: cargo test --all-features
+        run: cargo nextest run --all-features --profile mutants
+      # Read again after the run, whatever its end: what it wrote is still on
+      # disk, so this is close to the least room it had, and a run that came
+      # within 2 GiB of a full disk fails the baseline by name.
+      - name: Room left after the baseline run
+        if: always()
+        run: ./scripts/check-disk-floor.sh "Unmutated baseline, after the tests" 2
 
   shard:
     name: cargo-mutants shard ${{ matrix.shard }}
@@ -142,23 +230,30 @@ jobs:
     timeout-minutes: 330
     strategy:
       fail-fast: false
-      # A free organisation has 20 concurrent jobs; the sweep takes ten so
-      # pull-request CI is not queued behind it for days.
-      max-parallel: 10
+      # The width the top of this file names for the event.
+      max-parallel: ${{ fromJSON(needs.plan.outputs.width) }}
       matrix:
         shard: ${{ fromJSON(needs.plan.outputs.matrix) }}
     env:
-      # cargo-mutants builds in a copy of the tree; pointing it at the
-      # restored target keeps the dependencies warm there too.
+      # cargo-mutants builds in a copy of the tree; this keeps its builds in
+      # the workspace's target directory, where they stay after the copy is
+      # removed and the reading after the run counts them. No cache is
+      # restored there: rust-cache keys a cache on this variable too, and no
+      # job that sets it saves one. So every shard builds from cold, the
+      # floor before its run is for a cold build of every feature as well as
+      # the mutants, and the reading after the run holds one that needed
+      # more.
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       MUTANTS_BASELINE: ${{ needs.plan.outputs.mode == 'full' && 'skip' || 'run' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: stable
+      - uses: ./.github/actions/disk-headroom
+      # libclang and the system SQLite header: every feature on switches
+      # `sqlite-unbundled` on, whose bindings bindgen generates.
+      - uses: ./.github/actions/build-prerequisites
+      - uses: ./.github/actions/pinned-toolchain
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: mutants
@@ -168,15 +263,43 @@ jobs:
         with:
           name: mutants-plan
           path: plan
+      # The version the plan job installs.
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants@27.0.0 --locked
+      # The version the baseline job installs.
+      - name: Install cargo-nextest
+        run: cargo install cargo-nextest@0.9.151 --locked
+      # Each mutant is built and tested in the step below, in a copy of the
+      # tree, so the floor is read before all of it (scripts/check-disk-floor.sh
+      # says why): a build that fails for want of space reads as an
+      # unviable mutant, and a test that fails for it as a caught one.
+      - name: Room for shard ${{ matrix.shard }}
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: ./scripts/check-disk-floor.sh "cargo-mutants shard $SHARD, before the mutants" 20
       - name: Run shard ${{ matrix.shard }} of ${{ needs.plan.outputs.shards }}
         timeout-minutes: 300
+        env:
+          SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ needs.plan.outputs.shards }}
         run: |
           set -eu
-          install -m 0755 plan/cargo-mutants "$HOME/.cargo/bin/cargo-mutants"
           # shellcheck disable=SC2046
-          scripts/mutants-sweep.sh shard "${{ matrix.shard }}" "${{ needs.plan.outputs.shards }}" out $(cat plan/args)
-      - name: Upload shard ${{ matrix.shard }}
+          scripts/mutants-sweep.sh shard "$SHARD" "$SHARDS" out $(cat plan/args)
+      # Read again after the run, whatever its end: the target directory the
+      # mutants built into is still on disk, so this is close to the least
+      # room the run had. The summary judges a shard by its outcomes, not by
+      # its job, so a shard that came within 2 GiB of a full disk uploads
+      # none: it reads as lost and runs again, and a shard lost twice leaves
+      # the sweep red by number.
+      - name: Room left after shard ${{ matrix.shard }}
+        id: room
         if: always()
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: ./scripts/check-disk-floor.sh "cargo-mutants shard $SHARD, after the mutants" 2
+      - name: Upload shard ${{ matrix.shard }}
+        if: always() && steps.room.outcome == 'success'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: mutants-shard-${{ matrix.shard }}
@@ -184,9 +307,214 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
+  # A shard can be lost without a mutant being judged: cancelled at the job
+  # limit, or with its runner gone (one shard of a 197-shard sweep was
+  # cancelled after one minute while the other 196 passed). Such a shard
+  # is run once more in the same run, so that one lost runner does not
+  # cost the week's verdict; a shard lost twice leaves the sweep red, by
+  # name, and apart from any mutant it missed. A shard is lost when its
+  # artifact holds no whole outcomes.json (scripts/mutants-summary.py
+  # --lost), which covers a cancelled shard, a lost runner, a shard that
+  # came near a full disk (it uploads no outcomes) and a shard that failed
+  # for any other reason alike.
+  lost:
+    name: Shards that did not finish
+    needs: [plan, shard]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.total != '0' && needs.shard.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      lost: ${{ steps.find.outputs.lost }}
+      count: ${{ steps.find.outputs.count }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Fetch every shard
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: mutants-shard-*
+          path: shards
+          merge-multiple: true
+      - name: Find the shards that did not finish
+        id: find
+        env:
+          SHARDS: ${{ needs.plan.outputs.shards }}
+        run: |
+          set -eu
+          mkdir -p shards
+          lost=$(python3 scripts/mutants-summary.py shards --shards "$SHARDS" --lost)
+          count=$(printf '%s' "$lost" | jq length)
+          echo "Shards to run again: $lost"
+          echo "lost=$lost" >> "$GITHUB_OUTPUT"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+
+  retry:
+    name: cargo-mutants shard ${{ matrix.shard }}, run again
+    needs: [plan, baseline, lost]
+    # The job-level condition is read before the matrix, so an empty list
+    # skips the job instead of failing on a matrix with no values.
+    if: ${{ !cancelled() && needs.lost.result == 'success' && needs.lost.outputs.count != '0' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(needs.plan.outputs.width) }}
+      matrix:
+        shard: ${{ fromJSON(needs.lost.outputs.lost) }}
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      MUTANTS_BASELINE: ${{ needs.plan.outputs.mode == 'full' && 'skip' || 'run' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/disk-headroom
+      - uses: ./.github/actions/build-prerequisites
+      - uses: ./.github/actions/pinned-toolchain
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: mutants
+          save-if: false
+      - name: Fetch the plan
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: mutants-plan
+          path: plan
+      # The version the plan job installs.
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants@27.0.0 --locked
+      # The version the baseline job installs.
+      - name: Install cargo-nextest
+        run: cargo install cargo-nextest@0.9.151 --locked
+      - name: Room for shard ${{ matrix.shard }}, run again
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: ./scripts/check-disk-floor.sh "cargo-mutants shard $SHARD run again, before the mutants" 20
+      - name: Run shard ${{ matrix.shard }} of ${{ needs.plan.outputs.shards }} again
+        timeout-minutes: 300
+        env:
+          SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ needs.plan.outputs.shards }}
+        run: |
+          set -eu
+          # shellcheck disable=SC2046
+          scripts/mutants-sweep.sh shard "$SHARD" "$SHARDS" out $(cat plan/args)
+      # As after the first run: a second run that came within 2 GiB of a
+      # full disk uploads no outcomes, so the shard is lost in both runs.
+      - name: Room left after shard ${{ matrix.shard }}, run again
+        id: room
+        if: always()
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: ./scripts/check-disk-floor.sh "cargo-mutants shard $SHARD run again, after the mutants" 2
+      # An artifact name is used once in a run, so the second run's shard
+      # goes under a name of its own; inside it the directory is the same
+      # mutants-shard-K, which the summary reads from retry/.
+      - name: Upload shard ${{ matrix.shard }}, run again
+        if: always() && steps.room.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mutants-retry-${{ matrix.shard }}
+          path: out/
+          retention-days: 30
+          if-no-files-found: error
+
+  live:
+    # The live-store modules, judged with the store up. One shard, with its
+    # own baseline in every mode: a Valkey that does not answer fails the
+    # baseline, and the job with it, instead of passing every mutant as
+    # missed. The job judges itself with the same summary script and the same
+    # pull-request gate as the shards; the summary job below refuses a sweep
+    # in which it did not succeed.
+    name: cargo-mutants, live Valkey
+    needs: plan
+    if: needs.plan.result == 'success' && needs.plan.outputs.live_total != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    services:
+      # The image the Test Suite job of ci.yml runs its Valkey tests on,
+      # pinned by the digest of its multi-arch index. The digest is the one
+      # the registry served for the tag `valkey/valkey:latest`, and
+      # the tag is kept for the reader: the digest is what runs. Moving the
+      # pin is a deliberate edit that reads the new digest from the registry,
+      # here and in ci.yml together.
+      valkey:
+        image: valkey/valkey:latest@sha256:3add1a336a920ea54770a001ab6feb3da5fceea96a40373a3a2cd469b815f0b7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      VALKEY_URL: redis://localhost:6379
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/disk-headroom
+      - uses: ./.github/actions/pinned-toolchain
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: mutants
+          save-if: false
+      - name: Fetch the plan
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: mutants-plan
+          path: plan
+      # The version the plan job installs.
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants@27.0.0 --locked
+      # The version the baseline job installs.
+      - name: Install cargo-nextest
+        run: cargo install cargo-nextest@0.9.151 --locked
+      - name: Room for the live-store mutants
+        run: ./scripts/check-disk-floor.sh "cargo-mutants live Valkey, before the mutants" 20
+      - name: Run the live-store mutants
+        timeout-minutes: 300
+        run: |
+          set -eu
+          # shellcheck disable=SC2046
+          scripts/mutants-sweep.sh live out $(cat plan/args)
+      # Read again after the run, whatever its end. The summary judges this
+      # job by its result, so a run that came within 2 GiB of a full disk
+      # fails here by name and is not judged.
+      - name: Room left after the live-store mutants
+        if: always()
+        run: ./scripts/check-disk-floor.sh "cargo-mutants live Valkey, after the mutants" 2
+      - name: Judge the live-store mutants and refuse a blind run
+        env:
+          MODE: ${{ needs.plan.outputs.mode }}
+          LIVE_TOTAL: ${{ needs.plan.outputs.live_total }}
+        run: |
+          set -eu
+          gate=""
+          if [ "$MODE" = "in-diff" ]; then
+            gate="--fail-on-missed"
+          fi
+          python3 scripts/mutants-summary.py out \
+            --shards 1 \
+            --expected-total "$LIVE_TOTAL" \
+            $gate
+      - name: Upload the live-store outcomes
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          # Not `mutants-shard-*`: the summary job merges every artifact of
+          # that pattern into one directory, and this one holds a
+          # `mutants-shard-0` of its own.
+          name: mutants-live-valkey
+          path: out/
+          retention-days: 30
+          if-no-files-found: error
+
   summary:
     name: Mutation summary
-    needs: [plan, baseline, shard]
+    needs: [plan, baseline, shard, lost, retry, live]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -195,23 +523,46 @@ jobs:
         with:
           persist-credentials: false
       - name: Refuse a sweep whose jobs did not all succeed
+        env:
+          PLAN: ${{ needs.plan.result }}
+          BASELINE: ${{ needs.baseline.result }}
+          LOST: ${{ needs.lost.result }}
+          LIVE: ${{ needs.live.result }}
+          MODE: ${{ needs.plan.outputs.mode }}
+          TOTAL: ${{ needs.plan.outputs.total }}
+          LIVE_TOTAL: ${{ needs.plan.outputs.live_total }}
         run: |
           set -eu
-          if [ "${{ needs.plan.result }}" != "success" ]; then
-            echo "::error::the plan job ended '${{ needs.plan.result }}': nothing was measured."
+          if [ "$PLAN" != "success" ]; then
+            echo "::error::the plan job ended '$PLAN': nothing was measured."
             exit 1
           fi
-          if [ "${{ needs.plan.outputs.total }}" = "0" ]; then
-            echo "No mutants in the diff; nothing to measure."
+          # The live-store job runs when its modules have mutants in scope
+          # and is skipped when they have none. Any other end is a part of
+          # the sweep that was not measured, or one with a survivor.
+          live="$LIVE"
+          if [ "$LIVE_TOTAL" = "0" ] && [ "$live" = "skipped" ]; then
+            live=success
+          fi
+          if [ "$live" != "success" ]; then
+            echo "::error::the live-store job ended '$live': its modules were not judged, or a mutant in them survived."
+            exit 1
+          fi
+          if [ "$TOTAL" = "0" ]; then
+            echo "No mutants in the diff outside the live-store modules; nothing more to measure."
             exit 0
           fi
-          baseline="${{ needs.baseline.result }}"
-          if [ "${{ needs.plan.outputs.mode }}" = "in-diff" ] && [ "$baseline" = "skipped" ]; then
+          baseline="$BASELINE"
+          if [ "$MODE" = "in-diff" ] && [ "$baseline" = "skipped" ]; then
             baseline=success
           fi
-          for job in "baseline:$baseline" "shard:${{ needs.shard.result }}"; do
+          # The shards and their second runs are judged from their outcomes
+          # below, each by number: a shard job that failed is a lost shard
+          # if its outcomes are not whole, and is named there. The job that
+          # finds the lost shards must have run for that judgement to stand.
+          for job in "baseline:$baseline" "lost:$LOST"; do
             if [ "${job#*:}" != "success" ]; then
-              echo "::error::the ${job%%:*} job(s) ended '${job#*:}': the sweep is incomplete, so its kill rate is not a measurement."
+              echo "::error::the ${job%%:*} job ended '${job#*:}': the sweep is incomplete, so its kill rate is not a measurement."
               exit 1
             fi
           done
@@ -222,17 +573,30 @@ jobs:
           pattern: mutants-shard-*
           path: shards
           merge-multiple: true
-      - name: Merge the shards and refuse a blind sweep
+      - name: Fetch the shards run again
+        if: needs.plan.outputs.total != '0' && needs.retry.result != 'skipped'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: mutants-retry-*
+          path: retry
+          merge-multiple: true
+      - name: Merge the shards, name the lost ones apart from the missed mutants
         if: needs.plan.outputs.total != '0'
+        env:
+          MODE: ${{ needs.plan.outputs.mode }}
+          SHARDS: ${{ needs.plan.outputs.shards }}
+          TOTAL: ${{ needs.plan.outputs.total }}
         run: |
           set -eu
           gate=""
-          if [ "${{ needs.plan.outputs.mode }}" = "in-diff" ]; then
+          if [ "$MODE" = "in-diff" ]; then
             gate="--fail-on-missed"
           fi
+          mkdir -p retry
           python3 scripts/mutants-summary.py shards \
-            --shards "${{ needs.plan.outputs.shards }}" \
-            --expected-total "${{ needs.plan.outputs.total }}" \
+            --shards "$SHARDS" \
+            --expected-total "$TOTAL" \
+            --retry retry \
             $gate
       - name: Upload the merged outcomes
         if: always() && needs.plan.outputs.total != '0'

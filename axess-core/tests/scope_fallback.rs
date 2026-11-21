@@ -2,7 +2,7 @@
 //! Multi-tenant factor-scope resolution: user → tenant → system lookup
 //! chain through `AuthnService::verify_factor`.
 
-mod common;
+use axess_core::testing::fixtures as common;
 
 use axess_core::authn::AuditContext;
 use axess_core::authn::{
@@ -19,7 +19,9 @@ use common::{password_config, password_method, test_tenant, test_user, tid, uid}
 /// Factor config at user scope should be found first.
 #[tokio::test]
 async fn user_scope_takes_priority() {
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new()
@@ -37,7 +39,10 @@ async fn user_scope_takes_priority() {
         .with_factor(AuthnScope::System, password_config("system-password"))
         .with_method(&uid("u1"), password_method());
 
-    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
+    let service = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
+        .build()
+        .with_audit_context(AuditContext::default());
     let session = test_session();
 
     service
@@ -58,7 +63,9 @@ async fn user_scope_takes_priority() {
 /// When user scope has no config, tenant scope should resolve.
 #[tokio::test]
 async fn tenant_scope_fallback() {
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new()
@@ -68,7 +75,10 @@ async fn tenant_scope_fallback() {
         )
         .with_method(&uid("u1"), password_method());
 
-    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
+    let service = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
+        .build()
+        .with_audit_context(AuditContext::default());
     let session = test_session();
 
     service
@@ -88,14 +98,19 @@ async fn tenant_scope_fallback() {
 /// Full chain: user miss → tenant miss → system hit.
 #[tokio::test]
 async fn user_tenant_system_fallback_chain() {
+    let clock = common::test_clock();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new()
         .with_factor(AuthnScope::System, password_config("system-password"))
         .with_method(&uid("u1"), password_method());
 
-    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
+    let service = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
+        .build()
+        .with_audit_context(AuditContext::default());
     let session = test_session();
 
     service

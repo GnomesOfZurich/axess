@@ -22,7 +22,7 @@ Axess is a session-based multi-factor authentication and Cedar Policy authorizat
 
 ```toml
 [dependencies]
-axess = { version = "0.19.0", features = ["sqlite", "authz", "testing"] }
+axess = { version = "0.20.0", features = ["sqlite", "authz", "testing"] }
 axum = "0.8"
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
 tokio = { version = "1", features = ["full"] }
@@ -52,12 +52,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // and `docs/identity/store.md`.
     let backend = InMemoryBackend::new()
         .with_default_tenant("default", "Default tenant")
-        .with_user_password("alice", "default", "Gnomes2+");
+        .with_user_password("alice", "default", "Sample2+");
     // One registry for the service (it records every login) and the session
     // layer (it ends a revoked session on every route). Use the Valkey
     // registry for more than one instance.
     let registry = MemorySessionRegistry::new();
-    let _service = Arc::new(
+    let service = Arc::new(
         AuthnService::builder_from_backend(backend)
             .with_registry(registry.clone())
             .build(),
@@ -67,8 +67,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let signing_key: [u8; 32] = std::fs::read("/run/secrets/axess-signing-key")?
         .try_into()
         .map_err(|_| "signing key must be exactly 32 bytes")?;
-    let session_layer = SessionLayer::new(session_store, signing_key, registry.handle())
-        .with_ttl(Duration::from_secs(86400));
+    // The service's sink records each session the layer ends by itself
+    // (an age cap, a registry entry gone) as an audit row.
+    let session_layer = SessionLayer::new(
+        session_store,
+        signing_key,
+        registry.handle(),
+        service.session_end_audit(),
+    )
+    .with_ttl(Duration::from_secs(86400));
 
     let app = Router::new()
         .route("/", get(|| async { "hello" }))
@@ -112,7 +119,7 @@ In Axess, `PolicyStore` is loaded once at startup and is `Send + Sync`. Entity s
 
 ## Workspace layout
 
-10 library crates plus 6 example crates (see [`examples/README.md`](examples/README.md) for which to read first). See [`docs/intro/architecture.md`](docs/intro/architecture.md) for the dependency diagram and "what belongs where" rationale.
+10 library crates plus 7 example crates (see [`examples/README.md`](examples/README.md) for which to read first). See [`docs/intro/architecture.md`](docs/intro/architecture.md) for the dependency diagram and "what belongs where" rationale.
 
 | Crate | Role |
 |---|---|
@@ -122,7 +129,7 @@ In Axess, `PolicyStore` is loaded once at startup and is `Send + Sync`. Entity s
 | `axess-macros` | `require_authn!`, `require_partial_authn!` |
 | `axess-identity` | Typed IDs, `Principal { Human, Workload }` |
 | `axess-cache` | TTL+LRU cache with single-flight, DST-friendly |
-| `axess-clock` | `Clock` / `MockClock` for DST |
+| `axess-clock` | `Clock` / `MockClock` for DST, and the time types every crate holds: `Timestamp`, `SignedDuration`, `Until`, `UtcDate` |
 | `axess-rng` | `SecureRng` / `MockRng` for DST |
 | `axess-events` | rkyv-serialisable audit-event payloads |
 | `axess-strings` | `ShortString`, an immutable identifier: inline, `&'static str`, or shared |
@@ -167,7 +174,7 @@ axess covers a long list of concerns; the table below points at the cookbook doc
 | OAuth 2.0 / OIDC | `examples/oauth/` |
 | FAPI 2.0 (PAR / DPoP / JARM) | `examples/fapi/` |
 | OpenID Foundation RP conformance run | [`docs/factors/conformance.md`](docs/factors/conformance.md) |
-| FIDO2 / WebAuthn (passkeys) | [`docs/factors/fido2.md`](docs/factors/fido2.md) |
+| FIDO2 / WebAuthn (passkeys) | [`docs/factors/fido2.md`](docs/factors/fido2.md), `examples/fido2/` |
 | Workload identity (SPIFFE, K8s SA, GitHub OIDC) | [`docs/workload-identity/README.md`](docs/workload-identity/README.md) |
 | Cloud STS exchange (AWS / GCP / Azure) | [`docs/workload-identity/cloud-sts.md`](docs/workload-identity/cloud-sts.md) |
 | Cloud walkthroughs: pipeline to service to secret store | [`docs/workload-identity/azure.md`](docs/workload-identity/azure.md), [`docs/workload-identity/aws.md`](docs/workload-identity/aws.md) |
@@ -189,7 +196,7 @@ For the complete docs index, see [`docs/README.md`](docs/README.md).
 
 ```toml
 [dependencies]
-axess = { version = "0.19.0", features = ["sqlite", "authz"] }
+axess = { version = "0.20.0", features = ["sqlite", "authz"] }
 ```
 
 To track the development branch instead of a release:
@@ -209,9 +216,12 @@ Names are kebab-case throughout. The `axess` facade's default features are `["au
 |---|---|---|
 | `authz` | Cedar Policy authorization, `PolicyStore`, entity builders | yes |
 | `device` | First-class `Device` aggregate + binding factors | yes |
+| `device-keys` | Device keys: a session and its device held to a key the client cannot export (needs a `jwt-*` backend) | no |
 | `memory` | `MemorySessionStore` / `MemorySessionRegistry` / `MemoryStore<K, V>` (dev/test) | no |
-| `testing` | Test doubles + fixtures (`MockIdentityStore`, `MockClock`, `LocalIdpFixture`, …). Implies `memory`. | no |
+| `testing` | Test doubles + fixtures (`MockIdentityStore`, `MockClock`, `LocalIdpFixture`, …). Implies `memory`. A release build with it on is refused unless `allow-testing-in-release` is on too | no |
+| `allow-testing-in-release` | The named opt-out for the release-build guard on `testing`: for a benchmark, or a test run in release mode | no |
 | `sqlite` | SQLite session store with optional AES-256-GCM encryption | no |
+| `sqlite-unbundled` | The `sqlite` stores linked to the system's SQLite library instead of the source sqlx bundles; enable it in place of `sqlite` | no |
 | `postgres` | PostgreSQL session store with optional AES-256-GCM encryption | no |
 | `mysql` | MySQL / MariaDB session store with optional AES-256-GCM encryption | no |
 | `valkey` | Valkey/Redis session store and registry with optional encryption | no |
@@ -238,6 +248,8 @@ Names are kebab-case throughout. The `axess` facade's default features are `["au
 | `workload-id` | Umbrella over the SPIFFE / mTLS / outbound surfaces below | no |
 | `outbound-mtls` | axess presenting an mTLS identity to downstream services | no |
 | `outbound-oauth` | axess as an OAuth client to downstream services | no |
+| `spire` | SPIFFE Workload API client: X.509 and JWT SVIDs and trust bundles from a local SPIRE agent, rotated by a watcher on the injected clock; plugs into `outbound-mtls` and `jwt`. In no umbrella | no |
+| `client-assertion-rsa` | RSA client keys for `private_key_jwt` where they would sign in `rsa` 0.9 (RUSTSEC-2023-0071): on `jwt-rust-crypto`, or where a crypto provider was installed before axess's aws-lc one | no |
 | `aws-sts` | AWS STS exchange (federated workload identity → AWS creds) | no |
 | `gcp-wif` | GCP Workload Identity Federation exchange | no |
 | `azure-fic` | Azure Federated Identity Credentials exchange | no |
@@ -249,9 +261,15 @@ For JWT-bearer workload identity from any non-SPIFFE issuer (GitHub Actions OIDC
 
 | Feature | What it enables | Default |
 |---|---|---|
-| `delegated` | On-behalf-of (OBO) access + token exchange | no |
-| `local-idp` | `LocalIdpFixture` in-process IdP for tests / on-host issuance | no |
-| `audit-archive-fs` | Filesystem-backed `AuditArchiver` reference implementation | no |
+| `delegated-stored` | On-behalf-of (OBO) access with a persisted refresh token (authorization code with PKCE) | no |
+| `delegated-stored-encrypted` | `delegated-stored`, with a decorator that encrypts any delegated-credential store at rest (AES-256-GCM) | no |
+| `delegated-exchange` | On-behalf-of access by RFC 8693 token exchange, per request | no |
+| `delegated` | Umbrella: the three `delegated-*` features | no |
+| `local-idp` | `LocalIdpFixture` in-process IdP for tests / on-host issuance, with ES256 keys | no |
+| `local-idp-rsa` | RSA keys for the local IdP; compiles `rsa` 0.9 (RUSTSEC-2023-0071) | no |
+| `audit-archive-fs` | `FilesystemAuditArchiver`, the filesystem-backed reference `AuditArchiver`, under `axess::authn` | no |
+
+The audit archive types (`AuditArchiver`, `AuditRetentionLoop`, `AuditRetentionPolicy` and the rest) are re-exported under `axess::authn` with every feature set, and `audit-archive-fs` adds the filesystem-backed archiver beside them.
 
 #### Authz cache decorator
 
@@ -266,20 +284,16 @@ This is an opt-in alternative to the in-process `EntityCache` for the Cedar enti
 | Feature | What it enables | Default |
 |---|---|---|
 | `request-id` | UUID-based request ID injected into response headers | no |
-| `trace-id` | W3C Trace Context propagation via headers | no |
+| `trace-context` | W3C Trace Context propagation via headers | no |
 | `service-secret` | Shared-secret check for internal machine callers that cannot hold a key: signed requests (preferred) or a presented secret. The weakest machine credential; prefer `jwt` or `mtls` | no |
-| `accept-client-id` | `X-Client-ID` header extraction | no |
+| `accept-client-id` | With `request-id`: a well-formed request id the client sent is kept, where otherwise every request gets one the server generated | no |
 | `ws` | WebSocket session middleware | no |
 
-#### Umbrella
+There is no umbrella over every feature: the session backends are alternatives, so a deployment picks one and adds the capabilities it uses. `workload-id`, `cloud-sts` and `delegated` are the umbrellas there are. The tables above list every feature of the `axess` facade, and `scripts/check-docsrs-features.sh` holds them to its manifest.
 
-| Feature | What it enables | Default |
-|---|---|---|
-| `full` | Discoverability umbrella: turns on the common combinations | no |
+`axess-factors` has its own default feature flags: `password` (Argon2id), `totp` (RFC 6238), `hotp` (RFC 4226), `email_otp`, `recovery_code`. The rest of its surface (`fido2`, `ldap`, `mtls`, `jwt`, `oidc`, `oauth`, `fapi`, `bearer`, `outbound-oauth`, federation adapters) is opt-in. Most are wired through the matching flags on the `axess` facade; **`bearer` is not**: there is no `axess/bearer` feature, so an adopter who wants `validate_bearer_token` or `BearerTokenLayer` depends on `axess-factors` directly.
 
-`axess-factors` has its own default feature flags: `password` (Argon2id), `totp` (RFC 6238), `hotp` (RFC 4226), `email_otp`. The rest of its surface (`fido2`, `ldap`, `mtls`, `jwt`, `oidc`, `oauth`, `fapi`, `bearer`, `outbound-oauth`, federation adapters) is opt-in. Most are wired through the matching flags on the `axess` facade; **`bearer` is not**: there is no `axess/bearer` feature, so an adopter who wants `validate_bearer_token` or `BearerTokenLayer` depends on `axess-factors` directly.
-
-**The JWT crypto backend is chosen, not inherited.** `jsonwebtoken` takes its provider from a cargo feature, so anything enabling `jwt` must also enable exactly one of `jwt-aws-lc` (aws-lc-rs: FIPS-capable, needs a C toolchain and NASM on Windows) or `jwt-rust-crypto` (pure Rust, builds anywhere). Enabling neither is a compile error that says so. Enabling both is not: axess installs whichever backend is compiled in, preferring aws-lc-rs, because feature unification across crates is not something an adopter can always avoid and `jsonwebtoken` would otherwise panic on the first verification. Signing goes through `jsonwebtoken::encode` directly, so code that signs calls `axess_factors::jwt::ensure_crypto_provider` itself.
+**The JWT crypto backend is chosen, not inherited.** `jsonwebtoken` takes its provider from a cargo feature, so anything enabling `jwt` must also enable exactly one of `jwt-aws-lc` (aws-lc-rs: FIPS-capable, needs a C toolchain and NASM on Windows) or `jwt-rust-crypto` (pure Rust, builds anywhere). Enabling neither is a compile error that says so. Enabling both is not: axess installs whichever backend is compiled in, preferring aws-lc-rs, because feature unification across crates is not something an adopter can always avoid and `jsonwebtoken` would otherwise panic on the first verification. The first `jsonwebtoken` operation in a process fixes the provider for good, and with both backends one that comes before any install fixes `jsonwebtoken`'s fallback, which panics on that operation and every later one, axess's own included. So an application's own code that signs or verifies with `jsonwebtoken` goes through `axess::jwt::encode`, `decode`, `sign` and `verify` (also in `axess_factors::jwt`), which settle the provider first, or calls `axess::jwt::ensure_crypto_provider` before its first operation. On `jwt-rust-crypto` an RSA signature runs in `rsa` 0.9 (RUSTSEC-2023-0071), so axess signs with an RSA key only where a feature named for it chose that: `local-idp-rsa` for the local IdP, `client-assertion-rsa` for a `private_key_jwt` client. Without `client-assertion-rsa`, a `private_key_jwt` client signs with an RSA key only where the provider `jsonwebtoken` signs with is the aws-lc one axess installed: with both backends compiled, a provider the application or another crate installed first may be RustCrypto's, and axess cannot read which one it is, so it refuses.
 
 ---
 

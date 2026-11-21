@@ -49,15 +49,9 @@ where
         kind: &FactorKind,
         session: &AuthSession,
     ) -> Result<GuessSlot, AuthnError<I::Error>> {
-        let policy = self.inner.identity.lockout_policy_for_tenant(tenant_id);
+        let policy = self.lockout_policy(tenant_id);
         let reserved = self.inner.identity.reserve_attempt(user_id, &policy).await;
-        let fallback_until = || {
-            policy.duration.and_then(|d| {
-                chrono::Duration::from_std(d)
-                    .ok()
-                    .map(|d| self.inner.clock.now() + d)
-            })
-        };
+        let fallback_until = || policy.lockout_until(self.inner.clock.now());
         match reserved {
             Ok(Some(count)) => Ok(GuessSlot::Reserved(count)),
             // At the limit. A session on a device the account has used is let
@@ -68,8 +62,13 @@ where
             }
             Ok(None) => {
                 self.inner.metrics.auth_flow.account_locked();
-                self.record_locked_attempt_audit(user_id, tenant_id, Some(kind.clone()), session)
-                    .await?;
+                self.record_locked_attempt_audit(
+                    user_id,
+                    tenant_id,
+                    Some(kind.clone()),
+                    session.session_key().await,
+                )
+                .await?;
                 let until = match self.derived_lockout(user_id, tenant_id).await? {
                     Some(lock) => lock.until,
                     None => fallback_until(),

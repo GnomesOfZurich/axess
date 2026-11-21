@@ -4,7 +4,7 @@
 #![cfg(all(feature = "testing", feature = "authz"))]
 
 use axess::authn::AuthnService;
-use axess::authz::{PolicyStore, RequestEntityProvider};
+use axess::authz::{AuthzInstallation, PolicyStore, RequestEntityProvider};
 use axess::testing::AuthSessionTestExt;
 use axess::testing::{MockFactorStore, MockIdentityStore};
 use axess::{
@@ -13,7 +13,7 @@ use axess::{
 };
 use axess_core::authz::AuthzError;
 use axum::{
-    Extension, Router,
+    Router,
     body::Body,
     http::{Request, StatusCode, header},
     routing::get,
@@ -46,10 +46,10 @@ struct Provider;
 impl RequestEntityProvider for Provider {
     fn entities_for<'a>(
         &'a self,
-        _session: &'a AuthSession,
+        _: &'a AuthSession,
         principal: &'a EntityUid,
         resource: &'a EntityUid,
-        _action: &'a EntityUid,
+        _: &'a EntityUid,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Entities, AuthzError>> + Send + 'a>,
     > {
@@ -76,21 +76,29 @@ struct App {
 }
 
 fn app() -> App {
-    let registry = MemorySessionRegistry::new();
-    let svc = AuthnService::builder(MockIdentityStore::new(), MockFactorStore::new())
-        .with_registry(registry.clone())
-        .build();
+    let clock = axess::testing::MockClock::at_reference();
+    let registry = MemorySessionRegistry::new().with_clock(std::sync::Arc::new(clock.clone()));
+    let svc = AuthnService::builder(
+        MockIdentityStore::new().with_clock(clock.clone()),
+        MockFactorStore::new(),
+    )
+    .with_clock(clock.clone())
+    .with_registry(registry.clone())
+    .build();
     let alice = axess::testing::user("alice").to_string();
     let policy = format!(
         r#"permit (principal == App::User::"{alice}", action == App::Action::"Manage", resource == App::Platform::"global");"#
     );
     let store = Arc::new(PolicyStore::from_text(&policy, SCHEMA).expect("policy"));
-    let provider: Arc<dyn RequestEntityProvider> = Arc::new(Provider);
+    let installation = AuthzInstallation::new(store, Arc::new(Provider), None)
+        .expect("the policy does not read `context`");
     let reg = registry.clone();
     let session_layer = SessionLayer::without_registry_insecure(
-        MemorySessionStore::new(),
+        MemorySessionStore::new().with_clock(std::sync::Arc::new(clock.clone())),
         axess::testing::test_key(42),
+        std::sync::Arc::new(axess::session::UnrecordedSessionEnds),
     )
+    .with_clock(clock.clone())
     .with_ttl(Duration::from_secs(3600))
     .with_secure(false);
     let app = Router::new()
@@ -110,15 +118,18 @@ fn app() -> App {
                 let reg = reg.clone();
                 async move {
                     let user = axess::testing::user("alice");
-                    s.set_authenticated(user, axess::testing::tenant("t1"), chrono::Utc::now())
-                        .await;
-                    reg.register(&user, &s.session_id().await).await.unwrap();
+                    s.set_authenticated(
+                        user,
+                        axess::testing::tenant("t1"),
+                        axess::testing::MockClock::reference_time(),
+                    )
+                    .await;
+                    reg.register(&user, &s.session_key().await).await.unwrap();
                     "in"
                 }
             }),
         )
-        .layer(Extension(store))
-        .layer(Extension(provider))
+        .layer(installation)
         .layer(session_layer);
     App { app, registry }
 }

@@ -8,16 +8,29 @@
 //! headers, the `jti` and the clock are decided in one place. Nothing here reads the wall clock or the system
 //! random source: the caller passes both, and a test injects a `MockClock`
 //! and a seeded RNG to reproduce an assertion byte for byte.
+//!
+//! An RSA key (`RS*`, `PS*`) signs only where the build chose it. Its
+//! signature runs in whichever `jsonwebtoken` crypto provider the process
+//! installed: in aws-lc-rs where axess installed that one, which it does on
+//! the `jwt-aws-lc` backend unless another provider was installed first,
+//! and otherwise possibly in `rsa` 0.9, whose private-key operations leak
+//! timing (RUSTSEC-2023-0071). So a signer for an RSA algorithm is refused
+//! when it is built, before its key is read, unless the
+//! `client-assertion-rsa` feature names that choice or axess's own aws-lc
+//! install is the one in place. `jsonwebtoken` offers no read of which
+//! provider another crate or the application installed, so a build that
+//! installs one itself before axess does, aws-lc included, is refused as
+//! well.
 
 use axess_clock::Clock;
 use axess_rng::SecureRng;
-use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use uuid::Builder as UuidBuilder;
 
-/// The default lifetime of one assertion, in seconds. RFC 7523 section 3
-/// wants it short; an IdP that sees an `exp` far in the future may refuse it.
+/// The default lifetime of one assertion. RFC 7523 section 3 wants it short;
+/// an IdP that sees an `exp` far in the future may refuse it.
 pub const DEFAULT_ASSERTION_TTL: Duration = Duration::from_secs(60);
 
 /// RFC 7523 client-assertion JWT body.
@@ -68,6 +81,23 @@ pub enum ClientAssertionError {
          not {0:?}"
     )]
     Symmetric(Algorithm),
+    /// An RSA algorithm (`RS*`, `PS*`) where its signature may run in
+    /// `rsa` 0.9, whose private-key operations leak timing
+    /// (RUSTSEC-2023-0071): a build without `jwt-aws-lc`, or one with it
+    /// where a `jsonwebtoken` crypto provider was installed before axess
+    /// installed aws-lc (by the application or another crate; which one
+    /// cannot be read back, so any). Refused before the key is read. Enable
+    /// `client-assertion-rsa` to choose it, build with `jwt-aws-lc` and leave
+    /// installing the provider to axess, or sign with `ES256`, `ES384` or
+    /// `EdDSA`.
+    #[error(
+        "{0:?} signs with an RSA key, which may run in rsa 0.9 (RUSTSEC-2023-0071): the build \
+         lacks jwt-aws-lc, or a jsonwebtoken crypto provider was installed before axess \
+         installed aws-lc. Enable the `client-assertion-rsa` feature to choose it, build with \
+         `jwt-aws-lc` and leave installing the provider to axess, or sign with ES256, ES384 \
+         or EdDSA"
+    )]
+    RsaNotChosen(Algorithm),
     /// The key does not sign under the algorithm (an EC key for `RS256`).
     #[error("the key does not sign under {algorithm:?}: {reason}")]
     KeyMismatch {
@@ -79,6 +109,23 @@ pub enum ClientAssertionError {
     /// Signing one assertion failed after the signer was built.
     #[error("signing the client assertion failed: {0}")]
     Signing(String),
+    /// The assertion lifetime is no time, or has a fraction of a second: the
+    /// `exp` it sets is a whole count of seconds after `iat` (RFC 7519
+    /// NumericDate), and an assertion is not accepted on or after its `exp`.
+    #[error(
+        "the assertion lifetime of {0:?} is refused: `assertion_ttl` is a whole, non-zero \
+         number of seconds, since `exp` is whole seconds after `iat`"
+    )]
+    AssertionTtl(Duration),
+}
+
+/// `ttl`, when an assertion can be given it: a whole, non-zero number of
+/// seconds.
+fn checked_ttl(ttl: Duration) -> Result<Duration, ClientAssertionError> {
+    if ttl.is_zero() || ttl.subsec_nanos() != 0 {
+        return Err(ClientAssertionError::AssertionTtl(ttl));
+    }
+    Ok(ttl)
 }
 
 /// How a `private_key_jwt` signer shapes its assertions, apart from the key
@@ -103,10 +150,17 @@ pub struct SignerSpec {
     /// FAPI profile.
     #[serde(default)]
     pub audience: Option<String>,
-    /// Lifetime of one assertion in seconds; by default
-    /// [`DEFAULT_ASSERTION_TTL`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub assertion_ttl_secs: Option<u64>,
+    /// Lifetime of one assertion, a whole, non-zero number of seconds; by
+    /// default [`DEFAULT_ASSERTION_TTL`].
+    /// [`from_spec`](ClientAssertionSigner::from_spec) refuses another.
+    /// Stored as a count of seconds under `assertion_ttl_secs`, as before.
+    #[serde(
+        rename = "assertion_ttl_secs",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::whole_seconds::option_u64_seconds"
+    )]
+    pub assertion_ttl: Option<Duration>,
 }
 
 impl SignerSpec {
@@ -120,7 +174,7 @@ impl SignerSpec {
             x5t_s256: None,
             x5t: None,
             audience: None,
-            assertion_ttl_secs: None,
+            assertion_ttl: None,
         }
     }
 }
@@ -172,6 +226,49 @@ fn is_asymmetric(algorithm: Algorithm) -> bool {
     )
 }
 
+/// Whether `algorithm` signs with an RSA key.
+fn is_rsa(algorithm: Algorithm) -> bool {
+    matches!(
+        algorithm,
+        Algorithm::RS256
+            | Algorithm::RS384
+            | Algorithm::RS512
+            | Algorithm::PS256
+            | Algorithm::PS384
+            | Algorithm::PS512
+    )
+}
+
+/// Whether this process signs with an RSA key: where `client-assertion-rsa`
+/// chose it whatever the provider, or where the provider in place is the
+/// aws-lc one axess installed.
+///
+/// The second half is read at run time, not from the build's features: a
+/// build that compiles `jwt-aws-lc` may still have another provider in
+/// place, installed by the application or another crate before axess
+/// installed its own, and with both backends compiled that one may be
+/// RustCrypto's, which signs RSA in `rsa` 0.9. Which provider is in place
+/// cannot be read back (see
+/// [`axess_installed_aws_lc`](crate::jwt::axess_installed_aws_lc)), so the
+/// answer is yes only where axess's own install is known to have taken,
+/// and no for every other provider, aws-lc installed by someone else
+/// included. Without `jwt-aws-lc` axess never installs aws-lc, so the
+/// question is not asked.
+fn rsa_signs() -> bool {
+    cfg!(feature = "client-assertion-rsa")
+        || (cfg!(feature = "jwt-aws-lc") && crate::jwt::axess_installed_aws_lc())
+}
+
+/// [`ClientAssertionError::RsaNotChosen`] for an RSA algorithm when
+/// `rsa_signs` is false; every other algorithm passes.
+fn check_rsa_choice(algorithm: Algorithm, rsa_signs: bool) -> Result<(), ClientAssertionError> {
+    if is_rsa(algorithm) && !rsa_signs {
+        Err(ClientAssertionError::RsaNotChosen(algorithm))
+    } else {
+        Ok(())
+    }
+}
+
 impl ClientAssertionSigner {
     /// A signer for `client_id` with `key` under `algorithm`, no `kid`, the
     /// default audience (see [`with_audience`](Self::with_audience)) and a
@@ -183,8 +280,11 @@ impl ClientAssertionSigner {
     /// # Errors
     ///
     /// [`ClientAssertionError::Symmetric`] for an algorithm that is not
-    /// asymmetric, and [`ClientAssertionError::KeyMismatch`] when the key
-    /// does not sign under it.
+    /// asymmetric, [`ClientAssertionError::RsaNotChosen`] for an RSA
+    /// algorithm the build did not choose or the installed crypto provider
+    /// does not sign safely (see the module documentation),
+    /// both before the key is used, and [`ClientAssertionError::KeyMismatch`]
+    /// when the key does not sign under it.
     pub fn new(
         client_id: impl Into<String>,
         key: EncodingKey,
@@ -193,6 +293,7 @@ impl ClientAssertionSigner {
         if !is_asymmetric(algorithm) {
             return Err(ClientAssertionError::Symmetric(algorithm));
         }
+        check_rsa_choice(algorithm, rsa_signs())?;
         let signer = Self {
             client_id: client_id.into(),
             key,
@@ -215,9 +316,11 @@ impl ClientAssertionSigner {
     ///
     /// # Errors
     ///
-    /// A [`ClientAssertionError`] (never containing key material) when the
-    /// text is not PEM, the label does not suit the algorithm, `algorithm`
-    /// is a symmetric one, or the key does not sign under it.
+    /// A [`ClientAssertionError`] (never containing key material) when
+    /// `algorithm` is a symmetric one or an RSA algorithm the build did not
+    /// choose or the installed provider does not sign safely (both before
+    /// the text is read), the text is not PEM, the label
+    /// does not suit the algorithm, or the key does not sign under it.
     pub fn from_pem(
         client_id: impl Into<String>,
         pem: &str,
@@ -226,6 +329,7 @@ impl ClientAssertionSigner {
         if !is_asymmetric(algorithm) {
             return Err(ClientAssertionError::Symmetric(algorithm));
         }
+        check_rsa_choice(algorithm, rsa_signs())?;
         let (label, der) = decode_pem(pem)?;
         let mismatch = |label: &str| ClientAssertionError::LabelMismatch {
             algorithm,
@@ -258,7 +362,9 @@ impl ClientAssertionSigner {
     ///
     /// # Errors
     ///
-    /// As [`from_pem`](Self::from_pem).
+    /// As [`from_pem`](Self::from_pem), and
+    /// [`ClientAssertionError::AssertionTtl`] for a lifetime that is no time
+    /// or has a fraction of a second.
     pub fn from_spec(
         client_id: impl Into<String>,
         pem: &str,
@@ -269,8 +375,8 @@ impl ClientAssertionSigner {
         signer.header.x5t_s256.clone_from(&spec.x5t_s256);
         signer.header.x5t.clone_from(&spec.x5t);
         signer.audience.clone_from(&spec.audience);
-        if let Some(secs) = spec.assertion_ttl_secs {
-            signer.ttl = Duration::from_secs(secs);
+        if let Some(ttl) = spec.assertion_ttl {
+            signer.ttl = checked_ttl(ttl)?;
         }
         Ok(signer)
     }
@@ -314,10 +420,15 @@ impl ClientAssertionSigner {
     }
 
     /// Change how long one assertion lives (default 60 seconds).
-    #[must_use]
-    pub fn with_assertion_ttl(mut self, ttl: Duration) -> Self {
-        self.ttl = ttl;
-        self
+    ///
+    /// # Errors
+    ///
+    /// [`ClientAssertionError::AssertionTtl`] for a lifetime that is no time
+    /// or has a fraction of a second: the `exp` it sets is a whole count of
+    /// seconds after `iat`.
+    pub fn with_assertion_ttl(mut self, ttl: Duration) -> Result<Self, ClientAssertionError> {
+        self.ttl = checked_ttl(ttl)?;
+        Ok(self)
     }
 
     /// The client id the assertions name as `iss` and `sub`.
@@ -353,7 +464,7 @@ impl ClientAssertionSigner {
         rng.fill_bytes(&mut jti);
         self.sign(
             self.audience.as_deref().unwrap_or(default_audience),
-            clock.now().timestamp(),
+            clock.now().unix_seconds(),
             jti,
         )
         .map_err(ClientAssertionError::Signing)
@@ -374,11 +485,7 @@ impl ClientAssertionSigner {
                 .into_uuid()
                 .to_string(),
         };
-        // The first jsonwebtoken sign or verify in a process fixes its crypto
-        // provider; under feature unification that first call must be ours,
-        // or the crate's own fallback panics on every later use.
-        crate::jwt::ensure_crypto_provider();
-        encode(&self.header, &claims, &self.key).map_err(|e| e.to_string())
+        crate::jwt::encode(&self.header, &claims, &self.key).map_err(|e| e.to_string())
     }
 }
 
@@ -446,8 +553,8 @@ fn der_take(bytes: &[u8], tag: u8) -> Option<(&[u8], &[u8])> {
 /// PKCS#1 `RSAPrivateKey`.
 fn pkcs8_private_key(der: &[u8]) -> Option<&[u8]> {
     let (info, _) = der_take(der, 0x30)?;
-    let (_version, rest) = der_take(info, 0x02)?;
-    let (_algorithm, rest) = der_take(rest, 0x30)?;
+    let (_, rest) = der_take(info, 0x02)?;
+    let (_, rest) = der_take(rest, 0x30)?;
     der_take(rest, 0x04).map(|(key, _)| key)
 }
 

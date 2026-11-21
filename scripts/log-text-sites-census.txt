@@ -1,0 +1,67 @@
+# The raw log fields of caller-text names that stay raw, each with its
+# reason (scripts/check-log-text-sites.sh). One entry per site: COUNT, REASON,
+# PATH, NAME and EXPRESSION, separated by tabs; COUNT is how many identical
+# fields the file holds. The reasons:
+#   typed-id           a TenantId or UserId: a UUID, written hyphenated
+#   validated-newtype  a TrustDomain or WorkloadId: its characters are
+#                      checked when it is parsed ([a-z0-9._-] and the path's)
+#   http-type          an http::Method, which refuses control characters
+#                      and bytes past ASCII
+#   adopter-config     text the adopter's own code or configuration set: a
+#                      file path, a profile value, a configured issuer, a
+#                      provider registered at construction, the route
+#                      template a router matched
+#   escaped-code       an error code log_safe_error_code already escaped
+#   cedar-uid          a Cedar EntityUid built from data, whose display
+#                      quotes and escapes the id
+#   fixed-label        a static string the code chose
+
+1	adopter-config	axess-core/src/authn/audit/archive/filesystem.rs	path	%path.display()
+1	adopter-config	axess-core/src/authn/audit/archive/filesystem/sidecar.rs	path	%path.display()
+1	fixed-label	axess-core/src/authn/service/account/admin.rs	action	%action_label
+1	typed-id	axess-core/src/authn/service/account/impersonation.rs	tenant	%tenant_id
+1	typed-id	axess-core/src/authn/service/account/password_reset.rs	tenant	%user.tenant_id
+1	typed-id	axess-core/src/authn/service/account/signup.rs	tenant	%user.tenant_id
+1	adopter-config	axess-core/src/authn/service/builder/profile_floor.rs	value	%below.found
+1	typed-id	axess-core/src/authn/service/factor_pipeline.rs	tenant	%tenant_id
+1	typed-id	axess-core/src/authn/service/factor_pipeline/throttle.rs	tenant	%tenant_id
+3	typed-id	axess-core/src/authn/service/login/tenant_admission.rs	tenant	%tenant.id
+2	typed-id	axess-core/src/authn/service/provider_reload/client_ownership.rs	tenant	%tenant
+1	typed-id	axess-core/src/authn/service/provider_reload/install.rs	tenant	%tenant
+1	cedar-uid	axess-core/src/authz/audit.rs	action	%action
+1	cedar-uid	axess-core/src/authz/audit.rs	principal	%principal
+1	fixed-label	axess-core/src/authz/audit.rs	reason	%reason
+1	cedar-uid	axess-core/src/authz/audit.rs	resource	%resource
+5	cedar-uid	axess-core/src/authz/store.rs	action	%subject.action
+5	cedar-uid	axess-core/src/authz/store.rs	principal	%subject.principal
+5	cedar-uid	axess-core/src/authz/store.rs	resource	%subject.resource
+1	http-type	axess-core/src/device/resolver.rs	method	%parts.method
+1	adopter-config	axess-core/src/device/resolver.rs	route	%crate::logged_route::logged_route(&parts.extensions)
+3	typed-id	axess-core/src/device/storage/valkey/apply.rs	tenant	%tenant
+3	typed-id	axess-core/src/device/storage/valkey/read.rs	tenant	%tenant
+1	typed-id	axess-core/src/federation/backchannel_logout/provider_lookup.rs	tenant	%b.tenant
+1	typed-id	axess-core/src/federation/backchannel_logout/provider_lookup.rs	tenant	%tenant
+1	adopter-config	axess-core/src/federation/oauth.rs	provider_name	%name
+1	typed-id	axess-core/src/federation/oauth_tenant/directory.rs	tenant	%record.tenant_id
+1	typed-id	axess-core/src/federation/oauth_tenant/directory/register.rs	tenant	%record.tenant_id
+1	typed-id	axess-core/src/federation/oauth_tenant/directory/register.rs	tenant	%tenant
+1	typed-id	axess-core/src/federation/oauth_tenant/ownership.rs	tenant	%claim.record.tenant_id
+1	adopter-config	axess-core/src/middleware/csrf.rs	route	%crate::logged_route::logged_route(req.extensions())
+4	http-type	axess-core/src/middleware/csrf/presented.rs	method	%method
+3	adopter-config	axess-core/src/middleware/csrf/presented.rs	route	%crate::logged_route::logged_route(req.extensions())
+1	fixed-label	axess-core/src/middleware/csrf/presented.rs	reason	%reason
+1	adopter-config	axess-core/src/session/layer/service.rs	route	%crate::logged_route::logged_route(req.extensions())
+1	validated-newtype	axess-core/src/workload/spire/jwks.rs	trust_domain	%bundle.trust_domain()
+1	validated-newtype	axess-core/src/workload/spire/resolver.rs	expected	%self.expected_trust_domain
+1	validated-newtype	axess-core/src/workload/spire/resolver.rs	presented	%validated.trust_domain()
+1	validated-newtype	axess-core/src/workload/spire/tls.rs	spiffe_id	%svid.spiffe_id()
+1	adopter-config	axess-factors/src/bearer.rs	issuer	%issuer.issuer
+1	validated-newtype	axess-factors/src/jwt/svid.rs	expected	%self.expected_trust_domain
+1	validated-newtype	axess-factors/src/jwt/svid.rs	presented	%token_trust_domain
+1	validated-newtype	axess-factors/src/mtls.rs	expected	%self.expected_trust_domain
+1	validated-newtype	axess-factors/src/mtls.rs	presented	%comps.trust_domain
+1	escaped-code	axess-factors/src/oauth/provider/device_flow.rs	error_code	%error_code
+1	escaped-code	axess-factors/src/oauth/provider/sender_constrained.rs	error_code	%error_code
+2	cedar-uid	axess-macros/src/authz_macro.rs	action	%action_uid_parsed
+2	cedar-uid	axess-macros/src/authz_macro.rs	principal	%principal
+2	cedar-uid	axess-macros/src/authz_macro.rs	resource	%resource

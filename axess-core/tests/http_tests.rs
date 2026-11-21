@@ -7,7 +7,9 @@
 //! `MemorySessionStore` for round-tripping. Without the feature, the test
 //! binary compiles as empty rather than failing on missing types.
 
-#![cfg(feature = "memory")]
+#![cfg(all(feature = "memory", feature = "testing"))]
+
+use axess_core::testing::fixtures as common;
 
 use axess_core::session::{
     binding::UserAgentBinding, extractor::AuthSession, layer::SessionLayer,
@@ -25,11 +27,17 @@ use std::time::Duration;
 use tower::ServiceExt;
 
 fn test_router() -> Router {
-    let store = MemorySessionStore::new();
+    let clock = common::test_clock();
+    let store = MemorySessionStore::new().with_clock(std::sync::Arc::new(clock.clone()));
     let signing_key = axess_core::testing::test_key(42);
-    let session_layer = SessionLayer::without_registry_insecure(store, signing_key)
-        .with_ttl(Duration::from_secs(3600))
-        .with_secure(false);
+    let session_layer = SessionLayer::without_registry_insecure(
+        store,
+        signing_key,
+        std::sync::Arc::new(axess_core::session::UnrecordedSessionEnds),
+    )
+    .with_clock(clock.clone())
+    .with_ttl(Duration::from_secs(3600))
+    .with_secure(false);
 
     Router::new()
         .route("/set", get(set_handler))
@@ -131,10 +139,16 @@ async fn session_cookie_contains_hmac_signature() {
 
 #[tokio::test]
 async fn unmodified_session_does_not_set_cookie() {
-    let store = MemorySessionStore::new();
+    let clock = common::test_clock();
+    let store = MemorySessionStore::new().with_clock(std::sync::Arc::new(clock.clone()));
     let signing_key = axess_core::testing::test_key(42);
-    let session_layer =
-        SessionLayer::without_registry_insecure(store, signing_key).with_secure(false);
+    let session_layer = SessionLayer::without_registry_insecure(
+        store,
+        signing_key,
+        std::sync::Arc::new(axess_core::session::UnrecordedSessionEnds),
+    )
+    .with_clock(clock.clone())
+    .with_secure(false);
 
     let app = Router::new()
         // Reading the id keeps the session, so a cookieless first request
@@ -142,7 +156,7 @@ async fn unmodified_session_does_not_set_cookie() {
         .route(
             "/noop",
             get(|session: AuthSession| async move {
-                session.session_id().await;
+                session.session_key().await;
                 "noop"
             }),
         )
@@ -181,23 +195,21 @@ async fn unmodified_session_does_not_set_cookie() {
     );
 }
 
-// ── Integration tests that close the mutants on the
-//    SessionService::call save / cycle decision lines. The mutation-
-//    testing pass on `session/layer.rs` showed that:
+// ── The save / cycle decision of SessionService::call. In
 //
 //      let session_changed =
 //          guard.modified || guard.regenerate || existing_id.is_none();
 //
-//    could be replaced with `&&` on either `||` and the existing test
-//    suite did not notice. The same family of mutations covers the
-//    `max_custom_bytes` clamp on lines 540 and 544. The tests below
+//    either `||` written `&&` would save a changed session only when all
+//    three held; the same holds for the `max_custom_bytes` clamp. The
+//    tests below
 //    drive the public Axum stack so the assertions land on the
 //    on-the-wire behaviour, not the private fields. ───────────────────
 
 /// Modified-only session must persist its data across requests.
 ///
-/// Kills `replace || with && in let session_changed = guard.modified || …`
-/// (line 554). Under that mutation `session_changed` would only become
+/// Kills `replace || with && in let session_changed = guard.modified || …`.
+/// Under that mutation `session_changed` would only become
 /// true when *all three* conditions held (modified + regenerate + new),
 /// which is almost never. A second request with the same cookie would
 /// then see an empty session; exactly what this test forbids.
@@ -253,19 +265,25 @@ async fn modified_only_session_round_trips_value() {
 /// The `max_custom_bytes` clamp must actually clamp.
 ///
 /// Kills `> with ==` / `> with <` / `> with >=` mutations on
-/// `if custom_size > config.max_custom_bytes` (line 544) and the
-/// upstream `if config.max_custom_bytes > 0 && guard.modified`
-/// (line 540). The handler writes a payload above the configured
+/// `if custom_size > config.max_custom_bytes` and the
+/// upstream `if config.max_custom_bytes > 0 && guard.modified`.
+/// The handler writes a payload above the configured
 /// limit and the test asserts that, by request 2, the custom field
 /// has been cleared by the layer.
 #[tokio::test]
 async fn oversized_custom_data_is_cleared_on_save() {
-    let store = MemorySessionStore::new();
+    let clock = common::test_clock();
+    let store = MemorySessionStore::new().with_clock(std::sync::Arc::new(clock.clone()));
     let signing_key = axess_core::testing::test_key(13);
-    let session_layer = SessionLayer::without_registry_insecure(store, signing_key)
-        .with_ttl(Duration::from_secs(3600))
-        .with_secure(false)
-        .with_max_custom_bytes(32);
+    let session_layer = SessionLayer::without_registry_insecure(
+        store,
+        signing_key,
+        std::sync::Arc::new(axess_core::session::UnrecordedSessionEnds),
+    )
+    .with_clock(clock.clone())
+    .with_ttl(Duration::from_secs(3600))
+    .with_secure(false)
+    .with_max_custom_bytes(32);
 
     async fn fat_set(session: AuthSession) -> impl IntoResponse {
         // A small write marks the session modified; the ~256 byte payload is
@@ -330,18 +348,24 @@ async fn oversized_custom_data_is_cleared_on_save() {
 /// `max_custom_bytes = 0` MUST disable the clamp entirely.
 ///
 /// Kills the `> with <` and `> with >=` mutations on `max_custom_bytes
-/// > 0` (line 540). Under those mutations the clamp would either fire
+/// > 0`. Under those mutations the clamp would either fire
 /// universally (clearing every payload regardless of size) or never
 /// fire (no protection). With limit set to 0, the documented contract
 /// is "no clamp"; the test asserts a multi-KB payload survives.
 #[tokio::test]
 async fn max_custom_bytes_zero_disables_clamp() {
-    let store = MemorySessionStore::new();
+    let clock = common::test_clock();
+    let store = MemorySessionStore::new().with_clock(std::sync::Arc::new(clock.clone()));
     let signing_key = axess_core::testing::test_key(13);
-    let session_layer = SessionLayer::without_registry_insecure(store, signing_key)
-        .with_ttl(Duration::from_secs(3600))
-        .with_secure(false)
-        .with_max_custom_bytes(0); // disabled
+    let session_layer = SessionLayer::without_registry_insecure(
+        store,
+        signing_key,
+        std::sync::Arc::new(axess_core::session::UnrecordedSessionEnds),
+    )
+    .with_clock(clock.clone())
+    .with_ttl(Duration::from_secs(3600))
+    .with_secure(false)
+    .with_max_custom_bytes(0); // disabled
 
     async fn fat_set(session: AuthSession) -> impl IntoResponse {
         session
@@ -402,12 +426,18 @@ async fn max_custom_bytes_zero_disables_clamp() {
 // ── Session binding tests ───────────────────────────────────────────────────
 
 fn binding_router() -> Router {
-    let store = MemorySessionStore::new();
+    let clock = common::test_clock();
+    let store = MemorySessionStore::new().with_clock(std::sync::Arc::new(clock.clone()));
     let signing_key = axess_core::testing::test_key(42);
-    let session_layer = SessionLayer::without_registry_insecure(store, signing_key)
-        .with_ttl(Duration::from_secs(3600))
-        .with_secure(false)
-        .with_binding(UserAgentBinding);
+    let session_layer = SessionLayer::without_registry_insecure(
+        store,
+        signing_key,
+        std::sync::Arc::new(axess_core::session::UnrecordedSessionEnds),
+    )
+    .with_clock(clock.clone())
+    .with_ttl(Duration::from_secs(3600))
+    .with_secure(false)
+    .with_binding(UserAgentBinding);
 
     Router::new()
         .route("/login", post(login_handler))
@@ -418,9 +448,7 @@ fn binding_router() -> Router {
 async fn login_handler(session: AuthSession) -> impl IntoResponse {
     let uid = axess_core::authn::ids::testing::user("user1");
     let tid = axess_core::authn::ids::testing::tenant("tenant1");
-    session
-        .set_authenticated(uid, tid, chrono::Utc::now())
-        .await;
+    session.set_authenticated(uid, tid, common::start()).await;
     "logged in"
 }
 
@@ -512,11 +540,17 @@ async fn binding_invalidates_on_different_user_agent() {
 
 #[tokio::test]
 async fn binding_not_set_for_unauthenticated_sessions() {
-    let store = MemorySessionStore::new();
+    let clock = common::test_clock();
+    let store = MemorySessionStore::new().with_clock(std::sync::Arc::new(clock.clone()));
     let signing_key = axess_core::testing::test_key(42);
-    let session_layer = SessionLayer::without_registry_insecure(store.clone(), signing_key)
-        .with_secure(false)
-        .with_binding(UserAgentBinding);
+    let session_layer = SessionLayer::without_registry_insecure(
+        store.clone(),
+        signing_key,
+        std::sync::Arc::new(axess_core::session::UnrecordedSessionEnds),
+    )
+    .with_clock(clock.clone())
+    .with_secure(false)
+    .with_binding(UserAgentBinding);
 
     let app = Router::new()
         .route(
@@ -595,15 +629,27 @@ async fn binding_holds_for_a_session_that_logged_in_without_a_user_agent() {
 /// client; a replay from another client then fails.
 #[tokio::test]
 async fn binding_turned_on_later_binds_an_existing_authenticated_session() {
-    let store = MemorySessionStore::new();
+    let clock = common::test_clock();
+    let store = MemorySessionStore::new().with_clock(std::sync::Arc::new(clock.clone()));
     let signing_key = axess_core::testing::test_key(42);
     let unbound = Router::new().route("/login", post(login_handler)).layer(
-        SessionLayer::without_registry_insecure(store.clone(), signing_key).with_secure(false),
+        SessionLayer::without_registry_insecure(
+            store.clone(),
+            signing_key,
+            std::sync::Arc::new(axess_core::session::UnrecordedSessionEnds),
+        )
+        .with_clock(clock.clone())
+        .with_secure(false),
     );
     let bound = Router::new().route("/check", get(check_handler)).layer(
-        SessionLayer::without_registry_insecure(store, signing_key)
-            .with_secure(false)
-            .with_binding(UserAgentBinding),
+        SessionLayer::without_registry_insecure(
+            store,
+            signing_key,
+            std::sync::Arc::new(axess_core::session::UnrecordedSessionEnds),
+        )
+        .with_clock(clock.clone())
+        .with_secure(false)
+        .with_binding(UserAgentBinding),
     );
 
     let resp = unbound
@@ -686,11 +732,17 @@ mod device_resolver_wiring {
     }
 
     fn router_with_resolver<R: DeviceResolver>(resolver: R) -> Router {
-        let store = MemorySessionStore::new();
+        let clock = common::test_clock();
+        let store = MemorySessionStore::new().with_clock(std::sync::Arc::new(clock.clone()));
         let signing_key = axess_core::testing::test_key(42);
-        let session_layer = SessionLayer::without_registry_insecure(store, signing_key)
-            .with_secure(false)
-            .with_device_resolver(resolver);
+        let session_layer = SessionLayer::without_registry_insecure(
+            store,
+            signing_key,
+            std::sync::Arc::new(axess_core::session::UnrecordedSessionEnds),
+        )
+        .with_clock(clock.clone())
+        .with_secure(false)
+        .with_device_resolver(resolver);
 
         Router::new()
             .route("/reflect", get(reflect_device_handler))
@@ -736,12 +788,18 @@ mod device_resolver_wiring {
 
     #[tokio::test]
     async fn no_resolver_configured_leaves_device_id_unset() {
+        let clock = common::test_clock();
         // SessionLayer without `with_device_resolver`; the device-id
         // column stays None even when the `device` feature is on.
-        let store = MemorySessionStore::new();
+        let store = MemorySessionStore::new().with_clock(std::sync::Arc::new(clock.clone()));
         let signing_key = axess_core::testing::test_key(42);
-        let session_layer =
-            SessionLayer::without_registry_insecure(store, signing_key).with_secure(false);
+        let session_layer = SessionLayer::without_registry_insecure(
+            store,
+            signing_key,
+            std::sync::Arc::new(axess_core::session::UnrecordedSessionEnds),
+        )
+        .with_clock(clock.clone())
+        .with_secure(false);
         let app = Router::new()
             .route("/reflect", get(reflect_device_handler))
             .layer(session_layer);
@@ -782,31 +840,49 @@ mod device_resolver_wiring {
     /// Stamps the session with the stored device and, by asking for its id,
     /// has the session persisted so the device binding is saved.
     async fn persist_and_reflect_handler(session: AuthSession) -> impl IntoResponse {
-        session.session_id().await;
+        session.session_key().await;
         reflect_device_handler(session).await
     }
 
-    /// A resolver failure leaves the session's device binding as it was: a
-    /// transient fault in the device store must not strip the device from a
-    /// session that had one, and the untouched session is not rewritten.
+    /// Signs a user in on the session, which persists it with the device
+    /// stamped on it, and reflects the device.
+    async fn sign_in_and_reflect_handler(session: AuthSession) -> impl IntoResponse {
+        let user = axess_core::authn::ids::testing::user("user1");
+        let tenant = axess_core::authn::ids::testing::tenant("tenant1");
+        session
+            .set_authenticated(user, tenant, common::start())
+            .await;
+        reflect_device_handler(session).await
+    }
+
+    /// A resolver failure leaves a signed-in session's device binding as it
+    /// was: a transient fault in the device store must not strip the device
+    /// from a session that had one, and the untouched session is not
+    /// rewritten.
     #[tokio::test]
     async fn a_resolver_failure_keeps_the_stored_device_binding() {
+        let clock = common::test_clock();
         let id = axess_core::authn::ids::testing::device("dev-kept-on-fault");
-        let store = MemorySessionStore::new();
-        let session_layer =
-            SessionLayer::without_registry_insecure(store, axess_core::testing::test_key(42))
-                .with_secure(false)
-                .with_device_resolver(FailingLaterResolver {
-                    id,
-                    calls: std::sync::atomic::AtomicUsize::new(0),
-                });
+        let store = MemorySessionStore::new().with_clock(std::sync::Arc::new(clock.clone()));
+        let session_layer = SessionLayer::without_registry_insecure(
+            store,
+            axess_core::testing::test_key(42),
+            std::sync::Arc::new(axess_core::session::UnrecordedSessionEnds),
+        )
+        .with_clock(clock.clone())
+        .with_secure(false)
+        .with_device_resolver(FailingLaterResolver {
+            id,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
         let app = Router::new()
+            .route("/sign-in", get(sign_in_and_reflect_handler))
             .route("/reflect", get(persist_and_reflect_handler))
             .layer(session_layer);
 
         let first = app
             .clone()
-            .oneshot(Request::get("/reflect").body(Body::empty()).unwrap())
+            .oneshot(Request::get("/sign-in").body(Body::empty()).unwrap())
             .await
             .unwrap();
         let cookie = first
@@ -838,6 +914,86 @@ mod device_resolver_wiring {
             format!("device={id}"),
             "a resolver error must keep the session's stored device"
         );
+    }
+
+    /// A resolver that answers with the next of its devices on each call,
+    /// and with the last one from then on.
+    struct SequenceResolver {
+        ids: Vec<DeviceId>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl DeviceResolver for SequenceResolver {
+        type Error = std::convert::Infallible;
+        async fn resolve(&self, _: &Parts) -> Result<Option<BoundDevice>, Self::Error> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let id = self.ids[call.min(self.ids.len() - 1)];
+            Ok(Some(id.into()))
+        }
+    }
+
+    /// The session carries the device its latest request resolved to: when
+    /// the resolver answers with another device, the stored one is replaced,
+    /// though neither is proven.
+    #[tokio::test]
+    async fn a_session_whose_request_resolves_to_another_device_carries_the_new_one() {
+        let clock = common::test_clock();
+        let first_id = axess_core::authn::ids::testing::device("dev-first");
+        let second_id = axess_core::authn::ids::testing::device("dev-second");
+        let store = MemorySessionStore::new().with_clock(std::sync::Arc::new(clock.clone()));
+        let session_layer = SessionLayer::without_registry_insecure(
+            store,
+            axess_core::testing::test_key(42),
+            std::sync::Arc::new(axess_core::session::UnrecordedSessionEnds),
+        )
+        .with_clock(clock.clone())
+        .with_secure(false)
+        .with_device_resolver(SequenceResolver {
+            ids: vec![first_id, second_id],
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let app = Router::new()
+            .route("/reflect", get(persist_and_reflect_handler))
+            .layer(session_layer);
+
+        let first = app
+            .clone()
+            .oneshot(Request::get("/reflect").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let cookie = first
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("the persisted session sets a cookie")
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let body = axum::body::to_bytes(first.into_body(), 64).await.unwrap();
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            format!("device={first_id}")
+        );
+
+        for _ in 0..2 {
+            let later = app
+                .clone()
+                .oneshot(
+                    Request::get("/reflect")
+                        .header(header::COOKIE, &cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body = axum::body::to_bytes(later.into_body(), 64).await.unwrap();
+            assert_eq!(
+                std::str::from_utf8(&body).unwrap(),
+                format!("device={second_id}")
+            );
+        }
     }
 
     #[tokio::test]

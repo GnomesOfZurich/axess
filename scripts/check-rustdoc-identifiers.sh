@@ -49,16 +49,18 @@ ALLOW = {
     "Cookie", "CookieJar",                             # cookie / tower-cookies
     "Entities", "EntityUid", "Schema", "ValidationMode", "PolicySet",
     "Context", "Decision", "Request", "Validator",     # cedar-policy
-    "EncodingKey", "DecodingKey", "Algorithm", "Header",  # jsonwebtoken
+    "EncodingKey", "DecodingKey", "Algorithm", "Header", "Jwk",  # jsonwebtoken
     "StatusCode", "HeaderMap", "HeaderValue", "Method",   # http
     "Router", "Json", "Form", "State", "Extension",       # axum
-    "DateTime", "Utc", "NaiveDateTime", "TimeDelta",      # chrono
     "Pool", "PgPool", "SqlitePool", "MySqlPool",          # sqlx
     "WebauthnError",                                   # webauthn-rs
 }
 
+# Tracked files and untracked ones git does not ignore, so a file not yet
+# added is read as well.
 tracked = subprocess.run(
-    ["git", "ls-files", "*.rs"], cwd=root, capture_output=True, text=True, check=True
+    ["git", "ls-files", "--cached", "--others", "--exclude-standard", "--deduplicate", "*.rs"],
+    cwd=root, capture_output=True, text=True, check=True,
 ).stdout.split()
 
 blob = "\n".join((root / f).read_text() for f in tracked)

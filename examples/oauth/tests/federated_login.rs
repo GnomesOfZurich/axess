@@ -3,6 +3,7 @@
 //! cookie. Nothing here calls a handler directly.
 
 use axess::authn::AuditContext;
+use axess::federation::oauth::OAuthCallbackRoute;
 use axess::federation::oauth::OAuthLoginOptions;
 use axess_example_oauth::app::{self, App, ClientAuth, Config, ProviderSettings};
 use axess_example_oauth::provisioning::Provisioning;
@@ -102,15 +103,14 @@ impl Idp {
     }
 
     fn sign(&self, claims: &serde_json::Value, der: &[u8]) -> String {
-        axess_factors::jwt::ensure_crypto_provider();
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(self.kid.clone());
-        jsonwebtoken::encode(&header, claims, &EncodingKey::from_rsa_der(der)).expect("sign")
+        axess::jwt::encode(&header, claims, &EncodingKey::from_rsa_der(der)).expect("sign")
     }
 
     /// The ID token this provider would issue for a login with `nonce`.
     fn id_token(&self, who: &Who, nonce: &str) -> String {
-        let now = chrono_now();
+        let now = unix_now();
         self.sign(
             &json!({
                 "iss": self.issuer(), "sub": who.subject, "aud": self.client_id,
@@ -123,7 +123,7 @@ impl Idp {
 
     /// A back-channel logout token for `sid`, signed with `der`.
     fn logout_token(&self, sid: &str, der: &[u8]) -> String {
-        let now = chrono_now();
+        let now = unix_now();
         self.sign(
             &json!({
                 "iss": self.issuer(), "aud": self.client_id, "iat": now, "exp": now + 120,
@@ -221,11 +221,15 @@ impl Idp {
     }
 }
 
-fn chrono_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock")
-        .as_secs() as i64
+/// The time the identity provider signs at: the instant the application's
+/// clock is set to.
+fn unix_now() -> i64 {
+    axess::testing::MockClock::reference_time().unix_seconds()
+}
+
+/// The clock the application runs on, set to the reference instant.
+fn clock() -> std::sync::Arc<dyn axess::Clock> {
+    std::sync::Arc::new(axess::testing::MockClock::at_reference())
 }
 
 /// Who signs in at the provider.
@@ -382,12 +386,15 @@ fn settings(name: &str, idp: &Idp) -> ProviderSettings {
 }
 
 async fn app_with(providers: Vec<ProviderSettings>, provisioning: Provisioning) -> App {
-    app::build(Config {
-        providers,
-        provisioning,
-        require_verified_email: false,
-        secure_cookies: false,
-    })
+    app::build_on(
+        Config {
+            providers,
+            provisioning,
+            require_verified_email: false,
+            secure_cookies: false,
+        },
+        clock(),
+    )
     .await
     .expect("app")
 }
@@ -536,7 +543,7 @@ async fn linked_only_tenant_admits_a_linked_identity() {
 }
 
 /// The claims `complete_oauth_login` is given must be the ones
-/// `finish_oauth_login_with_iss` returned for this session: claims for a
+/// `finish_oauth_login` returned for this session: claims for a
 /// different subject do not complete, and the genuine ones do.
 #[tokio::test]
 async fn claims_that_are_not_this_sessions_do_not_complete() {
@@ -563,7 +570,13 @@ async fn claims_that_are_not_this_sessions_do_not_complete() {
             .expect("nonce");
         idp.queue_token(idp.id_token(&ALICE, &nonce)).await;
         let mut claims = authn
-            .finish_oauth_login_with_iss("code", &state, None, &session)
+            .finish_oauth_login(
+                OAuthCallbackRoute::global("idp"),
+                "code",
+                &state,
+                None,
+                &session,
+            )
             .await
             .expect("finish");
         let user = app.provisioner.resolve(&claims).await.expect("resolve");
@@ -629,12 +642,15 @@ async fn callback_on_another_providers_path_is_refused() {
 #[tokio::test]
 async fn unverified_email_is_refused_when_the_policy_requires_it() {
     let idp = Idp::start("client-a").await;
-    let app = app::build(Config {
-        providers: vec![settings("idp", &idp)],
-        provisioning: Provisioning::JustInTime,
-        require_verified_email: true,
-        secure_cookies: false,
-    })
+    let app = app::build_on(
+        Config {
+            providers: vec![settings("idp", &idp)],
+            provisioning: Provisioning::JustInTime,
+            require_verified_email: true,
+            secure_cookies: false,
+        },
+        clock(),
+    )
     .await
     .expect("app");
     let mut browser = Browser::new(&app);
@@ -851,7 +867,7 @@ async fn refresh_with_a_wrong_issuer_is_refused() {
         .sign_in_with(&idp, "idp", &ALICE, Some("refresh-1"))
         .await;
 
-    let now = chrono_now();
+    let now = unix_now();
     let wrong = idp.sign(
         &json!({
             "iss": "https://elsewhere.example", "sub": ALICE.subject, "aud": idp.client_id,
@@ -971,6 +987,22 @@ async fn a_secret_client_sends_the_secret_and_no_assertion() {
     assert!(!body.contains("client_assertion"), "{body}");
 }
 
+/// The client's P-256 key, made for this test only (`openssl ecparam -name
+/// prime256v1 -genkey`, then `openssl pkcs8 -topk8 -nocrypt`), and its public
+/// half, which the identity provider holds. The default client-key algorithm
+/// of the example, ES256.
+const CLIENT_KEY_PKCS8: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg+R5DI2yA+xsW+Xrm
+hzFZY4ukI0i2BUZ95FpzNpv1KOOhRANCAAQoDMI4AefRuEFsHoY/bu7DjUInUgNf
+wC8zl1VAgCiQ+FSOgHPPeudqCfv/4k2SjU8MCT4VDTh1ZhyKXRF06EHz
+-----END PRIVATE KEY-----
+";
+const CLIENT_KEY_PUBLIC: &str = "-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEKAzCOAHn0bhBbB6GP27uw41CJ1ID
+X8AvM5dVQIAokPhUjoBzz3rnagn7/+JNko1PDAk+FQ04dWYcil0RdOhB8w==
+-----END PUBLIC KEY-----
+";
+
 /// With `ClientAuth::PrivateKeyJwt` the token request carries an assertion
 /// that verifies against the registered public key, naming the client as
 /// issuer and subject, and no secret in the body or a Basic header. If the
@@ -979,15 +1011,10 @@ async fn a_secret_client_sends_the_secret_and_no_assertion() {
 #[tokio::test]
 async fn a_private_key_jwt_client_sends_a_verifiable_assertion_and_no_secret() {
     let idp = Idp::start("client-a").await;
-    let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).expect("key");
-    let public = key.to_public_key();
-    let pem = rsa::pkcs8::EncodePrivateKey::to_pkcs8_pem(&key, rsa::pkcs8::LineEnding::LF)
-        .expect("pem")
-        .to_string();
     let mut settings = settings("idp", &idp);
     settings.client_auth = ClientAuth::PrivateKeyJwt {
-        pem,
-        algorithm: Algorithm::RS256,
+        pem: CLIENT_KEY_PKCS8.to_string(),
+        algorithm: Algorithm::ES256,
         key_id: Some("client-key".to_string()),
     };
     let app = app_with(vec![settings], Provisioning::JustInTime).await;
@@ -1007,19 +1034,17 @@ async fn a_private_key_jwt_client_sends_a_verifiable_assertion_and_no_secret() {
         Some("urn:ietf:params:oauth:client-assertion-type:jwt-bearer")
     );
 
-    axess_factors::jwt::ensure_crypto_provider();
     let header = jsonwebtoken::decode_header(assertion).expect("header");
     assert_eq!(header.kid.as_deref(), Some("client-key"));
-    let mut validation = jsonwebtoken::Validation::new(Algorithm::RS256);
+    let mut validation = jsonwebtoken::Validation::new(Algorithm::ES256);
     validation.validate_aud = false;
+    // The assertion's times come from the application's clock, the test's
+    // mock; jsonwebtoken would judge them on the wall clock.
+    validation.validate_exp = false;
     validation.set_required_spec_claims(&["exp", "iss", "sub"]);
-    let claims = jsonwebtoken::decode::<serde_json::Value>(
+    let claims = axess::jwt::decode::<serde_json::Value>(
         assertion,
-        &jsonwebtoken::DecodingKey::from_rsa_components(
-            &URL_SAFE_NO_PAD.encode(public.n().to_bytes_be()),
-            &URL_SAFE_NO_PAD.encode(public.e().to_bytes_be()),
-        )
-        .expect("jwk"),
+        &jsonwebtoken::DecodingKey::from_ec_pem(CLIENT_KEY_PUBLIC.as_bytes()).expect("public key"),
         &validation,
     )
     .expect("the assertion verifies against the registered key")
@@ -1027,6 +1052,10 @@ async fn a_private_key_jwt_client_sends_a_verifiable_assertion_and_no_secret() {
     assert_eq!(claims["iss"], "client-a");
     assert_eq!(claims["sub"], "client-a");
     assert!(claims["jti"].is_string());
+    assert!(
+        claims["exp"].as_i64().expect("an exp") > unix_now(),
+        "the assertion is live at the test's time"
+    );
 
     assert!(!form.contains_key("client_secret"), "{body}");
     assert!(headers.get("authorization").is_none());

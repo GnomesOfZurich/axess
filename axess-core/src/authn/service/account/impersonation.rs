@@ -24,6 +24,11 @@
 //! as actor on every row, and `SessionLayer::with_max_impersonation_age`
 //! ends the session once the impersonation is older than the cap (1 hour by
 //! default; `None` lifts it).
+//!
+//! The browser of an impersonated session is the administrator's. The
+//! device of its requests is the administrator's own, no trust write and no
+//! lockout exemption of the user's can come from it, and a refresh token a
+//! deployment lets it issue names no device.
 
 use crate::authn::service::RequestAuthnService;
 use crate::authn::{
@@ -32,7 +37,23 @@ use crate::authn::{
     store::{FactorStore, IdentityStore},
 };
 use crate::session::extractor::AuthSession;
-use crate::session::store::note_revocation;
+use crate::session::store::{RevocationError, note_revocation};
+
+mod pending;
+use pending::PendingEntries;
+
+/// The error a caller sees when the registry did not confirm the end of the
+/// anchor entry of a failed impersonation: the entry may still be registered
+/// under the administrator, counted against their sessions, until an
+/// operator ends it (ending the administrator's sessions ends it with them).
+fn anchor_not_released<E>(error: RevocationError) -> AuthnError<E>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    AuthnError::ExternalService(format!(
+        "the impersonation anchor was not released and may still be registered: {error}"
+    ))
+}
 
 impl<I, F> RequestAuthnService<I, F>
 where
@@ -98,15 +119,30 @@ where
         reason: AuthFailureReason,
         error: AuthnError<I::Error>,
     ) -> AuthnError<I::Error> {
+        match self
+            .record_impersonation_refusal(admin, target, reason)
+            .await
+        {
+            Ok(()) => error,
+            Err(audit_error) => audit_error,
+        }
+    }
+
+    /// Write the failed `Impersonation` row of a refusal (see
+    /// [`refuse_impersonation`](Self::refuse_impersonation)), and say whether
+    /// it was written.
+    async fn record_impersonation_refusal(
+        &self,
+        admin: &crate::authn::ids::UserId,
+        target: Option<&crate::authn::types::User>,
+        reason: AuthFailureReason,
+    ) -> Result<(), AuthnError<I::Error>> {
         tracing::warn!(admin = %admin, reason = reason.as_str(), "impersonation refused");
         let builder = AuthEventBuilder::failure(AuthEventType::Impersonation)
             .maybe_attributed_to(target.map(|t| &t.id), target.map(|t| &t.tenant_id))
             .with_actor(*admin)
             .with_error(reason);
-        match self.emit_audit(builder).await {
-            Ok(()) => error,
-            Err(audit_error) => audit_error,
-        }
+        self.emit_audit(builder).await
     }
 
     /// The checks that come before the admin's session is touched: it is
@@ -182,12 +218,9 @@ where
         // built to ask. Stale authentication is refused before the target is
         // read, so the answer does not depend on which ids exist.
         if let Some(limit) = self.inner.hardening.impersonation_max_authn_age {
-            let age = self
-                .inner
-                .clock
-                .now()
-                .signed_duration_since(admin_snapshot.authn_time);
-            let limit = chrono::Duration::from_std(limit).unwrap_or(chrono::Duration::MAX);
+            let age = self.inner.clock.now().since(admin_snapshot.authn_time);
+            let limit = axess_clock::SignedDuration::try_from(limit)
+                .unwrap_or(axess_clock::SignedDuration::MAX);
             if age > limit {
                 return Err(self
                     .refuse_impersonation(
@@ -272,7 +305,7 @@ where
         &self,
         admin_user_id: &crate::authn::ids::UserId,
         target_user: &crate::authn::types::User,
-        now: chrono::DateTime<chrono::Utc>,
+        now: axess_clock::Timestamp,
     ) -> Result<(), AuthnError<I::Error>> {
         // A suspended administrator with a session still open cannot take
         // another identity through it: the session outlived the account's
@@ -374,7 +407,7 @@ where
         // The admin's own session ends with this call: its cookie is about
         // to carry the target's identity. Leaving the admin's sid in the
         // registry would keep a session alive that nobody can reach.
-        let admin_sid = session.session_id().await;
+        let admin_sid = session.registered_key().await;
 
         // Wipe any custom JSON the admin's session was carrying. Without
         // this, attacker-pre-seeded keys (OAuth PKCE_VERIFIER, CSRF_STATE,
@@ -399,13 +432,19 @@ where
         // authenticated state: the custom-data cap and `clear_custom` cannot
         // reach it, and it ends with the state.
         session.set_impersonator(*admin_user_id, now).await;
+        // The session is still the one the administrator's login created:
+        // its absolute age cap keeps counting from that login.
+        session.keep_signed_in_at(admin_snapshot.signed_in_at).await;
 
         // Force a session-ID rotation so the impersonating session never
         // shares its ID with the prior admin session; relevant for any
         // downstream code that keys things by session ID.
         session.regenerate().await;
 
-        let sid = session.session_id().await;
+        let sid = session.session_key().await;
+        // What is registered from here on is ended if this call is dropped
+        // before it accounts for it (see `pending`).
+        let mut pending = PendingEntries::new(self.inner.registry.clone());
         // Same as complete_signup; refuse to leave an admin in
         // an Authenticated-but-untracked impersonation session.
         if let Some(reg) = &self.inner.registry {
@@ -421,29 +460,22 @@ where
             // request, so ending the administrator's sessions ends this one.
             let anchored = match session.impersonation().await {
                 Some(imp) => {
-                    reg.register(admin_user_id, &imp.registry_anchor(&target_user.id))
-                        .await
+                    let anchor = imp.registry_anchor(&target_user.id);
+                    pending.owe(*admin_user_id, anchor);
+                    reg.register(admin_user_id, &anchor).await
                 }
                 None => false,
             };
+            pending.owe(target_user.id, sid);
             if !anchored || !reg.register(&target_user.id, &sid).await {
-                tracing::error!(
-                    admin_user_id = %admin_user_id,
-                    target_user_id = %target_user.id,
-                    "begin_impersonation register failed; clearing session and refusing"
-                );
-                self.release_impersonation_anchor(session, admin_user_id, &target_user.id)
+                let refusal = self
+                    .refuse_unregistered_impersonation(session, admin_user_id, target_user)
                     .await;
-                session.clear().await;
-                return Err(self
-                    .refuse_impersonation(
-                        admin_user_id,
-                        Some(target_user),
-                        AuthFailureReason::SessionNotRegistered,
-                        AuthnError::NoFlow,
-                    )
-                    .await);
+                pending.settle();
+                return Err(refusal);
             }
+            self.note_registration(reg.as_ref(), session, &target_user.id, sid)
+                .await;
         }
 
         // Record the impersonation event with both principals: the target
@@ -459,13 +491,25 @@ where
             )
             .await
         {
-            self.release_impersonation_anchor(session, admin_user_id, &target_user.id)
+            let released = self
+                .release_impersonation_anchor(session, admin_user_id, &target_user.id)
                 .await;
             self.end_session_after_audit_failure(&target_user.id, session)
                 .await;
-            return Err(e);
+            pending.settle();
+            return Err(match released {
+                Ok(()) => e,
+                Err(release) => {
+                    tracing::error!(
+                        error = %e,
+                        "the impersonation audit failed and its anchor was not released"
+                    );
+                    anchor_not_released(release)
+                }
+            });
         }
 
+        pending.settle();
         tracing::warn!(
             admin = %admin_user_id,
             target = %target_user.id,
@@ -475,24 +519,72 @@ where
         Ok(())
     }
 
+    /// Refuse an impersonation the registry did not register: end the
+    /// anchor, clear the session and write the failed row. A refusal whose
+    /// anchor is still registered says so, also when its row cannot be
+    /// written: the entry counts against the administrator until it is
+    /// ended, which the caller must learn, and the missing row is logged
+    /// beside it.
+    async fn refuse_unregistered_impersonation(
+        &self,
+        session: &AuthSession,
+        admin_user_id: &crate::authn::ids::UserId,
+        target_user: &crate::authn::types::User,
+    ) -> AuthnError<I::Error> {
+        tracing::error!(
+            admin_user_id = %admin_user_id,
+            target_user_id = %target_user.id,
+            "begin_impersonation register failed; clearing session and refusing"
+        );
+        let released = self
+            .release_impersonation_anchor(session, admin_user_id, &target_user.id)
+            .await;
+        session.clear().await;
+        let Err(release) = released else {
+            return self
+                .refuse_impersonation(
+                    admin_user_id,
+                    Some(target_user),
+                    AuthFailureReason::SessionNotRegistered,
+                    AuthnError::NoFlow,
+                )
+                .await;
+        };
+        if let Err(audit_error) = self
+            .record_impersonation_refusal(
+                admin_user_id,
+                Some(target_user),
+                AuthFailureReason::SessionNotRegistered,
+            )
+            .await
+        {
+            tracing::error!(
+                admin = %admin_user_id,
+                error = %audit_error,
+                "the refusal of an impersonation whose anchor may still be registered \
+                 could not be recorded"
+            );
+        }
+        anchor_not_released(release)
+    }
+
     /// End the entry an impersonation registered under the administrator, for
     /// an impersonation that did not stand. Read from the session before it
     /// is cleared; without it the entry would stay in the registry, counted
-    /// against the administrator's sessions, until they are all revoked.
+    /// against the administrator's sessions, until they are all revoked. The
+    /// registry's refusal is returned, so the caller can say the entry is
+    /// still registered.
     async fn release_impersonation_anchor(
         &self,
         session: &AuthSession,
         admin_user_id: &crate::authn::ids::UserId,
         target_id: &crate::authn::ids::UserId,
-    ) {
+    ) -> Result<(), RevocationError> {
         let (Some(reg), Some(imp)) = (&self.inner.registry, session.impersonation().await) else {
-            return;
+            return Ok(());
         };
-        note_revocation(
-            reg.invalidate_session(admin_user_id, &imp.registry_anchor(target_id))
-                .await,
-            "ending the anchor of a failed impersonation",
-        );
+        reg.invalidate_session(admin_user_id, &imp.registry_anchor(target_id))
+            .await
     }
 
     /// End an impersonation: the session and its registry entry are
@@ -511,7 +603,7 @@ where
         };
         let target = session.user_id().await;
         let tenant = session.tenant_id().await;
-        let sid = session.session_id().await;
+        let sid = session.session_key().await;
         if let (Some(reg), Some(target)) = (&self.inner.registry, &target) {
             note_revocation(
                 reg.invalidate_session(target, &sid).await,

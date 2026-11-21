@@ -4,22 +4,23 @@ Most of axess works against traits, and the identity store is the
 most consequential of them. The library does not prescribe a user
 schema, a tenant schema, or a factor schema; it prescribes a set
 of trait methods you implement against whatever
-schema it already has. The three-tier split is by privilege, so an
-adopter implements only the tier it needs, down to the
-read-replica-and-fixtures variant that the `NoopAuthnLog` adapter
-enables.
+schema your application already has. The traits are split into three tiers by
+privilege, so code of your own can ask for no more than it uses. The
+login service itself runs on all three.
 
 ## The traits
 
-Split by privilege, so an adopter implements only the tier it needs.
+Split by privilege: reads, the writes a login makes, and administration.
 
 ### The three tiers
 
-The identity store is split into three trait tiers, in order of
-increasing privilege. An adopter that needs only read access
-implements the narrowest tier; an adopter that needs write access
-for audit purposes implements the middle tier; an adopter that
-needs full administrative control implements the widest tier.
+The three trait tiers, in order of increasing privilege, are reads,
+the writes the login flow makes as it runs, and administrative writes.
+`AuthnService` is bounded on the umbrella `IdentityStore`, which is all
+three: the store a deployment hands it implements every tier, and no
+axess entry point takes less. The narrower tiers are bounds for code of your own
+that needs less: a function that only looks users up can take an
+`IdentityLookup` and be given no way to write.
 
 ```rust,ignore
 // Tier 1: read-only.
@@ -93,7 +94,7 @@ pub trait IdentityAuthnLog: IdentityLookup {
     fn failed_attempts(
         &self,
         user_id: &UserId,
-    ) -> impl Future<Output = Result<(u32, Option<DateTime<Utc>>), Self::Error>> + Send;
+    ) -> impl Future<Output = Result<(u32, Option<Timestamp>), Self::Error>> + Send;
 
     /// Atomically count one guess before the credential is checked:
     /// `Some(count)` while the account is under its limit, `None` (and no
@@ -121,7 +122,7 @@ pub trait IdentityAuthnLog: IdentityLookup {
     fn record_last_login(
         &self,
         user_id: &UserId,
-        at: DateTime<Utc>,
+        at: Timestamp,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
@@ -142,9 +143,10 @@ pub trait IdentityAdmin: IdentityAuthnLog {
         user_id: &UserId,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    // Plus the suspension verbs. `delete_user` is the one method here
-    // that still defaults to `unimplemented!()`; nothing in axess calls
-    // it, so the panic fires only if you call it yourself. See below.
+    // Plus the suspension verbs and `delete_user`. `delete_user` is
+    // required like the rest, with no default body: a backend that
+    // cannot erase does not compile, and the service's `delete_user`
+    // calls it. See below.
     // `delete_candidates_created_before(before, limit)` is required: it
     // deletes Candidates older than `before` and returns them, for the
     // `purge_expired_candidates` sweep.
@@ -165,8 +167,8 @@ pub trait IdentityPasswordReset: IdentityLookup {
         &self,
         user_id: &UserId,
         token_hash: &str,
-        expires_at: DateTime<Utc>,
-        now: DateTime<Utc>,
+        expires_at: Timestamp,
+        now: Timestamp,
         max_live: usize,
     ) -> impl Future<Output = Result<bool, Self::Error>> + Send;
 
@@ -174,7 +176,7 @@ pub trait IdentityPasswordReset: IdentityLookup {
         &self,
         user_id: &UserId,
         token_hash: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<bool, Self::Error>> + Send;
 
     // Same comparison, but the row stays: the flow checks with this
@@ -183,13 +185,12 @@ pub trait IdentityPasswordReset: IdentityLookup {
         &self,
         user_id: &UserId,
         token_hash: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<bool, Self::Error>> + Send;
 }
 ```
 
-Four things about that surface are worth stating plainly, because
-each one shapes an implementation.
+Four properties of that surface shape an implementation.
 
 The futures are native `impl Future`, not `#[async_trait]` boxes. Your
 methods are ordinary `async fn` bodies and cost no allocation per call.
@@ -197,102 +198,101 @@ methods are ordinary `async fn` bodies and cost no allocation per call.
 The error is an associated `Self::Error`, declared once on
 `IdentityLookup` and inherited by the other two tiers. Axess never asks
 you to convert into an error type of its own; `sqlx::Error` is a
-perfectly good `Self::Error`.
+valid `Self::Error`.
 
 There is no `AttemptRecord`, `LockoutRecord` or `NewUser`. The audit
 tier writes a single flat `AuthEvent` through `record_event`, and
 failure counting is a pair of numeric verbs rather than a record type.
 `record_failed_attempt` returns the count after the increment and stores
-the time of the failure; `failed_attempts` reads both back. Lockout state
-is derived from that pair and the policy by the library, not stored as its
-own row and not reported through `account_status`. `create_user` takes a fully-formed `User`, so identifier
+the time of the failure; `failed_attempts` reads both back. The library
+derives lockout state from that pair and the policy; it is not stored as
+its own row and not reported through `account_status`. `create_user` takes a fully-formed `User`, so identifier
 generation and defaulting happen in your code, before the call.
 
-Four methods that once had `unimplemented!()` defaults on `IdentityAdmin`
-no longer do. They live on two capability traits with no default bodies,
+Five methods that a store may not support are not on `IdentityAdmin`.
+They live on two capability traits with no default bodies,
 and the flows that need them are bounded on those traits, so a store that
 has not implemented them cannot reach the flow and the omission is a
 compile error rather than a panic.
 
 `IdentityPasswordReset` holds `store_reset_token`, `verify_reset_token`
-and `check_reset_token`. The reason is the shape of a mistake rather than a
-preference. `begin_password_reset` answers `Ok(None)` for an identifier
-it cannot find and reaches the store only for one it can, so a panicking
-default answered an unauthenticated "forgot password" request with a 200
-for an address that is not registered and a 500 for one that is: a
-user-enumeration oracle, in the function that equalizes its own timing
-specifically to avoid leaking that. A silently-succeeding default would
+and `check_reset_token`. The reason is a failure mode, not a preference. `begin_password_reset` answers `Ok(None)` for an identifier
+it cannot find. When the methods had panicking defaults it reached the
+store only for an identifier it could find, so a store that had not
+overridden them answered an unauthenticated "forgot password" request with
+a 200 for an address that is not registered and a 500 for one that is: a
+user-enumeration oracle, in the function that equalises its own timing
+specifically to avoid leaking that. (Today the unknown path makes the
+same store writes as the found one, against a dummy user, for that
+timing.) A silently succeeding default would
 have been worse, since recovery would appear to work while no token was
 ever stored.
 
 `begin_password_reset` holds a per-identifier cooldown, 60 seconds unless
 `AuthnServiceBuilder::with_password_reset_cooldown` sets another window or
-`without_password_reset_cooldown` removes it. It makes a second request
-for the same tenant and identifier inside the window answer `Ok(None)`, as
-an unknown identifier does. The key is the identifier as typed, whether or
-not an account has it, so the cooldown tells a caller nothing about who is
-registered. The record is per process and holds at most 100,000 identifiers,
-each for the window and no longer. A cooldown that has not run out is never
-pushed out by other identifiers, so a flood of them cannot clear one
-person's; when that many are live, a new identifier is answered `Ok(None)`
-until one runs out, so a caller who mints identifiers can hold the route shut
-for a window at a time. Put the route behind a shared rate limit as well,
-which is the bound for that and for several instances.
+`without_password_reset_cooldown` removes it. A second request
+for the same tenant and identifier inside the window answers `Ok(None)`, as
+an unknown identifier does. The key is the identifier as normalised (NFKC,
+lower case, invisible format characters dropped, trimmed), whether or not an
+account has it, so two spellings of one address are one request and the
+cooldown tells a caller nothing about who is registered. The record is per
+process and holds at most 100,000 identifiers, each for the window and no
+longer. When that many are live, the oldest cooldown is dropped to make
+room for a new identifier, so a caller who mints identifiers cannot refuse
+a real user's reset, and can at most cut a cooldown short. Put the route
+behind a shared rate limit as well: it bounds identifier minting, and it
+holds across several instances, which the per-process record does not.
 
-A completed reset invalidates the user's registered cookie sessions, which
-does not reach refresh tokens: they are a separate credential that mints a
-new session. Give the service the store the application issues refresh
-tokens into with `AuthnServiceBuilder::with_refresh_store`, and
-`complete_password_reset` and the `suspend_user` family revoke every
-refresh token of the user (through the store's `revoke_user_tokens`) and
-return an error if that fails, after the change itself is made and
-audited. Without it a refresh token stolen before a reset keeps working
-after it.
+A completed reset invalidates the user's registered cookie sessions but
+not their refresh tokens: a refresh token is a separate credential that
+mints a new session. Hand the service the store the application issues
+refresh tokens into with `AuthnServiceBuilder::with_refresh_store`.
+`complete_password_reset` and the `suspend_user` family then revoke every
+refresh token of the user through the store's `revoke_user_tokens`, after
+the change itself is made and audited, and return an error if the
+revocation fails. Without that store a refresh token stolen before a reset keeps working
+after it. A password the application changes by itself (a signed-in
+person choosing a new one) goes through neither: call
+`RequestAuthnService::invalidate_other_sessions` after the change, which
+ends the person's other sessions and revokes the refresh tokens the same
+way.
 
 `IdentityPasswordHistory` holds `record_password_hash` and
 `password_history`, for a plainer reason. `record_password_hash` is
 called on **every** password change with no guard, so a backend that had
 not overridden it panicked the first time any user changed their
-password, on a method that looked optional because a defaulted trait
+password, on a method that looked optional, as every defaulted trait
 method does.
 
-A deployment with no password-reuse policy implements neither trait and
-loses nothing.
-
-The hierarchy reads from narrowest to widest. An
-`IdentityAuthnLog` is an `IdentityLookup` plus the audit writes.
-An `IdentityAdmin` is an `IdentityAuthnLog` plus the
-administrative writes. The umbrella `IdentityStore` is the
-all-three-tiers shape that production backends implement.
+The reset flow is bounded on both traits together, so a store that offers
+`begin_password_reset` implements `IdentityPasswordHistory` as well; a
+deployment with no password-reuse policy records the hash and answers an
+empty history. A deployment with no password reset at all implements
+neither and loses nothing.
 
 ### Why three tiers
 
-The split is the answer to two adopter situations the library has
-seen often enough to model explicitly.
+The split says which verbs a concern needs, so that code can be given
+no more than it uses.
 
-The first situation is a read-replica deployment. A high-traffic
-application runs the login flow against a read-replica of the
-user database for latency reasons. The replica cannot accept
-writes, so you need the read verbs without the write
-verbs. The `IdentityLookup` tier covers this. The application
-implements `IdentityLookup` against the replica and
-`IdentityAuthnLog` (which needs writes) against the primary.
+The login service is not where the split is taken: `AuthnService`,
+its builder and the request-scoped handle are all bounded on
+`IdentityStore`, the three tiers together, because one login reads the
+user, counts the attempt, writes the audit row and may suspend the
+account. A store the service runs on implements all three; serving reads from a
+replica and writes to the primary is a routing decision inside that
+one implementation.
 
-The second situation is a fixture deployment. A test or an
-embedded usage of axess does not have a real database; the
-application uses an in-memory backend for the read verbs and does
-not care about the audit writes. The `NoopAuthnLog` adapter
-wraps an `IdentityLookup` and provides no-op implementations of
-the `IdentityAuthnLog` write verbs. The fixture has the trait
-surface it needs without writing an audit-table mock.
-
-The third situation, less common, is a deployment with a
-separation between the code that handles login and
-the administrative code that creates users. The application
-implements `IdentityAuthnLog`; the admin code separately
-implements `IdentityAdmin`. The split prevents the login path
-code from accidentally calling `delete_user` or `suspend_user`
-because it never has the trait method in scope.
+The split is taken in code of your own that is bounded on a narrower
+tier. A function
+that renders a profile can take `&impl IdentityLookup` and cannot
+suspend anyone, because the method is not in scope; one that records an
+event can take `&impl IdentityAuthnLog` and cannot create or delete a
+user. The `NoopAuthnLog` adapter serves that same code: it wraps an
+`IdentityLookup` and adds no-op `IdentityAuthnLog` verbs, for a caller
+bounded on the middle tier that has only a lookup to give. It does not
+implement `IdentityAdmin`, so it is not a store `AuthnService` can be
+built on.
 
 ### What the verbs actually do
 
@@ -300,12 +300,14 @@ The verbs split cleanly across the tiers.
 
 `IdentityLookup` is reads. `get_user` is a primary-key lookup by
 `UserId`. `find_user` is a credentials-side lookup by identifier
-and tenant: the user typed `alice@example.com`, and you
-needs to know if this is a real user in this tenant. Other read
-verbs cover the variants: looking up a user by email when email
-is separately indexed, looking up a user by a federated identity
-key when you support federated login, listing the
-users in a tenant for admin tooling.
+and tenant: the user typed `alice@example.com`, and the
+store says whether that is a real user in this tenant. The other read
+verbs are `get_user_tenant` and `get_user_in_tenant` (narrower forms
+of `get_user`), the tenant lookups (`get_tenant`, `find_tenant`,
+`default_tenant`), `account_status`, and the three per-tenant policy
+methods. There is no lookup by email, none by a federated identity
+key, and no listing of a tenant's users in the trait: those are
+queries of your own.
 
 `IdentityAuthnLog` is the writes the login flow makes as it runs.
 `record_event` takes one flat `AuthEvent`, carrying the event type, the
@@ -316,8 +318,8 @@ as an `IpAddr`, user agent, request id, and the failure reason as an
 flow, not only after a factor check, and its argument is the same type
 the audit query surface returns.
 
-Three of those fields deserve a nullable column and usually get a
-surprised implementer: the address, user agent and request id are `None`
+Give three of those fields a nullable column: the address, user agent
+and request id are `None`
 on every event unless the request path called
 `AuthnService::with_audit_context`. Axess cannot resolve a trustworthy
 client address on its own, since that needs your TCP peer and your
@@ -327,14 +329,16 @@ wiring.
 
 **What you return decides whether the login succeeds.** `Err` fails the
 authentication: an authentication that leaves no evidence has not, for
-evidence purposes, happened. Reserve it for a sink that is genuinely
+evidence purposes, happened. Reserve it for a sink that is
 broken, and expect logins to fail while yours is. `Ok(Shed)` says you
 dropped the event deliberately under load, and the flow continues.
 
-Shed on something identifier-independent, a global rate or a queue depth
-or a disk watermark. A shed decision derived from *which* identifier was
+Shed on something independent of the identifier: a global rate, a queue
+depth or a disk watermark. A shed decision derived from *which* identifier was
 tried is observable per identifier, and rebuilds the user-enumeration
-oracle that writing unattributable rejections exists to close. `record_failed_attempt` increments the user's failure
+oracle that writing unattributable rejections exists to close.
+
+`record_failed_attempt` increments the user's failure
 counter, stores the time of the failure and returns the new count;
 `failed_attempts` returns the count and that time;
 `reset_failed_attempts` zeroes both on a successful login or an
@@ -345,8 +349,8 @@ every gate that runs before a verifier (`begin_login`, `prepare_factor`,
 `LockoutPolicy`. An account whose count has reached `max_attempts` (zero
 reads as the default of five) is locked until `duration` after the last
 failure, or until an administrator resets the counter when `duration` is
-`None`. A store that cannot report the time of the last failure stays
-locked rather than guess. A password reset still works for a locked
+`None`. When the store cannot report the time of the last failure, the account
+stays locked; the library does not guess. A password reset still works for a locked
 account and clears the counter. A store that reports failures older than
 `attempt_window` as zero while the count is below the limit gets the
 sliding window for free. At the limit it reports the raw count and time
@@ -360,8 +364,8 @@ The throttle beside the lock is three more methods, keyed on a
 `ThrottleKey::AccountAndAddress`, the client address) that the library
 builds from the request: `throttle_state` reads the consecutive failures
 and the time of the last as a `ThrottleState`, `record_throttle_failure`
-adds one at the store's now, in one atomic step as `record_failed_attempt`
-is, and `clear_throttle` forgets the key when a guess is right. None has
+adds one at the store's current time, atomically, as `record_failed_attempt`
+does, and `clear_throttle` forgets the key when a guess is right. None has
 a default body: a store that silently reported nothing would leave every
 account unthrottled. An entry older than `Throttle::forget_after` (twice
 the longest delay) is as good as absent, and a store must not let such
@@ -370,12 +374,10 @@ entries grow without bound: the sqlite example sweeps them in
 in-memory stores drop them from the map on every record.
 
 `IdentityAdmin` is the privileged writes. `create_tenant` and
-`create_user` are the provisioning verbs, and `create_user` takes an
-already-built `User`, so identifier generation and defaulting happen in
-your code, not behind the trait. `activate_user` moves a user out of
+`create_user` are the provisioning verbs. `activate_user` moves a user out of
 the pending state. The rest of the tier is suspension and deletion.
-Password history and reset tokens used to live here; they are capability
-traits of their own now, for the reasons above.
+Password history and reset tokens are not on this tier; they are
+capability traits of their own, for the reasons above.
 
 ### A suspension says why
 
@@ -398,7 +400,7 @@ in the state:
 - `Other(key)`: your own cause under a short machine key. A row written
   before the field existed reads as `Other("unspecified")`.
 
-Build a detail with the constructor that names its cause,
+Build a detail with the constructor that names its cause:
 `StatusDetail::administrative(reason, since)`, `verification`, `lockout`,
 `closure` or `other(key, reason, since)`, and `.with_until(Some(t))` for
 a timed one. A store that keeps its own status columns writes the cause
@@ -422,9 +424,9 @@ nobody keys a decision on the spelling of `reason`:
 Ask them of `effective_at(now)`, so a timed suspension that has ended
 answers as the active account it is.
 
-The login path answers an error-level union. `AuthnError::Locked` is the
-counter's lockout, which ends by itself, and a `Suspended` account alike;
-`NotActive` is every other state. One message serves a login screen, so
+The login error merges states. `AuthnError::Locked` covers both the
+counter's lockout, which ends by itself, and a `Suspended` account;
+`NotActive` covers every other state. One message serves a login screen, so
 the error does not separate them, and it says nothing about the state:
 an eligibility decision reads the account's `EntityState` and asks the
 two questions above.
@@ -435,14 +437,13 @@ Against SQL, and the two places the contract is easy to get wrong.
 
 ### Implementing against SQL
 
-The typical implementation against a SQL database is verbose but
-mechanical. The pattern is to implement each verb as one query
-(or one transaction), with the right indexes on the user table
-to keep the reads fast.
+An implementation against a SQL database is verbose but mechanical:
+each verb is one query (or one transaction), with indexes on the user
+table to keep the reads fast.
 
-A reference implementation against PostgreSQL is in
-[`examples/sqlite/`](https://github.com/GnomesOfZurich/axess/tree/main/examples/sqlite)
-(the SQLite version of the pattern). The shape:
+A reference implementation against SQLite is in
+[`examples/sqlite/`](https://github.com/GnomesOfZurich/axess/tree/main/examples/sqlite).
+The shape:
 
 ```rust,ignore
 struct OurBackend {
@@ -454,8 +455,8 @@ impl IdentityLookup for OurBackend {
 
     async fn get_user(&self, user_id: &UserId) -> Result<Option<User>, Self::Error> {
         let row = sqlx::query(
-            "SELECT id, tenant_id, identifier, display_name, status,
-                    failed_attempts, locked_until, created_at, updated_at
+            "SELECT id, tenant_id, identifier, display_name, status, status_cause, failed_attempts,
+                    locked_until, created_by, created_at, updated_by, updated_at
              FROM users
              WHERE id = ?1",
         )
@@ -463,7 +464,7 @@ impl IdentityLookup for OurBackend {
         .fetch_optional(self.pool())
         .await?;
 
-        Ok(row.map(|r| user_from_row(self.clock(), &r)))
+        row.map(|r| user_from_row(self.clock(), &r)).transpose()
     }
 
     async fn find_user(
@@ -472,8 +473,8 @@ impl IdentityLookup for OurBackend {
         tenant_id: &TenantId,
     ) -> Result<Option<User>, Self::Error> {
         let row = sqlx::query(
-            "SELECT id, tenant_id, identifier, display_name, status,
-                    failed_attempts, locked_until, created_at, updated_at
+            "SELECT id, tenant_id, identifier, display_name, status, status_cause, failed_attempts,
+                    locked_until, created_by, created_at, updated_by, updated_at
              FROM users
              WHERE tenant_id = ?1 AND identifier = ?2",
         )
@@ -482,7 +483,7 @@ impl IdentityLookup for OurBackend {
         .fetch_optional(self.pool())
         .await?;
 
-        Ok(row.map(|r| user_from_row(self.clock(), &r)))
+        row.map(|r| user_from_row(self.clock(), &r)).transpose()
     }
     // ... get_tenant, find_tenant, default_tenant, account_status, and the
     // three tenant policies
@@ -493,14 +494,13 @@ The patterns to note:
 
 The tenant scope is on every query. `find_user` filters by both
 identifier and tenant id; the same identifier in a different
-tenant is not returned. The discipline is what enforces cross-tenant
+tenant is not returned. That discipline enforces cross-tenant
 refusal at the storage layer.
 
 The identifier comparison is whatever the deployment chose. The
 example treats the identifier as case-sensitive; deployments that
 want case-insensitive matching apply `LOWER()` to both sides (and
-index on `LOWER(identifier)`). The trait does not opinionate; the
-implementation decides.
+index on `LOWER(identifier)`).
 
 The error type is the implementation's own, declared once as
 `type Error = BackendError` on `IdentityLookup` and inherited by the
@@ -517,23 +517,24 @@ identifiers exist.
 
 ### Implementing the audit writes
 
-`IdentityAuthnLog` is the layer that requires care. Its verbs fire on
-every login attempt, so a slow implementation is the bottleneck of the
-whole authentication flow.
+`IdentityAuthnLog` needs care: its verbs run on every login attempt, so
+a slow implementation slows the whole authentication flow.
 
-There are three of them, and they divide neatly. `record_event` appends
-one flat `AuthEvent` row. `record_failed_attempt`, `failed_attempts` and
-`reset_failed_attempts` maintain a single counter, and the time of its last
-increment, on the user.
+There are ten of them, in four groups. `record_event` appends one flat
+`AuthEvent` row. `record_failed_attempt`, `failed_attempts`,
+`reserve_attempt`, `release_attempt` and `reset_failed_attempts` maintain
+a single counter, and the time of its last increment, on the user.
+`throttle_state`, `record_throttle_failure` and `clear_throttle` keep the
+pre-lockout throttle. `record_last_login` stamps a successful login.
 
 ```rust,ignore
 {{#include ../../examples/sqlite/src/models/backend/identity.rs:authn_log}}
 ```
 
-Two properties of that shape matter operationally.
+Several properties of that shape matter operationally.
 
 `auth_events` is append-only and flat. Every event lands in that one table,
-and no join to reconstruct an attempt; every event carries its own
+so no join is needed to reconstruct an attempt; every event carries its own
 `event_type`, `event_status` and nullable attribution. Index it on
 `(user_id, tenant_id, event_time DESC)` for the "what happened to this
 account" query, and on `(tenant_id, event_time DESC)` for the
@@ -542,11 +543,10 @@ tenant-wide one.
 The failure counter is a column on `users`, not a row count over
 `auth_events`. Lockout is derived from that counter and the
 `LockoutPolicy`, so there is no lockout table to upsert and no
-`clear_lockout` verb: `reset_failed_attempts` is the whole of it. The
-increment-then-read above is two statements; under contention, prefer
-whatever single-statement form your database offers (`UPDATE ...
-RETURNING failed_attempts` on PostgreSQL) so two concurrent failures
-cannot both read the same count.
+`clear_lockout` verb: `reset_failed_attempts` is the whole of it. The trait
+requires the increment and the read to be one atomic step: the example above does both in one statement (`UPDATE ...
+RETURNING failed_attempts`), so two concurrent failures cannot both
+read the same count.
 
 The throttle entry is its own small table, keyed on tenant, user and
 address (the empty string for the account-only key), because one account
@@ -556,44 +556,49 @@ it. The sqlite example's `login_throttle` migration and
 UPDATE SET failures = failures + 1` so parallel guesses all count, with
 the stale-row sweep beside it.
 
-The audit read is the hottest query in this layer.
-The index (user_id, tenant_id, event_time DESC) makes it cheap; without
-the index, the query degrades to a table scan and the login flow
-slows under load.
+The login flow never reads `auth_events`: the lockout consults the
+counter, not the rows. The audit read is the query your SOC and admin
+tooling run (`AuditQuery::query_events`); the index on
+(user_id, tenant_id, event_time DESC) keeps it from a table
+scan.
 
-The append-only attempts table grows. The retention story for it
-is in *Audit pipeline*: typically a hot/cold split where recent
-attempts (the ones the lockout policy consults) stay in the
-attempts table and older attempts archive to a cold store.
+The query answers an `AuditTrail`: the events it read, and in
+`UnreadableRows` how many matching rows it could not read, by
+`UnreadableReason` (a session field that names no session, an event
+type the release does not know, any other field that does not decode).
+Such a row is counted, never dropped in silence and never allowed to
+fail the query, and its text is neither returned nor logged. A screen
+that shows the trail shows the count when it is not zero.
+`testing::store_contract::assert_unreadable_rows_contract` holds your
+store to this; the sqlite example runs it.
+
+The append-only `auth_events` table grows. *Audit pipeline* covers its
+retention: typically a hot/cold split where recent events
+stay in the table and older ones archive to a cold store.
 
 ### The NoopAuthnLog adapter
 
 `NoopAuthnLog<L>` wraps an `IdentityLookup` and provides no-op
-implementations of the `IdentityAuthnLog` write verbs. The
-wrapper exists for two cases.
+implementations of the `IdentityAuthnLog` write verbs. It implements
+those two tiers and not `IdentityAdmin`, so it satisfies a bound of
+`IdentityAuthnLog` in code of your own and cannot be the store of an
+`AuthnService`. Tests of an `AuthnService` use `MockIdentityStore`, which
+implements every tier.
 
-The first is fixtures. A test uses `MockIdentityStore`
-(implementing `IdentityLookup`), and `verify_factor` needs
-`IdentityAuthnLog`. The test wraps the mock in `NoopAuthnLog`,
-satisfies the trait, and runs without recording anything.
+The case it exists for is a read-only source (a replica, a directory
+export) handed to code that is bounded on the middle tier, where the
+audit writes go through a different path (an out-of-band log shipper,
+a Kafka topic, an external SIEM).
 
-The second is read-replica deployments where the audit writes go
-through a different code path (an out-of-band log shipper, a
-Kafka topic, an external SIEM). The application implements
-`IdentityLookup` against the replica, wraps in `NoopAuthnLog`,
-and routes the audit writes through the side channel.
-
-The trade-off is that the lockout policy will not function correctly
-under `NoopAuthnLog`. The policy decides from the count
+The cost is that the lockout policy does not work under `NoopAuthnLog`. The policy decides from the count
 `record_failed_attempt` returns and `failed_attempts` reports; the noop
-discards the increment, returns zero for both, so the count never rises
+discards the increment and returns zero for both, so the count never rises
 and the threshold is never reached (not even a threshold of one).
 Deployments that use `NoopAuthnLog` for the read-replica case must
 accept a degraded lockout policy unless they implement an alternative.
 
-The chapter warns about this in the docstring of `NoopAuthnLog`;
-the warning is worth repeating: do not use `NoopAuthnLog` in
-production without an alternative lockout source.
+The `NoopAuthnLog` docstring carries the same warning: do not use
+`NoopAuthnLog` in production without an alternative lockout source.
 
 ## Fitting an existing system
 
@@ -610,12 +615,12 @@ The split is deliberate. Humans live in a user table; workloads
 live in a workload table (or do not live anywhere durable, when
 they are short-lived service-to-service callers). The audit
 events for workloads route differently from human events. The
-lockout policy does not apply to workloads at all. Trying to
-unify the two would produce a trait that does too many jobs.
+lockout policy does not apply to workloads at all. Unifying the
+two would produce a trait with too many jobs.
 
 The same is true for the principal model: the `Principal` enum
-has two variants, the read paths for the two variants go through
-two different stores. The application implements both stores and
+has two variants, and their read paths go through two different
+stores. The application implements both stores and
 the resolver code routes appropriately.
 
 ### Schema migration
@@ -623,38 +628,36 @@ the resolver code routes appropriately.
 The identity store is the part of your system most likely to
 need migrations over time: a new factor adds a column to the
 factor configurations table, a regulatory change requires a new
-field on the audit-attempts table, a refactor renames a column.
+field on the audit events table, a refactor renames a column.
 
 The migration mechanism is yours, not axess's.
 `sqlx::migrate!` is the standard pattern; alternative migration
 tools (Diesel migrations, Atlas, custom SQL) work the same way.
-Axess does not need to know about the migrations; the
-implementation just needs to keep satisfying the trait against
-the new schema.
+Axess does not see the migrations; the implementation only has to
+keep satisfying the trait against the new schema.
 
-The pattern in `examples/sqlite/` is the reference. The
-`migrations/` directory carries the SQL files; the `main.rs`
-runs them at startup; the implementation queries against the
-latest schema.
+`examples/sqlite/` is the reference: its `migrations/` directory
+holds the SQL files, its `main.rs` runs them at startup, and the
+implementation queries the latest schema.
 
 ### Fitting into a schema you already have
 
-The trait split is what lets axess fit into existing applications
-without forcing a schema rewrite. The library knows nothing about
+The trait split lets axess fit into existing applications without a
+schema rewrite. The library knows nothing about
 the user table; it knows only that there is a trait it can call
 to look up users. The application's data model is the source of
 truth, and the trait surface is the bridge.
 
-The three tiers and the noop adapter give you enough
-flexibility to fit the awkward shapes (read replicas, fixtures,
-split admin) without forcing every adopter to implement the full
-set of verbs.
+The three tiers and the noop adapter let code of your own fit the
+awkward shapes (read replicas, fixtures, split admin) by bounding on
+the tier it needs. An `AuthnService` still takes a store that
+implements all three.
 
 ## Further reading
 
 *Multi-tenancy* covers the per-tenant configuration that the
 identity store reads and writes. *Audit events* covers the
-`AuthEvent` variants the audit-log verbs emit. *Audit pipeline*
-covers the hot/cold retention story for the attempts table.
+`AuthEventType` variants the audit-log verbs emit. *Audit pipeline*
+covers the hot/cold retention of the audit events table.
 *Migration guide* covers the cross-version migrations that affect
 the user table.

@@ -16,13 +16,13 @@
 //!
 //! | Username  | Tenant  | Password     |
 //! |-----------|---------|--------------|
-//! | alice     | default | Gnomes2+Example |
+//! | alice     | default | Sample2+Example |
 //!
 //! ### Password + TOTP login
 //!
 //! | Username  | Tenant  | Password     |
 //! |-----------|---------|--------------|
-//! | bob       | default | Gnomes2+Example |
+//! | bob       | default | Sample2+Example |
 //!
 //! The accounts are seeded by a debug build, or by a release build run with
 //! `EXAMPLE_SEED=1`.
@@ -129,8 +129,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     });
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
-    info!("Listening on http://127.0.0.1:3000");
+    let listener = tokio::net::TcpListener::bind(web::app::LISTEN_ADDR).await?;
+    info!("Listening on http://{}", web::app::LISTEN_ADDR);
     axum::serve(
         listener,
         router.into_make_service_with_connect_info::<std::net::SocketAddr>(),

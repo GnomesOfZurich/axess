@@ -63,6 +63,23 @@ where
         )
         .await?;
 
+        // A wrong password spends the work of every refusal on the form:
+        // its own check, and a run at each of the current and the previous
+        // Argon2 cost but the one that check ran at. So a dormant account
+        // whose hash predates a cost change answers in the same work as an
+        // unknown identifier and a current hash (see
+        // `with_previous_argon2_cost`). A right password against a previous
+        // hash spends the same on its rehash.
+        if let (
+            VerifyOutcome::Fail,
+            FactorCredential::Password(password),
+            crate::authn::factor::FactorConfig::Password(cfg),
+        ) = (&outcome, credential, &opened.verify)
+        {
+            self.burn_password_work_after(password.as_ref(), cfg.hash.as_ref())
+                .await?;
+        }
+
         let close = |updated: crate::authn::factor::FactorConfig| -> Result<crate::authn::factor::FactorConfig, AuthnError<I::Error>> {
             factor_secrets::close(cipher, self.inner.allow_plaintext_factor_secrets, &opened, updated, &user_scope, &current_kind)
                 .map_err(|e| {

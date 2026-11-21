@@ -14,7 +14,7 @@
 //! socket is open and no enforcement fires until the next message attempt
 //! happens to fail.
 //!
-//! [`RevocationAwareSocket`](crate::middleware::ws::RevocationAwareSocket) wraps an [`axum::extract::ws::WebSocket`] so
+//! [`RevocationAwareSocket`] wraps an [`axum::extract::ws::WebSocket`] so
 //! the registry's [`watch_revocation`](crate::SessionRegistry::watch_revocation)
 //! event channel transparently closes the connection. Handler code looks
 //! identical to a normal WebSocket loop; `recv()` returns `None` when
@@ -33,10 +33,22 @@
 //! a registry that cannot answer closes the socket at the next poll, as the
 //! HTTP path refuses a request it cannot check. A connection has a maximum
 //! lifetime of one day by default ([`WatchOptions::max_lifetime`](crate::middleware::ws::WatchOptions::max_lifetime),
-//! [`DEFAULT_MAX_LIFETIME`](crate::middleware::ws::DEFAULT_MAX_LIFETIME)); the client reconnects and the upgrade runs
+//! [`DEFAULT_MAX_LIFETIME`]); the client reconnects and the upgrade runs
 //! through the session layer's checks again. Both can be turned off, and a
 //! deployment that does so has decided that a socket may outlive the
 //! library's ability to check its session.
+//!
+//! # Rotations
+//!
+//! A rotation of the session by another request (a step-up in another tab,
+//! [`RequestAuthnService::rotate_session`](crate::authn::service::RequestAuthnService::rotate_session),
+//! a `regenerate` behind the session layer) moves its registry entry to a new
+//! key, and the key the socket was opened under is no longer valid. That is
+//! not an ending, so it does not close the socket: the poll asks the registry
+//! where the session is now ([`SessionRegistry::current_key`])
+//! and the wrapper watches that key from then on, on the poll and on the push
+//! channel. The socket closes when the rotated session ends, by the push on
+//! its new key, or at the next poll when it ended before the poll found it.
 //!
 //! # Cross-site upgrades
 //!
@@ -69,10 +81,10 @@
 //!     let Some(who) = auth.snapshot().await else {
 //!         return StatusCode::UNAUTHORIZED.into_response();
 //!     };
-//!     let (user_id, session_id) = (who.user_id, who.session_id);
+//!     let (user_id, session) = (who.user_id, who.session_key);
 //!     ws.on_upgrade(move |socket| async move {
 //!         let mut socket = RevocationAwareSocket::new(
-//!             socket, registry, user_id, session_id);
+//!             socket, registry, user_id, session);
 //!         while let Some(Ok(msg)) = socket.recv().await {
 //!             // handle msg as usual
 //!         }
@@ -88,7 +100,7 @@ use axum::extract::ws::{CloseFrame, Message, Utf8Bytes, WebSocket};
 use tokio::sync::mpsc;
 
 use crate::authn::ids::UserId;
-use crate::session::SessionId;
+use crate::session::SessionKey;
 use crate::session::store::SessionRegistry;
 
 /// WebSocket close code for session-revocation. Application-defined range
@@ -179,46 +191,135 @@ impl Ending {
     }
 }
 
+/// What a check of the watched key found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Check {
+    /// The socket closes, for this reason.
+    Ends(Ending),
+    /// The session is live under this key, which the socket watches from now
+    /// on: the key it watched, or the key another request rotated it to.
+    LiveUnder(SessionKey),
+}
+
+/// The registry could not be asked: the socket closes as unverified when the
+/// options fail closed, and otherwise keeps watching the key it watched.
+fn unanswered(err: &dyn std::error::Error, watched: &SessionKey, options: WatchOptions) -> Check {
+    tracing::warn!(
+        target: "axess::ws",
+        %err,
+        fail_closed = options.fail_closed,
+        "ws revocation poll: registry unavailable",
+    );
+    if options.fail_closed {
+        Check::Ends(Ending::Unverified)
+    } else {
+        Check::LiveUnder(*watched)
+    }
+}
+
+/// The poll of the watched key. A key the registry still holds is the
+/// common case and costs one call, which also renews the entry as a request
+/// would. A key it does not hold is no proof that the session ended: another
+/// request (a step-up in another tab, `rotate_session`) may have moved the
+/// session to a new key, so the registry is asked where the session is now,
+/// and only "nowhere" closes the socket as revoked. Asking in this order
+/// leaves no window: a move that lands between the two calls is followed by
+/// the second, which resolves every earlier key of the session in one hop.
+async fn poll<R: SessionRegistry>(
+    registry: &R,
+    user_id: &UserId,
+    watched: &SessionKey,
+    options: WatchOptions,
+) -> Check {
+    match registry.is_valid(user_id, watched).await {
+        Ok(true) => return Check::LiveUnder(*watched),
+        Ok(false) => {}
+        Err(err) => return unanswered(&err, watched, options),
+    }
+    match registry.current_key(user_id, watched).await {
+        Ok(Some(now)) => Check::LiveUnder(now),
+        Ok(None) => Check::Ends(Ending::Revoked),
+        Err(err) => unanswered(&err, watched, options),
+    }
+}
+
+/// The push channel fired for the watched key. It fires when that key was
+/// ended, and also when a watcher found the key no longer live (a Valkey
+/// watcher after a dropped message, or while it polls without a connection),
+/// which a move away from it is. So the registry is asked where the session
+/// is now: a key other than the watched one is followed, and every other
+/// answer closes the socket as revoked. The push is the registry's word that
+/// the watched key ended, and only an answer naming the key the session moved
+/// to outweighs it; an error is no such answer, whatever `fail_closed` says.
+async fn after_push<R: SessionRegistry>(
+    registry: &R,
+    user_id: &UserId,
+    watched: &SessionKey,
+) -> Check {
+    match registry.current_key(user_id, watched).await {
+        Ok(Some(now)) if now != *watched => Check::LiveUnder(now),
+        Ok(_) => Check::Ends(Ending::Revoked),
+        Err(err) => {
+            tracing::warn!(
+                target: "axess::ws",
+                %err,
+                "ws revocation push: registry unavailable, closing the socket",
+            );
+            Check::Ends(Ending::Revoked)
+        }
+    }
+}
+
+/// The push channel of the registry for one key. The future owns its key, so
+/// a watch can be replaced by one for another key while the supervisor runs.
+async fn watch_key<R: SessionRegistry>(registry: &R, user_id: &UserId, key: SessionKey) {
+    registry.watch_revocation(user_id, &key).await;
+}
+
 /// Resolve when the session must be closed, with the reason: the push
-/// channel fired or the poll found it invalid, the poll could not tell and
-/// the options fail closed, or the lifetime ran out.
+/// channel fired or the poll found it ended, the poll could not tell and the
+/// options fail closed, or the lifetime ran out.
+///
+/// The session is followed across a rotation another request makes: the
+/// supervisor watches the key the registry holds the session under now
+/// ([`SessionRegistry::current_key`]), which starts as the key the socket
+/// was opened under. A rotation is not an ending, so it does not close the
+/// socket; an ending of the rotated session does. A move publishes nothing,
+/// so the poll is what finds a rotation; from then on the push channel
+/// listens on the new key. An ending of the rotated session before the poll
+/// found it is caught by that poll, which then finds the session nowhere.
 async fn supervise<R: SessionRegistry>(
     registry: &R,
     user_id: &UserId,
-    session_id: &SessionId,
+    session: &SessionKey,
     options: WatchOptions,
 ) -> Ending {
-    let poll = async {
-        let every = options.poll_interval.max(Duration::from_secs(1));
-        loop {
-            tokio::time::sleep(every).await;
-            match registry.is_valid(user_id, session_id).await {
-                Ok(true) => {}
-                Ok(false) => return Ending::Revoked,
-                Err(err) => {
-                    tracing::warn!(
-                        target: "axess::ws",
-                        %err,
-                        fail_closed = options.fail_closed,
-                        "ws revocation poll: registry unavailable",
-                    );
-                    if options.fail_closed {
-                        return Ending::Unverified;
-                    }
-                }
-            }
-        }
-    };
-    let lifetime = async {
+    let every = options.poll_interval.max(Duration::from_secs(1));
+    let mut watched = *session;
+    let mut watch = std::pin::pin!(watch_key(registry, user_id, watched));
+    let mut lifetime = std::pin::pin!(async {
         match options.max_lifetime {
             Some(limit) => tokio::time::sleep(limit).await,
             None => std::future::pending().await,
         }
-    };
-    tokio::select! {
-        () = registry.watch_revocation(user_id, session_id) => Ending::Revoked,
-        ending = poll => ending,
-        () = lifetime => Ending::LifetimeReached,
+    });
+    loop {
+        // A push is acted on at once; `after_push` never answers the watched
+        // key, so a completed watch is always replaced before it is polled
+        // again.
+        let check = tokio::select! {
+            () = watch.as_mut() => after_push(registry, user_id, &watched).await,
+            () = tokio::time::sleep(every) => poll(registry, user_id, &watched, options).await,
+            () = lifetime.as_mut() => return Ending::LifetimeReached,
+        };
+        match check {
+            Check::Ends(ending) => return ending,
+            Check::LiveUnder(now) if now == watched => {}
+            Check::LiveUnder(now) => {
+                watched = now;
+                watch.set(watch_key(registry, user_id, watched));
+            }
+        }
     }
 }
 
@@ -292,7 +393,9 @@ fn watcher_signalled(rx: &mut mpsc::Receiver<Ending>) -> Option<Ending> {
 impl RevocationAwareSocket {
     /// Wrap a `WebSocket` with revocation supervision.
     ///
-    /// The provided `registry`, `user_id`, and `session_id` are moved into
+    /// The provided `registry`, `user_id`, and `session` (the session's key,
+    /// [`AuthSession::session_key`](crate::session::AuthSession::session_key))
+    /// are moved into
     /// a background task that awaits `registry.watch_revocation`. The
     /// task is cancelled when the wrapper is dropped.
     ///
@@ -301,17 +404,11 @@ impl RevocationAwareSocket {
     /// Panics when called outside a Tokio runtime, because the watcher is
     /// started with `tokio::spawn`. A WebSocket upgrade handler always runs
     /// inside one.
-    pub fn new<R>(socket: WebSocket, registry: R, user_id: UserId, session_id: SessionId) -> Self
+    pub fn new<R>(socket: WebSocket, registry: R, user_id: UserId, session: SessionKey) -> Self
     where
         R: SessionRegistry,
     {
-        Self::with_options(
-            socket,
-            registry,
-            user_id,
-            session_id,
-            WatchOptions::default(),
-        )
+        Self::with_options(socket, registry, user_id, session, WatchOptions::default())
     }
 
     /// Like [`new`](Self::new), with explicit [`WatchOptions`].
@@ -323,7 +420,7 @@ impl RevocationAwareSocket {
         socket: WebSocket,
         registry: R,
         user_id: UserId,
-        session_id: SessionId,
+        session: SessionKey,
         options: WatchOptions,
     ) -> Self
     where
@@ -331,7 +428,7 @@ impl RevocationAwareSocket {
     {
         let (tx, rx) = mpsc::channel(1);
         let watch_task = tokio::spawn(async move {
-            let ending = supervise(&registry, &user_id, &session_id, options).await;
+            let ending = supervise(&registry, &user_id, &session, options).await;
             if let Err(err) = tx.send(ending).await {
                 tracing::trace!(
                     target: "axess::ws",
@@ -486,14 +583,18 @@ mod abort_on_drop_tests {
 mod recv_tests;
 
 #[cfg(all(test, feature = "memory"))]
+mod follow_tests;
+
+#[cfg(all(test, feature = "memory"))]
 mod supervise_tests {
     use super::*;
     use crate::session::store::MemorySessionRegistry;
+    use crate::testing::registry_double::{RegistryDouble, Step};
 
-    fn ids() -> (UserId, SessionId) {
+    fn ids() -> (UserId, SessionKey) {
         (
             axess_identity::testing::user("ws-user"),
-            SessionId::new(&crate::testing::mock_random::MockRng::new(7)),
+            SessionKey::from_bytes([7; 32]),
         )
     }
 
@@ -522,26 +623,8 @@ mod supervise_tests {
     }
 
     /// A registry that cannot be asked.
-    #[derive(Clone)]
-    struct Unreachable;
-
-    impl SessionRegistry for Unreachable {
-        type Error = std::io::Error;
-        async fn register(&self, _: &UserId, _: &SessionId) -> Result<(), Self::Error> {
-            Ok(())
-        }
-        async fn is_valid(&self, _: &UserId, _: &SessionId) -> Result<bool, Self::Error> {
-            Err(std::io::Error::other("registry unreachable"))
-        }
-        async fn invalidate_user(&self, _: &UserId) -> Result<(), Self::Error> {
-            Ok(())
-        }
-        async fn invalidate_session(&self, _: &UserId, _: &SessionId) -> Result<(), Self::Error> {
-            Ok(())
-        }
-        async fn active_sessions(&self, _: &UserId) -> Result<Vec<SessionId>, Self::Error> {
-            Ok(vec![])
-        }
+    fn unreachable() -> RegistryDouble {
+        RegistryDouble::new().before(|_, _| async { Step::Fail("registry unreachable") })
     }
 
     /// The defaults of a security library fail closed and bound the
@@ -566,7 +649,7 @@ mod supervise_tests {
     async fn an_unreachable_registry_closes_the_socket_under_the_defaults() {
         let (user, session) = ids();
         let watcher = tokio::spawn(async move {
-            supervise(&Unreachable, &user, &session, WatchOptions::default()).await
+            supervise(&unreachable(), &user, &session, WatchOptions::default()).await
         });
         tokio::time::sleep(Duration::from_secs(29)).await;
         assert!(

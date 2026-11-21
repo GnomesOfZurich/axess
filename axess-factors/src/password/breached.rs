@@ -209,7 +209,7 @@ impl BreachCheckOutage {
 impl BreachedPasswordCheck for BreachCheckOutage {
     fn is_breached<'a>(
         &'a self,
-        _password: &'a str,
+        _: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<bool, BreachCheckError>> + Send + 'a>> {
         Box::pin(std::future::ready(Err(BreachCheckError::new(
             self.0.clone(),

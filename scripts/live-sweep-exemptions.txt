@@ -1,0 +1,25 @@
+# The live Valkey tests scripts/check-live-sweeps.sh admits without a sweep,
+# one per line:
+#
+#   test<TAB>FILE<TAB>NAME
+#
+# each under a comment that gives its reason; a blank line ends a reason. A
+# test that writes a key holds a sweep and is not listed here. An entry for
+# a test that is not there, or for one that holds a sweep, is refused.
+
+# A store on a cluster left on the default prefix, which has no hash tag,
+# refuses every write before a command is sent, and the test asserts that
+# nothing was written under the keys the store would have used.
+test	axess-core/src/device/storage/valkey/cluster_tests.rs	a_store_left_on_the_default_prefix_refuses_its_writes_by_name
+
+# These change a server's maxmemory-policy and write no key; the policy is
+# put back by the guard that holds it (testing::valkey_server::HeldPolicy),
+# whose lease key is removed with it.
+test	axess-core/src/replay/valkey/tests.rs	checked_reads_a_live_servers_policy_under_both_protocols
+test	axess-core/src/replay/valkey/tests.rs	checked_asks_every_node_of_a_cluster
+
+# These publish reload notices on channels named for their own run and
+# write no key: a publish stores nothing on the server.
+test	axess-core/tests/authz_reload_valkey.rs	a_reload_on_one_store_reaches_a_second_store_through_valkey
+test	axess-core/tests/provider_reload_valkey.rs	a_provider_reload_on_one_service_reaches_a_second_service_through_valkey
+test	axess-core/tests/provider_reload_valkey.rs	the_policy_channel_and_the_provider_channel_do_not_cross

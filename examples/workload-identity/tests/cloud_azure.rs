@@ -12,8 +12,10 @@
 //! (AADSTS70021, AADSTS700211, AADSTS700212, AADSTS70011). The mock was
 //! written from that documentation, not recorded from a live tenant.
 
-mod common;
+mod signing;
+mod verifier;
 
+use axess_clock::testing::MockClock;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -104,7 +106,7 @@ async fn read_secret(
         svc.trust.clone(),
         {
             let tenant = svc.tenant;
-            move |_slug: &str| Some(tenant)
+            move |_: &str| Some(tenant)
         },
         Issuer::custom("pipeline").expect("issuer name"),
         bearer.to_string(),
@@ -298,9 +300,17 @@ fn good_credential() -> FederatedCredential {
 struct Fixture {
     app: Router,
     pipeline_token: String,
-    // Held so the mocks outlive the test and verify their expectations.
-    _ad: MockServer,
-    _vault: MockServer,
+    // Held so the mocks outlive the test, and ended by the fixture's `Drop`,
+    // where each verifies its expectations.
+    ad: Option<MockServer>,
+    vault: Option<MockServer>,
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        drop(self.ad.take());
+        drop(self.vault.take());
+    }
 }
 
 /// Wire the mock Azure AD (with `credential` configured) and a mock Key
@@ -311,6 +321,7 @@ async fn fixture(
     vault_reads: u64,
     pipeline_audience: &str,
 ) -> Fixture {
+    let clock = MockClock::at_reference();
     let ad = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(format!("/{TENANT}/oauth2/v2.0/token")))
@@ -331,19 +342,19 @@ async fn fixture(
         .mount(&vault)
         .await;
 
-    let (der, jwks) = common::rsa_keypair("pipe-1");
-    let (now, exp) = common::now_and_exp();
-    let pipeline_token = common::sign(
+    let (der, jwks) = signing::rsa_keypair("pipe-1");
+    let (now, exp) = signing::now_and_exp();
+    let pipeline_token = signing::sign(
         &serde_json::json!({
             "iss": CALLER_ISSUER,
-            "sub": "project_path:gnomes/ledger:ref_type:branch:ref:main",
+            "sub": "project_path:example-group/ledger:ref_type:branch:ref:main",
             "aud": pipeline_audience,
             "exp": exp,
             "iat": now,
             "namespace_id": "1204",
-            "namespace_path": "gnomes",
+            "namespace_path": "example-group",
             "project_id": "4711",
-            "project_path": "gnomes/ledger",
+            "project_path": "example-group/ledger",
             "ref": "main",
             "ref_type": "branch",
             "ref_protected": "true",
@@ -359,7 +370,7 @@ async fn fixture(
             Url::parse(&format!("{}/{TENANT}/oauth2/v2.0/token", ad.uri())).unwrap(),
         );
     let svc = Service {
-        verifier: common::build_verifier(jwks, CALLER_ISSUER, CALLER_AUDIENCE),
+        verifier: verifier::build_verifier(&clock, jwks, CALLER_ISSUER, CALLER_AUDIENCE),
         trust: TrustDomain::new("pipelines").unwrap(),
         tenant: TenantId::from_bytes([7u8; 16]),
         fic,
@@ -370,8 +381,8 @@ async fn fixture(
     Fixture {
         app: router(svc),
         pipeline_token,
-        _ad: ad,
-        _vault: vault,
+        ad: Some(ad),
+        vault: Some(vault),
     }
 }
 

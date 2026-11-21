@@ -1,11 +1,12 @@
 use super::*;
 use crate::authn::ids::{TenantId, UserId};
-use chrono::{DateTime, TimeZone, Utc};
+use axess_clock::Timestamp;
+use axess_clock::testing::Shift;
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
-fn at(secs: i64) -> DateTime<Utc> {
-    Utc.timestamp_opt(1_700_000_000 + secs, 0).unwrap()
+fn at(secs: i64) -> Timestamp {
+    Timestamp::from_unix_seconds(1_700_000_000 + secs).unwrap()
 }
 
 fn state(failures: u32, last_secs: i64) -> ThrottleState {
@@ -71,7 +72,7 @@ fn a_fraction_of_a_second_left_is_a_whole_second_to_wait() {
     let throttle = Throttle::default();
     let state = ThrottleState {
         failures: 1,
-        last_failure_at: at(10) + chrono::Duration::milliseconds(400),
+        last_failure_at: at(10).plus(axess_clock::SignedDuration::milliseconds(400)),
     };
     assert_eq!(
         throttle.retry_after(Some(&state), at(11)),
@@ -227,4 +228,57 @@ fn a_zero_first_delay_stays_zero_past_the_doubling_width() {
     };
     assert_eq!(throttle.delay_after(40), Duration::ZERO);
     assert_eq!(throttle.retry_after(Some(&state(40, 0)), at(0)), None);
+}
+
+/// A client behind a translator or a tunnel reaches the service from an IPv6
+/// address that carries its IPv4 address, inside a prefix every such client
+/// shares: keyed on that /64, every client of one NAT64 gateway, every 6to4
+/// site of one /64 and every Teredo client of one server would share one
+/// delay. Each is keyed as the IPv4 client it carries, and two clients are
+/// two keys.
+#[test]
+fn an_ipv6_form_that_carries_an_ipv4_client_is_keyed_on_that_client() {
+    use axess_testing::ipv6_forms::embedding_v4;
+    let throttle = Throttle::default();
+    let (one, two) = (
+        Ipv4Addr::new(203, 0, 113, 7),
+        Ipv4Addr::new(198, 51, 100, 9),
+    );
+    for (form_one, form_two) in embedding_v4(one).into_iter().zip(embedding_v4(two)) {
+        let (key_one, key_two) = (
+            subject_of(&throttle, IpAddr::V6(form_one.addr)),
+            subject_of(&throttle, IpAddr::V6(form_two.addr)),
+        );
+        assert_ne!(
+            key_one, key_two,
+            "{}: two clients share one throttle key",
+            form_one.name
+        );
+        // The locally used NAT64 prefix places the IPv4 address where the
+        // operator's prefix length puts it, so the whole address is the key.
+        if form_one.name != "local-use nat64" {
+            assert_eq!(
+                key_one,
+                subject_of(&throttle, IpAddr::V4(one)),
+                "{}: not keyed as the IPv4 client it carries",
+                form_one.name
+            );
+        }
+    }
+}
+
+/// The well-known IPv6 addresses inside the IPv4-compatible range are not
+/// clients carrying an IPv4 address: the unspecified and the loopback
+/// address keep the /64 reading.
+#[test]
+fn the_unspecified_and_loopback_addresses_are_not_read_as_ipv4_clients() {
+    let throttle = Throttle::default();
+    for text in ["::", "::1"] {
+        let address = addr6(text);
+        assert_eq!(
+            subject_of(&throttle, address).address,
+            Some(addr6("::")),
+            "{text}"
+        );
+    }
 }

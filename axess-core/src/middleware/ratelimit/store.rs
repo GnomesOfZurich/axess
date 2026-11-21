@@ -4,7 +4,7 @@
 use super::keys::{GROUP_BUCKET_CAP, Target};
 use crate::locked::lock;
 use axess_clock::Clock;
-use chrono::{DateTime, Utc};
+use axess_clock::Timestamp;
 use std::{
     collections::{HashMap, hash_map::Entry},
     sync::{
@@ -24,8 +24,8 @@ pub(super) const HARD_BUCKET_CAP: usize = 256 * 1024;
 const MIN_SWEEP_INTERVAL_MS: u64 = 1_000;
 
 /// Milliseconds since the Unix epoch, floored at zero.
-fn epoch_millis(now: DateTime<Utc>) -> u64 {
-    u64::try_from(now.timestamp_millis()).unwrap_or(0)
+fn epoch_millis(now: Timestamp) -> u64 {
+    u64::try_from(now.unix_millis()).unwrap_or(0)
 }
 
 /// One key's sliding-window counter: the requests admitted in the current
@@ -143,7 +143,7 @@ impl BucketStore {
     }
 
     /// The injected clock's current time.
-    pub(super) fn now(&self) -> DateTime<Utc> {
+    pub(super) fn now(&self) -> Timestamp {
         self.clock.now()
     }
 
@@ -154,7 +154,7 @@ impl BucketStore {
 
     /// Take a token for the plain key `key` at an explicit `now`.
     #[cfg(test)]
-    pub(super) fn try_acquire_at(&self, key: &str, now: DateTime<Utc>) -> Acquire {
+    pub(super) fn try_acquire_at(&self, key: &str, now: Timestamp) -> Acquire {
         self.try_acquire_target(&Target::plain(key), now)
     }
 
@@ -165,7 +165,7 @@ impl BucketStore {
     /// that asks for it) the table is three quarters full; it then folds into
     /// the target's shared overflow bucket, which limits the whole overflow
     /// together instead of letting it grow the table.
-    pub(super) fn try_acquire_target(&self, target: &Target, now: DateTime<Utc>) -> Acquire {
+    pub(super) fn try_acquire_target(&self, target: &Target, now: Timestamp) -> Acquire {
         let now_ms = epoch_millis(now);
         self.sweep_if_due(now_ms);
 
@@ -367,7 +367,7 @@ impl BucketStore {
 
     /// Remove buckets that no longer weigh on the estimate at `now`.
     #[cfg(test)]
-    pub(super) fn evict_expired_at(&self, now: DateTime<Utc>) {
+    pub(super) fn evict_expired_at(&self, now: Timestamp) {
         self.evict_expired_ms(epoch_millis(now));
     }
 

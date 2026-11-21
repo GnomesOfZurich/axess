@@ -1,8 +1,11 @@
 //! The session layer checks its whole configuration once, when it becomes a
 //! service, whatever order the setters ran in.
 
-#![cfg(feature = "memory")]
+#![cfg(all(feature = "memory", feature = "testing"))]
 
+use axess_core::testing::fixtures as common;
+
+use axess_clock::testing::MockClock;
 use axess_core::session::{
     config::{SameSite, SessionConfig},
     layer::SessionLayer,
@@ -12,16 +15,20 @@ use std::convert::Infallible;
 use std::time::Duration;
 use tower::{Layer, service_fn};
 
-fn base() -> SessionLayer<MemorySessionStore> {
+fn base(clock: &MockClock) -> SessionLayer<MemorySessionStore> {
     SessionLayer::new(
-        MemorySessionStore::new(),
+        MemorySessionStore::new().with_clock(std::sync::Arc::new(clock.clone())),
         axess_core::testing::test_key(1),
-        axess_core::MemorySessionRegistry::new().handle(),
+        axess_core::MemorySessionRegistry::new()
+            .with_clock(std::sync::Arc::new(clock.clone()))
+            .handle(),
+        std::sync::Arc::new(axess_core::session::UnrecordedSessionEnds),
     )
+    .with_clock(clock.clone())
 }
 
 fn build(layer: &SessionLayer<MemorySessionStore>) {
-    let inner = service_fn(|_req: axum::http::Request<axum::body::Body>| async {
+    let inner = service_fn(|_: axum::http::Request<axum::body::Body>| async {
         Ok::<_, Infallible>(axum::http::Response::new(axum::body::Body::empty()))
     });
     let _ = layer.layer(inner);
@@ -29,25 +36,29 @@ fn build(layer: &SessionLayer<MemorySessionStore>) {
 
 #[test]
 fn the_default_layer_builds() {
-    build(&base());
+    let clock = common::test_clock();
+    build(&base(&clock));
 }
 
 #[test]
 fn a_config_from_the_builder_builds() {
-    build(&base().with_config(SessionConfig::builder().build()));
+    let clock = common::test_clock();
+    build(&base(&clock).with_config(SessionConfig::builder().build()));
 }
 
 #[test]
 fn a_dev_layer_without_secure_falls_back_to_the_unprefixed_name() {
-    build(&base().with_secure(false));
-    build(&base().with_path("/app"));
+    let clock = common::test_clock();
+    build(&base(&clock).with_secure(false));
+    build(&base(&clock).with_path("/app"));
 }
 
 #[test]
 fn setter_order_does_not_matter() {
-    build(&base().with_cookie_name("__Host-a").with_secure(true));
+    let clock = common::test_clock();
+    build(&base(&clock).with_cookie_name("__Host-a").with_secure(true));
     build(
-        &base()
+        &base(&clock)
             .with_secure(false)
             .with_cookie_name("plain")
             .with_secure(true),
@@ -57,55 +68,72 @@ fn setter_order_does_not_matter() {
 #[test]
 #[should_panic(expected = "requires `path")]
 fn host_prefix_with_a_path_panics() {
-    build(&base().with_cookie_name("__Host-a").with_path("/app"));
+    let clock = common::test_clock();
+    build(&base(&clock).with_cookie_name("__Host-a").with_path("/app"));
 }
 
 #[test]
 #[should_panic(expected = "requires `secure = true`")]
 fn secure_prefix_without_secure_panics() {
-    build(&base().with_cookie_name("__Secure-a").with_secure(false));
+    let clock = common::test_clock();
+    build(
+        &base(&clock)
+            .with_cookie_name("__Secure-a")
+            .with_secure(false),
+    );
 }
 
 #[test]
 #[should_panic(expected = "requires `secure = true`")]
 fn host_prefix_without_secure_panics() {
-    build(&base().with_cookie_name("__Host-a").with_secure(false));
+    let clock = common::test_clock();
+    build(&base(&clock).with_cookie_name("__Host-a").with_secure(false));
 }
 
 #[test]
 #[should_panic(expected = "ttl must be > 0")]
 fn zero_ttl_panics() {
-    build(&base().with_ttl(Duration::ZERO));
+    let clock = common::test_clock();
+    build(&base(&clock).with_ttl(Duration::ZERO));
 }
 
 #[test]
 #[should_panic(expected = "must not be empty")]
 fn empty_cookie_name_panics() {
-    build(&base().with_cookie_name(""));
+    let clock = common::test_clock();
+    build(&base(&clock).with_cookie_name(""));
 }
 
 #[test]
 #[should_panic(expected = "not valid in a cookie name")]
 fn a_cookie_name_with_a_separator_panics() {
-    build(&base().with_cookie_name("a;b"));
+    let clock = common::test_clock();
+    build(&base(&clock).with_cookie_name("a;b"));
 }
 
 #[test]
 #[should_panic(expected = "SameSite=None")]
 fn same_site_none_without_secure_panics() {
-    build(&base().with_same_site(SameSite::None).with_secure(false));
+    let clock = common::test_clock();
+    build(
+        &base(&clock)
+            .with_same_site(SameSite::None)
+            .with_secure(false),
+    );
 }
 
 #[test]
 #[should_panic(expected = "max_authenticated_age must be > 0")]
 fn zero_session_age_panics() {
-    build(&base().with_max_session_age(Some(Duration::ZERO)));
+    let clock = common::test_clock();
+    build(&base(&clock).with_max_session_age(Some(Duration::ZERO)));
 }
 
 #[test]
 #[should_panic(expected = "max_impersonation_age must be > 0")]
 fn zero_impersonation_age_panics() {
-    build(&base().with_max_impersonation_age(Some(Duration::ZERO)));
+    let clock = common::test_clock();
+    build(&base(&clock).with_max_impersonation_age(Some(Duration::ZERO)));
 }
 
 #[test]

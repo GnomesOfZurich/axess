@@ -1,6 +1,6 @@
 [package]
 name = "axess-example-oauth"
-version = "0.19.0"
+version = "0.20.0"
 edition = "2024"
 rust-version.workspace = true
 publish = false
@@ -11,13 +11,18 @@ authors = ["Gnomes"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/GnomesOfZurich/axess"
 
+[lints]
+workspace = true
+
 [dependencies]
 # `oauth` + `jwt-rust-crypto` for OIDC; `social` + `memory` for `--bin social`.
-# Demo built on the mock stores and mock provider of `testing`: it opts out of the release-build guard by name.
-axess = { path = "../../axess", version = "=0.19.0", features = ["oauth", "jwt-rust-crypto", "testing", "allow-testing-in-release", "social", "memory"] }
+# Demo built on the mock stores and mock provider of `testing`: a debug demo, so a release build of it is refused by the guard.
+axess = { path = "../../axess", version = "=0.20.0", features = ["oauth", "jwt-rust-crypto", "testing", "social", "memory"] }
 # `Algorithm` names the signing algorithm of a `private_key_jwt` key. No crypto
 # backend here: `axess`'s `jwt-rust-crypto` feature picks the one provider, and
 # a second one makes `jsonwebtoken` refuse to choose.
+# Held at 11: jsonwebtoken 12 requires rsa ^0.10, which openidconnect and
+# crypto-glue keep out of the lock (see rsa).
 jsonwebtoken = { version = "11.1.0", default-features = false }
 axum = { version = "0.8.9", features = ["json", "form", "macros"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -28,14 +33,16 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
-# `ensure_crypto_provider` for signing test tokens, and `test_session` for the
-# claim-lock test; both are what the library tests use.
-axess-core = { path = "../../axess-core", version = "=0.19.0", features = ["testing", "oauth"] }
-axess-factors = { path = "../../axess-factors", version = "=0.19.0", features = ["jwt-rust-crypto"] }
+# `test_session` for the claim-lock test, which is what the library tests use.
+axess-core = { path = "../../axess-core", version = "=0.20.0", features = ["testing", "oauth"] }
 # The tests stand up an OIDC provider in process and sign its tokens.
 base64 = { version = "0.23.1", default-features = false, features = ["std"] }
 http-body-util = "0.1.5"
+# Held at 11: jsonwebtoken 12 requires rsa ^0.10, which openidconnect and
+# crypto-glue keep out of the lock (see rsa).
 jsonwebtoken = { version = "11.1.0", features = ["aws_lc_rs"] }
+# Held at 0.9 until openidconnect accepts rsa 0.10 and crypto-glue (through
+# webauthn-rs) moves from its rsa 0.10 release candidate to rsa 0.10.0.
 rsa = { version = "0.9.10", features = ["pkcs5"] }
 tower = { version = "0.5.3", features = ["util"] }
 url = "2.5.8"

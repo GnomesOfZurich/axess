@@ -7,13 +7,14 @@ use crate::{
 use axess::authn::BreachedPasswordList;
 use axess::authn::{AuthnService, FactorSecretCipher};
 use axess::csrf::{CsrfConfig, CsrfLayer};
+use axess::profile::SecurityProfile;
 use axess::session::{LegacyBlobs, SessionCrypto};
 use axess::{
     AuditMetrics, AuthFlowMetrics, AuthSession, AuthzCacheMetrics, CompositeHealthCheck,
-    CsrfRefusal, FactorMetrics, KeyExtractor, MemorySessionRegistry, MetricSinks, ProviderCategory,
-    ProviderRegistryMetrics, RateLimitConfig, RateLimitLayer, RequestGuardMetrics, RotationMetrics,
-    SecureRng, SessionLayer, SessionMetrics, SystemRng,
-    backends::sqlite::SessionStore as SqliteSessionStore,
+    CsrfRefusal, DeviceKeyMetrics, FactorMetrics, KeyExtractor, MemorySessionRegistry, MetricSinks,
+    ProviderCategory, ProviderRegistryMetrics, RateLimitConfig, RateLimitLayer,
+    RequestGuardMetrics, RotationMetrics, SecureRng, SessionLayer, SessionMetrics, SystemClock,
+    SystemRng, backends::sqlite::SessionStore as SqliteSessionStore,
 };
 use axum::response::{IntoResponse, Redirect};
 use axum::{Router, routing::get, routing::post};
@@ -49,6 +50,10 @@ pub struct AppMetrics {
     pub provider_reload_refusals: AtomicU64,
     pub policy_reloads: AtomicU64,
     pub policy_reload_refusals: AtomicU64,
+    pub device_keys_offered: AtomicU64,
+    pub device_keys_registered: AtomicU64,
+    pub device_key_proofs_refused: AtomicU64,
+    pub bound_sessions_unproven: AtomicU64,
 }
 
 impl AppMetrics {
@@ -105,6 +110,22 @@ impl AppMetrics {
                 "axess_authz_policy_reload_refusals_total",
                 get(&self.policy_reload_refusals),
             ),
+            (
+                "axess_device_keys_offered_total",
+                get(&self.device_keys_offered),
+            ),
+            (
+                "axess_device_keys_registered_total",
+                get(&self.device_keys_registered),
+            ),
+            (
+                "axess_device_key_proofs_refused_total",
+                get(&self.device_key_proofs_refused),
+            ),
+            (
+                "axess_bound_sessions_unproven_total",
+                get(&self.bound_sessions_unproven),
+            ),
         ]
     }
 }
@@ -158,13 +179,13 @@ impl ProviderRegistryMetrics for AppMetrics {
     fn provider_duplicate_registration(&self) {
         self.provider_duplicates.fetch_add(1, Ordering::Relaxed);
     }
-    fn provider_reloaded(&self, _category: ProviderCategory) {
+    fn provider_reloaded(&self, _: ProviderCategory) {
         self.provider_reloads.fetch_add(1, Ordering::Relaxed);
     }
-    fn provider_removed(&self, _category: ProviderCategory) {
+    fn provider_removed(&self, _: ProviderCategory) {
         self.provider_removals.fetch_add(1, Ordering::Relaxed);
     }
-    fn provider_reload_refused(&self, _category: ProviderCategory) {
+    fn provider_reload_refused(&self, _: ProviderCategory) {
         self.provider_reload_refusals
             .fetch_add(1, Ordering::Relaxed);
     }
@@ -174,7 +195,7 @@ impl RequestGuardMetrics for AppMetrics {
     fn rate_limit_rejected(&self) {
         self.rate_limit_rejections.fetch_add(1, Ordering::Relaxed);
     }
-    fn csrf_rejected(&self, _reason: CsrfRefusal) {
+    fn csrf_rejected(&self, _: CsrfRefusal) {
         self.csrf_rejections.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -188,7 +209,27 @@ impl AuthzCacheMetrics for AppMetrics {
     }
 }
 
-// The concern this example does not export. An empty impl is all it takes
+// The device-key counters an operator watches first: keys offered and keys
+// taken, read against each other before keys are required, proofs that were
+// not the key's, and requests of a bound session that came without its key
+// (a copied session cookie is one).
+impl DeviceKeyMetrics for AppMetrics {
+    fn key_offered(&self) {
+        self.device_keys_offered.fetch_add(1, Ordering::Relaxed);
+    }
+    fn key_registered(&self) {
+        self.device_keys_registered.fetch_add(1, Ordering::Relaxed);
+    }
+    fn key_proof_refused(&self) {
+        self.device_key_proofs_refused
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    fn bound_session_unproven(&self) {
+        self.bound_sessions_unproven.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+// The concerns this example does not export. An empty impl is all it takes
 // for `AppMetrics` to satisfy `AxessMetrics` and wire to every concern.
 impl AuditMetrics for AppMetrics {}
 
@@ -229,10 +270,8 @@ const BREACHED_PASSWORDS: [&str; 6] = [
 /// read. Each such secret is sealed by the login that verifies it, so the date
 /// only has to outlast the users who have not signed in yet. It is a fixed
 /// date, not a span from the start of the run, so a restart does not move it.
-pub fn plain_secret_cutoff() -> chrono::DateTime<chrono::Utc> {
-    chrono::DateTime::parse_from_rfc3339("2027-01-31T00:00:00Z")
-        .expect("a fixed RFC 3339 date")
-        .to_utc()
+pub fn plain_secret_cutoff() -> axess::Timestamp {
+    axess::Timestamp::parse_rfc3339("2027-01-31T00:00:00Z").expect("a fixed RFC 3339 date")
 }
 
 /// The key TOTP secrets are sealed under: 32 bytes, hex encoded, in a file
@@ -345,11 +384,17 @@ pub fn factor_secret_key_at(path: &std::path::Path) -> std::io::Result<[u8; 32]>
 /// plain secret until `plain_secret_cutoff` so rows written before the
 /// cipher existed are moved by their owner's next login.
 pub fn factor_secret_cipher() -> Arc<FactorSecretCipher> {
+    factor_secret_cipher_on(Arc::new(SystemClock))
+}
+
+/// [`factor_secret_cipher`], reading the plain-secret cutoff against `clock`.
+pub fn factor_secret_cipher_on(clock: Arc<dyn axess::Clock>) -> Arc<FactorSecretCipher> {
     Arc::new(
         FactorSecretCipher::new(
             factor_secret_key()
                 .expect("the factor secret key file must be readable by its owner only"),
         )
+        .with_clock(clock)
         .with_plain_secrets(LegacyBlobs::AcceptUntil(plain_secret_cutoff())),
     )
 }
@@ -360,6 +405,35 @@ pub fn factor_secret_cipher() -> Arc<FactorSecretCipher> {
 /// `localhost` as a secure context in most cases; set this only for a
 /// browser or host name that refuses `Secure` cookies over HTTP.
 pub const INSECURE_COOKIES_ENV: &str = "AXESS_DEV_INSECURE_COOKIES";
+
+/// The address the binary listens on, over plain HTTP.
+pub const LISTEN_ADDR: &str = "127.0.0.1:3000";
+
+/// The variable naming the origin the application is reached at when it is
+/// served over HTTPS, such as `https://app.example`. Device keys
+/// (`--features device-keys`) need it: every key proof is made for it.
+pub const ORIGIN_ENV: &str = "AXESS_ORIGIN";
+
+/// How the application is reached: what the cookies and the device keys are
+/// built for.
+#[derive(Debug, Clone)]
+pub struct Serving {
+    /// Whether cookies carry `Secure`.
+    pub secure: bool,
+    /// The origin the application is reached at, when it is known. Read by
+    /// the device keys of `--features device-keys`.
+    pub origin: Option<String>,
+}
+
+impl Serving {
+    /// From the environment: [`INSECURE_COOKIES_ENV`] and [`ORIGIN_ENV`].
+    pub fn from_env() -> Self {
+        Self {
+            secure: secure_cookies(),
+            origin: std::env::var(ORIGIN_ENV).ok(),
+        }
+    }
+}
 
 /// Whether the operator asked for cookies without the `Secure` attribute.
 /// Prints a banner when they did, so the setting cannot go unnoticed.
@@ -378,7 +452,35 @@ fn secure_cookies() -> bool {
 ///
 /// Call once at startup, after migrations have run.
 pub async fn build_router(pool: SqlitePool) -> (Router, SqliteSessionStore) {
-    let backend = OurBackend::new(pool.clone());
+    build_router_on(pool, Arc::new(SystemClock)).await
+}
+
+/// [`build_router`], with every time-bound part of the application on
+/// `clock`: the backend, the authentication service and its factor cipher,
+/// the session layer and its stores, and the rate limits. A test passes a
+/// mock set to the instant it plays the user's authenticator at.
+pub async fn build_router_on(
+    pool: SqlitePool,
+    clock: Arc<dyn axess::Clock>,
+) -> (Router, SqliteSessionStore) {
+    build_router_serving(pool, clock, Serving::from_env()).await
+}
+
+/// [`build_router_on`], reached as `serving` says rather than as the
+/// environment does: a test names the origin its device keys are held to.
+pub async fn build_router_serving(
+    pool: SqlitePool,
+    clock: Arc<dyn axess::Clock>,
+    serving: Serving,
+) -> (Router, SqliteSessionStore) {
+    let backend = OurBackend::new(pool.clone()).with_clock(clock.clone());
+    // The lockout policy is checked where it is loaded, so a value past a
+    // bound stops the start-up by name instead of being clamped on every
+    // login; a deployment that reads the policy from a tenant table makes
+    // the same call where it reads the row.
+    if let Err(fault) = backend.lockout_policy().validate() {
+        panic!("the lockout policy is refused: {fault}");
+    }
 
     // SQLite-backed session store with AES-256-GCM encryption at rest.
     // In production, load both keys from a secrets manager and persist them.
@@ -400,9 +502,11 @@ pub async fn build_router(pool: SqlitePool) -> (Router, SqliteSessionStore) {
     let session_store = SqliteSessionStore::new(
         pool.clone(),
         SessionCrypto::new(encryption_key)
+            .with_clock(clock.clone())
             .with_previous_key(previous_key)
             .with_metrics(sinks.rotation()),
-    );
+    )
+    .with_clock(clock.clone());
     session_store
         .init_schema()
         .await
@@ -426,18 +530,72 @@ pub async fn build_router(pool: SqlitePool) -> (Router, SqliteSessionStore) {
     //
     // The in-memory registry is per process and empty after a restart; use
     // the Valkey registry for more than one instance.
-    let registry = MemorySessionRegistry::default();
+    let registry = MemorySessionRegistry::default().with_clock(clock.clone());
 
-    let secure = secure_cookies();
+    let state_backend = backend.clone();
+    let factor_cipher = factor_secret_cipher_on(clock.clone());
+    // The strict profile: the Argon2id cost, the password-reset lifetime and
+    // cap and the impersonation recency a deployment that holds money or
+    // regulated data runs with, as named values. Applied first, so every
+    // setting below it (the cipher, the breach check, the stores) stays as
+    // written here. Applying never loosens: a looser value of a setting the
+    // profile names is written after it, on the builder it returns.
+    let strict = SecurityProfile::Strict.values();
+    let service = Arc::new(
+        strict
+            .authn_service_builder(AuthnService::builder(backend.clone(), backend))
+            .with_clock(clock.clone())
+            // TOTP secrets are opened to check a code and kept sealed at rest.
+            .with_factor_secret_cipher(factor_cipher.clone())
+            .with_metrics(sinks.clone())
+            // Registered sessions are what a password reset or an admin
+            // action can revoke; handing over the session store lets the
+            // revocation delete the rows as well.
+            // One reset token per account a minute: the form cannot be used to
+            // flood an inbox, or to spend the reset budget of another user.
+            .with_password_reset_cooldown(Duration::from_secs(60))
+            // Every chosen password (signup, reset) is screened against a
+            // breach corpus and refused by name when found. This is a short
+            // fixed list so the refusal can be seen; a deployment implements
+            // `BreachedPasswordCheck` over the k-anonymity range protocol
+            // (see the README). The default refuses a password the check
+            // could not screen; `allow_unchecked_when_breach_check_unavailable`
+            // is the opt-out.
+            .with_breached_password_check(BreachedPasswordList::new(BREACHED_PASSWORDS))
+            .with_registry(registry.clone())
+            .with_session_store(session_store.clone())
+            .build(),
+    );
+
+    let secure = serving.secure;
     let session_layer = SessionLayer::new(
         session_store.clone(),
         signing_key,
-        Arc::new(axess::SessionRegistryAdapter(registry.clone())),
+        Arc::new(axess::SessionRegistryAdapter(registry)),
+        // The service's sink writes an audit row for each session the
+        // layer ends by itself: one past an age cap, one the registry no
+        // longer holds.
+        service.session_end_audit(),
     )
+    .with_clock(clock.clone())
     .with_ttl(STRICT_IDLE_TTL)
     .with_max_session_age(Some(STRICT_MAX_SESSION_AGE))
     .with_secure(secure)
     .with_metrics(sinks.clone());
+    // Device keys, with `--features device-keys` (`web::device_keys` says
+    // what they add). Their routes are merged below.
+    #[cfg(feature = "device-keys")]
+    let (session_layer, device_keys) = crate::web::device_keys::with_device_keys(
+        session_layer,
+        crate::web::device_keys::Wiring {
+            pool: &pool,
+            clock: clock.clone(),
+            serving: &serving,
+            sinks: &sinks,
+            audit: state_backend.clone(),
+        },
+    )
+    .await;
 
     // CSRF layer: signed double-submit cookie bound to the session id.
     // The key is a purpose-bound subkey of the session layer's master key
@@ -466,6 +624,7 @@ pub async fn build_router(pool: SqlitePool) -> (Router, SqliteSessionStore) {
                 .max_requests(max_requests)
                 .window(Duration::from_secs(60))
                 .key(KeyExtractor::ClientIp)
+                .clock(clock.clone())
                 .build(),
         )
         .with_metrics(sinks.clone())
@@ -476,31 +635,6 @@ pub async fn build_router(pool: SqlitePool) -> (Router, SqliteSessionStore) {
     // below. Cloning one limiter onto several routes would share its bucket
     // (the clones keep one store), and the forms would spend one budget.
 
-    let state_backend = backend.clone();
-    let factor_cipher = factor_secret_cipher();
-    let service = Arc::new(
-        AuthnService::builder(backend.clone(), backend)
-            // TOTP secrets are opened to check a code and kept sealed at rest.
-            .with_factor_secret_cipher(factor_cipher.clone())
-            .with_metrics(sinks.clone())
-            // Registered sessions are what a password reset or an admin
-            // action can revoke; handing over the session store lets the
-            // revocation delete the rows as well.
-            // One reset token per account a minute: the form cannot be used to
-            // flood an inbox, or to spend the reset budget of another user.
-            .with_password_reset_cooldown(Duration::from_secs(60))
-            // Every chosen password (signup, reset) is screened against a
-            // breach corpus and refused by name when found. This is a short
-            // fixed list so the refusal can be seen; a deployment implements
-            // `BreachedPasswordCheck` over the k-anonymity range protocol
-            // (see the README). The default refuses a password the check
-            // could not screen; `allow_unchecked_when_breach_check_unavailable`
-            // is the opt-out.
-            .with_breached_password_check(BreachedPasswordList::new(BREACHED_PASSWORDS))
-            .with_registry(registry)
-            .with_session_store(session_store.clone())
-            .build(),
-    );
     let state = AppState {
         service,
         backend: state_backend,
@@ -549,7 +683,20 @@ pub async fn build_router(pool: SqlitePool) -> (Router, SqliteSessionStore) {
         // handler registered here directly runs for guests too.
         .merge(protected::router(limiter(10)))
         .route("/healthz", get(healthz))
-        .route("/metrics", get(metrics_endpoint))
+        .route("/metrics", get(metrics_endpoint));
+    // The two device-key paths. The browser posts to them itself, with no
+    // form token: the session layer marks a request to either, and the CSRF
+    // layer lets a marked request through, as the key's signature over a
+    // server challenge is what authenticates it. Anybody can post to them,
+    // and each post costs a signature check and a device read, so they are
+    // limited per client address like the forms: a browser refreshes once
+    // per proof lifetime.
+    #[cfg(feature = "device-keys")]
+    let router = match &device_keys {
+        Some(keys) => router.merge(keys.router().layer(limiter(60))),
+        None => router,
+    };
+    let router = router
         .with_state(state)
         // Layer order: CSRF inner, session outer. `session_layer` runs
         // FIRST on request entry (injecting the session handle) so that

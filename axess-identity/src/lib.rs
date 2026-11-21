@@ -7,6 +7,9 @@
 //!    [`EventId`]: all `FooId(Uuid)` newtypes (16 bytes, `Copy`)
 //!    minted via the [`define_id!`] macro. Adopters can declare their
 //!    own domain ids (`AccountId`, `OrderId`, …) with the same shape.
+//!    Beside them [`SessionKey`], the digest of a [`SessionId`] that a
+//!    session is stored, registered, recorded and logged under, so that
+//!    none of those places holds the value a cookie carries.
 //! 2. **Principal abstraction**: [`Principal`] unifies human and
 //!    workload identity under one type so authorization policies, audit
 //!    trails, and downstream consumers treat both kinds symmetrically.
@@ -28,7 +31,8 @@
 //! # Layering
 //!
 //! Foundation crate, deliberately small: depends only on `axess-rng`
-//! (for the DST-injectable `SecureRng` trait), `uuid`, and `thiserror`.
+//! (for the DST-injectable `SecureRng` trait), `uuid`, `thiserror`, and
+//! `sha2` (a session's key is a SHA-256 of its id).
 //! No tokio, no axum, no Cedar. axess-core layers two more pieces on
 //! top:
 //! - `SessionResolver`: extracts a [`HumanPrincipal`] from an
@@ -40,16 +44,46 @@
 //! Downstream consumers that only need the principal *data* (event
 //! envelope stamping, log spans, audit attribution) pull in
 //! `axess-identity` directly and skip the heavier axess-core dep.
+//!
+//! # Text for a log line
+//!
+//! [`log_text`] holds the workspace's one predicate for what outside text
+//! must not carry raw into a log line or an error: control characters, the
+//! line and paragraph separators, bidirectional controls, zero-width
+//! characters, the byte order mark and the Hangul fillers
+//! ([`log_text::escapes`]), and the escape and cut that make such text
+//! safe ([`log_text::log_safe`]). It lives here, in the crate every other
+//! axess crate depends on, so each one asks the same question.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+// The `testing` feature compiles the label-driven id builders and the mock
+// resolver. A release build that links it ships those in a production
+// binary, and cargo feature unification lets any one dependent switch it on
+// for the whole build, so the build refuses by name.
+// `allow-testing-in-release` is the named opt-out for a build that means
+// it. Every crate with a `testing` feature carries this gate
+// (scripts/check-testing-gates.sh).
+#[cfg(all(
+    feature = "testing",
+    not(debug_assertions),
+    not(feature = "allow-testing-in-release")
+))]
+compile_error!(
+    "the `testing` feature of axess-identity is enabled in a release build; it ships test \
+     doubles in a production binary. Remove the feature from the release build, or enable \
+     `allow-testing-in-release` to keep it on purpose."
+);
+
 use std::collections::BTreeMap;
 
 pub mod human;
 pub mod id;
+pub mod log_text;
 pub mod resolver;
+pub mod session_key;
 #[cfg(any(test, feature = "testing"))]
 #[cfg_attr(docsrs, doc(cfg(feature = "testing")))]
 pub mod testing;
@@ -58,7 +92,8 @@ pub mod workload;
 pub use human::HumanPrincipal;
 pub use id::*;
 pub use resolver::{CliResolver, CliResolverBuilder, PrincipalResolver};
-pub use workload::{TrustDomain, WorkloadId, WorkloadPrincipal};
+pub use session_key::{SESSION_KEY_DOMAIN, SessionKey, SessionKeyError, SessionKeyPrefix};
+pub use workload::{TrustDomain, WorkloadId, WorkloadIdComponents, WorkloadPrincipal};
 
 /// An authenticated principal: either a human user or a workload.
 ///
@@ -105,9 +140,12 @@ impl Principal {
 /// constructor that no resolver impl ever produces.
 ///
 /// A custom issuer is built only through [`Issuer::custom`], which refuses a
-/// built-in label by name; the variant cannot be written out by hand:
+/// built-in label by name; the variant cannot be written out by hand. The
+/// two compile errors that guarantee it (a string where the label type is
+/// expected, and the label's private field) are held to their recorded text
+/// in `tests/ui/`; this example shows the first:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0308
 /// use axess_identity::Issuer;
 /// // issuer_custom_variant_not_constructible_outside_crate
 /// let _ = Issuer::Custom("oauth".to_string());

@@ -2,8 +2,7 @@
 //! renders must embed the token the response cookie carries.
 
 use super::*;
-use crate::session::data::SessionData;
-use crate::session::id::SessionId;
+use crate::session::layer::CookieSession;
 use crate::session::layer::SessionInner;
 use crate::testing::mock_random::MockRng;
 use axum::http::Method;
@@ -14,16 +13,8 @@ use tower::{Layer, ServiceExt, service_fn};
 fn handle(seed: u64) -> SessionHandle {
     let rng = MockRng::new(seed);
     SessionHandle(Arc::new(RwLock::new(SessionInner {
-        id: SessionId::new(&rng),
-        data: SessionData::default(),
-        modified: false,
-        needs_persist: false,
-        regenerate: false,
-        pre_cycle_id: None,
-        rng: std::sync::Arc::new(axess_rng::SystemRng),
-        pending_fingerprint: None,
-        max_custom_bytes: 64 * 1024,
-        consume: None,
+        session: CookieSession::mint(&rng),
+        ..SessionInner::detached(std::sync::Arc::new(axess_rng::SystemRng))
     })))
 }
 
@@ -83,7 +74,7 @@ async fn rotated_token_is_reachable_in_the_same_request_and_matches_the_cookie()
     let config = CsrfConfig::new(key);
     let service = CsrfLayer::new(config.clone()).layer(rotate_then_render());
     let h = handle(3);
-    let sid_before = h.0.read().await.id;
+    let sid_before = *h.0.read().await.session.key();
 
     let req = Request::builder()
         .method(Method::GET)
@@ -100,7 +91,7 @@ async fn rotated_token_is_reachable_in_the_same_request_and_matches_the_cookie()
     let [stale, before, after, again]: [&str; 4] =
         body.split('\n').collect::<Vec<_>>().try_into().unwrap();
 
-    let sid_after = h.0.read().await.id;
+    let sid_after = *h.0.read().await.session.key();
     assert_ne!(sid_before, sid_after, "precondition: the handler rotated");
     assert_eq!(
         before, stale,

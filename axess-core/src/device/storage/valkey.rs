@@ -96,11 +96,11 @@
 //! | `sweep` | Per row, atomic CAS demotion or CAS purge. Only ever demotes, so it cannot resurrect a `Revoked` row; a row changed under it is re-planned from its new state. A row that cannot be decoded is logged and skipped. A revoked row with no `revoked_at` is stamped. |
 //! | `delete` | One script removes the row, its fingerprint entry (only while it points at this device) and its index entries, conditional on the row as read; a writer that changed it meanwhile makes the delete run again on the fresh row. |
 //! | `create_or_find` | One script inserts the row with its indexes only while the key's create guard still holds what the caller read before finding no live device of the key, and sets the guard to the new id; of two concurrent creates of one key, one inserts and the other conflicts and returns the first one's device. |
-//! | `save` | A CAS against the row as read (or its absence), retried on a conflict, so the last writer wins without two saves interleaving their index changes. A stored `Revoked` row is left as it is by a save that is not itself revoked; a revoked row saved without `revoked_at` gets the write time. |
+//! | `save` | A CAS against the row as read (or its absence), retried on a conflict, so the last writer wins without two saves interleaving their index changes. A stored `Revoked` row is left as it is by every save, a revoked one included; a revoked row saved for the first time without `revoked_at` gets the write time. |
 //!
 //! The scripts address several keys (row, fingerprint index, membership
 //! indexes); on a Valkey cluster give them one hash slot with a prefix such
-//! as `{axess}`.
+//! as `{axess}`. A prefix without a hash tag is refused there by name.
 //!
 //! The fingerprint index is a sorted set of the ids of every device that
 //! carries the fingerprint, scored by the sighting each write carried, so
@@ -138,9 +138,8 @@
 //! read that finds the row gone, like the other membership indexes.
 
 use std::sync::Arc;
-use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use axess_clock::Timestamp;
 use fred::prelude::*;
 
 use crate::authn::ids::{DeviceId, TenantId, UserId};
@@ -153,14 +152,18 @@ use crate::session::crypto::SessionCrypto;
 use std::future::Future;
 
 mod apply;
+#[cfg(test)]
+mod cluster_tests;
 mod create;
 mod fingerprint;
+mod health;
 mod index;
 mod owner_lookup;
 mod policy;
 mod read;
 mod row;
 mod scripts;
+mod slots;
 mod sweep;
 #[cfg(test)]
 mod tests;
@@ -227,6 +230,23 @@ pub enum ValkeyDeviceStoreError {
     /// A store script answered with a reply this version does not know.
     #[error("unexpected device script reply: {0}")]
     UnexpectedScriptReply(String),
+
+    /// The store's client is a cluster's and its key prefix has no hash
+    /// tag. Every write of a device is one script over several keys, which
+    /// a cluster runs only when they share a slot, so such a store could
+    /// write nothing. Returned by
+    /// [`try_with_prefix`](ValkeyDeviceStore::try_with_prefix) for the
+    /// prefix it is given, and by every write of a store that was left on
+    /// the default prefix.
+    #[error(
+        "the key prefix `{prefix}` has no hash tag, and on a Valkey cluster the keys of one \
+         device write must share a slot: give the store a prefix with a hash tag, such as \
+         `{{axess}}`"
+    )]
+    PrefixWithoutHashTag {
+        /// The prefix that was refused.
+        prefix: String,
+    },
 }
 
 impl From<fred::error::Error> for ValkeyDeviceStoreError {
@@ -273,6 +293,11 @@ pub struct ValkeyDeviceStore {
     /// `find_by_fingerprint`, the user's whole index on a miss in
     /// `find_by_fingerprint_for_user`.
     legacy_fingerprint_keys: bool,
+    /// The client is a cluster's and the prefix has no hash tag, so the
+    /// keys of one write would hash to different slots. True only of a
+    /// store left on the default prefix: a prefix that is given is refused
+    /// where it is given. Such a store refuses every write by name.
+    keys_apart: bool,
 }
 
 impl ValkeyDeviceStore {
@@ -280,18 +305,26 @@ impl ValkeyDeviceStore {
     /// configuration and fingerprint layout, with `crypto` as the row
     /// envelope (`None` for plaintext).
     fn with_parts(client: Client, crypto: Option<SessionCrypto>) -> Self {
+        let keys_apart = slots::keys_apart(&client, DEFAULT_PREFIX);
         Self {
             client,
             prefix: DEFAULT_PREFIX.into(),
             crypto,
             sweep_config: SweepConfig::default(),
             legacy_fingerprint_keys: false,
+            keys_apart,
         }
     }
 
     /// Create an encrypted store (recommended for production).
-    pub fn new(client: Client, key: [u8; 32]) -> Self {
-        Self::with_parts(client, Some(SessionCrypto::new(key)))
+    ///
+    /// The key is copied into a buffer that is zeroed on drop, and the copy
+    /// handed to this call is zeroed before it returns. The caller's own
+    /// copy is the caller's to wipe.
+    pub fn new(client: Client, mut key: [u8; 32]) -> Self {
+        let store = Self::with_parts(client, Some(SessionCrypto::from_key(&key)));
+        zeroize::Zeroize::zeroize(&mut key);
+        store
     }
 
     /// Create an encrypted store from a [`SessionCrypto`] you configured,
@@ -311,8 +344,9 @@ impl ValkeyDeviceStore {
     /// Accept rows sealed with `previous` as well as the current key, for key
     /// rotation. Has no effect on a plaintext store. See
     /// [`with_crypto`](Self::with_crypto) for how rows move to the new key.
-    pub fn with_previous_key(mut self, previous: [u8; 32]) -> Self {
-        self.crypto = self.crypto.map(|c| c.with_previous_key(previous));
+    pub fn with_previous_key(mut self, mut previous: [u8; 32]) -> Self {
+        self.crypto = self.crypto.map(|c| c.with_previous_key_from(&previous));
+        zeroize::Zeroize::zeroize(&mut previous);
         self
     }
 
@@ -327,9 +361,46 @@ impl ValkeyDeviceStore {
     }
 
     /// Override the key prefix (default `axess`).
-    pub fn with_prefix(mut self, prefix: impl Into<Arc<str>>) -> Self {
-        self.prefix = prefix.into();
-        self
+    ///
+    /// On a Valkey cluster the prefix must hold a hash tag, such as
+    /// `{axess}`: every write of a device is one script over several keys,
+    /// and a cluster runs it only when the keys share a slot. The default
+    /// prefix has none, so a store on a cluster is given one here.
+    ///
+    /// # Panics
+    ///
+    /// When the client is a cluster's and `prefix` has no hash tag, with
+    /// the text of [`ValkeyDeviceStoreError::PrefixWithoutHashTag`]. Use
+    /// [`try_with_prefix`](Self::try_with_prefix) to handle the refusal.
+    #[track_caller]
+    pub fn with_prefix(self, prefix: impl Into<Arc<str>>) -> Self {
+        match self.try_with_prefix(prefix) {
+            Ok(store) => store,
+            Err(refused) => panic!("{refused}"),
+        }
+    }
+
+    /// [`with_prefix`](Self::with_prefix), refusing instead of panicking.
+    ///
+    /// # Errors
+    ///
+    /// [`ValkeyDeviceStoreError::PrefixWithoutHashTag`] when the client is a
+    /// cluster's and `prefix` has no hash tag. Whether the client is a
+    /// cluster's is read from its configuration, so the refusal needs no
+    /// connection.
+    pub fn try_with_prefix(
+        mut self,
+        prefix: impl Into<Arc<str>>,
+    ) -> Result<Self, ValkeyDeviceStoreError> {
+        let prefix = prefix.into();
+        if slots::keys_apart(&self.client, &prefix) {
+            return Err(ValkeyDeviceStoreError::PrefixWithoutHashTag {
+                prefix: prefix.to_string(),
+            });
+        }
+        self.prefix = prefix;
+        self.keys_apart = false;
+        Ok(self)
     }
 
     /// Override the [`SweepConfig`] driving the retention ladder.
@@ -380,6 +451,14 @@ impl ValkeyDeviceStore {
 }
 
 impl DeviceStore for ValkeyDeviceStore {
+    fn load_fresh(
+        &self,
+        tenant_id: &TenantId,
+        id: &DeviceId,
+    ) -> impl Future<Output = Result<Option<Device>, Self::Error>> + Send {
+        // No cache of its own: the database is the authoritative store.
+        self.load(tenant_id, id)
+    }
     type Error = ValkeyDeviceStoreError;
 
     fn load(
@@ -475,7 +554,7 @@ impl DeviceStore for ValkeyDeviceStore {
     fn save(
         &self,
         device: &Device,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         let store = self.clone();
         let device = device.clone();
@@ -485,7 +564,7 @@ impl DeviceStore for ValkeyDeviceStore {
     fn create_or_find(
         &self,
         device: &Device,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<Device, Self::Error>> + Send {
         let store = self.clone();
         let device = device.clone();
@@ -496,7 +575,7 @@ impl DeviceStore for ValkeyDeviceStore {
         &self,
         tenant_id: &TenantId,
         id: &DeviceId,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<DeviceTrustLevel, Self::Error>> + Send {
         let store = self.clone();
         let tenant = tenant_id.to_string();
@@ -533,7 +612,7 @@ impl DeviceStore for ValkeyDeviceStore {
         tenant_id: &TenantId,
         id: &DeviceId,
         level: DeviceTrustLevel,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         let store = self.clone();
         let tenant = tenant_id.to_string();
@@ -562,7 +641,7 @@ impl DeviceStore for ValkeyDeviceStore {
         id: &DeviceId,
         expected: DeviceTrustLevel,
         level: DeviceTrustLevel,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<TrustTransition, Self::Error>> + Send {
         let store = self.clone();
         let tenant = tenant_id.to_string();
@@ -601,7 +680,7 @@ impl DeviceStore for ValkeyDeviceStore {
         id: &DeviceId,
         expected: &[DeviceBinding],
         bindings: &[DeviceBinding],
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<BindingsUpdate, Self::Error>> + Send {
         let store = self.clone();
         let tenant = tenant_id.to_string();
@@ -640,7 +719,7 @@ impl DeviceStore for ValkeyDeviceStore {
         tenant_id: &TenantId,
         id: &DeviceId,
         user: &UserId,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<OwnerClaim, Self::Error>> + Send {
         let store = self.clone();
         let tenant = tenant_id.to_string();
@@ -693,30 +772,12 @@ impl DeviceStore for ValkeyDeviceStore {
     fn sweep(
         &self,
         tenant_id: &TenantId,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> impl Future<Output = Result<SweepCounts, Self::Error>> + Send {
         let store = self.clone();
         let tenant = tenant_id.to_string();
         let now = whole_second(now);
         async move { store.sweep_tenant(&tenant, now).await }
-    }
-}
-
-// ── HealthCheck ──────────────────────────────────────────────────────
-
-use crate::health::{HealthCheck, HealthStatus};
-
-impl HealthCheck for ValkeyDeviceStore {
-    fn check(
-        &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = HealthStatus> + Send + '_>> {
-        Box::pin(async {
-            match tokio::time::timeout(Duration::from_secs(2), self.client.ping::<()>(None)).await {
-                Ok(Ok(_)) => HealthStatus::Healthy,
-                Ok(Err(e)) => HealthStatus::Unhealthy(format!("valkey PING failed: {e}")),
-                Err(_) => HealthStatus::Unhealthy("valkey PING timeout (2s)".into()),
-            }
-        })
     }
 }
 

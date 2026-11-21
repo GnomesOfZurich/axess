@@ -6,9 +6,10 @@
 //! each store instead. Times are whole seconds because the stores keep
 //! seconds.
 
+use axess_clock::testing::Shift;
 use std::fmt::Debug;
 
-use chrono::Duration;
+use axess_clock::SignedDuration;
 
 use super::DeviceStore;
 use super::consistency::{at, dev_id, device, tenant, user};
@@ -623,7 +624,7 @@ where
         "idle",
         1,
         DeviceTrustLevel::Trusted,
-        now - Duration::days(200),
+        now.minus(SignedDuration::days(200)),
     );
     idle.first_seen_at = idle.last_seen_at;
     store.save(&idle, now).await.unwrap();
@@ -631,7 +632,7 @@ where
         "unknown",
         2,
         DeviceTrustLevel::Unknown,
-        now - Duration::days(365),
+        now.minus(SignedDuration::days(365)),
     );
     unknown.first_seen_at = unknown.last_seen_at;
     store.save(&unknown, now).await.unwrap();
@@ -639,7 +640,7 @@ where
         "foreign",
         3,
         DeviceTrustLevel::Trusted,
-        now - Duration::days(200),
+        now.minus(SignedDuration::days(200)),
     );
     foreign.tenant_id = crate::authn::ids::testing::tenant("t-foreign");
     store.save(&foreign, now).await.unwrap();
@@ -664,9 +665,12 @@ where
         .unwrap();
     assert_eq!(foreign_row.trust_level, DeviceTrustLevel::Trusted);
 
-    let counts = store.sweep(&t, now + Duration::days(29)).await.unwrap();
+    let counts = store
+        .sweep(&t, now.plus(SignedDuration::days(29)))
+        .await
+        .unwrap();
     assert_eq!(counts.seen_to_revoked, 0);
-    let later = now + Duration::days(31);
+    let later = now.plus(SignedDuration::days(31));
     let counts = store.sweep(&t, later).await.unwrap();
     assert_eq!(
         (

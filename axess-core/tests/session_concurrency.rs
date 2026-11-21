@@ -3,12 +3,11 @@
 //! `Arc<RwLock<SessionInner>>` and racing clear/authenticate paths.
 //! Verifies no panics, no data corruption, no torn-read views.
 
-mod common;
+use axess_core::testing::fixtures as common;
 
 use axess_core::authn::factor::FactorKind;
 use axess_core::session::data::AuthState;
 use axess_core::testing::{AuthSessionTestExt, test_session};
-use chrono::Utc;
 use common::{tid, uid};
 use std::sync::Arc;
 
@@ -43,7 +42,7 @@ async fn concurrent_read_write_no_corruption() {
                 match (i + j) % 3 {
                     0 => {
                         // Record an attempt timestamp.
-                        s.record_attempt_at(Utc::now()).await;
+                        s.record_attempt_at(common::start()).await;
                     }
                     1 => {
                         // Write custom data.
@@ -154,7 +153,8 @@ async fn concurrent_clear_and_write() {
         let s = Arc::clone(&session);
         handles.push(tokio::spawn(async move {
             for _ in 0..iterations {
-                s.set_authenticated(uid("u1"), tid("t1"), Utc::now()).await;
+                s.set_authenticated(uid("u1"), tid("t1"), common::start())
+                    .await;
             }
         }));
     }

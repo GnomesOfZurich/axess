@@ -16,29 +16,44 @@
 //!   Compatible with MySQL 8.x and MariaDB 10.5+.
 //! - `ValkeyDeviceStore` (`device,valkey`): Valkey-backed store with TTL eviction.
 
-#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
+#[cfg(any(
+    feature = "sqlite",
+    feature = "sqlite-unbundled",
+    feature = "postgres",
+    feature = "mysql"
+))]
 pub(crate) mod sql_common;
 
-#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
+#[cfg(any(
+    feature = "sqlite",
+    feature = "sqlite-unbundled",
+    feature = "postgres",
+    feature = "mysql"
+))]
 pub(crate) mod sweep_batches;
 
 #[cfg(feature = "mysql")]
 pub mod mysql;
 #[cfg(feature = "postgres")]
 pub mod postgres;
-#[cfg(feature = "sqlite")]
+#[cfg(any(feature = "sqlite", feature = "sqlite-unbundled"))]
 pub mod sqlite;
 #[cfg(feature = "valkey")]
 pub mod valkey;
 
-#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
+#[cfg(any(
+    feature = "sqlite",
+    feature = "sqlite-unbundled",
+    feature = "postgres",
+    feature = "mysql"
+))]
 pub use sql_common::SqlDeviceStoreError;
 
 #[cfg(feature = "mysql")]
 pub use mysql::MysqlDeviceStore;
 #[cfg(feature = "postgres")]
 pub use postgres::PostgresDeviceStore;
-#[cfg(feature = "sqlite")]
+#[cfg(any(feature = "sqlite", feature = "sqlite-unbundled"))]
 pub use sqlite::SqliteDeviceStore;
 #[cfg(feature = "valkey")]
 pub use valkey::{ValkeyDeviceStore, ValkeyDeviceStoreError};

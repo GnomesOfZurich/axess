@@ -25,6 +25,7 @@ use axess::service_secret::{
     SIGNATURE_HEADER, ServiceCaller, ServiceSecret, ServiceSecretError, ServiceSecretLayer,
     ServiceSecrets, ServiceSigner, SignedRequests,
 };
+use axess::{Clock, SystemClock};
 use axum::{
     Json, Router,
     body::Body,
@@ -32,6 +33,7 @@ use axum::{
     routing::post,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// The environment variable both sides read the secret from.
 pub const SECRET_VAR: &str = "INTAKE_WEBHOOK_SECRET";
@@ -79,11 +81,22 @@ pub fn secrets_from_env() -> Result<ServiceSecrets, ServiceSecretError> {
 /// handler idempotent (dedupe on the report's contents, so a repeat changes
 /// nothing), or route the webhook to a single instance.
 pub fn bounce_routes(secrets: ServiceSecrets) -> Result<Router, ServiceSecretError> {
+    bounce_routes_on(secrets, Arc::new(SystemClock))
+}
+
+/// [`bounce_routes`], judging each signature's time on `clock`: a test signs
+/// at a fixed instant and passes a mock set to it.
+pub fn bounce_routes_on(
+    secrets: ServiceSecrets,
+    clock: Arc<dyn Clock>,
+) -> Result<Router, ServiceSecretError> {
     Ok(Router::new()
         .route(BOUNCE_PATH, post(receive_bounce))
         .layer(ServiceSecretLayer::signed(
             secrets,
-            SignedRequests::default().audience(BOUNCE_AUDIENCE),
+            SignedRequests::default()
+                .audience(BOUNCE_AUDIENCE)
+                .clock(clock),
         )?))
 }
 

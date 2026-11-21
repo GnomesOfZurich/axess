@@ -13,7 +13,10 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use axess_rng::SecureRng;
 
 use super::keys::{CurrentKey, KeyProvider, KeyProviderError};
-use super::{AAD_SEP, ENVELOPE_VERSION, NONCE_LEN, SCOPED_ENVELOPE_VERSION};
+use super::{
+    AAD_SEP, ENVELOPE_VERSION, EXPIRY_ENVELOPE_VERSION, NONCE_LEN, SCOPED_ENVELOPE_VERSION, TAG_LEN,
+};
+use crate::delegated::stored::credential::StoredDelegation;
 
 // ── AAD ──────────────────────────────────────────────────────────────────────
 
@@ -95,10 +98,10 @@ pub(super) fn build_aad_v3(
     field: &[u8],
     scopes: &[String],
     token_type: &str,
-    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    expires_at: Option<axess_clock::Timestamp>,
 ) -> Vec<u8> {
     let mut buf = build_aad_scoped(
-        ENVELOPE_VERSION,
+        EXPIRY_ENVELOPE_VERSION,
         provider,
         tenant,
         user,
@@ -106,11 +109,52 @@ pub(super) fn build_aad_v3(
         scopes,
         token_type,
     );
-    match expires_at {
-        Some(at) => put(&mut buf, &at.timestamp().to_be_bytes()),
-        None => put(&mut buf, b""),
+    put_expiry(&mut buf, expires_at);
+    buf
+}
+
+/// `v4` AAD: the `v3` fields under the `v4` tag, then the registration the
+/// credential was granted through: a `0` byte for none, or a `1` byte and
+/// its provider name and fingerprint, each length-prefixed. The session uses
+/// a credential only with that registration, so a writer who moved a row
+/// under another registration's label would otherwise have its refresh
+/// token sent there. The scopes, token type, expiry and registration are
+/// `row`'s; `provider` is the key the row is stored under.
+pub(super) fn build_aad_v4(
+    provider: &str,
+    tenant: &TenantId,
+    user: &UserId,
+    field: &[u8],
+    row: &StoredDelegation,
+) -> Vec<u8> {
+    let mut buf = build_aad_scoped(
+        ENVELOPE_VERSION,
+        provider,
+        tenant,
+        user,
+        field,
+        &row.scopes,
+        &row.token_type,
+    );
+    put_expiry(&mut buf, row.expires_at);
+    match &row.registration {
+        None => buf.push(0),
+        Some(registration) => {
+            buf.push(1);
+            put(&mut buf, registration.provider.as_bytes());
+            put(&mut buf, registration.fingerprint.as_bytes());
+        }
     }
     buf
+}
+
+/// `expires_at` as eight big-endian bytes of Unix seconds, or an empty
+/// length-prefixed value for `None`.
+fn put_expiry(buf: &mut Vec<u8>, expires_at: Option<axess_clock::Timestamp>) {
+    match expires_at {
+        Some(at) => put(buf, &at.unix_seconds().to_be_bytes()),
+        None => put(buf, b""),
+    }
 }
 
 /// One decrypted field and what it was sealed under.
@@ -121,10 +165,17 @@ pub(super) struct Opened {
 }
 
 impl Opened {
-    /// Whether the envelope's AAD covers `expires_at`. Only the current
-    /// version does; the expiry stored beside an older envelope is
+    /// Whether the envelope's AAD covers `expires_at`: the current version
+    /// and `v3` do; the expiry stored beside an older envelope is
     /// unauthenticated.
     pub(super) fn binds_expiry(&self) -> bool {
+        self.version == ENVELOPE_VERSION || self.version == EXPIRY_ENVELOPE_VERSION
+    }
+
+    /// Whether the envelope's AAD covers the registration. Only the current
+    /// version does; a registration stored beside an older envelope is
+    /// unauthenticated.
+    pub(super) fn binds_registration(&self) -> bool {
         self.version == ENVELOPE_VERSION
     }
 
@@ -220,8 +271,13 @@ pub(super) fn open_envelope<K: KeyProvider>(
     let body = URL_SAFE_NO_PAD
         .decode(body_b64)
         .map_err(|_| EnvelopeError::Base64)?;
-    if body.len() <= NONCE_LEN {
-        return Err(EnvelopeError::Malformed("body shorter than nonce"));
+    // The shortest body a seal produces is a nonce and the tag of an empty
+    // plaintext. Anything shorter was never sealed, so it is malformed, and
+    // it is refused before its key is looked up or tried.
+    if body.len() < NONCE_LEN + TAG_LEN {
+        return Err(EnvelopeError::Malformed(
+            "body shorter than a nonce and a tag",
+        ));
     }
     let (nonce_bytes, ciphertext) = body.split_at(NONCE_LEN);
 

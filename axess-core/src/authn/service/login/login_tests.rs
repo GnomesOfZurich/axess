@@ -1,21 +1,18 @@
-//! `login_tests`: extracted from `login.rs` per the
-//! 200-LoC inline-test rule in AGENTS.md.
+//! `login_tests`: the unit tests of `login.rs`, kept beside it per the
+//! 200-line inline-test rule in AGENTS.md.
 
 //! Pin the cheap, observable surfaces of `login.rs`:
 //! `check_session` (all branches), `logout` (registry invalidation),
 //! `find_user_with_timing_equalization` (real-user lookup).
 //!
-//! Mutations in `prepare_factor` (line 303 temporal `+`) and
-//! `verify_factor` (lines 431/444/473 dispatch + replay-prevention)
-//! require a full factor-pipeline harness with active `MockClock` and
-//! a per-factor verification fixture; those are deferred until the
-//! larger sweep across login flows lands.
+//! `prepare_factor` and `verify_factor` need a factor-pipeline harness
+//! with a `MockClock` and a fixture per factor; their tests are the
+//! integration tests under `tests/` and `factor_pipeline/tests/`.
 use super::super::AuthnService;
 use super::*;
 use crate::authn::ids::{TenantId, UserId};
 use crate::authn::types::{EntityState, LockoutPolicy, Tenant, User};
 use crate::authn::{AuditContext, RequestAuthnService};
-use crate::session::data::SessionData;
 use crate::session::extractor::AuthSession;
 use crate::session::layer::{SessionHandle, SessionInner};
 use crate::session::store::MemorySessionRegistry;
@@ -32,31 +29,24 @@ fn fixture_tenant_id() -> TenantId {
 }
 
 fn make_session() -> AuthSession {
-    let inner = SessionInner {
-        id: crate::session::id::SessionId::new(&axess_rng::SystemRng),
-        data: SessionData::default(),
-        modified: false,
-        needs_persist: false,
-        regenerate: false,
-        pre_cycle_id: None,
-        rng: std::sync::Arc::new(axess_rng::SystemRng),
-        pending_fingerprint: None,
-        max_custom_bytes: 64 * 1024,
-        consume: None,
-    };
+    let inner = SessionInner::detached(std::sync::Arc::new(axess_rng::SystemRng));
     AuthSession(SessionHandle(Arc::new(RwLock::new(inner))))
 }
 
 async fn authenticated_session() -> AuthSession {
     let session = make_session();
     session
-        .set_authenticated(fixture_user_id(), fixture_tenant_id(), chrono::Utc::now())
+        .set_authenticated(
+            fixture_user_id(),
+            fixture_tenant_id(),
+            axess_clock::testing::MockClock::reference_time(),
+        )
         .await;
     session
 }
 
 fn build_user(user_id: &UserId, tenant_id: &TenantId, identifier: &str) -> User {
-    let now = chrono::Utc::now();
+    let now = axess_clock::testing::MockClock::reference_time();
     User {
         id: *user_id,
         tenant_id: *tenant_id,
@@ -72,7 +62,7 @@ fn build_user(user_id: &UserId, tenant_id: &TenantId, identifier: &str) -> User 
 }
 
 fn build_tenant(tenant_id: TenantId, identifier: &str) -> Tenant {
-    let now = chrono::Utc::now();
+    let now = axess_clock::testing::MockClock::reference_time();
     Tenant {
         id: tenant_id,
         identifier: identifier.into(),
@@ -100,9 +90,9 @@ fn build_service_builder(
     AuthnService::builder(identity, MockFactorStore::new())
 }
 
-// ── check_session (line 491) ─────────────────────────────────────
+// ── check_session ─────────────────────────────────────
 
-/// Kills line 491 body `-> true` / `delete !`: unauthenticated
+/// Kills the body `-> true` / `delete !`: unauthenticated
 /// session must return `false`.
 #[tokio::test]
 async fn check_session_unauthenticated_returns_false() {
@@ -111,7 +101,7 @@ async fn check_session_unauthenticated_returns_false() {
     assert!(!service.check_session(&session).await);
 }
 
-/// Kills line 491 `-> false`: authenticated session with no
+/// Kills the mutant `-> false`: authenticated session with no
 /// registry must return `true`.
 #[tokio::test]
 async fn check_session_authenticated_no_registry_returns_true() {
@@ -140,7 +130,7 @@ async fn check_session_registry_rejection_returns_false() {
 async fn check_session_registry_acceptance_returns_true() {
     let registry = MemorySessionRegistry::new();
     let session = authenticated_session().await;
-    let sid = session.session_id().await;
+    let sid = session.session_key().await;
     crate::session::store::SessionRegistry::register(&registry, &fixture_user_id(), &sid)
         .await
         .unwrap();
@@ -152,9 +142,9 @@ async fn check_session_registry_acceptance_returns_true() {
     assert!(service.check_session(&session).await);
 }
 
-// ── logout (line 509) ────────────────────────────────────────────
+// ── logout ────────────────────────────────────────────
 
-/// Kills line 509 `-> Ok(())`: `logout` must (a) succeed for an
+/// Kills the mutant `-> Ok(())`: `logout` must (a) succeed for an
 /// authenticated session and (b) actually invalidate the user's
 /// sessions in the registry. The mutation returns `Ok(())` without
 /// touching the registry; observable via `registry.is_valid`
@@ -174,7 +164,7 @@ async fn logout_invalidates_user_in_registry() {
 
     let registry = MemorySessionRegistry::new();
     let session = authenticated_session().await;
-    let sid = session.session_id().await;
+    let sid = session.session_key().await;
     registry.register(&fixture_user_id(), &sid).await.unwrap();
     assert!(registry.is_valid(&fixture_user_id(), &sid).await.unwrap());
 
@@ -191,11 +181,11 @@ async fn logout_invalidates_user_in_registry() {
     );
 }
 
-// ── find_user_with_timing_equalization (line 575) ────────────────
+// ── find_user_with_timing_equalization ────────────────
 
-// ── begin_login input guard (line 41-48) ─────────────────────────
+// ── begin_login input guard ─────────────────────────
 
-/// Kills the line-42 `||` / `>` mutations: an oversized identifier
+/// Kills the `||` / `>` mutations: an oversized identifier
 /// or oversized tenant_identifier must reject as
 /// `InvalidCredentials` *before* hitting the database. Every
 /// mutation in the early-reject chain (`|| → &&`, `> → ==`,
@@ -238,7 +228,7 @@ async fn begin_login_rejects_empty_identifier() {
 }
 
 /// Oversized tenant_identifier must reject. Discriminates the
-/// second `>` mutation at line 44.
+/// second `>` mutation.
 #[tokio::test]
 async fn begin_login_rejects_oversized_tenant_identifier() {
     use crate::validation::MAX_IDENTIFIER_BYTES;
@@ -271,7 +261,7 @@ async fn begin_login_rejects_empty_tenant_identifier() {
     );
 }
 
-/// Kills line 575 `-> Ok(None)`: when the user EXISTS, the
+/// Kills the mutant `-> Ok(None)`: when the user EXISTS, the
 /// helper must surface `Some(user)`. The mutation always returns
 /// `None`, which collapses `begin_login` to the user-not-found arm.
 /// With the original body and a configured user (but no factor

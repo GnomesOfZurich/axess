@@ -9,10 +9,50 @@ name: Release
 #      main or on a release/X.Y.x branch, the tag equals the workspace
 #      version and CHANGELOG.md has that version's dated section;
 #   2. "CI": the whole of ci.yml passes on the tagged commit;
-#   3. "Publish to crates.io": the maintainer approves the deployment to the
-#      `crates-io` environment, and the job publishes with the
-#      organisation's CARGO_REGISTRY_TOKEN secret, which only a job in that
-#      environment reaches after that approval.
+#   3. "Audit the lockfile at release": cargo-audit, installed and run in a
+#      job that holds no secret, passes the lockfile against the advisory
+#      database as it stands on the day;
+#   4. "Hardening at release": the workflow pin check and
+#      scripts/supply-chain.sh pass on the tagged commit, in a job that
+#      holds no secret. hardening.yml runs the same gates on the tag push,
+#      but a workflow cannot wait for another workflow's run (`needs` does
+#      not cross workflows, and a `workflow_run` trigger fires for the
+#      default branch only), so the gates run here too and publish waits
+#      for them;
+#   5. "Hardening and Mutants runs on the release commit": a Hardening run
+#      on the release commit itself ended in success, and the Mutants run
+#      on it is read and reported without stopping the publish
+#      (scripts/check-scheduled-runs.sh --mutants-report-only); both run on
+#      the push of the release commit to its release branch, beside CI, and
+#      publish could not otherwise wait for them;
+#   6. "Publish to crates.io": the maintainer approves the deployment to the
+#      `crates-io` environment, and the job publishes by trusted publishing.
+#      No registry token is stored anywhere: for each `cargo publish` the
+#      job hands its OIDC token to crates.io and is answered with a token
+#      that is short-lived, which crates.io issues only to a job of this
+#      workflow file, in this repository and that environment, and which
+#      the job revokes when cargo returns. The exchange is written out in
+#      the publish step, with curl and jq from the runner's image, and the
+#      job runs no repository script. Its two actions are GitHub's own
+#      (checkout, download-artifact). It installs one thing, without an
+#      action: its cargo is the runner image's rustup, which reads
+#      rust-toolchain.toml in the checkout and fetches the release pinned
+#      there from static.rust-lang.org the first time cargo runs.
+#      rustup does that by default from 1.28.1 on, and the job sets
+#      RUSTUP_AUTO_INSTALL=1 for a runner configured otherwise; its first
+#      step stops the job by name unless the toolchain is that release.
+#      scripts/check-workflow-pins.sh refuses a job that names a secret, or
+#      may ask for an OIDC token, and runs `cargo install`, a program it
+#      does not name, or a build without `--locked`.
+#
+# Every job builds with the release rust-toolchain.toml pins: what this
+# workflow packages, attests and publishes is built by a release named here,
+# not by whatever `stable` is on the day of the run. The toolchain steps
+# write that release out, because scripts/check-workflow-pins.sh refuses a
+# toolchain that is not an exact release (an expression among them) in a
+# workflow with a job that names a secret or may ask for an OIDC token, and
+# it refuses a release in any workflow that is not the one the file pins,
+# so moving the pin without these lines fails that check.
 #
 # workflow_dispatch re-runs an existing tag, for instance after a publish
 # that stopped part-way (the publish step skips crates already uploaded).
@@ -22,6 +62,12 @@ name: Release
 #
 # A dispatch from a branch is refused by step 1, and the `crates-io`
 # environment admits tags only, so the publish job would not start anyway.
+#
+# A tag's run uses this file as the tagged commit has it. Steps 1 to 5
+# therefore hold for a tag on a commit that carries the reviewed workflow,
+# and say nothing about a tag someone put on another commit: the approval in
+# step 6 is the one gate that binds whoever made the tag, and what the
+# approver checks first is in docs/project/publishing.md (Before approving).
 # docs/project/publishing.md is the runbook.
 on:
   push:
@@ -135,7 +181,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: 1.100.0
 
       # --locked: the verify build of each package resolves from the
       # Cargo.lock CI tested. The sums are the record the later jobs check
@@ -174,7 +220,7 @@ jobs:
             sbom/*.cdx.json
           if-no-files-found: error
 
-  # The one job with signing permissions. It runs no build and installs no
+  # The one job that writes attestations. It runs no build and installs no
   # tool: it downloads what `package` made and attests exactly those files, so
   # adopters have a provenance statement for each .crate as well as for the
   # SBOM, tying them to this workflow run and this commit.
@@ -197,18 +243,19 @@ jobs:
             target/package/*.crate
             sbom/*.cdx.json
 
-  publish:
-    name: Publish to crates.io
-    needs: [verify, ci, package, attest]
+  # The advisory database as it stands now, against the Cargo.lock the
+  # crates are about to be published from: CI audited the lock when the
+  # pull request ran, and an advisory can land between that run and the
+  # approval of the deployment. The tool is installed and run in a job of
+  # its own, with no secret and no environment, because `cargo install`
+  # builds and runs whatever the registry serves that day, and the runner
+  # that does so must not be the one the registry token reaches. The
+  # ignore list is the one .cargo/audit.toml carries, so this refuses what
+  # CI refuses; publish waits for it.
+  audit-at-release:
+    name: Audit the lockfile at release
+    needs: [verify, ci]
     runs-on: ubuntu-latest
-    # The maintainer is the environment's required reviewer, and its deployment
-    # policy admits `v*` tags only: the job waits here for that approval.
-    # The crates.io token is the organisation secret CARGO_REGISTRY_TOKEN;
-    # crates.io trusted publishing can replace it later (docs/project/
-    # publishing.md, settings step 5).
-    environment:
-      name: crates-io
-      url: https://crates.io/crates/axess
     permissions:
       contents: read
     steps:
@@ -217,71 +264,412 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: release-files
-          path: attested
-
-      # The advisory database as it stands now, against the Cargo.lock the
-      # crates are about to be published from: CI audited the lock when the
-      # pull request ran, and an advisory can land between that run and the
-      # approval of this deployment. The tool is installed and run in steps
-      # that do not hold the registry token. The ignore list is the one
-      # .cargo/audit.toml carries, so this refuses what CI refuses.
+          toolchain: 1.100.0
       - name: Audit the lockfile against the current advisory database
         run: |
           cargo install cargo-audit@0.22.2 --locked
           cargo audit --file Cargo.lock --deny warnings
 
+  # The hardening gates on the tagged commit: the workflow pin check and
+  # scripts/supply-chain.sh (audit, deny with advisories, unsafe and unused
+  # dependency reports, duplicate crypto crates, the release-build feature
+  # guard), as hardening.yml runs them on every push. That run is a
+  # separate workflow and publish cannot wait for it, so the same steps run
+  # here, in a job with no secret and no environment, and publish waits
+  # for this one. The tools are installed at the versions hardening.yml
+  # pins, --locked.
+  hardening-at-release:
+    name: Hardening at release
+    needs: [verify, ci]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.100.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Install the supply-chain tools (exact versions, --locked)
+        run: |
+          cargo install --locked cargo-audit@0.22.2 cargo-deny@0.20.2 cargo-geiger@0.14.0
+      - name: Crafted cases for the workflow pin check
+        run: scripts/check-workflow-pins-tests.sh
+      - name: Actions pinned to commits, images to digests, no tool install beside a secret
+        run: scripts/check-workflow-pins.sh
+      - name: Run scripts/supply-chain.sh
+        run: scripts/supply-chain.sh
+
+  # hardening.yml and mutants.yml run on the push of the release commit to
+  # its release branch, beside CI, and no workflow waits for another's run.
+  # So this job reads their runs, and publish waits for it: the newest
+  # Hardening run that counts on the release commit itself (for the squash
+  # merge into main, the head of the release pull request) must have ended
+  # in success. The newest Mutants run is read and reported, its address
+  # and its ending, and does not stop the publish (--mutants-report-only):
+  # no full sweep has yet passed at the shard size scripts/mutants-sweep.sh
+  # plans. The requirement returns, and the option goes, once a full sweep
+  # has passed. scripts/check-scheduled-runs.sh says which runs count and
+  # why; it reads them with the job's own token, which may read Actions and
+  # nothing more.
+  scheduled-runs:
+    name: Hardening and Mutants runs on the release commit
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: A Hardening run on the release commit ended in success; the Mutants run is reported
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.verify.outputs.tag }}
+        run: ./scripts/check-scheduled-runs.sh --tag "$TAG" --mutants-report-only
+
+  publish:
+    name: Publish to crates.io
+    needs: [verify, ci, package, attest, audit-at-release, hardening-at-release, scheduled-runs]
+    runs-on: ubuntu-latest
+    # The maintainer is the environment's required reviewer, and its deployment
+    # policy admits `v*` tags only: the job waits here for that approval.
+    # The job holds no stored secret, and `id-token: write` for the crates.io
+    # exchange alone. crates.io answers that exchange when a crate's Trusted
+    # Publishing settings name this repository, this workflow file and this
+    # environment, and the token it issues publishes only such crates
+    # (docs/project/publishing.md, settings step 5), so the approval above is
+    # also what crates.io requires. The job builds nothing: `package` built
+    # and verified every crate, so here packaging and publishing run with
+    # `--no-verify`, and no build script of a dependency runs beside the OIDC
+    # permission. No toolchain action runs here either: cargo is the runner
+    # image's rustup, which takes the release rust-toolchain.toml pins.
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/axess
+    permissions:
+      contents: read
+      id-token: write      # the OIDC token crates.io exchanges for a publish token
+    # rustup installs the toolchain rust-toolchain.toml names on first use by
+    # default from 1.28.1 on (1.28.0 alone did not); this overrides a runner
+    # whose rustup was configured not to.
+    env:
+      RUSTUP_AUTO_INSTALL: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The toolchain of this job is the release rust-toolchain.toml pins,
+      # read from that file and written nowhere else: any other stops the
+      # job here, before anything is packaged or published. The release is
+      # read from cargo (`cargo -vV`), which rustup runs from the same
+      # toolchain as rustc; this job never runs rustc itself, and
+      # scripts/check-workflow-pins.sh lets no program it does not name run
+      # beside the OIDC permission.
+      - name: The toolchain is the release rust-toolchain.toml pins
+        run: |
+          set -eu
+          pinned=$(grep -E '^channel *= *"[0-9]+[.][0-9]+[.][0-9]+"' rust-toolchain.toml | cut -d '"' -f 2 || true)
+          if [ -z "$pinned" ]; then
+            echo "::error::refused: rust-toolchain.toml names no exact release (channel = \"X.Y.Z\"); nothing was packaged or published."
+            exit 1
+          fi
+          found=$(cargo -vV) || {
+            echo "::error::refused: cargo did not run, so the toolchain $pinned is not installed; nothing was packaged or published."
+            exit 1
+          }
+          echo "$found"
+          release=$(grep -E '^release: ' <<<"$found" | cut -d ' ' -f 2 || true)
+          if [ "$release" != "$pinned" ]; then
+            echo "::error::refused: the toolchain is ${release:-of no release cargo names} and rust-toolchain.toml pins $pinned; nothing was packaged or published."
+            exit 1
+          fi
+          echo "OK: the toolchain is $release, the release rust-toolchain.toml pins."
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-files
+          path: attested
+
       # `cargo publish` packages again before it uploads; it cannot upload a
-      # file made elsewhere. So the files it will upload are made here first
-      # and their sums compared with the attested ones, and the job stops by
-      # name if a single byte differs.
+      # file made elsewhere. So the packages are made here first, by the
+      # cargo that will publish, and their sums compared with the attested
+      # ones, and the job stops by name before anything is uploaded if a
+      # single byte differs. What crates.io then holds is compared with the
+      # attested files crate by crate, in the publish step.
       - name: The crates packaged here are the attested crates
         run: |
           set -eu
-          cargo package --workspace --exclude "axess-example-*" --locked
-          (cd target/package && sha256sum -- *.crate) > packaged-here.sha256
-          if ! diff -u attested/target/package/crates.sha256 packaged-here.sha256; then
+          cargo package --workspace --exclude "axess-example-*" --locked --no-verify
+          # The sums are written to the runner's temporary directory: this job
+          # may ask for an OIDC token, and scripts/check-workflow-pins.sh lets
+          # such a job write no file into its checkout.
+          (cd target/package && sha256sum -- *.crate) > "$RUNNER_TEMP/packaged-here.sha256"
+          if ! diff -u attested/target/package/crates.sha256 "$RUNNER_TEMP/packaged-here.sha256"; then
             echo "::error::refused: the crates packaged in this job are not the crates that were attested; nothing was published."
             exit 1
           fi
           echo "OK: every crate packaged here matches the attested package."
 
-      # bottom-up dependency order. --locked: the verify build of each crate
-      # resolves from the Cargo.lock CI tested, not from whatever
-      # semver-compatible versions are newest at publish time.
-      - name: Publish crates (resumable, rate-limit-aware)
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      # bottom-up dependency order. --locked: each crate's lockfile resolves
+      # from the Cargo.lock CI tested, not from whatever semver-compatible
+      # versions are newest at publish time. --no-verify: `package` verified
+      # the build.
+      #
+      # Every attempt publishes with a token crates.io issues for it, in
+      # exchange for the job's OIDC token, and the token is revoked when
+      # cargo returns, so a rate-limit wait cannot outlive it. It is revoked
+      # on every other way out of the step too, a cancelled or timed-out run
+      # included. A failed exchange ends the job by name before that crate is
+      # published. The exchange names no crate: crates.io answers it when any
+      # crate's settings name this workflow and environment. So the first
+      # exchange stops a release no crate trusts before anything is uploaded,
+      # but a crate whose settings are missing is refused at its own upload,
+      # after the crates before it (docs/project/publishing.md, The publish).
+      # The exchange is not retried, so a lost answer never sends one OIDC
+      # token twice.
+      #
+      # `cargo publish` packages once more before it uploads, and a crate a
+      # second run of the tag finds already there was uploaded by an earlier
+      # run. Neither is taken on trust: after each publish or skip the step
+      # reads the checksum crates.io's index lists for that version and
+      # compares it with the SHA-256 of the attested file, and ends the job
+      # by name when they differ, before the next crate and before the
+      # GitHub release.
+      #
+      # The credentials go to curl in files under the runner's temporary
+      # directory, never as arguments, and an answer is printed as one line
+      # of printable text, so it cannot write a workflow command into the
+      # log. A call curl may try again writes its answer to a file, which
+      # curl empties before the next attempt; what it wrote to a pipe would
+      # stay in front of the answer. No `shell:` is set, so the runner runs
+      # this as `bash -e`. scripts/release-publish-tests.sh runs the step the
+      # same way against a recorded curl and cargo.
+      - name: Publish crates by trusted publishing (resumable, rate-limit-aware)
         run: |
-          publish() {
-            crate="$1"
-            attempt=0
+          set -u
+          tokens=https://crates.io/api/v1/trusted_publishing/tokens
+          index=https://index.crates.io
+          # Every crates.io call says who asks: this workflow, in its repository.
+          agent="GnomesOfZurich/axess release.yml (https://github.com/GnomesOfZurich/axess)"
+          token=""; current=""; child=""
+
+          # Every way out of the step passes here, a cancelled or timed-out
+          # run included: the runner signals the step, and the two traps
+          # after this one make the signal an exit. cargo is stopped if it
+          # is still running, a token still in hand is revoked, and no file
+          # that held a credential, an answer or cargo's output stays
+          # behind. A run that is being stopped has seconds left, so the
+          # revocation is asked once and briefly. The calls are written out
+          # in the trap, which scripts/check-workflow-pins.sh reads as a
+          # script of its own: a function of the step is not one it knows
+          # there.
+          trap '
+            if [ -n "$child" ]; then kill "$child" 2>/dev/null || true; fi
+            if [ -n "$token" ]; then
+              printf "Authorization: Bearer %s\n" "$token" > "$RUNNER_TEMP/crates-io.header"
+              curl --silent --show-error --fail-with-body --max-time 5 --output "$RUNNER_TEMP/answer" \
+                --request DELETE --user-agent "$agent" --header "@$RUNNER_TEMP/crates-io.header" \
+                --url https://crates.io/api/v1/trusted_publishing/tokens \
+                || echo "::warning::the token issued to publish $current was not revoked on the way out; it ends by itself when its short lifetime runs out."
+            fi
+            rm -f "$RUNNER_TEMP/github.header" "$RUNNER_TEMP/crates-io.header" \
+              "$RUNNER_TEMP/exchange.json" "$RUNNER_TEMP/answer" "$RUNNER_TEMP/cargo.out"
+          ' EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+
+          # One line of printable text from an answer, cut at 300 bytes.
+          log_safe() {
+            printf '%s' "$1" | LC_ALL=C tr -c '[:print:]' ' ' | cut -c1-300
+          }
+
+          # The reason crates.io gives for a refusal, or the answer as it stands.
+          reason() {
+            local detail
+            detail=$(jq -r '[.errors[]?.detail] | join("; ")' <<<"$1" 2>/dev/null || true)
+            log_safe "${detail:-$1}"
+          }
+
+          # What the call before wrote, into $answer. A call curl may try
+          # again answers into a file, which curl empties before another
+          # attempt: what a failed attempt wrote to a pipe would stay in
+          # front of the answer. The file is what a server sent, so it is
+          # read as data and no further than a megabyte.
+          answered() {
+            answer=$(head -c 1048576 "$RUNNER_TEMP/answer" 2>/dev/null || true)
+            rm -f "$RUNNER_TEMP/answer"
+          }
+
+          # A crates.io token for one publish, into $token; 1 and a refusal by
+          # name when there is none.
+          exchange() {
+            local answer status=0
+            token=""
+            if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+              echo "::error::refused: this job cannot ask GitHub for an OIDC token; it needs 'permissions: id-token: write'."
+              return 1
+            fi
+            printf 'Authorization: bearer %s\n' "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" > "$RUNNER_TEMP/github.header"
+            curl --silent --show-error --fail-with-body --max-time 30 --retry 2 --output "$RUNNER_TEMP/answer" \
+              --header "@$RUNNER_TEMP/github.header" \
+              --url "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=crates.io" || status=$?
+            answered
+            rm -f "$RUNNER_TEMP/github.header"
+            if [ "$status" -ne 0 ]; then
+              echo "::error::refused: GitHub gave this job no OIDC token (curl exit $status): $(log_safe "$answer")"
+              return 1
+            fi
+            if ! jq -e '{jwt: (.value | strings | select(length > 0))}' <<<"$answer" > "$RUNNER_TEMP/exchange.json" 2>/dev/null; then
+              rm -f "$RUNNER_TEMP/exchange.json"
+              echo "::error::refused: GitHub's answer to the OIDC token request holds no token."
+              return 1
+            fi
+            # Asked once, and answered into memory: nothing is tried again
+            # here, and the token is in no file.
+            answer=$(curl --silent --show-error --fail-with-body --max-time 30 \
+              --request POST --user-agent "$agent" --header "Content-Type: application/json" \
+              --data-binary "@$RUNNER_TEMP/exchange.json" --url "$tokens") || status=$?
+            rm -f "$RUNNER_TEMP/exchange.json"
+            if [ "$status" -ne 0 ]; then
+              echo "::error::refused: crates.io issued no trusted-publishing token (curl exit $status): $(reason "$answer"). Each crate's Trusted Publishing settings must name this repository, release.yml and the crates-io environment (docs/project/publishing.md, settings step 5)."
+              return 1
+            fi
+            token=$(jq -r '.token | strings' <<<"$answer" 2>/dev/null || true)
+            if [ -z "$token" ]; then
+              echo "::error::refused: crates.io answered the token exchange with no token."
+              return 1
+            fi
+            echo "::add-mask::$token"
+          }
+
+          # Revoke $token, issued to publish crate $1: it ends with that
+          # publish, not when its lifetime runs out.
+          revoke() {
+            local answer status=0 held="$token"
+            token=""
+            printf 'Authorization: Bearer %s\n' "$held" > "$RUNNER_TEMP/crates-io.header"
+            curl --silent --show-error --fail-with-body --max-time 30 --retry 2 --output "$RUNNER_TEMP/answer" \
+              --request DELETE --user-agent "$agent" --header "@$RUNNER_TEMP/crates-io.header" \
+              --url "$tokens" || status=$?
+            answered
+            rm -f "$RUNNER_TEMP/crates-io.header"
+            if [ "$status" -ne 0 ]; then
+              echo "::warning::the token issued to publish $1 was not revoked (curl exit $status): $(reason "$answer"); it ends by itself when its short lifetime runs out."
+            fi
+          }
+
+          # The attested package of crate $1: the one file CRATE-VERSION.crate
+          # among those `attest` signed, into $file, and its version into
+          # $version.
+          attested() {
+            local found count=0
+            file=""
+            for found in attested/target/package/"$1"-[0-9]*.crate; do
+              if [ -f "$found" ]; then file="$found"; count=$((count + 1)); fi
+            done
+            if [ "$count" -ne 1 ]; then
+              echo "::error::refused: the attested files hold $count packages of $1, not one."
+              return 1
+            fi
+            version=${file##*/$1-}
+            version=${version%.crate}
+          }
+
+          # crates.io holds the attested file of crate $1: the checksum its
+          # index lists for this version is the SHA-256 of that file. A new
+          # version takes a moment to reach the index, so it is read up to
+          # ten times, 30 seconds apart. Every crate here has four or more
+          # characters in its name, which the index keeps under the first
+          # two, then the next two.
+          confirm() {
+            local crate="$1" file version want held="" attempt=0 answer status=0
+            attested "$crate" || return 1
+            want=$(sha256sum -- "$file")
+            want="${want%% *}"
             while [ "$attempt" -lt 10 ]; do
               attempt=$((attempt + 1))
-              if out=$(cargo publish --locked -p "$crate" 2>&1); then
-                echo "$out"; return 0
+              status=0
+              curl --silent --show-error --fail-with-body --max-time 30 --retry 2 --output "$RUNNER_TEMP/answer" \
+                --user-agent "$agent" --url "$index/${crate:0:2}/${crate:2:2}/$crate" || status=$?
+              answered
+              if [ "$status" -eq 0 ]; then
+                held=$(jq -rs --arg version "$version" 'map(select(.vers == $version) | .cksum | strings) | last // empty' <<<"$answer" 2>/dev/null || true)
               fi
+              if [ -n "$held" ]; then break; fi
+              if [ "$attempt" -lt 10 ]; then sleep 30; fi
+            done
+            if [ -z "$held" ]; then
+              echo "::error::refused: crates.io's index did not list $crate $version in $attempt reads (curl exit $status), so what it holds was not compared with the attested file. No crate after it is published; run the tag again and it is compared again."
+              return 1
+            fi
+            if [ "$held" != "$want" ]; then
+              echo "::error::refused: crates.io holds $crate $version with SHA-256 $held, and the attested file has $want. They are not the same file. No crate after it is published (docs/project/publishing.md, The publish)."
+              return 1
+            fi
+            echo "OK: crates.io holds the attested $crate $version ($want)."
+          }
+
+          publish() {
+            local crate="$1" attempt=0 out status after target now wait
+            current="$crate"
+            while [ "$attempt" -lt 10 ]; do
+              attempt=$((attempt + 1))
+              if ! exchange; then
+                echo "::error::$crate was not published, and no crate after it."
+                return 1
+              fi
+              # cargo runs behind `wait`, which a signal ends at once, so a
+              # run stopped in the middle of an upload leaves by the trap.
+              status=0
+              CARGO_REGISTRY_TOKEN="$token" cargo publish --locked --no-verify -p "$crate" > "$RUNNER_TEMP/cargo.out" 2>&1 &
+              child=$!
+              wait "$child" || status=$?
+              child=""
+              revoke "$crate"
+              out=$(cat "$RUNNER_TEMP/cargo.out")
+              rm -f "$RUNNER_TEMP/cargo.out"
               echo "$out"
-              if printf '%s' "$out" | grep -qiE "already uploaded|already exists"; then
-                echo "::notice::$crate already published; skipping"; return 0
+              if [ "$status" -eq 0 ]; then
+                confirm "$crate"
+                return $?
               fi
-              if printf '%s' "$out" | grep -qi "429 Too Many Requests"; then
-                after=$(printf '%s' "$out" | grep -oiE "try again after [^.]*GMT" | sed -E 's/.*after //I')
-                target=$(date -u -d "$after" +%s 2>/dev/null || echo 0)
+              if grep -qiE "already uploaded|already exists" <<<"$out"; then
+                echo "::notice::$crate already published; skipping"
+                confirm "$crate"
+                return $?
+              fi
+              if grep -qi "429 Too Many Requests" <<<"$out"; then
+                # crates.io names the time: "... try again after <date> GMT".
+                # The date starts after those 16 characters.
+                after=$(grep -m 1 -oiE "try again after [^.]*GMT" <<<"$out" || true)
+                target=$(date -u -d "${after:16}" +%s 2>/dev/null || echo 0)
                 now=$(date -u +%s)
-                if [ "$target" -gt "$now" ]; then wait=$((target - now + 10)); else wait=120; fi
+                if [ -n "$after" ] && [ "$target" -gt "$now" ]; then wait=$((target - now + 10)); else wait=120; fi
                 echo "::notice::$crate rate-limited; sleeping ${wait}s"
                 sleep "$wait"; continue
+              fi
+              if grep -q "403 Forbidden" <<<"$out"; then
+                echo "::error::crates.io refused the token for $crate: its Trusted Publishing settings may not name this repository, release.yml and the crates-io environment (docs/project/publishing.md, settings step 5). The crates before it are published; set it up and re-run the tag."
+                return 1
               fi
               echo "::error::publishing $crate failed"; return 1
             done
             echo "::error::publishing $crate exhausted retries"; return 1
           }
-          for c in axess-strings axess-clock axess-rng axess-testing axess-identity axess-events axess-cache axess-factors axess-core axess-macros axess; do
-            publish "$c"
+
+          crates="axess-strings axess-clock axess-rng axess-testing axess-identity axess-events axess-cache axess-factors axess-core axess-macros axess"
+          # Every crate has its attested file before the first is published.
+          for c in $crates; do
+            attested "$c" || exit 1
+          done
+          for c in $crates; do
+            publish "$c" || exit 1
             sleep 30
           done
 
@@ -337,12 +725,17 @@ jobs:
         run: |
           set -eu
           # The checkout keeps no credential (persist-credentials: false), so
-          # the token reaches git only for the two pushes below, as a header
-          # on that one command and in no file under .git.
+          # the token reaches git only for the push below, as a header on
+          # that one command and in no file under .git. The push is written
+          # out whole: it moves origin's release/next to the local branch of
+          # that name, and the lease refuses the move if the branch changed
+          # since it was read. scripts/check-workflow-pins.sh reads every
+          # word of it, which it could not do for arguments handed on.
           push() {
             auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')
             echo "::add-mask::$auth"
-            git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" push "$@"
+            git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" push \
+              --force-with-lease="refs/heads/release/next:$next" origin refs/heads/release/next:refs/heads/release/next
           }
           git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main' \
             '+refs/heads/release/next:refs/remotes/origin/release/next' || {
@@ -358,9 +751,10 @@ jobs:
           if git merge-base --is-ancestor "$next" "$main" \
              || [ "$(git rev-parse "$next^{tree}")" = "$(git rev-parse "$main^{tree}")" ]; then
             # Behind main, or the same tree as the squashed release: nothing on
-            # release/next is lost by moving it. The lease refuses the move if
-            # the branch changed since it was read.
-            push --force-with-lease="refs/heads/release/next:$next" origin "$main:refs/heads/release/next"
+            # release/next is lost by moving it. The local branch is put at
+            # main's commit and pushed.
+            git branch -f release/next "$main"
+            push
             echo "OK: release/next moved from $next to main ($main) after ${TAG}."
             exit 0
           fi
@@ -373,5 +767,5 @@ jobs:
             echo "::error::release/next and main conflict after ${TAG}; merge main into release/next by hand (git checkout release/next && git merge main) and push."
             exit 1
           fi
-          push --force-with-lease="refs/heads/release/next:$next" origin "release/next:refs/heads/release/next"
+          push
           echo "OK: main ($main) merged into release/next after ${TAG}."

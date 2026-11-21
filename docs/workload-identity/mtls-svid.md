@@ -29,8 +29,8 @@ The certificate chain is signed by the trust domain's CA. The
 chain validates the certificate's authenticity; the SAN URI
 identifies the workload within the trust domain.
 
-The resolver reads exactly one SPIFFE URI. A leaf with two `spiffe://` URI
-SANs is refused (taking "the first" would let whoever orders the SAN pick
+The resolver reads exactly one SPIFFE URI. A leaf with more than one URI
+SAN, of whatever scheme, is refused (taking "the first" would let whoever orders the SAN pick
 the identity), and so is a leaf that may sign certificates: one with
 `basicConstraints` CA set, or with `keyCertSign` or `cRLSign` in its key
 usage. An X.509-SVID is a leaf, not a CA.
@@ -43,10 +43,13 @@ and it validates against whatever roots it was given. If the client-certificate
 root store holds the CA bundles of several trust domains, any of those
 authorities can mint a certificate that chains correctly and names a path in
 your trust domain's namespace, and the pinned-domain comparison is then the
-only thing between them and your workloads. Configure the terminator with
-only the bundle of the trust domain the resolver pins, one resolver and one
-root store per trust domain, or verify against a per-domain bundle in the
-terminator.
+only thing between them and your workloads. Either give the terminator
+only the bundle of the trust domain the resolver pins (one resolver and one
+root store per trust domain), or have the terminator verify against a
+per-domain bundle. For a rustls terminator on a node with a SPIRE agent, the `spire`
+feature's `SpiffeClientCertVerifier` is that per-domain verifier, on the
+agent's bundles as they are at each handshake; *SPIRE Workload API client*
+covers it.
 
 ### Where the certificate comes from
 
@@ -59,14 +62,17 @@ connection, and on acceptance makes the certificate available to
 the application.
 
 The mechanism for making the certificate available depends on the
-terminator. For rustls in process, the certificate is available
-through `axum_server::tls_rustls::RustlsConnectInfo` or an
-equivalent connector callback, which the resolver wires through
-directly. For a sidecar proxy (Istio, Linkerd, Envoy in a service
-mesh), the proxy forwards the certificate as a header (Istio uses
-`X-Forwarded-Client-Cert`, Linkerd uses `l5d-client-id`), and the
-resolver wires through a small adapter that parses the header
-into a certificate. For a load balancer in passthrough TLS mode,
+terminator, and reading it is the application's: axess reads no
+connection and no header. For rustls in process, the application
+reads the chain the handshake recorded
+(`ServerConnection::peer_certificates()` under tokio-rustls, or an
+equivalent connector callback). For a sidecar proxy (Istio, Linkerd,
+Envoy in a service mesh), what reaches the application depends on
+the proxy. Envoy, and Istio through it, can be configured to forward
+the certificate in the `X-Forwarded-Client-Cert` header, which the
+application parses back into a certificate. Linkerd's `l5d-client-id`
+header carries the client's identity name, not a certificate, so it
+cannot feed this resolver. For a load balancer in passthrough TLS mode,
 rustls handles the validation in-process; for a load balancer in
 mTLS-terminating mode (AWS ALB with mTLS, Cloudflare with
 client-cert auth, nginx with `ssl_verify_client`), the load
@@ -79,11 +85,9 @@ insert it into the request extensions before the resolver runs.
 
 ```rust,ignore
 use axess::federation::mtls::PeerCertChain;
+use axum::{extract::Request, middleware::Next, response::Response};
 
-async fn mtls_middleware<B>(
-    mut req: Request<B>,
-    next: Next<B>,
-) -> Response {
+async fn mtls_middleware(mut req: Request, next: Next) -> Response {
     // `chain` is a `Vec<CertificateDer<'static>>`, leaf first.
     if let Some(chain) = extract_cert_from_terminator(&req) {
         req.extensions_mut().insert(PeerCertChain::new(chain));
@@ -92,8 +96,8 @@ async fn mtls_middleware<B>(
 }
 ```
 
-The critical detail: the extraction must trust only sources the
-deployment trusts. A request that arrives directly to the
+The extraction must accept a certificate only from a source the
+deployment trusts. A request that arrives directly at the
 application with a forged `X-Forwarded-Client-Cert` header must
 not be accepted. Either run the application on a socket the
 terminator owns and reject direct connections at the network
@@ -102,7 +106,8 @@ alongside the certificate.
 
 ## Wiring it up
 
-Reading the tenant out of the leaf comes first, and that read validates nothing.
+The resolver reads the tenant out of the leaf itself. It checks the trust
+domain before it looks the tenant up, and it does not validate the chain.
 
 ### The resolver
 
@@ -112,22 +117,22 @@ the certificate's own slug, and produces a `Principal::Workload`.
 
 ```rust,ignore
 use axess::federation::mtls::{MtlsResolver, PeerCertChain, peek_spiffe};
-use axess_identity::PrincipalResolver;
+use axess_identity::{PrincipalResolver, TrustDomain};
 
 // The slug in the certificate's SPIFFE ID is looked up by the resolver,
 // in your registry (a cached map, say), after it has parsed the leaf.
 let tenants = my_directory.tenants_by_slug(); // HashMap<String, TenantId>
 
 let resolver = MtlsResolver::from_chain(
-    &chain,
-    "prod.example.com".parse()?,
+    &chain, // the request's `PeerCertChain`
+    TrustDomain::new("prod.example.com")?,
     move |slug: &str| tenants.get(slug).copied(),
 )?;
 let principal = resolver.resolve().await?;   // Principal::Workload
 ```
 
-`from_chain` takes the leaf and returns `MtlsError::EmptyChain` if
-there is none. Where you already hold a leaf, from a terminator that
+`from_chain` takes the leaf from the chain and returns
+`MtlsError::EmptyChain` if there is none. Where you already hold a leaf, from a terminator that
 hands you one certificate rather than a chain, `MtlsResolver::new` takes it
 directly and is infallible.
 
@@ -144,14 +149,17 @@ checks the trust domain.
 
 ### The validation flow
 
-Two error types are in play, and which one you see depends on where
-you are standing.
+Two error types are in play; which one you see depends on the function
+you call.
 
 `peek_spiffe` is the parsing step, and it reports `MtlsError`. It
 parses the leaf's DER, where a failure is `MtlsError::CertParse`, then
 reads the Subject Alternative Name extension. A certificate with no
-SAN yields `MtlsError::NoSan`; one whose SAN carries no `spiffe://`
-URI yields `MtlsError::NoSpiffeUri`. The URI is then parsed as a
+SAN yields `MtlsError::NoSan`; one whose SAN carries no URI, or whose
+one URI is not a `spiffe://` URI, yields `MtlsError::NoSpiffeUri`. A
+SAN with more than one URI entry, and a leaf that may sign
+certificates, yield `MtlsError::Identity` carrying
+`IdentityError::InvalidSpiffeId`. The URI is then parsed as a
 SPIFFE ID and decomposed into
 `spiffe://<trust_domain>/<service>/<tenant_slug>`; a URI that is
 malformed, or whose path does not match that shape, yields
@@ -167,9 +175,14 @@ than through whatever the middleware peeked at earlier, then compares
 the presented trust domain against the configured one. A mismatch is
 `IdentityError::InvalidSpiffeId`, naming both domains, and is logged at
 `warn`. A tenant slug the lookup does not know is
-`IdentityError::NotAuthenticated`, logged at `warn`. Every other parse
-failure collapses to `IdentityError::NotAuthenticated`, with the
-specific `MtlsError` logged at `debug`.
+`IdentityError::NotAuthenticated`, logged at `warn`. An
+`MtlsError::Identity` from the parse passes through as the
+`IdentityError` it carries, so a malformed URI, a path of the wrong
+shape, a second URI SAN or a signing leaf is
+`IdentityError::InvalidSpiffeId`. The other parse failures
+(`CertParse`, `NoSan`, `NoSpiffeUri`) collapse to
+`IdentityError::NotAuthenticated`, with the specific `MtlsError`
+logged at `debug`.
 
 That collapse is deliberate: a caller presenting a bad certificate
 learns only that it was rejected, while the operator reading the logs
@@ -187,13 +200,13 @@ A successful validation produces:
 
 ```rust,ignore
 Principal::Workload(WorkloadPrincipal {
-    workload_id: WorkloadId::new("spiffe://prod.example.com/svc/billing/tenant-acme"),
-    trust_domain: TrustDomain::new("prod.example.com"),
+    workload_id: WorkloadId::parse("spiffe://prod.example.com/billing/acme")?,
+    trust_domain: TrustDomain::new("prod.example.com")?,
     issuer: Issuer::Mtls,
-    tenant_id: TenantId::parse("acme").unwrap(),
+    tenant_id: acme_tenant_id, // what your lookup answered for "acme"
     tenant_slug: "acme".into(),
     service_name: "billing".into(),
-    attributes: { /* X.509 fields the deployment exposes */ },
+    attributes: BTreeMap::new(), // always empty from MtlsResolver
 })
 ```
 
@@ -212,11 +225,14 @@ plus a session cookie or a JWT as the application-level proof of
 who the user behind the workload is. The two layers compose: the
 mTLS resolver runs first and establishes the workload's identity;
 the session or JWT layer runs second and establishes the human's
-identity inside the workload. Cedar policies can match on both.
+identity inside the workload. Each layer resolves to its own
+`Principal`, and a Cedar request has one principal, so a policy sees
+both only when the application passes the second identity in itself:
+for instance the human as the principal and the workload's identity in
+the request context, through `for_user_id_with_context`.
 
-The composition is what gives a deployment "the calling service is
-authenticated AND the user inside the call is authenticated", which
-is the right shape for delegated workflows. *Delegated and OBO
+The composition authenticates both the calling service and the user
+inside the call, which is the shape delegated workflows need. *Delegated and OBO
 access* covers the pattern from the OBO side.
 
 ## Threat model
@@ -271,10 +287,13 @@ PEM where DER was expected.
 If `resolve` returns `IdentityError::InvalidSpiffeId`, read the
 message. "trust domain mismatch" means a workload from another trust
 domain connected; if that is intentional, see *Inbound: federation*.
-Anything else means the SPIFFE path does not have the
-`/<service>/<tenant_slug>` shape axess decomposes, and the issuer's
-path convention needs to change, because axess does not make the shape
-configurable.
+"SPIFFE path is not <service>/<tenant_slug>" means the path does not
+have the shape axess decomposes. Axess does not make the
+shape configurable, so the issuer's path convention must change.
+"more than one URI SAN" and "must not be a signing certificate" mean
+the issuer minted a leaf that is not an X.509-SVID; any other message
+says what in the URI is malformed (its length, a query, a port, the
+trust domain or a path segment).
 
 If `resolve` answers `NotAuthenticated` although the certificate parses, the
 `tenant_slug` in the path is not one your lookup knows. That is your

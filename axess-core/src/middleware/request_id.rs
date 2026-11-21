@@ -1,8 +1,8 @@
 //! `X-Request-Id` (or custom-header) middleware for axum/tower stacks.
 //!
 //! Generates an ID per inbound request (UUID v4 by default), propagates
-//! it via [`RequestIdExt`](crate::middleware::request_id::RequestIdExt) to handler code, and mirrors it on the outbound
-//! response. With the `accept_client_id` feature activated, valid
+//! it via [`RequestIdExt`] to handler code, and mirrors it on the outbound
+//! response. With the `accept-client-id` feature activated, valid
 //! client-supplied IDs are preserved (invalid ones are replaced); without
 //! it, every request gets a fresh server-generated ID.
 //!
@@ -12,7 +12,7 @@
 //! ships `SetRequestId` + `PropagateRequestId` with the same default
 //! shape; reach for it first if you don't need the
 //! validation-of-client-supplied-IDs path. This crate's
-//! [`RequestIdLayer`](crate::middleware::request_id::RequestIdLayer) adds that path behind the `accept_client_id`
+//! [`RequestIdLayer`] adds that path behind the `accept-client-id`
 //! feature.
 //!
 //! ## Wiring
@@ -28,8 +28,8 @@
 //!     .layer(RequestIdLayer::default());
 //! ```
 //!
-//! Custom header or generator: implement [`RequestIdGenerator`](crate::middleware::request_id::RequestIdGenerator) and
-//! construct [`RequestIdLayer`](crate::middleware::request_id::RequestIdLayer) with the custom generator type.
+//! Custom header or generator: implement [`RequestIdGenerator`] and
+//! construct [`RequestIdLayer`] with the custom generator type.
 //! `HEADER_NAME` must be lowercase per HTTP/2 + HTTP/3.
 
 use axess_rng::SecureRng;
@@ -68,7 +68,7 @@ pub trait RequestIdGenerator {
     const HEADER_NAME: HeaderName;
 
     /// Expected length of an inbound client-supplied ID, used to validate
-    /// the value when the `accept_client_id` feature is enabled.
+    /// the value when the `accept-client-id` feature is enabled.
     #[cfg(feature = "accept-client-id")]
     const ID_LENGTH: usize;
 
@@ -143,7 +143,7 @@ impl RequestIdGenerator for RngUuidGenerator {
 
 /// Tower [`Service`] that ensures every request and response carries a
 /// stable request ID under [`RequestIdGenerator::HEADER_NAME`]. With the
-/// `accept_client_id` feature, a well-formed inbound ID is preserved.
+/// `accept-client-id` feature, a well-formed inbound ID is preserved.
 #[derive(Clone, Debug)]
 pub struct RequestIdService<S, G> {
     inner: S,

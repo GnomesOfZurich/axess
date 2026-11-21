@@ -49,6 +49,13 @@ use std::time::Duration;
 /// not leave a live session that no `sid` logout can reach.
 const RESTORE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// A login the sid store could not record: its subject record or its `sid`
+/// mapping was not written, so no logout from the provider could reach its
+/// session, and the login is refused. It carries what the steps before the
+/// failure took out of the map, still owed (boxed: the answer of a login
+/// that went through stays small).
+pub(super) struct Unrecorded(pub(super) Box<PendingEnds>);
+
 /// Sessions owed an end by one login. See the [module docs](self).
 pub(super) struct PendingEnds {
     registry: Option<Arc<dyn SessionRegistryHandle>>,
@@ -212,18 +219,18 @@ async fn settle_refused(
             tokio::time::timeout(timeout, sid_map.restore_if_vacant(key.clone(), displaced)).await;
         match attempt {
             Ok(Ok(true)) => tracing::debug!(
-                iss = %key.0,
+                iss = %crate::authn::service::log_text::logged_request_text(&key.0),
                 "sid_map: put back the mapping a refused login had displaced"
             ),
             Ok(Ok(false)) => tracing::debug!(
-                iss = %key.0,
-                session = %session,
+                iss = %crate::authn::service::log_text::logged_request_text(&key.0),
+                session = %session.prefix(),
                 "sid_map: the displaced mapping was not put back (key taken or session ended)"
             ),
             Ok(Err(_)) | Err(_) => {
                 tracing::warn!(
-                    iss = %key.0,
-                    session = %session,
+                    iss = %crate::authn::service::log_text::logged_request_text(&key.0),
+                    session = %session.prefix(),
                     "sid_map: the displaced mapping could not be put back; ending its session"
                 );
                 end(vec![(key.0, user, session)]).await;
@@ -239,7 +246,7 @@ async fn settle_refused(
 /// A session the registry could not end is still live, and its `sid`
 /// mapping is already gone, so the subject entry is the one way a later
 /// `sub` logout still reaches it: it is kept. Forgetting it on the failed
-/// end used to put the session out of reach of every logout for good.
+/// end would put the session out of reach of every logout for good.
 async fn end_sessions(
     registry: Arc<dyn SessionRegistryHandle>,
     sid_map: Arc<dyn SidStore>,
@@ -265,9 +272,9 @@ async fn end_sessions(
             }
         } else {
             tracing::warn!(
-                iss = %issuer,
+                iss = %crate::authn::service::log_text::logged_request_text(&issuer),
                 user_id = %user,
-                session = %session,
+                session = %session.prefix(),
                 "the registry could not end a displaced OAuth session; \
                  it stays in the subject registry for a later logout"
             );

@@ -6,6 +6,7 @@ use super::test_support::{fixture_tenant, fixture_user, now, store, test_config}
 use super::*;
 use crate::authn::ids::DeviceId;
 use crate::testing::mock_random::MockRng;
+use axess_clock::testing::Shift;
 
 fn device(label: &str) -> DeviceId {
     axess_identity::testing::device(label)
@@ -57,16 +58,19 @@ async fn rotation_checks_the_digest_and_the_child_keeps_it() {
 
     let wrong = Refresh::any_tenant(&plaintext, |_| async { true })
         .device_info(Some("other"))
+        .without_device_check()
         .run(&store, &config, &MockRng::new(6), now())
         .await;
     assert!(matches!(wrong, Err(RefreshError::DeviceMismatch)));
     let none = Refresh::any_tenant(&plaintext, |_| async { true })
+        .without_device_check()
         .run(&store, &config, &MockRng::new(6), now())
         .await;
     assert!(matches!(none, Err(RefreshError::DeviceMismatch)));
 
     let (_, child) = Refresh::any_tenant(&plaintext, |_| async { true })
         .device_info(Some("fp-hex"))
+        .without_device_check()
         .run(&store, &config, &MockRng::new(6), now())
         .await
         .unwrap();
@@ -149,7 +153,7 @@ fn row_with(info: Option<String>, device_id: Option<DeviceId>) -> RefreshToken {
         tenant_id: fixture_tenant(),
         token_hash: "h".into(),
         issued_at: now(),
-        expires_at: now() + Duration::days(1),
+        expires_at: axess_clock::Until::At(now().plus(SignedDuration::days(1))),
         revoked: false,
         device_info: info,
         family_id: None,

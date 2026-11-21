@@ -14,6 +14,7 @@ pub mod config;
 pub mod cookies;
 #[cfg(any(
     feature = "sqlite",
+    feature = "sqlite-unbundled",
     feature = "postgres",
     feature = "mysql",
     feature = "valkey",
@@ -36,24 +37,31 @@ pub use binding::{SessionBinding, UserAgentBinding};
 pub use config::{SameSite, SessionConfig, SessionConfigBuilder};
 #[cfg(any(
     feature = "sqlite",
+    feature = "sqlite-unbundled",
     feature = "postgres",
     feature = "mysql",
     feature = "valkey",
     feature = "delegated-stored-encrypted"
 ))]
 pub use crypto::{CryptoError, SessionCrypto};
-pub use data::{AuthState, Impersonation, SessionData, WorkflowKind, WorkflowState};
+pub use data::{
+    AuthFlow, AuthState, EndingClaim, Impersonation, SessionData, WorkflowKind, WorkflowState,
+};
 pub use extractor::{AuthSession, SessionMissing};
-pub use id::SessionId;
-pub use layer::{SessionLayer, UnknownLiveness};
+pub use id::{SESSION_KEY_DOMAIN, SessionId, SessionKey, SessionKeyError, SessionKeyPrefix};
+pub use layer::{
+    LayerSessionEnded, SessionEndAudit, SessionEndReason, SessionLayer, UnknownLiveness,
+    UnrecordedSessionEnds,
+};
 pub use legacy_blobs::LegacyBlobs;
 pub use refresh::{
     DeviceTokenRevocation, IssueRequest, PreviousPepper, RefreshError, RefreshToken,
     RefreshTokenConfig, RefreshTokenStore, RotationOutcome,
 };
 pub use store::{
-    ConditionalUpdate, CycleOutcome, RevocationError, SessionLiveness, SessionRegistry,
-    SessionRegistryAdapter, SessionRegistryHandle, SessionRevoker, SessionStore,
+    ConditionalUpdate, CutOff, CycleOutcome, MAX_MOVE_RECORDS_PER_USER, MoveOutcome,
+    RevocationError, SessionLiveness, SessionRegistry, SessionRegistryAdapter,
+    SessionRegistryHandle, SessionRevoker, SessionStore,
 };
 #[cfg(any(test, feature = "memory"))]
 pub use store::{MemoryRegistryError, MemorySessionRegistry, MemorySessionStore, MemoryStoreError};

@@ -4,15 +4,15 @@
 //! only the credentials its ceremony accepts; and an assertion records what
 //! it proved.
 
-mod common;
+use axess_core::testing::fixtures as common;
 
 use axess_core::Clock;
 use axess_core::authn::AuditContext;
 use axess_core::authn::assurance::{CredentialBinding, StepUp};
 use axess_core::authn::error::AuthnError;
 use axess_core::authn::factor::{
-    FactorConfig, FactorCredential, FactorKind, FactorStep, Fido2Config, Fido2Credential,
-    Fido2Options,
+    DiscoverableCredential, FactorConfig, FactorCredential, FactorKind, FactorStep, Fido2Config,
+    Fido2Credential, Fido2Options,
 };
 use axess_core::authn::service::{
     AuthnService, FactorOutcome, PrepareOutcome, RequestAuthnService,
@@ -205,7 +205,7 @@ fn fixture(
         tenant_id: user.tenant_id,
         user_id: user.id,
     };
-    let clock = MockClock::now();
+    let clock = common::test_clock();
     let credentials = keys
         .into_iter()
         .map(|key| Fido2Credential::new(key, "key", clock.now()))
@@ -235,6 +235,7 @@ fn fixture(
         vouches,
     });
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_default_tenant(test_tenant())
         .with_user(user);
     let service = AuthnService::builder(identity, factors.clone())
@@ -563,4 +564,64 @@ async fn a_registration_runs_the_chosen_ceremony_and_stores_the_key_it_typed() {
         .await
         .unwrap();
     assert_eq!(last_asked(&f), attested_ceremony, "one call's own ceremony");
+}
+
+/// `Fido2Options::discoverable_credential` reaches the authenticator in the
+/// passkey registration's challenge, leaves the security-key ceremony a
+/// non-discoverable one, and changes nothing the finish verifies.
+#[tokio::test]
+async fn a_passkey_registration_asks_for_the_discoverable_credential_the_options_name() {
+    let options = Fido2Options {
+        discoverable_credential: DiscoverableCredential::Required,
+        ..Fido2Options::default()
+    };
+    let f = fixture(vec![], options, result(AAAA, true, false), false);
+    let user = test_user("u1", "alice");
+    let session = session_for(&user).await;
+
+    let (challenge, _) = f
+        .service
+        .begin_fido2_registration(&user, &session)
+        .await
+        .unwrap();
+    let selection = &challenge["publicKey"]["authenticatorSelection"];
+    assert_eq!(selection["residentKey"], "required");
+    assert_eq!(selection["requireResidentKey"], true);
+    assert_eq!(selection["userVerification"], "required");
+    f.service
+        .finish_fido2_registration(&user, &registration(), "laptop", &session)
+        .await
+        .unwrap();
+    assert!(matches!(stored(&f).await[0].key, Fido2Key::Passkey(_)));
+
+    let security_key = Fido2Ceremony::SecurityKey(SecurityKeyVerification::Preferred);
+    let (challenge, _) = f
+        .service
+        .begin_fido2_registration_with(&user, &session, &security_key)
+        .await
+        .unwrap();
+    let selection = &challenge["publicKey"]["authenticatorSelection"];
+    assert_eq!(selection["residentKey"], "discouraged");
+    assert_eq!(selection["requireResidentKey"], false);
+}
+
+#[tokio::test]
+async fn a_passkey_registration_leaves_storage_to_the_authenticator_by_default() {
+    let f = fixture(
+        vec![],
+        Fido2Options::default(),
+        result(AAAA, true, false),
+        false,
+    );
+    let user = test_user("u1", "alice");
+    let session = session_for(&user).await;
+    let (challenge, _) = f
+        .service
+        .begin_fido2_registration(&user, &session)
+        .await
+        .unwrap();
+    assert_eq!(
+        challenge["publicKey"]["authenticatorSelection"]["residentKey"],
+        "discouraged"
+    );
 }

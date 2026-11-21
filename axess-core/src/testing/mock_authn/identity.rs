@@ -16,10 +16,10 @@ use std::sync::{Arc, Mutex};
 use subtle::ConstantTimeEq as _;
 
 /// A user's failed-attempt count and the time of the last failure.
-type FailedAttempts = (u32, chrono::DateTime<chrono::Utc>);
+type FailedAttempts = (u32, axess_clock::Timestamp);
 
 /// A reset token's hash and its expiry.
-type ResetToken = (String, chrono::DateTime<chrono::Utc>);
+type ResetToken = (String, axess_clock::Timestamp);
 // A user's live reset tokens.
 type ResetTokens = Vec<ResetToken>;
 
@@ -79,6 +79,11 @@ pub struct MockIdentityStore {
     fail_get_user: Arc<std::sync::atomic::AtomicBool>,
     /// When set, `account_status` fails: a status-table outage.
     fail_account_status: Arc<std::sync::atomic::AtomicBool>,
+    /// When set, `activate_user` fails and activates nothing.
+    fail_activate_user: Arc<std::sync::atomic::AtomicBool>,
+    /// When set, `failed_attempts` fails: the counter cannot be read, for
+    /// tests of the lockout a policy derives when its counter is unknown.
+    fail_failed_attempts: Arc<std::sync::atomic::AtomicBool>,
     /// Password history per user: `user_id -> Vec<hash>`.
     password_history: Arc<Mutex<HashMap<String, Vec<String>>>>,
     /// Active password reset tokens: `user_id -> (token_hash, expires_at)`.
@@ -98,7 +103,7 @@ pub struct MockIdentityStore {
     call_log: Option<CallLog>,
     /// user_id -> time of the last successful authentication, as written by
     /// [`record_last_login`](crate::authn::IdentityAuthnLog::record_last_login).
-    last_logins: Arc<Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>>,
+    last_logins: Arc<Mutex<HashMap<String, axess_clock::Timestamp>>>,
 }
 
 impl Default for MockIdentityStore {
@@ -128,6 +133,8 @@ impl MockIdentityStore {
             fail_store_reset_token: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fail_get_user: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fail_account_status: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fail_activate_user: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fail_failed_attempts: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             password_history: Default::default(),
             reset_tokens: Default::default(),
             password_rules: Default::default(),
@@ -223,10 +230,41 @@ impl MockIdentityStore {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Arm an outage of the write that activates an account: subsequent
+    /// `activate_user` calls fail with [`MockStoreError::Unavailable`] and
+    /// change nothing, until
+    /// [`disarm_activate_user_failure`](Self::disarm_activate_user_failure).
+    pub fn arm_activate_user_failure(&self) {
+        self.fail_activate_user
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// End the outage armed by
+    /// [`arm_activate_user_failure`](Self::arm_activate_user_failure).
+    pub fn disarm_activate_user_failure(&self) {
+        self.fail_activate_user
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// End the status-table outage armed by
     /// [`arm_account_status_failure`](Self::arm_account_status_failure).
     pub fn disarm_account_status_failure(&self) {
         self.fail_account_status
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Arm the counter-read outage: subsequent `failed_attempts` calls fail
+    /// with [`MockStoreError::NotFound`] until
+    /// [`disarm_failed_attempts_failure`](Self::disarm_failed_attempts_failure).
+    pub fn arm_failed_attempts_failure(&self) {
+        self.fail_failed_attempts
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// End the counter-read outage armed by
+    /// [`arm_failed_attempts_failure`](Self::arm_failed_attempts_failure).
+    pub fn disarm_failed_attempts_failure(&self) {
+        self.fail_failed_attempts
             .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -332,7 +370,7 @@ impl MockIdentityStore {
 
     /// When [`record_last_login`](crate::authn::IdentityAuthnLog::record_last_login)
     /// last ran for `user_id`, or `None` when it never did.
-    pub fn last_login(&self, user_id: &UserId) -> Option<chrono::DateTime<chrono::Utc>> {
+    pub fn last_login(&self, user_id: &UserId) -> Option<axess_clock::Timestamp> {
         lock(&self.last_logins)
             .get(user_id.to_string().as_str())
             .copied()
@@ -413,7 +451,7 @@ impl crate::authn::store::IdentityLookup for MockIdentityStore {
             .unwrap_or(EntityState::Guest))
     }
 
-    fn lockout_policy_for_tenant(&self, _tenant_id: &TenantId) -> LockoutPolicy {
+    fn lockout_policy_for_tenant(&self, _: &TenantId) -> LockoutPolicy {
         self.lockout_policy.clone()
     }
 
@@ -498,14 +536,16 @@ impl crate::authn::store::IdentityAuthnLog for MockIdentityStore {
         // Holding the map's lock makes the test and the increment one step.
         let mut attempts = lock(&self.failed_attempts);
         let entry = attempts.entry(user_id.to_string()).or_insert((0, now));
-        let window = chrono::Duration::from_std(policy.attempt_window)
-            .unwrap_or_else(|_| chrono::Duration::hours(1));
+        // A window too long for a span is one no failure is older than,
+        // the reading the SQLite example gives it; a fallback of an hour
+        // would freshen a count the policy asked to keep.
+        let window = axess_clock::SignedDuration::try_from(policy.attempt_window).ok();
         // The window freshens a count below the limit only; at the limit the
         // count stays until a timed lockout has run out or the counter is
         // reset, so an indefinite lockout is not ended by the window.
         let at_limit = entry.0 >= max;
         let fresh = entry.0 == 0
-            || (!at_limit && now - entry.1 > window)
+            || (!at_limit && window.is_some_and(|window| now.since(entry.1) > window))
             || (at_limit
                 && policy
                     .derived_lockout(entry.0, Some(entry.1), now)
@@ -539,7 +579,13 @@ impl crate::authn::store::IdentityAuthnLog for MockIdentityStore {
     async fn failed_attempts(
         &self,
         user_id: &UserId,
-    ) -> Result<(u32, Option<chrono::DateTime<chrono::Utc>>), Self::Error> {
+    ) -> Result<(u32, Option<axess_clock::Timestamp>), Self::Error> {
+        if self
+            .fail_failed_attempts
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(MockStoreError::NotFound);
+        }
         note(&self.call_log, "failed_attempts");
         Ok(lock(&self.failed_attempts)
             .get(user_id.to_string().as_str())
@@ -589,7 +635,7 @@ impl crate::authn::store::IdentityAuthnLog for MockIdentityStore {
     async fn record_last_login(
         &self,
         user_id: &UserId,
-        at: chrono::DateTime<chrono::Utc>,
+        at: axess_clock::Timestamp,
     ) -> Result<(), Self::Error> {
         note(&self.call_log, "record_last_login");
         lock(&self.last_logins).insert(user_id.to_string(), at);
@@ -630,6 +676,12 @@ impl crate::authn::store::IdentityAdmin for MockIdentityStore {
     }
 
     async fn activate_user(&self, user_id: &UserId) -> Result<(), Self::Error> {
+        if self
+            .fail_activate_user
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(MockStoreError::Unavailable);
+        }
         let mut users = lock(&self.users);
         let entry = users
             .get_mut(user_id.to_string().as_str())
@@ -653,7 +705,8 @@ impl crate::authn::store::IdentityAdmin for MockIdentityStore {
 
     /// Erase the user: the row, its identifier index entry, failed-attempt
     /// counter, password history and any pending reset token, and (when a
-    /// factor store is linked) its factor configs and auth methods. A missing
+    /// factor store is linked) its factor configs, passkey credential-id
+    /// claims and auth methods. A missing
     /// user is [`MockStoreError::NotFound`], and a second delete of the same
     /// user is therefore `NotFound` too.
     async fn delete_user(&self, user_id: &UserId) -> Result<(), Self::Error> {
@@ -675,7 +728,7 @@ impl crate::authn::store::IdentityAdmin for MockIdentityStore {
     /// The oldest candidates first, up to `limit`.
     async fn delete_candidates_created_before(
         &self,
-        before: chrono::DateTime<chrono::Utc>,
+        before: axess_clock::Timestamp,
         limit: usize,
     ) -> Result<Vec<crate::authn::types::User>, Self::Error> {
         let mut expired: Vec<crate::authn::types::User> = lock(&self.users)
@@ -700,8 +753,8 @@ impl crate::authn::store::IdentityPasswordReset for MockIdentityStore {
         &self,
         user_id: &UserId,
         token_hash: &str,
-        expires_at: chrono::DateTime<chrono::Utc>,
-        now: chrono::DateTime<chrono::Utc>,
+        expires_at: axess_clock::Timestamp,
+        now: axess_clock::Timestamp,
         max_live: usize,
     ) -> Result<bool, Self::Error> {
         note(&self.call_log, "store_reset_token");
@@ -728,7 +781,7 @@ impl crate::authn::store::IdentityPasswordReset for MockIdentityStore {
         &self,
         user_id: &UserId,
         token_hash: &str,
-        now: chrono::DateTime<chrono::Utc>,
+        now: axess_clock::Timestamp,
     ) -> Result<bool, Self::Error> {
         // One atomic remove-if: of two concurrent verifications of the same
         // token exactly one may succeed (the token is single-use), and a
@@ -751,7 +804,7 @@ impl crate::authn::store::IdentityPasswordReset for MockIdentityStore {
         &self,
         user_id: &UserId,
         token_hash: &str,
-        now: chrono::DateTime<chrono::Utc>,
+        now: axess_clock::Timestamp,
     ) -> Result<bool, Self::Error> {
         Ok(lock(&self.reset_tokens)
             .get(user_id.to_string().as_str())

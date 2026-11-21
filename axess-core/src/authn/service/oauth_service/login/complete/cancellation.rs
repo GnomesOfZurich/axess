@@ -6,93 +6,56 @@ use crate::authn::ids::TenantId;
 use crate::authn::ids::UserId;
 use crate::federation::sid_map::{DisplacedSid, SidEntry, SidKey, SidMap};
 use crate::federation::sid_store::{SidFuture, SidStore};
-use crate::session::id::SessionId;
-use crate::session::store::{
-    MemorySessionRegistry, SessionRegistry, SessionRegistryAdapter, SessionRegistryHandle,
-};
+use crate::session::id::{SessionId, SessionKey};
+use crate::session::store::{SessionRegistry, SessionRegistryAdapter, SessionRegistryHandle};
+use crate::testing::registry_double::{RegistryDouble, RegistryOp, Step};
+use axess_clock::Timestamp;
 use axess_rng::testing::MockRng;
+use axess_testing::mock_tracing::TracingCapture;
 use axess_testing::stall::{Gate, abort_inside, eventually};
-use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use std::time::Duration;
 
 const ISS: &str = "https://idp.example.com";
 
 /// A registry whose invalidation takes `delay`, over a memory registry.
-#[derive(Clone)]
-struct Slow {
-    inner: MemorySessionRegistry,
-    delay: Duration,
-}
-
-impl SessionRegistry for Slow {
-    type Error = std::io::Error;
-    async fn register(&self, u: &UserId, s: &SessionId) -> Result<(), Self::Error> {
-        self.inner
-            .register(u, s)
-            .await
-            .map_err(std::io::Error::other)
-    }
-    async fn is_valid(&self, u: &UserId, s: &SessionId) -> Result<bool, Self::Error> {
-        self.inner
-            .is_valid(u, s)
-            .await
-            .map_err(std::io::Error::other)
-    }
-    async fn invalidate_user(&self, u: &UserId) -> Result<(), Self::Error> {
-        self.inner
-            .invalidate_user(u)
-            .await
-            .map_err(std::io::Error::other)
-    }
-    async fn invalidate_session(&self, u: &UserId, s: &SessionId) -> Result<(), Self::Error> {
-        tokio::time::sleep(self.delay).await;
-        self.inner
-            .invalidate_session(u, s)
-            .await
-            .map_err(std::io::Error::other)
-    }
-    async fn active_sessions(&self, u: &UserId) -> Result<Vec<SessionId>, Self::Error> {
-        self.inner
-            .active_sessions(u)
-            .await
-            .map_err(std::io::Error::other)
-    }
+fn slow(delay: Duration) -> RegistryDouble {
+    RegistryDouble::new().before(move |call, _| async move {
+        if call.op() == RegistryOp::InvalidateSession {
+            tokio::time::sleep(delay).await;
+        }
+        Step::Forward
+    })
 }
 
 /// The instant the fixtures stamp their mappings with: a fixed one, so the
 /// tests read the same clock on every run and nothing here reads the wall.
-fn at() -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-        .expect("a valid instant")
-        .with_timezone(&Utc)
+fn at() -> Timestamp {
+    Timestamp::parse_rfc3339("2026-01-01T00:00:00Z").expect("a valid instant")
 }
 
 struct Fixture {
-    registry: Slow,
+    registry: RegistryDouble,
     sid_map: SidMap,
     user: UserId,
-    aged: SessionId,
-    displaced: SessionId,
+    aged: SessionKey,
+    displaced: SessionKey,
 }
 
 /// One session aged out of the map and one displaced from `sid-1`, both live
 /// in the registry.
 async fn fixture(delay: Duration) -> Fixture {
-    let registry = Slow {
-        inner: MemorySessionRegistry::new(),
-        delay,
-    };
+    let registry = slow(delay);
     let sid_map = SidMap::new();
     let rng = MockRng::new(31);
     let user = axess_identity::testing::user("u1");
     let (aged, displaced, newcomer) = (
-        SessionId::new(&rng),
-        SessionId::new(&rng),
-        SessionId::new(&rng),
+        SessionKey::of(&SessionId::new(&rng)),
+        SessionKey::of(&SessionId::new(&rng)),
+        SessionKey::of(&SessionId::new(&rng)),
     );
     for s in [&aged, &displaced, &newcomer] {
-        registry.inner.register(&user, s).await.unwrap();
+        registry.inner().register(&user, s).await.unwrap();
         sid_map.register_subject_session(ISS, &user.to_string(), None, user, *s);
     }
     let now = at();
@@ -128,7 +91,7 @@ fn pending_for(f: &Fixture, newcomer_user: UserId) -> PendingEnds {
             &newcomer_user.to_string(),
             None,
             newcomer_user,
-            SessionId::new(&rng),
+            SessionKey::of(&SessionId::new(&rng)),
             at(),
         )
         .expect("the fixture mapped sid-1");
@@ -136,8 +99,8 @@ fn pending_for(f: &Fixture, newcomer_user: UserId) -> PendingEnds {
     pending
 }
 
-async fn valid(f: &Fixture, s: &SessionId) -> bool {
-    f.registry.inner.is_valid(&f.user, s).await.unwrap()
+async fn valid(f: &Fixture, s: &SessionKey) -> bool {
+    f.registry.inner().is_valid(&f.user, s).await.unwrap()
 }
 
 /// Dropping the holder unsettled (the login future was cancelled between the
@@ -211,8 +174,8 @@ impl SidStore for StallingSid {
         subject: &'a str,
         tenant: Option<TenantId>,
         user: UserId,
-        session: SessionId,
-        inserted_at: DateTime<Utc>,
+        session: SessionKey,
+        inserted_at: Timestamp,
     ) -> SidFuture<'a, Option<DisplacedSid>> {
         self.inner
             .insert_displacing(key, subject, tenant, user, session, inserted_at)
@@ -236,7 +199,7 @@ impl SidStore for StallingSid {
     fn remove_if_session<'a>(
         &'a self,
         key: &'a SidKey,
-        session: &'a SessionId,
+        session: &'a SessionKey,
     ) -> SidFuture<'a, Option<SidEntry>> {
         self.inner.remove_if_session(key, session)
     }
@@ -247,7 +210,7 @@ impl SidStore for StallingSid {
         subject: &'a str,
         tenant: Option<TenantId>,
         user: UserId,
-        session: SessionId,
+        session: SessionKey,
     ) -> SidFuture<'a, ()> {
         self.inner
             .register_subject_session(issuer, subject, tenant, user, session)
@@ -257,7 +220,7 @@ impl SidStore for StallingSid {
         &'a self,
         issuer: &'a str,
         user: &'a UserId,
-        session: &'a SessionId,
+        session: &'a SessionKey,
     ) -> SidFuture<'a, bool> {
         self.inner.forget_subject_session(issuer, user, session)
     }
@@ -267,24 +230,24 @@ impl SidStore for StallingSid {
         issuer: &'a str,
         subject: &'a str,
         scope: Option<&'a TenantId>,
-    ) -> SidFuture<'a, Vec<(UserId, SessionId)>> {
+    ) -> SidFuture<'a, Vec<(UserId, SessionKey)>> {
         self.inner.subject_sessions(issuer, subject, scope)
     }
 
     fn sweep_subject_candidates(
         &self,
         max: usize,
-    ) -> SidFuture<'_, Vec<(String, UserId, SessionId)>> {
+    ) -> SidFuture<'_, Vec<(String, UserId, SessionKey)>> {
         self.inner.sweep_subject_candidates(max)
     }
 
-    fn remove_session<'a>(&'a self, session: &'a SessionId) -> SidFuture<'a, usize> {
+    fn remove_session<'a>(&'a self, session: &'a SessionKey) -> SidFuture<'a, usize> {
         self.inner.remove_session(session)
     }
 
     fn evict_inserted_before(
         &self,
-        cutoff: DateTime<Utc>,
+        cutoff: Timestamp,
         max: usize,
     ) -> SidFuture<'_, Vec<(SidKey, SidEntry)>> {
         self.inner.evict_inserted_before(cutoff, max)
@@ -325,7 +288,7 @@ async fn aborting_the_caller_during_refuse_still_ends_the_aged_session() {
             &newcomer.to_string(),
             None,
             newcomer,
-            SessionId::new(&MockRng::new(99)),
+            SessionKey::of(&SessionId::new(&MockRng::new(99))),
             at(),
         )
         .expect("the fixture mapped sid-1");
@@ -349,5 +312,69 @@ async fn aborting_the_caller_during_refuse_still_ends_the_aged_session() {
     assert!(
         settled,
         "the displaced session is unmapped and live: no sid logout reaches it"
+    );
+}
+
+/// What a refused login logs about the session it displaced names that
+/// session by the first eight characters of its key, never by the whole
+/// key: when the mapping is not put back because the key is taken, and when
+/// the store does not answer and the session is ended instead.
+#[tokio::test]
+async fn a_refused_login_logs_the_displaced_session_by_a_prefix_only() {
+    let capture = TracingCapture::install();
+    let newcomer = axess_identity::testing::user("newcomer");
+
+    // The key is still taken by the newcomer's mapping: nothing is put back.
+    let f = fixture(Duration::ZERO).await;
+    pending_for(&f, newcomer).refuse().await;
+
+    // The store never answers the restore: after the wait the displaced
+    // session is ended instead.
+    let g = fixture(Duration::ZERO).await;
+    let stalling: Arc<dyn SidStore> = Arc::new(StallingSid {
+        inner: Arc::new(g.sid_map.clone()),
+        gate: Gate::new(),
+    });
+    let registry: Arc<dyn SessionRegistryHandle> =
+        Arc::new(SessionRegistryAdapter(g.registry.clone()));
+    let mut pending =
+        PendingEnds::new(Some(registry), stalling).restore_timeout(Duration::from_millis(100));
+    let key = (ISS.to_string(), "sid-1".to_string());
+    let displaced = g
+        .sid_map
+        .insert_displacing(
+            key.clone(),
+            &newcomer.to_string(),
+            None,
+            newcomer,
+            SessionKey::of(&SessionId::new(&MockRng::new(99))),
+            at(),
+        )
+        .expect("the fixture mapped sid-1");
+    pending.displace(key.clone(), displaced);
+    let taken = g.sid_map.get(&key).expect("the newcomer's mapping");
+    g.sid_map.remove_session(&taken.1);
+    pending.refuse().await;
+    assert!(
+        !valid(&g, &g.displaced).await,
+        "the displaced session ended"
+    );
+
+    assert_eq!(f.displaced, g.displaced, "both fixtures draw the same ids");
+    let full = f.displaced.to_string();
+    let prefix = f.displaced.prefix().to_string();
+    assert_eq!(prefix, format!("{}...", &full[..8]));
+    let events = capture.events();
+    for line in ["was not put back", "could not be put back"] {
+        let logged: Vec<_> = events
+            .iter()
+            .filter(|event| event.message.contains(line))
+            .collect();
+        assert_eq!(logged.len(), 1, "{line}: {events:?}");
+        assert!(logged[0].message.contains(&prefix), "{}", logged[0]);
+    }
+    assert!(
+        events.iter().all(|event| !event.message.contains(&full)),
+        "the whole session key is logged: {events:?}"
     );
 }

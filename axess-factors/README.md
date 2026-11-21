@@ -36,6 +36,7 @@ use axess_factors::{
     generate_totp_secret, generate_totp_secret_with_rng, verify_totp, build_totp_uri,
     verify_hotp,
 };
+use std::time::Duration;
 
 // Passwords
 // A password a person just chose: refused if over MAX_PASSWORD_BYTES or if it
@@ -46,7 +47,8 @@ verify_password("My-secure-password1", &hash).expect("should match");
 
 // TOTP
 let secret = generate_totp_secret();
-let uri = build_totp_uri("alice@example.com", "MyApp", &secret, 6, 30).expect("valid digits and period");
+let uri = build_totp_uri("alice@example.com", "MyApp", &secret, 6, Duration::from_secs(30))
+    .expect("valid digits and period");
 // verify_totp(secret, code, now, length, period, past_window, future_window) -> Option<step>
 
 // TOTP with injectable RNG (for deterministic tests)

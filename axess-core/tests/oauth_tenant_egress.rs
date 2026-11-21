@@ -13,6 +13,7 @@ use axess_factors::FactorSecret;
 use axess_factors::egress::EgressPolicy;
 use axess_factors::oauth::OAuthError;
 use axess_testing::oauth_wiremock::{oauth_discovery_document, oauth_generate_rsa_keypair};
+use std::sync::Arc;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -30,14 +31,25 @@ fn record(issuer: &str) -> TenantOAuthProviderRecord {
         scopes: vec![],
         credential: TenantClientCredential::Secret(FactorSecret::Plain("secret".into())),
         dpop: TenantDpop::Advertised,
+        kind: None,
         revision: 0,
     }
 }
 
-type Directory = StoredTenantOAuthProviders<MemoryTenantOAuthProviderStore>;
+type Directory = StoredTenantOAuthProviders<Arc<MemoryTenantOAuthProviderStore>>;
 
 fn directory() -> Directory {
-    StoredTenantOAuthProviders::new_unencrypted(MemoryTenantOAuthProviderStore::new())
+    directory_over(Arc::new(MemoryTenantOAuthProviderStore::new()))
+}
+
+/// A directory over `store`, which the caller keeps to write past it.
+fn directory_over(store: Arc<MemoryTenantOAuthProviderStore>) -> Directory {
+    let clock = axess_clock::testing::MockClock::at_reference();
+    StoredTenantOAuthProviders::new_unencrypted(
+        store,
+        axess_core::testing::oauth_tenant::ownership_assumed(),
+    )
+    .with_clock(Arc::new(clock.clone()))
 }
 
 async fn refused(directory: &Directory) -> String {
@@ -59,9 +71,10 @@ async fn a_loopback_issuer_is_refused_without_a_connection() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let issuer = format!("http://{}", listener.local_addr().unwrap());
-    let directory = directory();
+    let store = Arc::new(MemoryTenantOAuthProviderStore::new());
+    let directory = directory_over(store.clone());
     // Written by another process, past `upsert`.
-    directory.store().put(record(&issuer)).await.unwrap();
+    store.put(record(&issuer)).await.unwrap();
 
     let text = refused(&directory).await;
 
@@ -158,7 +171,7 @@ async fn an_endpoint_the_document_names_is_refused_by_name() {
 #[tokio::test]
 async fn the_unscreened_opt_out_reaches_a_loopback_idp() {
     let server = MockServer::start().await;
-    let (_der, jwk, _kid) = oauth_generate_rsa_keypair();
+    let (_, jwk, _) = oauth_generate_rsa_keypair();
     axess_testing::oauth_wiremock::oauth_mount_oidc_endpoints(&server, &jwk).await;
     let directory = directory().with_egress_policy(EgressPolicy::unscreened());
     directory.upsert(record(&server.uri())).await.unwrap();

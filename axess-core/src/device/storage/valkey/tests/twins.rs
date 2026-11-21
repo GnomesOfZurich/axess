@@ -2,27 +2,30 @@
 //! through: the fingerprint stays findable until the last of them is gone,
 //! and an index entry written by an earlier release still reads and is
 //! replaced by the next write. Live-server tests, ignored by default
-//! (`VALKEY_URL=redis://127.0.0.1:56382`).
+//! (`VALKEY_URL=redis://127.0.0.1:56382`); each removes what it wrote, also
+//! when it fails.
 
 use super::*;
 use crate::device::lifecycle::DeviceLifecycleService;
 use crate::device::store::consistency::{self as shared, at, dev_id, tenant};
+use axess_clock::testing::Shift;
 
-async fn store(tag: &str) -> ValkeyDeviceStore {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    live_store(&format!("axw_{tag}_{nanos}")).await
+/// A store under a fresh prefix, held with the sweep that removes its keys
+/// when the test ends, also when it fails.
+async fn store(tag: &str) -> Swept<ValkeyDeviceStore> {
+    live_store(&format!("twins_{tag}")).await
 }
 
 /// A store told to read the index layouts of earlier releases.
-async fn store_reading_legacy(tag: &str) -> ValkeyDeviceStore {
-    store(tag).await.with_legacy_fingerprint_keys()
+async fn store_reading_legacy(tag: &str) -> Swept<ValkeyDeviceStore> {
+    Swept::map(
+        store(tag).await,
+        ValkeyDeviceStore::with_legacy_fingerprint_keys,
+    )
 }
 
 /// A device nobody owns, as a guest request makes it.
-fn guest(label: &str, fp: u8, level: DeviceTrustLevel, seen: DateTime<Utc>) -> Device {
+fn guest(label: &str, fp: u8, level: DeviceTrustLevel, seen: Timestamp) -> Device {
     let mut d = shared::device(label, fp, level, seen);
     d.user_id = None;
     d
@@ -35,7 +38,7 @@ async fn found(s: &ValkeyDeviceStore, fp: &FingerprintHash) -> Option<DeviceId> 
         .map(|d| d.id)
 }
 
-async fn mint_or_find(s: &ValkeyDeviceStore, fp: FingerprintHash, now: DateTime<Utc>) -> DeviceId {
+async fn mint_or_find(s: &ValkeyDeviceStore, fp: FingerprintHash, now: Timestamp) -> DeviceId {
     DeviceLifecycleService::new(s.clone())
         .ensure_device(&tenant(), None, fp, now, || dev_id("must-not-be-minted"))
         .await
@@ -104,14 +107,22 @@ async fn valkey_device_deleting_the_indexed_unowned_device_keeps_its_twin_findab
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn valkey_device_a_sweep_purge_keeps_an_unowned_twin_findable() {
     let s = store("purgeunowned").await;
-    let day = chrono::Duration::days(1);
-    let a = guest("purge-a", 0x96, DeviceTrustLevel::Seen, at(0) + day * 29);
+    let day = axess_clock::SignedDuration::days(1);
+    let a = guest(
+        "purge-a",
+        0x96,
+        DeviceTrustLevel::Seen,
+        at(0).plus(day.checked_mul(29).unwrap()),
+    );
     let b = guest("purge-b", 0x96, DeviceTrustLevel::Revoked, at(0));
     s.save(&a, a.last_seen_at).await.unwrap();
     s.save(&b, at(0)).await.unwrap(); // the last writer
     assert!(found(&s, &a.fingerprint_hash).await.is_some());
 
-    let counts = s.sweep(&tenant(), at(0) + day * 30).await.unwrap();
+    let counts = s
+        .sweep(&tenant(), at(0).plus(day.checked_mul(30).unwrap()))
+        .await
+        .unwrap();
     assert_eq!(counts.revoked_purged, 1, "the revoked twin is purged");
     assert!(s.load(&tenant(), &b.id).await.unwrap().is_none());
 
@@ -163,9 +174,13 @@ async fn valkey_device_a_single_id_index_entry_still_finds_its_device_and_the_ne
     );
 
     // The next write of that device lists it in the set and removes the old key.
-    s.record_sighting(&tenant(), &b.id, now + chrono::Duration::seconds(5))
-        .await
-        .unwrap();
+    s.record_sighting(
+        &tenant(),
+        &b.id,
+        now.plus(axess_clock::SignedDuration::seconds(5)),
+    )
+    .await
+    .unwrap();
     let old: Option<String> = s
         .client
         .get(legacy_key(&s, &a.fingerprint_hash))
@@ -177,9 +192,13 @@ async fn valkey_device_a_single_id_index_entry_still_finds_its_device_and_the_ne
 
     // The twin the old key never named is listed by its own next write, and
     // deleting the one found first then leaves it findable.
-    s.record_sighting(&tenant(), &a.id, now + chrono::Duration::seconds(1))
-        .await
-        .unwrap();
+    s.record_sighting(
+        &tenant(),
+        &a.id,
+        now.plus(axess_clock::SignedDuration::seconds(1)),
+    )
+    .await
+    .unwrap();
     s.delete(&tenant(), &b.id).await.unwrap();
     assert_eq!(found(&s, &a.fingerprint_hash).await, Some(a.id));
 }

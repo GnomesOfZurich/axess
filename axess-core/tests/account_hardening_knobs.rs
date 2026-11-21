@@ -4,14 +4,17 @@
 //! administrator must have authenticated to impersonate. Each starts at the
 //! behaviour the library has always had.
 
-mod common;
+use axess_clock::testing::Shift;
+use axess_core::testing::fixtures as common;
 
+use axess_clock::testing::MockClock;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axess_core::Clock;
 use axess_core::authn::error::AuthnError;
 use axess_core::authn::factor::PasswordRules;
-use axess_core::authn::service::AuthnService;
+use axess_core::authn::service::{AuthnBuildError, AuthnService};
 use axess_core::authn::{AuditContext, RequestAuthnService};
 use axess_core::session::{
     extractor::AuthSession,
@@ -29,8 +32,7 @@ use axum::{
     http::{Request, header},
     routing::get,
 };
-use chrono::Utc;
-use common::{test_tenant, test_user};
+use common::{test_clock, test_tenant, test_user};
 use tower::ServiceExt;
 
 const KEY: [u8; 32] = [
@@ -40,8 +42,9 @@ const KEY: [u8; 32] = [
 
 type Svc = RequestAuthnService<MockIdentityStore, MockFactorStore>;
 
-fn identity() -> MockIdentityStore {
+fn identity(clock: &MockClock) -> MockIdentityStore {
     MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("admin", "ops"))
         .with_user(test_user("u2", "bob"))
@@ -50,6 +53,7 @@ fn identity() -> MockIdentityStore {
 // ── Password reset lifetime and cap ─────────────────────────────────────────
 
 fn reset_service(
+    clock: &MockClock,
     configure: impl FnOnce(
         axess_core::authn::service::AuthnServiceBuilder<MockIdentityStore, MockFactorStore>,
     ) -> axess_core::authn::service::AuthnServiceBuilder<
@@ -57,14 +61,17 @@ fn reset_service(
         MockFactorStore,
     >,
 ) -> Svc {
-    configure(AuthnService::builder(identity(), MockFactorStore::new()))
-        .build()
-        .with_audit_context(AuditContext::default())
+    configure(
+        AuthnService::builder(identity(clock), MockFactorStore::new()).with_clock(clock.clone()),
+    )
+    .build()
+    .with_audit_context(AuditContext::default())
 }
 
 #[tokio::test]
 async fn the_reset_cap_is_seven_days_unless_set() {
-    let svc = reset_service(|b| b);
+    let clock = common::test_clock();
+    let svc = reset_service(&clock, |b| b);
     let week = Duration::from_secs(7 * 24 * 3600);
     assert!(
         svc.begin_password_reset("ops", "default", week)
@@ -80,7 +87,10 @@ async fn the_reset_cap_is_seven_days_unless_set() {
 
 #[tokio::test]
 async fn a_lower_reset_cap_refuses_a_longer_lifetime() {
-    let svc = reset_service(|b| b.with_max_password_reset_ttl(Duration::from_secs(3600)));
+    let clock = common::test_clock();
+    let svc = reset_service(&clock, |b| {
+        b.with_max_password_reset_ttl(Duration::from_secs(3600))
+    });
     assert!(
         svc.begin_password_reset("ops", "default", Duration::from_secs(3600))
             .await
@@ -95,7 +105,8 @@ async fn a_lower_reset_cap_refuses_a_longer_lifetime() {
 
 #[tokio::test]
 async fn the_default_reset_ttl_refuses_until_configured() {
-    let svc = reset_service(|b| b);
+    let clock = common::test_clock();
+    let svc = reset_service(&clock, |b| b);
     let refused = svc
         .begin_password_reset_with_default_ttl("ops", "default")
         .await;
@@ -104,33 +115,43 @@ async fn the_default_reset_ttl_refuses_until_configured() {
 
 #[tokio::test]
 async fn the_default_reset_ttl_issues_a_token_and_obeys_the_cap() {
-    let svc = reset_service(|b| b.with_password_reset_ttl(Duration::from_secs(1800)));
+    let clock = common::test_clock();
+    let svc = reset_service(&clock, |b| {
+        b.with_password_reset_ttl(Duration::from_secs(1800))
+    });
     assert!(
         svc.begin_password_reset_with_default_ttl("ops", "default")
             .await
             .unwrap()
             .is_some()
     );
-    let over = reset_service(|b| {
-        b.with_password_reset_ttl(Duration::from_secs(7200))
-            .with_max_password_reset_ttl(Duration::from_secs(3600))
-    });
-    let refused = over
-        .begin_password_reset_with_default_ttl("ops", "default")
-        .await;
-    assert!(matches!(refused, Err(AuthnError::Internal(_))));
+    // A default above the cap would refuse every reset: the service is not
+    // built with one.
+    let (ttl, cap) = (Duration::from_secs(7200), Duration::from_secs(3600));
+    let over = AuthnService::builder(identity(&clock), MockFactorStore::new())
+        .with_clock(clock.clone())
+        .with_password_reset_ttl(ttl)
+        .with_max_password_reset_ttl(cap)
+        .try_build()
+        .err();
+    assert_eq!(
+        over,
+        Some(AuthnBuildError::PasswordResetTtlAboveCap { ttl, cap })
+    );
 }
 
 // ── Password hashing cost ───────────────────────────────────────────────────
 
 #[tokio::test]
 async fn a_chosen_password_is_hashed_under_the_configured_cost() {
+    let clock = common::test_clock();
     let cost = Argon2Cost::new(24 * 1024, 3, 1).unwrap();
-    let service = AuthnService::builder(identity(), MockFactorStore::new())
+    let service = AuthnService::builder(identity(&clock), MockFactorStore::new())
+        .with_clock(clock.clone())
         .with_argon2_cost(cost)
         .build();
     let hash = service
-        .hash_chosen_password("Gnomes-of-Zurich-7", &PasswordRules::default())
+        .hash_chosen_password("Example-Passphrase-7", &PasswordRules::default())
         .await
         .unwrap();
     assert!(
@@ -143,9 +164,12 @@ async fn a_chosen_password_is_hashed_under_the_configured_cost() {
 
 #[tokio::test]
 async fn a_chosen_password_is_hashed_under_the_pinned_cost_by_default() {
-    let service = AuthnService::new(identity(), MockFactorStore::new());
+    let clock = common::test_clock();
+    let service = AuthnService::builder(identity(&clock), MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build();
     let hash = service
-        .hash_chosen_password("Gnomes-of-Zurich-7", &PasswordRules::default())
+        .hash_chosen_password("Example-Passphrase-7", &PasswordRules::default())
         .await
         .unwrap();
     assert!(hash.contains("m=19456,t=2,p=1"), "{hash}");
@@ -162,25 +186,40 @@ fn a_cost_below_the_floor_is_refused() {
 fn impersonation_app(max_age: Option<Duration>) -> Router {
     let admin = test_user("admin", "ops");
     let target = test_user("u2", "bob");
-    let reg = MemorySessionRegistry::new();
-    let mut builder =
-        AuthnService::builder(identity(), MockFactorStore::new()).with_registry(reg.clone());
+    let clock = test_clock();
+    let reg = MemorySessionRegistry::new().with_clock(Arc::new(clock.clone()));
+    let mut builder = AuthnService::builder(
+        identity(&clock).with_clock(clock.clone()),
+        MockFactorStore::new(),
+    )
+    .with_clock(clock.clone())
+    .with_registry(reg.clone());
     if let Some(age) = max_age {
         builder = builder.with_impersonation_max_authn_age(age);
     }
     let svc = builder.build().with_audit_context(AuditContext::default());
     let handle: Arc<dyn SessionRegistryHandle> = Arc::new(SessionRegistryAdapter(reg));
-    let layer =
-        SessionLayer::new(MemorySessionStore::new(), KEY, handle.clone()).with_secure(false);
+    let store = MemorySessionStore::new().with_clock(Arc::new(clock.clone()));
+    let layer = SessionLayer::new(
+        store,
+        KEY,
+        handle.clone(),
+        std::sync::Arc::new(axess_core::session::UnrecordedSessionEnds),
+    )
+    .with_clock(clock.clone())
+    .with_secure(false);
     let login = |age_minutes: i64,
                  admin: axess_core::authn::types::User,
                  h: Arc<dyn SessionRegistryHandle>| {
+        let clock = clock.clone();
         get(move |s: AuthSession| {
             let (u, reg) = (admin.clone(), Arc::clone(&h));
+            let at = clock.now().minus(axess_clock::SignedDuration::minutes(
+                i32::try_from(age_minutes).unwrap(),
+            ));
             async move {
-                let at = Utc::now() - chrono::Duration::minutes(age_minutes);
                 s.set_authenticated(u.id, u.tenant_id, at).await;
-                reg.register(&u.id, &s.session_id().await).await;
+                reg.register(&u.id, &s.session_key().await).await;
                 "in"
             }
         })

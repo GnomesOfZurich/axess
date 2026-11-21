@@ -3,26 +3,37 @@
 //!
 //! Every operation is one Lua script, so a mapping, its session record and
 //! its indexes change together. Scripts address keys beyond the ones they
-//! are passed (the subject and session records they read out of a record), so
-//! a clustered deployment must give every key one hash slot, for instance
-//! with a prefix such as `{axess}` passed to `with_prefix`.
+//! are passed (the subject and session records they read out of a record),
+//! so on a cluster every key of the store must hash to one slot. The store
+//! puts its whole prefix in a hash tag, so its keys share one slot on any
+//! cluster with no setting of the operator's; a prefix that is empty or
+//! begins with `}` would split them and is refused. The replay log's keys
+//! are single: each of its scripts takes one key.
 //!
 //! # Keys
 //!
-//! - `{prefix}:sid:{issuer}:{sid}`: the mapping, one JSON record, expiring
-//!   after the `sid` time to live.
-//! - `{prefix}:sub:{issuer}:{subject}`: a hash from session to
+//! `<prefix>` is the store's prefix (default `axess:logout`); the braces
+//! around it are literal characters, the hash tag. `<key>` is the session's
+//! [`SessionKey`], 64 hexadecimal characters.
+//!
+//! - `{<prefix>}:v2:sid:<issuer>:<sid>`: the mapping, one JSON record that
+//!   names its session by the key, expiring after the `sid` time to live.
+//! - `{<prefix>}:v2:sub:<issuer>:<subject>`: a hash from session key to
 //!   `{user, tenant}`, the subject registry.
-//! - `{prefix}:ses:{session}`: the session's subject record, and
-//!   `{prefix}:ses:{session}:sids`: the set of mapping keys that name it.
-//! - `{prefix}:jti:{issuer}:{jti}`: one replay-log pair.
+//! - `{<prefix>}:v2:ses:<key>`: the session's subject record, and
+//!   `{<prefix>}:v2:ses:<key>:sids`: the set of mapping keys that name it.
+//! - `<prefix>:jti:<issuer>:<jti>`: one replay-log pair, under the replay
+//!   log's own prefix.
 //!
 //! Strings that come from a token are length-prefixed in a key, so two
-//! different pairs never share one.
+//! different pairs never share one. No key, field or value of the store
+//! holds a session id. Records an earlier release wrote under
+//! `<prefix>:sid:`, `<prefix>:sub:` and `<prefix>:ses:` named sessions by
+//! their ids; they are never read, and expire by their time to live.
 
 use std::time::Duration;
 
-use chrono::{DateTime, TimeZone, Utc};
+use axess_clock::Timestamp;
 use fred::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -30,8 +41,8 @@ use super::replay_log::{LogoutReplayLog, Recorded, ReplayFuture, ReplayLogError}
 use super::sid_map::{DisplacedSid, SidEntry, SidKey};
 use super::sid_store::{SidFuture, SidStore, SidStoreError};
 use crate::authn::ids::{TenantId, UserId};
-use crate::session::id::SessionId;
-use axess_factors::oidc::logout_token::JTI_RETENTION_SECS;
+use crate::session::id::SessionKey;
+use axess_factors::oidc::logout_token::JTI_RETENTION;
 
 /// Default time to live of a `sid` mapping: a day and an hour, past the
 /// in-process map's 24 hour prune.
@@ -45,6 +56,11 @@ pub const DEFAULT_SUBJECT_TTL: Duration = Duration::from_secs(30 * 24 * 3600);
 const IN_FLIGHT_SECS: u64 = 120;
 
 const DEFAULT_PREFIX: &str = "axess:logout";
+
+/// What every method of a [`ValkeySidStore`] answers when its prefix cannot
+/// be put in a hash tag.
+const REFUSED_PREFIX: &str = "the sid store's key prefix is empty or begins with a closing brace: \
+     its keys would lie in different cluster slots";
 
 const INSERT: &str = r#"
 local old = redis.call('GET', KEYS[1])
@@ -140,7 +156,7 @@ struct SidRecord {
     t: Option<String>,
     /// Local user.
     u: String,
-    /// Local session.
+    /// The local session's key, 64 hexadecimal characters.
     s: String,
     /// Insertion time, microseconds since the epoch.
     at: i64,
@@ -170,6 +186,32 @@ fn part(s: &str) -> String {
     format!("{}:{s}", s.len())
 }
 
+/// The text every key of a [`ValkeySidStore`] begins with: `{<prefix>}:v2`.
+///
+/// Why this puts every key of the store in one cluster slot. A cluster hashes
+/// a key by the text between its first `{` and the first `}` after that one,
+/// when that text is not empty, and by the whole key otherwise. The first
+/// `{` of every key built here is the one this function writes, at the
+/// start. The first `}` after it is the first `}` inside the prefix when the
+/// prefix holds one, and else the one this function writes after the prefix.
+/// Either way the tag is the prefix up to its first `}`, a text that depends
+/// on the prefix alone and is not empty unless the prefix is empty or begins
+/// with `}`. What follows the stem (an issuer, a subject, a `sid` a provider
+/// chose, braces included) cannot move either brace, so for every other
+/// prefix all keys of the store share one slot, whatever the token held.
+/// The two forms that would leave the tag empty are refused here, and every
+/// method fails before it sends anything.
+///
+/// The `v2` part keeps the names of this release apart from those an
+/// earlier release wrote, whose records named a session by its id: none of
+/// those is ever read.
+fn key_stem(prefix: &str) -> Result<String, SidStoreError> {
+    if prefix.is_empty() || prefix.starts_with('}') {
+        return Err(SidStoreError(REFUSED_PREFIX.to_string()));
+    }
+    Ok(format!("{{{prefix}}}:v2"))
+}
+
 fn fail(e: impl std::fmt::Display) -> SidStoreError {
     SidStoreError(e.to_string())
 }
@@ -178,12 +220,12 @@ fn secs(ttl: Duration) -> String {
     ttl.as_secs().max(1).to_string()
 }
 
-fn micros(at: DateTime<Utc>) -> i64 {
-    at.timestamp_micros()
+fn micros(at: Timestamp) -> i64 {
+    at.unix_micros()
 }
 
-fn from_micros(at: i64) -> DateTime<Utc> {
-    Utc.timestamp_micros(at).single().unwrap_or_default()
+fn from_micros(at: i64) -> Timestamp {
+    Timestamp::from_unix_micros(at).unwrap_or(Timestamp::UNIX_EPOCH)
 }
 
 /// A [`SidStore`] on Valkey (or Redis). See the [module docs](self).
@@ -206,10 +248,18 @@ impl ValkeySidStore {
         }
     }
 
-    /// Key prefix (default `axess:logout`).
+    /// Key prefix (default `axess:logout`). The store puts it in a hash tag
+    /// (`{<prefix>}`), so every key it writes lies in one cluster slot. A
+    /// prefix that is empty or begins with `}` cannot be: every method of a
+    /// store given one answers a [`SidStoreError`] and sends nothing.
     #[must_use]
     pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.prefix = prefix.into();
+        if key_stem(&self.prefix).is_err() {
+            tracing::error!(
+                "ValkeySidStore::with_prefix: {REFUSED_PREFIX}; every call of this store fails"
+            );
+        }
         self
     }
 
@@ -227,25 +277,27 @@ impl ValkeySidStore {
         self
     }
 
-    fn sid_key(&self, key: &SidKey) -> String {
-        format!("{}:sid:{}:{}", self.prefix, part(&key.0), part(&key.1))
+    fn sid_key(&self, key: &SidKey) -> Result<String, SidStoreError> {
+        let stem = key_stem(&self.prefix)?;
+        Ok(format!("{stem}:sid:{}:{}", part(&key.0), part(&key.1)))
     }
 
-    fn subject_key(&self, issuer: &str, subject: &str) -> String {
-        format!("{}:sub:{}:{}", self.prefix, part(issuer), part(subject))
+    fn subject_key(&self, issuer: &str, subject: &str) -> Result<String, SidStoreError> {
+        let stem = key_stem(&self.prefix)?;
+        Ok(format!("{stem}:sub:{}:{}", part(issuer), part(subject)))
     }
 
-    fn session_key(&self, session: &SessionId) -> String {
-        format!("{}:ses:{session}", self.prefix)
+    fn session_record_key(&self, session: &SessionKey) -> Result<String, SidStoreError> {
+        Ok(format!("{}{session}", self.sessions_stem()?))
     }
 
-    fn sids_key(&self, session: &SessionId) -> String {
-        format!("{}:sids", self.session_key(session))
+    fn sids_key(&self, session: &SessionKey) -> Result<String, SidStoreError> {
+        Ok(format!("{}:sids", self.session_record_key(session)?))
     }
 
-    /// The stem the scripts append `{session}:sids` to.
-    fn sessions_stem(&self) -> String {
-        format!("{}:ses:", self.prefix)
+    /// The stem the scripts append `<key>:sids` to.
+    fn sessions_stem(&self) -> Result<String, SidStoreError> {
+        Ok(format!("{}:ses:", key_stem(&self.prefix)?))
     }
 
     async fn run<T: FromValue>(
@@ -257,10 +309,13 @@ impl ValkeySidStore {
         self.client.eval(script, keys, args).await.map_err(fail)
     }
 
+    /// The entry a stored mapping names. Its session is a key's 64
+    /// characters; any other text was not written by this store and fails
+    /// the call.
     fn entry(record: &SidRecord) -> Result<SidEntry, SidStoreError> {
         Ok((
             record.u.parse::<UserId>().map_err(fail)?,
-            record.s.parse::<SessionId>().map_err(fail)?,
+            record.s.parse::<SessionKey>().map_err(fail)?,
             from_micros(record.at),
         ))
     }
@@ -283,9 +338,10 @@ impl ValkeySidStore {
         subject: &str,
         tenant: Option<TenantId>,
         user: UserId,
-        session: SessionId,
-        at: DateTime<Utc>,
+        session: SessionKey,
+        at: Timestamp,
     ) -> Result<Option<SidRecord>, SidStoreError> {
+        key_stem(&self.prefix)?;
         let record = SidRecord {
             sub: subject.to_string(),
             t: tenant.map(|t| t.to_string()),
@@ -297,12 +353,12 @@ impl ValkeySidStore {
         let old: Option<String> = self
             .run(
                 INSERT,
-                vec![self.sid_key(key), self.sids_key(&session)],
+                vec![self.sid_key(key)?, self.sids_key(&session)?],
                 vec![
                     json,
                     secs(self.sid_ttl),
                     session.to_string(),
-                    self.sessions_stem(),
+                    self.sessions_stem()?,
                 ],
             )
             .await?;
@@ -318,8 +374,8 @@ impl SidStore for ValkeySidStore {
         subject: &'a str,
         tenant: Option<TenantId>,
         user: UserId,
-        session: SessionId,
-        inserted_at: DateTime<Utc>,
+        session: SessionKey,
+        inserted_at: Timestamp,
     ) -> SidFuture<'a, Option<DisplacedSid>> {
         Box::pin(async move {
             let Some(old) = self
@@ -341,6 +397,7 @@ impl SidStore for ValkeySidStore {
 
     fn restore_if_vacant(&self, key: SidKey, displaced: DisplacedSid) -> SidFuture<'_, bool> {
         Box::pin(async move {
+            key_stem(&self.prefix)?;
             let record = SidRecord {
                 sub: displaced.subject,
                 t: displaced.tenant.map(|t| t.to_string()),
@@ -353,9 +410,9 @@ impl SidStore for ValkeySidStore {
                 .run(
                     RESTORE,
                     vec![
-                        self.sid_key(&key),
-                        self.session_key(&displaced.session),
-                        self.sids_key(&displaced.session),
+                        self.sid_key(&key)?,
+                        self.session_record_key(&displaced.session)?,
+                        self.sids_key(&displaced.session)?,
                     ],
                     vec![json, secs(self.sid_ttl)],
                 )
@@ -370,7 +427,7 @@ impl SidStore for ValkeySidStore {
         scope: Option<&'a TenantId>,
     ) -> SidFuture<'a, Option<SidEntry>> {
         Box::pin(async move {
-            let raw: Option<String> = self.client.get(self.sid_key(key)).await.map_err(fail)?;
+            let raw: Option<String> = self.client.get(self.sid_key(key)?).await.map_err(fail)?;
             let Some(raw) = raw else { return Ok(None) };
             let record: SidRecord = serde_json::from_str(&raw).map_err(fail)?;
             if !Self::visible(record.t.as_deref(), scope) {
@@ -383,14 +440,14 @@ impl SidStore for ValkeySidStore {
     fn remove_if_session<'a>(
         &'a self,
         key: &'a SidKey,
-        session: &'a SessionId,
+        session: &'a SessionKey,
     ) -> SidFuture<'a, Option<SidEntry>> {
         Box::pin(async move {
             let removed: Option<String> = self
                 .run(
                     REMOVE_IF,
-                    vec![self.sid_key(key)],
-                    vec![session.to_string(), self.sessions_stem()],
+                    vec![self.sid_key(key)?],
+                    vec![session.to_string(), self.sessions_stem()?],
                 )
                 .await?;
             let Some(raw) = removed else { return Ok(None) };
@@ -408,10 +465,11 @@ impl SidStore for ValkeySidStore {
         subject: &'a str,
         tenant: Option<TenantId>,
         user: UserId,
-        session: SessionId,
+        session: SessionKey,
     ) -> SidFuture<'a, ()> {
         Box::pin(async move {
-            let subject_key = self.subject_key(issuer, subject);
+            let subject_key = self.subject_key(issuer, subject)?;
+            let record_key = self.session_record_key(&session)?;
             let record = serde_json::to_string(&SessionRecord {
                 i: issuer,
                 u: user.to_string(),
@@ -426,7 +484,7 @@ impl SidStore for ValkeySidStore {
             let _: i64 = self
                 .run(
                     REGISTER,
-                    vec![self.session_key(&session), subject_key],
+                    vec![record_key, subject_key],
                     vec![record, value, session.to_string(), secs(self.subject_ttl)],
                 )
                 .await?;
@@ -438,13 +496,13 @@ impl SidStore for ValkeySidStore {
         &'a self,
         issuer: &'a str,
         user: &'a UserId,
-        session: &'a SessionId,
+        session: &'a SessionKey,
     ) -> SidFuture<'a, bool> {
         Box::pin(async move {
             let forgot: i64 = self
                 .run(
                     FORGET,
-                    vec![self.session_key(session)],
+                    vec![self.session_record_key(session)?],
                     vec![issuer.to_string(), user.to_string(), session.to_string()],
                 )
                 .await?;
@@ -457,11 +515,11 @@ impl SidStore for ValkeySidStore {
         issuer: &'a str,
         subject: &'a str,
         scope: Option<&'a TenantId>,
-    ) -> SidFuture<'a, Vec<(UserId, SessionId)>> {
+    ) -> SidFuture<'a, Vec<(UserId, SessionKey)>> {
         Box::pin(async move {
             let flat: Vec<String> = self
                 .client
-                .hgetall(self.subject_key(issuer, subject))
+                .hgetall(self.subject_key(issuer, subject)?)
                 .await
                 .map_err(fail)?;
             let mut out = Vec::new();
@@ -473,7 +531,7 @@ impl SidStore for ValkeySidStore {
                 }
                 out.push((
                     value.u.parse::<UserId>().map_err(fail)?,
-                    session.parse::<SessionId>().map_err(fail)?,
+                    session.parse::<SessionKey>().map_err(fail)?,
                 ));
             }
             out.sort_unstable();
@@ -483,18 +541,21 @@ impl SidStore for ValkeySidStore {
 
     fn sweep_subject_candidates(
         &self,
-        _max: usize,
-    ) -> SidFuture<'_, Vec<(String, UserId, SessionId)>> {
+        _: usize,
+    ) -> SidFuture<'_, Vec<(String, UserId, SessionKey)>> {
         // Subject records expire with their time to live.
-        Box::pin(async { Ok(Vec::new()) })
+        Box::pin(async move {
+            key_stem(&self.prefix)?;
+            Ok(Vec::new())
+        })
     }
 
-    fn remove_session<'a>(&'a self, session: &'a SessionId) -> SidFuture<'a, usize> {
+    fn remove_session<'a>(&'a self, session: &'a SessionKey) -> SidFuture<'a, usize> {
         Box::pin(async move {
             let removed: i64 = self
                 .run(
                     REMOVE_SESSION,
-                    vec![self.session_key(session), self.sids_key(session)],
+                    vec![self.session_record_key(session)?, self.sids_key(session)?],
                     vec![session.to_string()],
                 )
                 .await?;
@@ -504,18 +565,27 @@ impl SidStore for ValkeySidStore {
 
     fn evict_inserted_before(
         &self,
-        _cutoff: DateTime<Utc>,
-        _max: usize,
+        _: Timestamp,
+        _: usize,
     ) -> SidFuture<'_, Vec<(SidKey, SidEntry)>> {
-        Box::pin(async { Ok(Vec::new()) })
+        Box::pin(async move {
+            key_stem(&self.prefix)?;
+            Ok(Vec::new())
+        })
     }
 
-    fn evict_oldest(&self, _max: usize) -> SidFuture<'_, Vec<(SidKey, SidEntry)>> {
-        Box::pin(async { Ok(Vec::new()) })
+    fn evict_oldest(&self, _: usize) -> SidFuture<'_, Vec<(SidKey, SidEntry)>> {
+        Box::pin(async move {
+            key_stem(&self.prefix)?;
+            Ok(Vec::new())
+        })
     }
 
     fn mapping_count(&self) -> SidFuture<'_, usize> {
-        Box::pin(async { Ok(0) })
+        Box::pin(async move {
+            key_stem(&self.prefix)?;
+            Ok(0)
+        })
     }
 }
 
@@ -556,7 +626,7 @@ impl LogoutReplayLog for ValkeyReplayLog {
         &'a self,
         issuer: &'a str,
         jti: &'a str,
-        _now: DateTime<Utc>,
+        _: Timestamp,
     ) -> ReplayFuture<'a, Recorded> {
         Box::pin(async move {
             let verdict: String = self
@@ -584,7 +654,9 @@ impl LogoutReplayLog for ValkeyReplayLog {
                 .set(
                     self.key(issuer, jti),
                     "s",
-                    Some(Expiration::EX(JTI_RETENTION_SECS)),
+                    Some(Expiration::EX(
+                        i64::try_from(JTI_RETENTION.as_secs()).unwrap_or(i64::MAX),
+                    )),
                     None,
                     false,
                 )
@@ -608,3 +680,6 @@ impl LogoutReplayLog for ValkeyReplayLog {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod name_tests;

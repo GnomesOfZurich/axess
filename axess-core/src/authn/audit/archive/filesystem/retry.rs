@@ -10,7 +10,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 fn lines(archiver: &FilesystemAuditArchiver, day: u32) -> usize {
-    let path = archiver.path_for_date(chrono::NaiveDate::from_ymd_opt(2026, 5, day).unwrap());
+    let path = archiver
+        .path_for_date(axess_clock::UtcDate::new(2026, 5, u8::try_from(day).unwrap()).unwrap());
     std::fs::read_to_string(path).map_or(0, |t| t.lines().count())
 }
 
@@ -56,16 +57,12 @@ impl AuditRetentionSource for FlakyMark {
 
     async fn select_unarchived_before(
         &self,
-        _: chrono::DateTime<chrono::Utc>,
+        _: axess_clock::Timestamp,
         _: usize,
     ) -> Result<Vec<(u64, AuthEvent)>, Self::Error> {
         Ok(self.rows.clone())
     }
-    async fn mark_archived(
-        &self,
-        _: &[u64],
-        _: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), Self::Error> {
+    async fn mark_archived(&self, _: &[u64], _: axess_clock::Timestamp) -> Result<(), Self::Error> {
         let mut left = self.failures_left.lock().unwrap();
         if *left > 0 {
             *left -= 1;
@@ -75,7 +72,7 @@ impl AuditRetentionSource for FlakyMark {
     }
     async fn purge_hot_archived_before(
         &self,
-        _: chrono::DateTime<chrono::Utc>,
+        _: axess_clock::Timestamp,
     ) -> Result<u64, Self::Error> {
         Ok(0)
     }

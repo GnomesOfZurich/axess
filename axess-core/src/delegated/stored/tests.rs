@@ -6,18 +6,19 @@
 //! decision deterministic.
 
 use super::*;
+use axess_clock::Timestamp;
 use axess_clock::testing::MockClock;
+use axess_clock::testing::Shift;
 use axess_identity::{TenantId, UserId};
 use axess_rng::testing::MockRng;
-use chrono::{DateTime, Utc};
 use serde_json::json;
 use std::sync::Arc;
 use url::Url;
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-fn t0() -> DateTime<Utc> {
-    DateTime::from_timestamp(1_700_000_000, 0).expect("fixed t0")
+fn t0() -> Timestamp {
+    Timestamp::from_unix_seconds(1_700_000_000).expect("fixed t0")
 }
 
 fn sample_tenant() -> TenantId {
@@ -36,7 +37,7 @@ fn build_provider(server_uri: &str) -> Arc<DelegatedProvider> {
             Url::parse(&format!("{server_uri}/oauth2/token")).unwrap(),
             "axess-client-id",
             "axess-secret",
-            Url::parse("https://gnomes.local/callback").unwrap(),
+            Url::parse("https://example.org/callback").unwrap(),
         )
         .with_default_scopes(["mail.read", "mail.send"]),
     )
@@ -60,7 +61,7 @@ fn begin_grant_produces_well_formed_authorization_url() {
     );
     assert_eq!(
         q.get("redirect_uri").map(String::as_str),
-        Some("https://gnomes.local/callback")
+        Some("https://example.org/callback")
     );
     assert_eq!(
         q.get("code_challenge_method").map(String::as_str),
@@ -78,7 +79,7 @@ fn begin_grant_produces_well_formed_authorization_url() {
 #[test]
 fn begin_grant_respects_scope_override() {
     let provider = build_provider("https://idp.example");
-    let (url, _ctx) = begin_grant(
+    let (url, _) = begin_grant(
         &provider,
         &["calendar.events".to_string()],
         &MockRng::new(1),
@@ -112,9 +113,9 @@ async fn complete_grant_exchanges_code_for_credential() {
         .await;
 
     let provider = build_provider(&server.uri());
-    let (_url, ctx) = begin_grant(&provider, &[], &MockRng::new(1)).expect("begin_grant");
+    let (_, ctx) = begin_grant(&provider, &[], &MockRng::new(1)).expect("begin_grant");
 
-    let http = reqwest::Client::new();
+    let http = grant_client(|settings| settings).expect("client");
     let clock = MockClock::at(t0());
     let cred = complete_grant(&provider, &ctx, "auth-code-42", &ctx.state, &http, &clock)
         .await
@@ -122,7 +123,7 @@ async fn complete_grant_exchanges_code_for_credential() {
     // Measured from the injected clock, not the system clock.
     assert_eq!(
         cred.expires_at,
-        Some(t0() + chrono::Duration::seconds(3600))
+        Some(t0().plus(axess_clock::SignedDuration::seconds(3600)))
     );
     assert_eq!(cred.provider, "test-provider");
     assert_eq!(&*cred.access_token, "tok-access");
@@ -137,16 +138,16 @@ async fn complete_grant_rejects_state_mismatch() {
     // No mock mounted; `complete_grant` must reject before any HTTP
     // call lands.
     let provider = build_provider(&server.uri());
-    let (_url, ctx) = begin_grant(&provider, &[], &MockRng::new(1)).expect("begin_grant");
+    let (_, ctx) = begin_grant(&provider, &[], &MockRng::new(1)).expect("begin_grant");
 
-    let http = reqwest::Client::new();
+    let http = grant_client(|settings| settings).expect("client");
     let err = complete_grant(
         &provider,
         &ctx,
         "code",
         "WRONG-STATE",
         &http,
-        &axess_clock::SystemClock,
+        &axess_clock::testing::MockClock::at_reference(),
     )
     .await
     .expect_err("state mismatch must reject");
@@ -171,16 +172,16 @@ async fn complete_grant_surfaces_token_endpoint_error() {
         .mount(&server)
         .await;
     let provider = build_provider(&server.uri());
-    let (_url, ctx) = begin_grant(&provider, &[], &MockRng::new(1)).expect("begin_grant");
+    let (_, ctx) = begin_grant(&provider, &[], &MockRng::new(1)).expect("begin_grant");
 
-    let http = reqwest::Client::new();
+    let http = grant_client(|settings| settings).expect("client");
     let err = complete_grant(
         &provider,
         &ctx,
         "code",
         &ctx.state,
         &http,
-        &axess_clock::SystemClock,
+        &axess_clock::testing::MockClock::at_reference(),
     )
     .await
     .expect_err("400 must propagate");
@@ -199,9 +200,10 @@ async fn memory_store_round_trips_credential() {
     let user = sample_user();
     let credential = StoredDelegation {
         provider: "gmail".to_string(),
+        registration: None,
         access_token: "tok".into(),
         refresh_token: Some("rfr".into()),
-        expires_at: Some(t0() + chrono::Duration::hours(1)),
+        expires_at: Some(t0().plus(axess_clock::SignedDuration::hours(1))),
         scopes: vec!["mail.read".to_string()],
         token_type: "Bearer".to_string(),
     };
@@ -231,9 +233,10 @@ async fn session_returns_fresh_token_from_store() {
 
     let credential = StoredDelegation {
         provider: provider.name.clone(),
+        registration: Some(GrantRegistration::of(&provider)),
         access_token: "fresh-token".into(),
         refresh_token: Some("rfr".into()),
-        expires_at: Some(t0() + chrono::Duration::hours(1)),
+        expires_at: Some(t0().plus(axess_clock::SignedDuration::hours(1))),
         scopes: vec![],
         token_type: "Bearer".to_string(),
     };
@@ -294,9 +297,10 @@ async fn session_refreshes_expired_access_token() {
     // Seed with a credential that's already expired.
     let credential = StoredDelegation {
         provider: provider.name.clone(),
+        registration: Some(GrantRegistration::of(&provider)),
         access_token: "stale".into(),
         refresh_token: Some("existing-refresh".into()),
-        expires_at: Some(t0() - chrono::Duration::seconds(60)),
+        expires_at: Some(t0().minus(axess_clock::SignedDuration::seconds(60))),
         scopes: vec![],
         token_type: "Bearer".to_string(),
     };
@@ -341,9 +345,10 @@ async fn session_preserves_refresh_token_when_idp_omits_it() {
     let user = sample_user();
     let credential = StoredDelegation {
         provider: provider.name.clone(),
+        registration: Some(GrantRegistration::of(&provider)),
         access_token: "stale".into(),
         refresh_token: Some("original-refresh".into()),
-        expires_at: Some(t0() - chrono::Duration::seconds(60)),
+        expires_at: Some(t0().minus(axess_clock::SignedDuration::seconds(60))),
         scopes: vec![],
         token_type: "Bearer".to_string(),
     };
@@ -385,9 +390,10 @@ async fn session_surfaces_refresh_rejected_on_invalid_grant() {
     let user = sample_user();
     let credential = StoredDelegation {
         provider: provider.name.clone(),
+        registration: Some(GrantRegistration::of(&provider)),
         access_token: "stale".into(),
         refresh_token: Some("rejected".into()),
-        expires_at: Some(t0() - chrono::Duration::seconds(60)),
+        expires_at: Some(t0().minus(axess_clock::SignedDuration::seconds(60))),
         scopes: vec![],
         token_type: "Bearer".to_string(),
     };
@@ -431,16 +437,16 @@ async fn complete_grant_form_encodes_basic_credentials() {
         Url::parse(&format!("{}/oauth2/token", server.uri())).unwrap(),
         "axess-client-id",
         "a:b%c+d",
-        Url::parse("https://gnomes.local/callback").unwrap(),
+        Url::parse("https://example.org/callback").unwrap(),
     );
-    let (_url, ctx) = begin_grant(&provider, &[], &MockRng::new(1)).expect("begin_grant");
+    let (_, ctx) = begin_grant(&provider, &[], &MockRng::new(1)).expect("begin_grant");
     complete_grant(
         &provider,
         &ctx,
         "c",
         &ctx.state,
-        &reqwest::Client::new(),
-        &axess_clock::SystemClock,
+        &grant_client(|settings| settings).expect("client"),
+        &axess_clock::testing::MockClock::at_reference(),
     )
     .await
     .expect("secret with reserved characters reaches the IdP intact");
@@ -459,14 +465,14 @@ async fn complete_grant_refuses_out_of_range_expires_in() {
             .mount(&server)
             .await;
         let provider = build_provider(&server.uri());
-        let (_url, ctx) = begin_grant(&provider, &[], &MockRng::new(1)).expect("begin_grant");
+        let (_, ctx) = begin_grant(&provider, &[], &MockRng::new(1)).expect("begin_grant");
         let err = complete_grant(
             &provider,
             &ctx,
             "c",
             &ctx.state,
-            &reqwest::Client::new(),
-            &axess_clock::SystemClock,
+            &grant_client(|settings| settings).expect("client"),
+            &axess_clock::testing::MockClock::at_reference(),
         )
         .await
         .expect_err("out-of-range lifetime is refused, not a panic or an expired token");

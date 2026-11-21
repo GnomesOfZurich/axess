@@ -20,6 +20,7 @@ mod discoverable;
 mod enrolment_gate;
 mod registration;
 
+pub use discoverable::DiscoverableLogin;
 use enrolment_gate::CredentialChange;
 
 pub(crate) mod fido2_keys {
@@ -151,7 +152,7 @@ where
         let stored = session
             .set_custom(
                 fido2_keys::started_key(state_key),
-                serde_json::Value::String(self.inner.clock.now().to_rfc3339()),
+                serde_json::Value::String(self.inner.clock.now().to_rfc3339_numeric_offset()),
             )
             .await;
         if stored {
@@ -202,12 +203,12 @@ where
             tracing::warn!("FIDO2 ceremony timestamp not a string; treating as expired");
             return true;
         };
-        let Ok(started_at) = chrono::DateTime::parse_from_rfc3339(ts) else {
+        let Ok(started_at) = axess_clock::Timestamp::parse_rfc3339(ts) else {
             tracing::warn!("FIDO2 ceremony timestamp unparseable; treating as expired");
             return true;
         };
-        let elapsed = self.inner.clock.now() - started_at.with_timezone(&chrono::Utc);
-        match elapsed.to_std() {
+        let elapsed = self.inner.clock.now().since(started_at);
+        match std::time::Duration::try_from(elapsed) {
             Ok(d) => d > self.inner.fido2_options.ceremony_timeout,
             Err(_) => {
                 // Negative duration (clock skew); treat as expired and log.
@@ -220,35 +221,18 @@ where
     }
 
     /// Begin a passwordless/discoverable FIDO2 authentication.
+    ///
+    /// The challenge is sent as the provider issued it: with
+    /// [`DefaultFido2Provider`](axess_factors::fido2::DefaultFido2Provider),
+    /// conditional mediation, as `webauthn-rs` issues it.
+    /// [`begin_discoverable_login_with`](Self::begin_discoverable_login_with)
+    /// chooses the tenant and the prompt.
     #[tracing::instrument(skip(self, session))]
     pub async fn begin_discoverable_login(
         &self,
         session: &AuthSession,
     ) -> Result<serde_json::Value, AuthnError<I::Error>> {
-        let fido2 = self.inner.fido2.load_full();
-        let webauthn = match &fido2 {
-            Some(w) => w,
-            None => return Err(AuthnError::NoFlow),
-        };
-
-        // A tenant left by an earlier ceremony must not bind this one.
-        session.remove_custom(fido2_keys::DISC_TENANT).await;
-        let (challenge, auth_state) =
-            webauthn.start_discoverable_authentication().map_err(|e| {
-                tracing::warn!("FIDO2 start_discoverable_authentication failed: {e:?}");
-                AuthnError::NoFlow
-            })?;
-
-        let state_json = serde_json::to_value(&auth_state).map_err(|_| AuthnError::NoFlow)?;
-        if !session.set_custom(fido2_keys::DISC_STATE, state_json).await {
-            // The ceremony state did not fit; a challenge handed out without
-            // it could never be finished.
-            return Err(AuthnError::NoFlow);
-        }
-        self.stamp_ceremony_start(session, fido2_keys::DISC_STATE)
-            .await?;
-
-        serde_json::to_value(&challenge).map_err(|_| AuthnError::NoFlow)
+        self.begin_discoverable(session, None, None).await
     }
 
     /// Begin a passwordless/discoverable FIDO2 authentication that may only
@@ -266,19 +250,106 @@ where
         tenant_id: &TenantId,
         session: &AuthSession,
     ) -> Result<serde_json::Value, AuthnError<I::Error>> {
-        let challenge = self.begin_discoverable_login(session).await?;
-        let bound = session
-            .set_custom(
-                fido2_keys::DISC_TENANT,
-                serde_json::Value::String(tenant_id.to_string()),
-            )
-            .await;
-        if !bound {
-            // The ceremony must not run without its tenant: retire it.
+        self.begin_discoverable(session, Some(*tenant_id), None)
+            .await
+    }
+
+    /// Begin a passwordless/discoverable FIDO2 authentication as `login`
+    /// describes it: bound to a tenant or to none, and presented by the
+    /// browser as [`DiscoverableLogin::prompt`] says.
+    ///
+    /// The prompt is where cross-device authentication is asked for
+    /// ([`DiscoverablePrompt::CrossDevice`](crate::authn::factor::DiscoverablePrompt::CrossDevice)):
+    /// the browser shows a QR code and the passkey on the phone that scans
+    /// it signs the challenge. That exchange runs between the browser and
+    /// the phone, so the ceremony state stored here, its timeout and
+    /// [`finish_discoverable_login`](RequestAuthnService::finish_discoverable_login)
+    /// are the same for every prompt.
+    ///
+    /// Returns the challenge for the browser. A ceremony whose state, start
+    /// time or tenant does not fit the session is [`AuthnError::NoFlow`],
+    /// as is a service with no FIDO2 provider.
+    ///
+    /// A begin retires the passwordless ceremony the session held before
+    /// it, whether or not it succeeds: the earlier challenge can no longer
+    /// be finished, and a begin that fails leaves no ceremony at all.
+    #[tracing::instrument(skip(self, session))]
+    pub async fn begin_discoverable_login_with(
+        &self,
+        session: &AuthSession,
+        login: DiscoverableLogin,
+    ) -> Result<serde_json::Value, AuthnError<I::Error>> {
+        self.begin_discoverable(session, login.tenant, Some(login.prompt))
+            .await
+    }
+
+    /// The body of the three begins: the ceremony bound to `tenant` when
+    /// there is one, and its challenge rewritten for `prompt` when the caller
+    /// chose one; with none it goes out as the provider issued it.
+    async fn begin_discoverable(
+        &self,
+        session: &AuthSession,
+        tenant: Option<TenantId>,
+        prompt: Option<crate::authn::factor::DiscoverablePrompt>,
+    ) -> Result<serde_json::Value, AuthnError<I::Error>> {
+        // An earlier ceremony ends here, whole: its state, its start time
+        // and its tenant. Whatever becomes of this begin, the challenge the
+        // browser already holds cannot be finished, with its tenant or
+        // without it.
+        self.clear_discoverable_ceremony(session).await;
+        let begun = self.store_discoverable(session, tenant, prompt).await;
+        if begun.is_err() {
+            // A begin that fails part way leaves no half of a ceremony.
             self.clear_discoverable_ceremony(session).await;
+        }
+        begun
+    }
+
+    /// Start the ceremony and store all of it: state, start time, tenant.
+    async fn store_discoverable(
+        &self,
+        session: &AuthSession,
+        tenant: Option<TenantId>,
+        prompt: Option<crate::authn::factor::DiscoverablePrompt>,
+    ) -> Result<serde_json::Value, AuthnError<I::Error>> {
+        let fido2 = self.inner.fido2.load_full();
+        let webauthn = match &fido2 {
+            Some(w) => w,
+            None => return Err(AuthnError::NoFlow),
+        };
+        let (mut challenge, auth_state) =
+            webauthn.start_discoverable_authentication().map_err(|e| {
+                tracing::warn!("FIDO2 start_discoverable_authentication failed: {e:?}");
+                AuthnError::NoFlow
+            })?;
+        // The prompt is the browser's to read; the state holds none of it.
+        if let Some(prompt) = prompt {
+            prompt.apply(&mut challenge);
+        }
+
+        let state_json = serde_json::to_value(&auth_state).map_err(|_| AuthnError::NoFlow)?;
+        if !session.set_custom(fido2_keys::DISC_STATE, state_json).await {
+            // The ceremony state did not fit; a challenge handed out without
+            // it could never be finished.
             return Err(AuthnError::NoFlow);
         }
-        Ok(challenge)
+        self.stamp_ceremony_start(session, fido2_keys::DISC_STATE)
+            .await?;
+
+        if let Some(tenant_id) = tenant {
+            let bound = session
+                .set_custom(
+                    fido2_keys::DISC_TENANT,
+                    serde_json::Value::String(tenant_id.to_string()),
+                )
+                .await;
+            if !bound {
+                // The ceremony must not run without its tenant.
+                return Err(AuthnError::NoFlow);
+            }
+        }
+
+        serde_json::to_value(&challenge).map_err(|_| AuthnError::NoFlow)
     }
 
     // ── Credential management ────────────────────────────────────────────────
@@ -446,9 +517,27 @@ where
         // `complete_factor_step` can still refuse (the account was
         // suspended meanwhile, the registry would not take the session),
         // and a binding row must not record a login that did not happen.
-        if let Some(device_id) = session.device_id().await {
-            webauthn.on_credential_used(auth_result.cred_id(), &device_id);
-        }
+        credential_used(webauthn, auth_result.cred_id(), session).await;
         Ok(outcome)
     }
+}
+
+/// Hand the provider's device-binding hook the device this request proved
+/// (`AuthSession::proven_device`), by its token or its key, and skip the
+/// call when it proved none. The session's device alone is a label: a
+/// request with the session cookie and no proof of the device keeps it,
+/// so a ceremony performed on another browser with a copied cookie would
+/// otherwise be recorded against the session's own device.
+async fn credential_used(
+    provider: &std::sync::Arc<dyn axess_factors::fido2::Fido2Provider>,
+    credential: &webauthn_rs::prelude::CredentialID,
+    session: &AuthSession,
+) {
+    #[cfg(feature = "device")]
+    if let Some(device) = session.proven_device().await {
+        provider.on_credential_used(credential, &device.id());
+    }
+    // Without the device subsystem no request proves a device.
+    #[cfg(not(feature = "device"))]
+    let _ = (provider, credential, session);
 }

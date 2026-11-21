@@ -2,8 +2,8 @@
 
 This chapter follows a CI job through two exchanges on AWS, with the
 configuration on both sides of each and the error each wrong setting produces.
-The job assumes a role with its own ID token; it then calls a Rust service
-protected by axess; the service, on EKS, exchanges its own projected token for
+The job assumes a role with its own ID token and then calls a Rust service
+protected by axess. The service, on EKS, exchanges its own projected token for
 a role that can read a secret. It adds no code of its own: the code is
 `examples/workload-identity/tests/cloud_aws.rs`, which compiles and runs under
 `cargo test`, built on the GitLab recipe (module `gitlab` of the
@@ -23,8 +23,8 @@ workload-identity example, see [Inbound: federation](federation.md)) and the AWS
    │◄────── response ────────────┤◄───────────────────────────────────────────────────┤
 ```
 
-The job and the service use two different tokens for two different audiences,
-and the chapter keeps them apart. The token for AWS has the audience
+Two tokens for two different audiences are in play, and the chapter keeps
+them apart. The token for AWS has the audience
 `sts.amazonaws.com`; the token for the service has the audience the service is
 configured for. A token minted for one is refused by the other.
 
@@ -69,15 +69,15 @@ token's `aud` and `sub`:
     "Condition": {
       "StringEquals": {
         "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
-        "token.actions.githubusercontent.com:sub": "repo:gnomes/axess:ref:refs/heads/main"
+        "token.actions.githubusercontent.com:sub": "repo:example-org/example-repo:ref:refs/heads/main"
       }
     }
   }]
 }
 ```
 
-The `sub` condition is what keeps every other repository on GitHub, and every
-other branch of this one, out of the role. Without it, any workflow that can
+The `sub` condition keeps every other repository on GitHub, and every other
+branch of this one, out of the role. Without it, any workflow that can
 obtain a token for `sts.amazonaws.com` can assume the role. For GitLab the
 subject has the shape `project_path:<group>/<project>:ref_type:branch:ref:<name>`
 and the issuer is the GitLab instance's URL, registered as its own IAM provider.
@@ -123,7 +123,7 @@ call, because the kubelet rotates it, and asks the regional STS endpoint for
 credentials for `AWS_ROLE_ARN`. A failed exchange is logged with AWS's error
 and answered with a generic 502.
 
-The EKS side is the same two parts as before, with the cluster as the issuer.
+The EKS side has the same two parts as before, with the cluster as the issuer.
 Register the cluster's OIDC issuer as an IAM provider, then write a trust policy
 whose `sub` is the service account:
 
@@ -182,21 +182,21 @@ metadata:
 ```
 
 `sts_from_env` in the code above builds the client from those variables. This
-is IAM roles for service accounts, and it is the form the adapter serves: the
+is IAM roles for service accounts, the form the adapter serves: the
 pod holds a web identity token and the service makes the
 `AssumeRoleWithWebIdentity` call itself. The newer EKS Pod Identity feature
 works differently: an agent on the node serves credentials from a local
-container-credentials endpoint and the pod never calls STS, so there is nothing
-for this adapter to do and the AWS SDK's default credential chain is the right
-tool.
+container-credentials endpoint and the pod never calls STS, so the adapter has
+no part in it; use the AWS SDK's default credential chain.
 
-The last hop, `GetSecretValue`, is signed with SigV4, which axess does not
-implement and the example crate does not depend on an SDK for. The tests stop
+The last hop, `GetSecretValue`, is signed with SigV4. Axess does not implement
+SigV4, and the example crate does not depend on an AWS SDK. The tests stop
 at the credentials; the call itself is the AWS SDK's, given the adapter's
 output:
 
 ```rust,ignore
 use aws_sdk_secretsmanager::config::{BehaviorVersion, Credentials, Region};
+use std::time::SystemTime;
 
 let assumed = secret_reader_credentials(&svc).await?;
 let c = &assumed.credentials;
@@ -207,7 +207,7 @@ let config = aws_sdk_secretsmanager::Config::builder()
         &*c.access_key_id,
         &*c.secret_access_key,
         Some(c.session_token.to_string()),
-        Some(c.expiration.into()),
+        SystemTime::try_from(c.expiration).ok(),
         "axess-sts",
     ))
     .build();
@@ -224,8 +224,8 @@ in [Cloud STS exchange](cloud-sts.md).
 
 ## What each wrong setting produces
 
-Each row is a test in `cloud_aws.rs` that reproduces it against a mock STS
-holding the IAM configuration above. The mock applies AWS's three checks in
+Each row names the test in `cloud_aws.rs` that reproduces it against a mock
+STS holding the IAM configuration above. The mock applies AWS's three checks in
 order: the issuer must be a registered IAM provider, the token's `aud` must be
 in the provider's client ID list, and the role's trust policy must admit the
 provider, `aud` and `sub`. It does not verify signatures, and it was written
@@ -239,17 +239,17 @@ are the stable part, and the message wording may differ.
 | The issuer was never registered as an IAM provider, or under a different URL | `issuer_without_an_iam_oidc_provider_is_invalid_identity_token` | HTTP 400, `InvalidIdentityToken` ("No OpenIDConnect provider found in your account for https://...") | Register the issuer URL exactly as it appears in the token's `iss` |
 
 Note the pair: a wrong subject is `AccessDenied` and a wrong audience or issuer
-is `InvalidIdentityToken`. The adapter's troubleshooting advice in
-[Cloud STS exchange](cloud-sts.md) lumps them together; the code tells you
-which check failed.
+is `InvalidIdentityToken`, so the code tells you which check failed. The
+troubleshooting section of [Cloud STS exchange](cloud-sts.md) draws the same
+line.
 
 The third test also drives the whole service and asserts the 502. Two cases
-belong to the service rather than to AWS: a pipeline token with the wrong
+belong to the service rather than to AWS. A pipeline token with the wrong
 audience is refused with a 401 before any exchange
-(`pipeline_token_for_another_audience_never_reaches_aws`), and a role whose
-permissions policy lacks `secretsmanager:GetSecretValue` assumes fine and
-fails at step E with `AccessDeniedException` from Secrets Manager, which is the
-SDK's answer, not the adapter's, and is not reproduced here.
+(`pipeline_token_for_another_audience_never_reaches_aws`). A role whose
+permissions policy lacks `secretsmanager:GetSecretValue` is assumed without
+error and fails at step E with `AccessDeniedException` from Secrets Manager;
+that is the SDK's answer, not the adapter's, and is not reproduced here.
 
 ## Running it
 
@@ -257,19 +257,19 @@ SDK's answer, not the adapter's, and is not reproduced here.
 cargo test -p axess-example-workload-identity --test cloud_aws
 ```
 
-Everything above runs offline: STS is a local mock server. What no test here
-proves is a live account: the IAM providers, the trust policies, the webhook
+Everything above runs offline: STS is a local mock server. No test here
+proves a live account: the IAM providers, the trust policies, the webhook
 and the SigV4 call are configuration or SDK behaviour this chapter describes.
 
 ## GCP
 
 The GCP adapter is `GcpStsClient` in `axess::workload::outbound::cloud_sts::gcp`
 (feature `gcp-wif`), with `GcpServiceAccountImpersonator` for the second hop.
-It differs from AWS in two ways. The exchange is two calls: Google's STS
+It differs from AWS in two ways. First, the exchange is two calls: Google's STS
 exchanges the token (RFC 8693) for a federated access token, which most APIs
-refuse, so a service normally impersonates a service account with it. And the
+refuse, so a service normally impersonates a service account with it. Second, the
 trust lives on a workload identity pool provider (an attribute mapping and a
-condition on the provider) rather than on a role's trust policy, with the
-token's audience being the provider's full resource name, built for you by
-`WorkloadIdentityPoolProvider`. Everything else in this chapter carries over,
+condition on the provider) rather than on a role's trust policy, and the
+token's audience is the provider's full resource name, which
+`WorkloadIdentityPoolProvider` builds. Everything else in this chapter carries over,
 and [Cloud STS exchange](cloud-sts.md) has the configuration.

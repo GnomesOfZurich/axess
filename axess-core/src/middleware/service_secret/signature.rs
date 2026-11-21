@@ -4,6 +4,7 @@
 use super::rejection::{Rejection, peer_of};
 use super::{ServiceCaller, ServiceSecret, ServiceSecrets};
 use crate::session::hmac::new_signer;
+use axess_clock::Timestamp;
 use axess_clock::{Clock, SystemClock};
 use axum::{
     body::Body,
@@ -13,7 +14,6 @@ use axum::{
         header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue},
     },
 };
-use chrono::{DateTime, Utc};
 use hmac::Mac;
 use sha2::{Digest as _, Sha256};
 use std::{
@@ -85,7 +85,7 @@ const KEY_LABEL: &[u8] = b"axess-service-signature-v1";
 pub(super) fn derive_key(secret: &[u8]) -> Zeroizing<[u8; 32]> {
     let mut mac = new_signer(secret);
     mac.update(KEY_LABEL);
-    Zeroizing::new(mac.finalize().into_bytes().into())
+    crate::session::hmac::finalize_key(mac)
 }
 
 /// The `v3` tag: the `v2` message with the hashes of `Content-Type` and
@@ -229,8 +229,8 @@ pub struct SignedRequests {
     max_body_bytes: usize,
     max_remembered: usize,
     audience: Option<String>,
-    unaddressed_until: Option<DateTime<Utc>>,
-    v2_until: Option<DateTime<Utc>>,
+    unaddressed_until: Option<Timestamp>,
+    v2_until: Option<Timestamp>,
     clock: Arc<dyn Clock>,
 }
 
@@ -327,7 +327,7 @@ impl SignedRequests {
     /// the secret; this is a migration window, not a setting to leave on. From
     /// `instant` on, `v1` is refused.
     #[must_use]
-    pub fn accept_unaddressed_until(mut self, instant: DateTime<Utc>) -> Self {
+    pub fn accept_unaddressed_until(mut self, instant: Timestamp) -> Self {
         self.unaddressed_until = Some(instant);
         self
     }
@@ -342,7 +342,7 @@ impl SignedRequests {
     /// window, not a setting to leave on. A header that carries `v3` is
     /// always judged by it. From `instant` on, `v2` is refused.
     #[must_use]
-    pub fn accept_v2_until(mut self, instant: DateTime<Utc>) -> Self {
+    pub fn accept_v2_until(mut self, instant: Timestamp) -> Self {
         self.v2_until = Some(instant);
         self
     }
@@ -461,7 +461,7 @@ impl Verifier {
         match self.check(secrets, req).await {
             Ok(req) => Ok(req),
             Err(rejection) => {
-                let now = self.config.clock.now().timestamp();
+                let now = self.config.clock.now().unix_seconds();
                 let warn_due = rejection.warns() && self.claim_warn(now);
                 rejection.log(peer, warn_due);
                 Err(rejection.status())
@@ -497,8 +497,8 @@ impl Verifier {
         // open. A header without a tag the route reads is malformed for this
         // route.
         let instant = self.config.clock.now();
-        let now = instant.timestamp();
-        let open = |until: Option<DateTime<Utc>>| until.is_some_and(|until| instant < until);
+        let now = instant.unix_seconds();
+        let open = |until: Option<Timestamp>| until.is_some_and(|until| instant < until);
         let (v1_open, v2_open) = (
             open(self.config.unaddressed_until),
             open(self.config.v2_until),

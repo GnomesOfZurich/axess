@@ -1,0 +1,37 @@
+# What a build with every feature on needs from the runner beyond the Rust
+# toolchain. The `sqlite-unbundled` feature (sqlx's) generates its SQLite
+# bindings with bindgen, which loads libclang, and a build with that feature
+# alone reads the system's SQLite header and links its library. The jobs
+# that switch the feature on (`--all-features`, and the feature matrix's
+# `sqlite-unbundled-only` profile) run this first.
+#
+# It checks and installs nothing. The hosted Linux image holds Clang with its
+# libclang and the SQLite development package, and a distribution install in
+# a workflow would be an install this repository cannot pin
+# (scripts/check-workflow-pins.sh refuses `apt-get install` for that reason).
+# So a runner that lacks either one fails here, in one named step that says
+# which is missing and which package holds it, in place of a bindgen or
+# linker error deep in a build. On macOS nothing is checked: the Xcode tools
+# hold libclang and the SDK holds the SQLite header.
+name: Build prerequisites
+description: Checks for libclang and the system SQLite header, for builds that switch `sqlite-unbundled` on.
+runs:
+  using: composite
+  steps:
+    - name: Check that the runner holds libclang and the SQLite header
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        set -euo pipefail
+        missing=0
+        if ! compgen -G '/usr/lib/llvm-*/lib/libclang*.so*' >/dev/null &&
+          ! compgen -G '/usr/lib/*/libclang*.so*' >/dev/null &&
+          [ -z "${LIBCLANG_PATH:-}" ]; then
+          echo "::error::No libclang shared library on this runner. bindgen loads one to build with sqlite-unbundled (Debian and Ubuntu: libclang-dev)."
+          missing=1
+        fi
+        if ! pkg-config --exists sqlite3; then
+          echo "::error::pkg-config finds no sqlite3 on this runner. A build with sqlite-unbundled reads the system SQLite's header and links its library (Debian and Ubuntu: libsqlite3-dev)."
+          missing=1
+        fi
+        exit "$missing"

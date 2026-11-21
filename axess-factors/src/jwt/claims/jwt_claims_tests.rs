@@ -116,7 +116,7 @@ fn aud_contains_accepts_single_string_with_matching_client_id() {
 }
 
 /// `check_iat` pins the `age = now - iat` subtraction and the
-/// `(-60..=MAX_IAT_AGE_SECS).contains(&age)` range. Discriminates
+/// `(-60..=MAX_IAT_AGE).contains(&age)` range, in whole seconds. Discriminates
 /// `- → +`, `- → /`, and `delete -` mutations:
 ///
 /// - `iat = now`: age = 0 → in range → Ok. Under `+`, age =
@@ -143,7 +143,7 @@ fn check_iat_pins_subtraction_against_plus_div_and_delete() {
     let p = serde_json::json!({ "iat": now });
     assert!(matches!(check_iat(&p, now), IatCheck::Ok));
 
-    // iat = now - 600 → age 600s, out of MAX_IAT_AGE_SECS=300 → OutOfRange.
+    // iat = now - 600 → age 600s, out of MAX_IAT_AGE (300 s) → OutOfRange.
     let p = serde_json::json!({ "iat": now - 600 });
     assert!(
         matches!(check_iat(&p, now), IatCheck::OutOfRange { .. }),

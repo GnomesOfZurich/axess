@@ -4,25 +4,25 @@
 use super::*;
 use crate::authn::factor::{EmailOtpConfig, PasswordConfig, ZeroizedString};
 use crate::testing::mock_random::MockRng;
-use chrono::Utc;
+use axess_clock::testing::Shift;
 use std::sync::Arc;
 
 // ── Password ─────────────────────────────────────────────────────
 
 #[test]
 fn password_correct() {
-    let hash = axess_factors::generate_password_hash("Gnomes2+");
+    let hash = axess_factors::generate_password_hash("Sample2+");
     let cfg = FactorConfig::Password(PasswordConfig {
         hash: ZeroizedString::new(&hash),
         rules: Default::default(),
         password_id: None,
     });
-    let cred = FactorCredential::Password(ZeroizedString::new("Gnomes2+"));
+    let cred = FactorCredential::Password(ZeroizedString::new("Sample2+"));
     let outcome = verify_credential(
         &cred,
         &cfg,
         &FactorKind::Password,
-        Utc::now(),
+        axess_clock::testing::MockClock::reference_time(),
         &RecoveryPeppers::default(),
     );
     assert!(matches!(outcome, VerifyOutcome::Pass));
@@ -30,7 +30,7 @@ fn password_correct() {
 
 #[test]
 fn password_wrong() {
-    let hash = axess_factors::generate_password_hash("Gnomes2+");
+    let hash = axess_factors::generate_password_hash("Sample2+");
     let cfg = FactorConfig::Password(PasswordConfig {
         hash: ZeroizedString::new(&hash),
         rules: Default::default(),
@@ -41,7 +41,7 @@ fn password_wrong() {
         &cred,
         &cfg,
         &FactorKind::Password,
-        Utc::now(),
+        axess_clock::testing::MockClock::reference_time(),
         &RecoveryPeppers::default(),
     );
     assert!(matches!(outcome, VerifyOutcome::Fail));
@@ -61,7 +61,7 @@ fn password_oversized_rejected() {
         &cred,
         &cfg,
         &FactorKind::Password,
-        Utc::now(),
+        axess_clock::testing::MockClock::reference_time(),
         &RecoveryPeppers::default(),
     );
     assert!(matches!(outcome, VerifyOutcome::Fail));
@@ -73,11 +73,12 @@ fn password_oversized_rejected() {
 fn email_otp_expired_rejected() {
     let code = "12345678";
     let hash = axess_factors::generate_password_hash(code);
-    let expired = Utc::now() - chrono::Duration::seconds(10);
+    let expired = axess_clock::testing::MockClock::reference_time()
+        .minus(axess_clock::SignedDuration::seconds(10));
     let cfg = FactorConfig::EmailOtp(EmailOtpConfig {
         email: "test@example.com".into(),
         pending_hash: Some(ZeroizedString::new(&hash)),
-        pending_until: Some(expired),
+        pending_until: Some(axess_clock::Until::At(expired)),
         ..Default::default()
     });
     let cred = FactorCredential::OtpCode(Arc::from(code));
@@ -85,7 +86,7 @@ fn email_otp_expired_rejected() {
         &cred,
         &cfg,
         &FactorKind::EmailOtp,
-        Utc::now(),
+        axess_clock::testing::MockClock::reference_time(),
         &RecoveryPeppers::default(),
     );
     assert!(matches!(outcome, VerifyOutcome::Fail));
@@ -104,7 +105,7 @@ fn email_otp_no_pending_hash_rejected() {
         &cred,
         &cfg,
         &FactorKind::EmailOtp,
-        Utc::now(),
+        axess_clock::testing::MockClock::reference_time(),
         &RecoveryPeppers::default(),
     );
     assert!(matches!(outcome, VerifyOutcome::Fail));
@@ -114,11 +115,12 @@ fn email_otp_no_pending_hash_rejected() {
 fn email_otp_attempt_limit_burns_code() {
     let code = "12345678";
     let hash = axess_factors::generate_password_hash(code);
-    let future = Utc::now() + chrono::Duration::seconds(300);
+    let future = axess_clock::testing::MockClock::reference_time()
+        .plus(axess_clock::SignedDuration::seconds(300));
     let cfg = FactorConfig::EmailOtp(EmailOtpConfig {
         email: "test@example.com".into(),
         pending_hash: Some(ZeroizedString::new(&hash)),
-        pending_until: Some(future),
+        pending_until: Some(axess_clock::Until::At(future)),
         attempt_count: 5,
         max_attempts: 5,
         ..Default::default()
@@ -128,7 +130,7 @@ fn email_otp_attempt_limit_burns_code() {
         &cred,
         &cfg,
         &FactorKind::EmailOtp,
-        Utc::now(),
+        axess_clock::testing::MockClock::reference_time(),
         &RecoveryPeppers::default(),
     );
     match outcome {
@@ -145,7 +147,9 @@ fn apply_email_otp_failure_increments_below_limit() {
     let prior = EmailOtpConfig {
         email: "test@example.com".into(),
         pending_hash: Some(ZeroizedString::new("hash")),
-        pending_until: Some(Utc::now()),
+        pending_until: Some(axess_clock::Until::At(
+            axess_clock::testing::MockClock::reference_time(),
+        )),
         attempt_count: 2,
         max_attempts: 5,
         ..Default::default()
@@ -160,7 +164,9 @@ fn apply_email_otp_failure_burns_at_limit() {
     let prior = EmailOtpConfig {
         email: "test@example.com".into(),
         pending_hash: Some(ZeroizedString::new("hash")),
-        pending_until: Some(Utc::now()),
+        pending_until: Some(axess_clock::Until::At(
+            axess_clock::testing::MockClock::reference_time(),
+        )),
         attempt_count: 5,
         max_attempts: 5,
         ..Default::default()
@@ -174,11 +180,12 @@ fn apply_email_otp_failure_burns_at_limit() {
 #[test]
 fn email_otp_wrong_code_increments_counter() {
     let hash = axess_factors::generate_password_hash("12345678");
-    let future = Utc::now() + chrono::Duration::seconds(300);
+    let future = axess_clock::testing::MockClock::reference_time()
+        .plus(axess_clock::SignedDuration::seconds(300));
     let cfg = FactorConfig::EmailOtp(EmailOtpConfig {
         email: "test@example.com".into(),
         pending_hash: Some(ZeroizedString::new(&hash)),
-        pending_until: Some(future),
+        pending_until: Some(axess_clock::Until::At(future)),
         attempt_count: 2,
         max_attempts: 5,
         ..Default::default()
@@ -188,7 +195,7 @@ fn email_otp_wrong_code_increments_counter() {
         &cred,
         &cfg,
         &FactorKind::EmailOtp,
-        Utc::now(),
+        axess_clock::testing::MockClock::reference_time(),
         &RecoveryPeppers::default(),
     );
     match outcome {
@@ -214,7 +221,7 @@ fn mismatched_credential_config_rejected() {
         &cred,
         &cfg,
         &FactorKind::Totp,
-        Utc::now(),
+        axess_clock::testing::MockClock::reference_time(),
         &RecoveryPeppers::default(),
     );
     assert!(matches!(outcome, VerifyOutcome::Fail));

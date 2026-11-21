@@ -26,10 +26,12 @@
 //! without giving up the tenant-scoped query primitives that drive
 //! the rest of the device subsystem.
 
-use chrono::{DateTime, TimeZone, Utc};
+use axess_clock::Timestamp;
 
 use crate::authn::ids::{DeviceId, TenantId, UserId};
-use crate::device::store::{BindingsUpdate, OwnerClaim, SweepConfig, TrustTransition};
+use crate::device::store::{
+    BindingsUpdate, OwnerClaim, SweepConfig, TrustTransition, window_seconds,
+};
 use crate::device::types::{Device, DeviceBinding, DeviceTrustLevel, FingerprintHash};
 use crate::session::crypto::{
     Binding, BoundFormat, CryptoError, SessionCrypto, device_row_id, device_row_id_v1,
@@ -39,14 +41,15 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 /// Codec for the bindings column on a device row.
 ///
 /// Serialises `Vec<DeviceBinding>` with `rmp-serde` (MessagePack) and
-/// optionally encrypts with AES-256-GCM. The encrypted output is then
-/// base64-encoded so the column stays TEXT: same shape as the
-/// session store, intentionally.
+/// optionally encrypts with AES-256-GCM. The output is then base64-encoded
+/// so the column stays TEXT (the session stores write a binary column).
 ///
 /// # Binding to the device row
 ///
-/// An encrypted blob is `AXD 0x02 || nonce(12) || ciphertext+tag` (marker
-/// bytes `0x41 0x58 0x44 0x02`) with AES-GCM additional authenticated data
+/// An encrypted blob is `AXD 0x82 || salt(16) || ciphertext+tag` (marker
+/// bytes `0x41 0x58 0x44 0x82`), sealed under a key derived for the record;
+/// the earlier `AXD 0x02 || nonce(12) || ciphertext+tag` under the key
+/// itself is a legacy blob. The AES-GCM additional authenticated data is
 /// `"axess.device-bindings.v2" || 0x00 || len(tenant_id) || tenant_id ||
 /// len(device_id) || device_id`, each length a big-endian `u32` and each id
 /// its UTF-8 bytes, so two different id pairs can never produce the same
@@ -59,9 +62,9 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 /// them. The bindings carry no ids of their own, so the policy's cutoff is the
 /// protection against a moved legacy blob.
 /// A bindings write seals the current form, and so does a read that finds an
-/// older form (a conditional write of the exact bytes it read), so the older
-/// forms age out as devices are written or read. Plaintext codecs have
-/// nothing to bind.
+/// older form that is bound to its row (a conditional write of the exact
+/// bytes it read); a blob with no binding waits for the device's next write.
+/// Plaintext codecs have nothing to bind.
 ///
 /// `SessionCrypto` is reused as a *generic* AES-256-GCM envelope
 /// primitive. The "session" prefix in its name is historical; the
@@ -324,17 +327,17 @@ pub enum SqlDeviceStoreError {
     MalformedRow(String),
 }
 
-/// Seconds since the Unix epoch back to a UTC instant; a value chrono
-/// cannot represent is a corrupt row, not a panic.
-pub(crate) fn unix_to_utc(secs: i64) -> Result<DateTime<Utc>, SqlDeviceStoreError> {
-    Utc.timestamp_opt(secs, 0).single().ok_or_else(|| {
+/// Seconds since the Unix epoch back to a UTC instant; a value outside the
+/// range of a reading is a corrupt row, not a panic.
+pub(crate) fn unix_to_utc(secs: i64) -> Result<Timestamp, SqlDeviceStoreError> {
+    Timestamp::from_unix_seconds(secs).ok_or_else(|| {
         SqlDeviceStoreError::MalformedRow(format!("unrepresentable Unix timestamp: {secs}"))
     })
 }
 
 /// The whole-second Unix form every timestamp column stores.
-pub(crate) fn utc_to_unix(dt: DateTime<Utc>) -> i64 {
-    dt.timestamp()
+pub(crate) fn utc_to_unix(dt: Timestamp) -> i64 {
+    dt.unix_seconds()
 }
 
 /// The name of the lock a create of `device` serialises on, for the engines
@@ -613,7 +616,7 @@ pub(crate) struct TrustWrite {
 }
 
 impl TrustWrite {
-    pub(crate) fn new(level: DeviceTrustLevel, now: DateTime<Utc>) -> Self {
+    pub(crate) fn new(level: DeviceTrustLevel, now: Timestamp) -> Self {
         let now = utc_to_unix(now);
         Self {
             trust: trust_level_codec::to_str(level),
@@ -639,11 +642,7 @@ pub(crate) struct GuardedTrustWrite {
 }
 
 impl GuardedTrustWrite {
-    pub(crate) fn new(
-        expected: DeviceTrustLevel,
-        level: DeviceTrustLevel,
-        now: DateTime<Utc>,
-    ) -> Self {
+    pub(crate) fn new(expected: DeviceTrustLevel, level: DeviceTrustLevel, now: Timestamp) -> Self {
         let now = utc_to_unix(now);
         let to_seen = level == DeviceTrustLevel::Seen;
         Self {
@@ -762,13 +761,13 @@ pub(crate) struct SweepCutoffs {
 }
 
 impl SweepCutoffs {
-    pub(crate) fn new(cfg: &SweepConfig, now: DateTime<Utc>) -> Self {
+    pub(crate) fn new(cfg: &SweepConfig, now: Timestamp) -> Self {
         let now = utc_to_unix(now);
         Self {
             now,
-            trusted: now.saturating_sub(cfg.trusted_idle.num_seconds()),
-            seen: now.saturating_sub(cfg.seen_idle.num_seconds()),
-            grace: now.saturating_sub(cfg.revoked_grace.num_seconds()),
+            trusted: now.saturating_sub(window_seconds(cfg.trusted_idle)),
+            seen: now.saturating_sub(window_seconds(cfg.seen_idle)),
+            grace: now.saturating_sub(window_seconds(cfg.revoked_grace)),
         }
     }
 }
@@ -799,16 +798,47 @@ mod device_sql_common_tests {
     use crate::device::types::{
         AttestationClass, DeviceBinding, DeviceTrustLevel, FingerprintHash,
     };
-    use chrono::Utc;
 
-    /// line 68: `decode -> Ok(vec![])` body replacement.
+    /// Every timestamp column holds whole Unix seconds: the fraction is
+    /// dropped, rounding down before the epoch too, and a value as far out
+    /// as an earlier release clamped a lifetime to ("for ever") reads back.
+    #[test]
+    fn a_timestamp_column_holds_whole_unix_seconds() {
+        let now = axess_clock::testing::MockClock::reference_time();
+        assert_eq!(utc_to_unix(now), 1_767_225_600);
+        for secs in [
+            0,
+            -1,
+            1_767_225_600,
+            253_402_300_799,
+            8_210_266_876_799,
+            -8_334_601_228_800,
+        ] {
+            assert_eq!(utc_to_unix(unix_to_utc(secs).expect("reads")), secs);
+        }
+        let stamp = |text: &str| {
+            let row =
+                format!(r#"{{"admin":"01010101-0101-0101-0101-010101010101","since":"{text}"}}"#);
+            serde_json::from_str::<crate::session::data::Impersonation>(&row)
+                .expect("reads")
+                .since
+        };
+        assert_eq!(
+            utc_to_unix(stamp("2026-01-01T00:00:00.999999999Z")),
+            1_767_225_600
+        );
+        assert_eq!(utc_to_unix(stamp("1969-12-31T23:59:59.5Z")), -1);
+        assert!(unix_to_utc(i64::MAX).is_err());
+    }
+
+    /// `decode -> Ok(vec![])` body replacement.
     /// Discriminator: encode a non-empty bindings vector and confirm
     /// decode round-trips the same content. Mutation returns an empty
     /// Vec for any non-empty input.
     #[test]
     fn bindings_codec_round_trips_non_empty_vector() {
         let codec = BindingsCodec::plaintext();
-        let now = Utc::now();
+        let now = axess_clock::testing::MockClock::reference_time();
         let bindings = vec![
             DeviceBinding::Cookie {
                 token_hash: FingerprintHash::from_bytes([0xAA; 32]),
@@ -832,7 +862,7 @@ mod device_sql_common_tests {
         assert_eq!(decoded, bindings, "round-trip must preserve content");
     }
 
-    /// line 89: `to_str` body replacement (`""`, `"xyzzy"`).
+    /// `to_str` body replacement (`""`, `"xyzzy"`).
     /// Pin every variant's wire-form value.
     #[test]
     fn trust_level_to_str_pins_variant_strings() {
@@ -851,7 +881,7 @@ mod device_sql_common_tests {
         );
     }
 
-    /// line 98 + 99-102: `from_str` body replacement and arm
+    /// `from_str` body replacement and arm
     /// deletions. Each variant string must round-trip; an unknown
     /// string must yield None.
     #[test]
@@ -883,7 +913,7 @@ mod device_sql_common_tests {
     /// the index once, and the order of first appearance is kept.
     #[test]
     fn refresh_family_ids_are_distinct_and_keep_first_seen_order() {
-        let now = Utc::now();
+        let now = axess_clock::testing::MockClock::reference_time();
         let refresh = |f: &str| DeviceBinding::Refresh {
             family_id: f.to_string(),
             issued_at: now,
@@ -895,17 +925,16 @@ mod device_sql_common_tests {
     }
 
     /// A window of `Duration::MAX`, used to mean "never", yields a cutoff far
-    /// in the past: no row is older than it, so nothing is swept. A
-    /// `chrono::Duration` holds at most `i64::MAX` milliseconds, so its seconds
-    /// can never overflow the subtraction.
+    /// in the past: no row is older than it, so nothing is swept. The
+    /// subtraction saturates, so a window of any length cannot overflow it.
     #[test]
     fn an_unbounded_window_is_a_cutoff_far_in_the_past() {
         let cfg = SweepConfig {
-            trusted_idle: chrono::Duration::MAX,
-            seen_idle: chrono::Duration::MAX,
-            revoked_grace: chrono::Duration::MAX,
+            trusted_idle: std::time::Duration::MAX,
+            seen_idle: std::time::Duration::MAX,
+            revoked_grace: std::time::Duration::MAX,
         };
-        let cutoffs = SweepCutoffs::new(&cfg, Utc::now());
+        let cutoffs = SweepCutoffs::new(&cfg, axess_clock::testing::MockClock::reference_time());
         for cutoff in [cutoffs.trusted, cutoffs.seen, cutoffs.grace] {
             assert!(cutoff < 0 && cutoff < cutoffs.now, "cutoff {cutoff}");
         }

@@ -3,10 +3,10 @@
 
 use super::*;
 use crate::device::types::{DeviceBinding, FingerprintHash};
-use chrono::{TimeZone, Utc};
+use axess_clock::Timestamp;
 
 fn bindings() -> Vec<DeviceBinding> {
-    let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    let now = Timestamp::from_unix_seconds(1_700_000_000).unwrap();
     vec![DeviceBinding::Cookie {
         token_hash: FingerprintHash::from_bytes([0xAB; 32]),
         issued_at: now,

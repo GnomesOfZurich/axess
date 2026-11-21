@@ -57,7 +57,7 @@ impl PolicyStore {
         let held = AssuranceContext::from_context(&request.context)?;
         // The proofs are aged against a fixed instant: only their age
         // reaches the policy, and the best proof's is zero.
-        let now = chrono::DateTime::<chrono::Utc>::UNIX_EPOCH;
+        let now = axess_clock::Timestamp::UNIX_EPOCH;
         self.step_ups.iter().find_map(|step_up| {
             let assurance = held.clone().with_proof(&step_up.best_proof(now), now);
             let context = replace_assurance(request.context.clone(), &assurance).ok()?;

@@ -46,15 +46,20 @@ for group in re.findall(r'pub use [\w:]*::\{([^}]*)\}', lib, re.S):
             surface.add(n)
 surface |= set(re.findall(r'pub use [\w:]*::(\w+);', lib))
 
+# Tracked files and untracked ones git does not ignore, so a file not yet
+# added is checked as well.
 tracked = subprocess.run(
-    ["git", "ls-files", "*.md"], capture_output=True, text=True, check=True
+    ["git", "ls-files", "--cached", "--others", "--exclude-standard", "--deduplicate", "*.md"],
+    capture_output=True, text=True, check=True,
 ).stdout.split()
 
 bad = {}
 for f in tracked:
     for i, line in enumerate(pathlib.Path(f).read_text().split("\n"), 1):
         # `axess::` exactly: `axess_core::`, `axess_factors::` are other crates.
-        for seg in re.findall(r'(?<![\w_])axess::(\w+)::', line):
+        # A segment followed by `::"` is a Cedar entity UID in the `axess`
+        # namespace (`axess::Human::"<id>"`), never a Rust path.
+        for seg in re.findall(r'(?<![\w_])axess::(\w+)::(?!")', line):
             if seg not in surface:
                 bad.setdefault(f"axess::{seg}", []).append(f"{f}:{i}")
 

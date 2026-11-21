@@ -1,6 +1,6 @@
 use super::*;
 use crate::federation::sid_map::SidMap;
-use crate::session::id::SessionId;
+use crate::session::id::{SessionId, SessionKey};
 use crate::session::store::SessionRegistryAdapter;
 use crate::session::store::{MemorySessionRegistry, SessionRegistry};
 use crate::testing::mock_random::MockRng;
@@ -18,7 +18,7 @@ async fn frontchannel_logout_invalidates_by_sid() {
     let sid_map: SidMap = SidMap::new();
 
     let rng = MockRng::new(42);
-    let session_id = SessionId::new(&rng);
+    let session_id = SessionKey::of(&SessionId::new(&rng));
     let user_id = axess_identity::testing::user("user-1");
 
     registry.register(&user_id, &session_id).await.unwrap();
@@ -32,7 +32,7 @@ async fn frontchannel_logout_invalidates_by_sid() {
         None,
         user_id,
         session_id,
-        chrono::Utc::now(),
+        axess_clock::testing::MockClock::reference_time(),
     );
     assert!(registry.is_valid(&user_id, &session_id).await.unwrap());
 
@@ -63,7 +63,7 @@ async fn frontchannel_logout_unknown_sid_is_noop() {
         "https://idp.example.com".to_string(),
         "nonexistent".to_string(),
     );
-    let some_session = SessionId::new(&MockRng::new(7));
+    let some_session = SessionKey::of(&SessionId::new(&MockRng::new(7)));
     assert!(
         handler
             .sid_map
@@ -123,7 +123,7 @@ async fn handle_frontchannel_logout_drives_registry_and_gates_issuer() {
     let registry = MemorySessionRegistry::new();
     let sid_map: SidMap = SidMap::new();
     let rng = MockRng::new(7);
-    let session_id = SessionId::new(&rng);
+    let session_id = SessionKey::of(&SessionId::new(&rng));
     let user_id = axess_identity::testing::user("u1");
     registry.register(&user_id, &session_id).await.unwrap();
     let key: SidKey = (
@@ -136,7 +136,7 @@ async fn handle_frontchannel_logout_drives_registry_and_gates_issuer() {
         None,
         user_id,
         session_id,
-        chrono::Utc::now(),
+        axess_clock::testing::MockClock::reference_time(),
     );
 
     let handler = FrontChannelLogoutHandler::new_unbound(
@@ -184,7 +184,7 @@ fn bound_handler(
     registry: &MemorySessionRegistry,
     sid_map: &SidMap,
 ) -> BoundFrontChannelLogoutHandler {
-    FrontChannelLogoutHandler::new(
+    BoundFrontChannelLogoutHandler::new(
         sid_map.clone(),
         Arc::new(SessionRegistryAdapter(registry.clone())),
         known_issuers(),
@@ -206,7 +206,7 @@ async fn a_bound_logout_ends_only_the_callers_own_session() {
     let registry = MemorySessionRegistry::new();
     let sid_map: SidMap = SidMap::new();
     let (victim_cookie, attacker_cookie) = (test_session(), test_session());
-    let victim_session = victim_cookie.session_id().await;
+    let victim_session = victim_cookie.session_key().await;
     let victim = axess_identity::testing::user("victim");
     registry.register(&victim, &victim_session).await.unwrap();
     let key: SidKey = ("https://idp.example.com".to_string(), "sid-1".to_string());
@@ -216,7 +216,7 @@ async fn a_bound_logout_ends_only_the_callers_own_session() {
         None,
         victim,
         victim_session,
-        chrono::Utc::now(),
+        axess_clock::testing::MockClock::reference_time(),
     );
     let bound = bound_handler(&registry, &sid_map);
 
@@ -310,11 +310,21 @@ async fn end_by_sid_removes_only_the_mapping_it_matched() {
     let registry = MemorySessionRegistry::new();
     let sid_map: SidMap = SidMap::new();
     let rng = MockRng::new(34);
-    let (old, new) = (SessionId::new(&rng), SessionId::new(&rng));
+    let (old, new) = (
+        SessionKey::of(&SessionId::new(&rng)),
+        SessionKey::of(&SessionId::new(&rng)),
+    );
     let user = axess_identity::testing::user("re-mapped");
     registry.register(&user, &new).await.unwrap();
     let key: SidKey = ("https://idp.example.com".to_string(), "sid-r".to_string());
-    sid_map.insert(key.clone(), "sub-r", None, user, new, chrono::Utc::now());
+    sid_map.insert(
+        key.clone(),
+        "sub-r",
+        None,
+        user,
+        new,
+        axess_clock::testing::MockClock::reference_time(),
+    );
     let handler = FrontChannelLogoutHandler::new_unbound(
         sid_map.clone(),
         Arc::new(SessionRegistryAdapter(registry.clone())),

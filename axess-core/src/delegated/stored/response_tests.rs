@@ -4,18 +4,19 @@
 
 use super::*;
 use crate::delegated::error::DelegatedError;
+use axess_clock::Timestamp;
 use axess_clock::testing::MockClock;
+use axess_clock::testing::Shift;
 use axess_identity::{TenantId, UserId};
 use axess_rng::testing::MockRng;
-use chrono::{DateTime, Utc};
 use serde_json::json;
 use std::sync::Arc;
 use url::Url;
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-fn t0() -> DateTime<Utc> {
-    DateTime::from_timestamp(1_700_000_000, 0).expect("fixed t0")
+fn t0() -> Timestamp {
+    Timestamp::from_unix_seconds(1_700_000_000).expect("fixed t0")
 }
 
 fn provider(server: &MockServer) -> Arc<DelegatedProvider> {
@@ -26,7 +27,7 @@ fn provider(server: &MockServer) -> Arc<DelegatedProvider> {
             Url::parse(&format!("{}/oauth2/token", server.uri())).unwrap(),
             "axess-client-id",
             "axess-secret",
-            Url::parse("https://gnomes.local/callback").unwrap(),
+            Url::parse("https://example.org/callback").unwrap(),
         )
         .with_default_scopes(["mail.read", "mail.send"]),
     )
@@ -42,13 +43,13 @@ async fn respond(server: &MockServer, status: u16, body: Vec<u8>) {
 
 async fn grant(server: &MockServer) -> Result<StoredDelegation, DelegatedError> {
     let provider = provider(server);
-    let (_url, ctx) = begin_grant(&provider, &[], &MockRng::new(1)).expect("begin_grant");
+    let (_, ctx) = begin_grant(&provider, &[], &MockRng::new(1)).expect("begin_grant");
     complete_grant_at(
         &provider,
         &ctx,
         "code",
         &ctx.state,
-        &reqwest::Client::new(),
+        &grant_client(|settings| settings).expect("client"),
         t0(),
     )
     .await
@@ -57,9 +58,10 @@ async fn grant(server: &MockServer) -> Result<StoredDelegation, DelegatedError> 
 fn stored(provider: &DelegatedProvider, scopes: &[&str], token_type: &str) -> StoredDelegation {
     StoredDelegation {
         provider: provider.name.clone(),
+        registration: Some(GrantRegistration::of(provider)),
         access_token: "stale".into(),
         refresh_token: Some("rfr".into()),
-        expires_at: Some(t0() - chrono::Duration::seconds(60)),
+        expires_at: Some(t0().minus(axess_clock::SignedDuration::seconds(60))),
         scopes: scopes.iter().map(|s| s.to_string()).collect(),
         token_type: token_type.to_string(),
     }
@@ -97,7 +99,7 @@ async fn expires_in_zero_is_already_expired_not_never_expiring() {
 
     assert_eq!(cred.expires_at, Some(t0()));
     assert!(
-        !cred.is_fresh(t0(), chrono::Duration::zero()),
+        !cred.is_fresh(t0(), std::time::Duration::ZERO),
         "a token that expired on arrival is not fresh"
     );
 }
@@ -193,7 +195,7 @@ async fn code_exchange_without_scope_stores_the_requested_scopes() {
 async fn an_empty_state_is_refused_even_when_the_callback_state_is_empty_too() {
     let server = MockServer::start().await;
     let provider = provider(&server);
-    let (_url, mut ctx) = begin_grant(&provider, &[], &MockRng::new(1)).expect("begin_grant");
+    let (_, mut ctx) = begin_grant(&provider, &[], &MockRng::new(1)).expect("begin_grant");
     ctx.state = String::new();
 
     let err = complete_grant(
@@ -201,8 +203,8 @@ async fn an_empty_state_is_refused_even_when_the_callback_state_is_empty_too() {
         &ctx,
         "code",
         "",
-        &reqwest::Client::new(),
-        &axess_clock::SystemClock,
+        &grant_client(|settings| settings).expect("client"),
+        &axess_clock::testing::MockClock::at_reference(),
     )
     .await
     .expect_err("an empty state checks nothing");
@@ -216,7 +218,7 @@ async fn a_non_bearer_token_is_not_handed_out_as_a_bearer_string() {
     let server = MockServer::start().await;
     let provider = provider(&server);
     let mut credential = stored(&provider, &[], "DPoP");
-    credential.expires_at = Some(t0() + chrono::Duration::hours(1));
+    credential.expires_at = Some(t0().plus(axess_clock::SignedDuration::hours(1)));
     let (session, ..) = session_over(provider, credential).await;
 
     let err = session.get_access_token().await.expect_err("DPoP token");
@@ -252,7 +254,7 @@ async fn bearer_is_matched_case_insensitively() {
     let server = MockServer::start().await;
     let provider = provider(&server);
     let mut credential = stored(&provider, &[], "bearer");
-    credential.expires_at = Some(t0() + chrono::Duration::hours(1));
+    credential.expires_at = Some(t0().plus(axess_clock::SignedDuration::hours(1)));
     let (session, ..) = session_over(provider, credential).await;
 
     assert_eq!(session.get_access_token().await.expect("token"), "stale");
@@ -275,6 +277,33 @@ async fn a_huge_error_body_is_cut_to_one_kib_in_the_error() {
         body.len()
     );
     assert!(body.ends_with("…[truncated]"));
+}
+
+/// The error body reaches the error with control characters and the Unicode
+/// line separators escaped, so the token endpoint cannot forge a log line.
+#[tokio::test]
+async fn an_error_body_is_log_safe() {
+    let server = MockServer::start().await;
+    respond(
+        &server,
+        500,
+        "upstream broke\r\nINFO forged line\x1b[2J\u{2028}"
+            .as_bytes()
+            .to_vec(),
+    )
+    .await;
+
+    let err = grant(&server).await.expect_err("500");
+
+    let DelegatedError::TokenEndpoint { body, .. } = &err else {
+        panic!("expected TokenEndpoint, got {err:?}");
+    };
+    assert!(!body.chars().any(char::is_control), "{body:?}");
+    assert!(!body.contains('\u{2028}'), "{body:?}");
+    assert!(
+        body.contains("upstream broke") && body.contains("forged line"),
+        "{body}"
+    );
 }
 
 #[tokio::test]
@@ -342,6 +371,27 @@ async fn invalid_grant_on_a_refresh_is_a_rejected_refresh() {
         refresh_against(&server).await,
         Err(DelegatedError::RefreshRejected)
     ));
+}
+
+/// A rejected refresh whose `error_description` runs past the 1 KiB that
+/// reaches the error message is still a rejected refresh, whichever member
+/// comes first: the code is read from up to 64 KiB of the answer.
+#[tokio::test]
+async fn invalid_grant_with_a_long_description_is_still_a_rejected_refresh() {
+    let description = "d".repeat(4096);
+    for body in [
+        format!(r#"{{"error":"invalid_grant","error_description":"{description}"}}"#),
+        format!(r#"{{"error_description":"{description}","error":"invalid_grant"}}"#),
+    ] {
+        let server = MockServer::start().await;
+        respond(&server, 400, body.into_bytes()).await;
+        let outcome = refresh_against(&server).await;
+        assert!(
+            matches!(outcome, Err(DelegatedError::RefreshRejected)),
+            "got {:?}",
+            outcome.err()
+        );
+    }
 }
 
 /// The same body on the authorization-code exchange is a bad or used code, not

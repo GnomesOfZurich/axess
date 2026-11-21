@@ -170,31 +170,42 @@ pub fn peek_spiffe(peer_cert: &CertificateDer<'_>) -> Result<SpiffeIdComponents,
         .map_err(|e| MtlsError::CertParse(e.to_string()))?
         .ok_or(MtlsError::NoSan)?;
 
-    // X509-SVID spec: a leaf names exactly one SPIFFE ID, in the URI SAN,
-    // and is never a CA. A certificate with two SPIFFE URIs is ambiguous
-    // about who it is, and "take the first" would let whoever controls the
-    // SAN order pick the identity, so it is refused. So is a certificate
-    // that may sign other certificates (basicConstraints CA, keyCertSign,
-    // cRLSign): such a certificate is a CA, not a workload leaf.
-    let mut spiffe_uris = san_ext
+    // X509-SVID standard, sections 2 and 5.2: an SVID carries exactly one
+    // URI SAN, the SPIFFE ID, and a validator rejects one with more, of
+    // whatever scheme. Two names are ambiguous about who the peer is, and
+    // "take the SPIFFE one" would let whoever controls the SAN order or a
+    // second name pick the identity. A leaf is also never a CA: a
+    // certificate that may sign other certificates (basicConstraints CA,
+    // keyCertSign, cRLSign) is refused below.
+    let mut uris = san_ext
         .value
         .general_names
         .iter()
         .filter_map(|name| match name {
-            GeneralName::URI(uri) if uri.starts_with("spiffe://") => Some(*uri),
+            GeneralName::URI(uri) => Some(*uri),
             _ => None,
         });
-    let spiffe_uri = spiffe_uris.next().ok_or(MtlsError::NoSpiffeUri)?;
-    if spiffe_uris.next().is_some() {
+    let spiffe_uri = uris.next().ok_or(MtlsError::NoSpiffeUri)?;
+    if uris.next().is_some() {
         return Err(MtlsError::Identity(IdentityError::InvalidSpiffeId(
-            "certificate carries more than one SPIFFE URI SAN".into(),
+            "certificate carries more than one URI SAN".into(),
         )));
+    }
+    // The scheme of a SPIFFE ID is case-insensitive (SPIFFE-ID standard,
+    // section 2.4); `WorkloadId::parse` keeps it in lower case.
+    let scheme = spiffe_uri.get(..9);
+    if !scheme.is_some_and(|scheme| scheme.eq_ignore_ascii_case("spiffe://")) {
+        return Err(MtlsError::NoSpiffeUri);
     }
     reject_signing_leaf(&cert)?;
 
     let workload_id = WorkloadId::parse(spiffe_uri).map_err(MtlsError::Identity)?;
-    let (trust_domain, service_name, tenant_slug) =
-        decompose_platform_spiffe(&workload_id).map_err(MtlsError::Identity)?;
+    let parts = workload_id.components().map_err(MtlsError::Identity)?;
+    let (trust_domain, service_name, tenant_slug) = (
+        parts.trust_domain,
+        parts.service.to_owned(),
+        parts.tenant_slug.to_owned(),
+    );
 
     Ok(SpiffeIdComponents {
         workload_id,
@@ -330,45 +341,6 @@ impl PrincipalResolver for MtlsResolver {
             attributes: BTreeMap::new(),
         }))
     }
-}
-
-/// Split a parsed [`WorkloadId`] into its
-/// `(trust_domain, service, tenant_slug)` components per the platform
-/// shape `spiffe://<trust_domain>/<service>/<tenant_slug>`. Returns
-/// [`IdentityError::InvalidSpiffeId`] if the SPIFFE path doesn't
-/// match the platform shape.
-///
-/// Duplicated structure from
-/// `axess_core::authn::jwt::svid::decompose_platform_spiffe`. Kept
-/// private here to avoid coupling the mTLS path to the
-/// `oauth`/`jwt-svid` feature gate. The two helpers should stay in
-/// lock-step on shape changes.
-fn decompose_platform_spiffe(
-    id: &WorkloadId,
-) -> Result<(TrustDomain, String, String), IdentityError> {
-    let raw = id.as_str();
-    let after = raw
-        .strip_prefix("spiffe://")
-        .ok_or_else(|| IdentityError::InvalidSpiffeId(format!("missing scheme: {raw}")))?;
-    let (td_str, rest) = after.split_once('/').ok_or_else(|| {
-        IdentityError::InvalidSpiffeId(format!(
-            "SPIFFE path missing service/tenant components: {raw}"
-        ))
-    })?;
-    let mut parts = rest.split('/');
-    let service = parts.next().filter(|s| !s.is_empty()).ok_or_else(|| {
-        IdentityError::InvalidSpiffeId(format!("SPIFFE path missing service component: {raw}"))
-    })?;
-    let tenant_slug = parts.next().filter(|s| !s.is_empty()).ok_or_else(|| {
-        IdentityError::InvalidSpiffeId(format!("SPIFFE path missing tenant component: {raw}"))
-    })?;
-    if parts.next().is_some() {
-        return Err(IdentityError::InvalidSpiffeId(format!(
-            "SPIFFE path has unexpected extra components beyond service/tenant: {raw}"
-        )));
-    }
-    let td = TrustDomain::new(td_str)?;
-    Ok((td, service.to_string(), tenant_slug.to_string()))
 }
 
 #[cfg(test)]

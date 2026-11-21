@@ -18,10 +18,11 @@ concurrency:
   group: docs
   cancel-in-progress: false
 
+# The build reads the repository and nothing else. The deploy job alone may
+# ask for the OIDC token Pages takes and write to Pages, so the job that
+# runs the book's tools holds a token that can only read.
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 jobs:
   build:
@@ -32,6 +33,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # libclang and the system SQLite header: every feature on switches
+      # `sqlite-unbundled` on, whose bindings bindgen generates.
+      - uses: ./.github/actions/build-prerequisites
 
       # Pinned in the script, which the CI "Book" job also runs, so the book
       # a pull request was checked with is the book published here.
@@ -48,16 +52,11 @@ jobs:
       # this the marking means nothing: the getting-started example sat at
       # `rust,no_run` for releases while calling an async method without
       # `.await` and importing `AuthnService` from the wrong module, because
-      # nothing ever tried to build it.
-      - name: Build the crates the book's examples import
-        run: cargo build -p axess --all-features -p axess-example-minimal
+      # nothing ever tried to build it. The script builds the crates the
+      # examples import and puts the directories cargo names for them on
+      # mdbook's search path, as the CI "Book" job does.
       - name: Test book code
-        run: mdbook test docs -L target/debug/deps
-
-      - name: Configure Pages
-        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
-        with:
-          enablement: true
+        run: ./scripts/book-test.sh
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
@@ -69,10 +68,18 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     if: github.event.repository.visibility == 'public'
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      - name: Configure Pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+        with:
+          enablement: true
+
       - name: Deploy
         id: deployment
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

@@ -1,6 +1,7 @@
 //! What a caller accepts when it reloads the FIDO2 provider.
 
-/// Options for [`AuthnService::reload_fido2_with`](crate::authn::service::AuthnService::reload_fido2_with).
+/// Options for
+/// [`RequestAuthnService::reload_fido2_with_as`](crate::authn::service::RequestAuthnService::reload_fido2_with_as).
 ///
 /// The default accepts nothing beyond a like-for-like swap: a candidate with
 /// another relying-party id is refused, because a passkey is bound to its

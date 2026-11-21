@@ -6,7 +6,6 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 documentation = "https://docs.rs/axess-factors"
 readme = "README.md"
 resolver = "3"
@@ -18,17 +17,25 @@ categories = ["authentication", "cryptography"]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
+[lints]
+workspace = true
+
 [dependencies]
 # Workspace internal
-axess-clock = { workspace = true, optional = true }
-axess-identity = { workspace = true, optional = true }
+# `serde`: the stored factors write their timestamps through its serde.
+axess-clock = { workspace = true, features = ["serde"], optional = true }
+# Always: `log_text` re-exports its one predicate for text bound for a log
+# line, and that module is always compiled.
+axess-identity = { workspace = true }
 axess-rng = { workspace = true, optional = true }
 
 # External
 axum = { workspace = true, default-features = false, features = ["original-uri", "form", "json", "query"], optional = true }
 base32 = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
-chrono = { workspace = true, features = ["serde"], optional = true }
+# Only for `oauth`: openidconnect takes and hands chrono values, which are
+# converted where they cross. No public item of this crate names chrono.
+chrono = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 # No backend chosen here: `jsonwebtoken` 11 takes its crypto from a cargo
 # feature, and pinning one makes that choice for every adopter. An adopter
@@ -36,21 +43,24 @@ hmac = { workspace = true, optional = true }
 # `jsonwebtoken` then cannot determine a provider at all, and panics on the
 # first verification. So the choice is theirs, through `jwt-aws-lc` or
 # `jwt-rust-crypto` below, and `jwt` without either does not compile.
+# Held at 11: jsonwebtoken 12 requires rsa ^0.10, which openidconnect and
+# crypto-glue keep out of the lock (see rsa).
 jsonwebtoken = { version = "11.1.0", default-features = false, optional = true }
 ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-ring"], optional = true }
 # `timing-resistant-secret-traits` makes secret types refuse `PartialEq` / `Hash`.
 openidconnect = { version = "4.1.0", default-features = false, features = ["reqwest", "rustls-tls", "timing-resistant-secret-traits"], optional = true }
-# 0.13 to match jsonwebtoken's transitive pin. openidconnect 4.1 and
-# webauthn-rs (through crypto-glue) are on 0.14, so a build with `oauth` or
-# `fido2` carries both. 0.14 additionally needs elliptic-curve 0.14 and drops the `jwk`
-# feature selected here.
-p256 = { version = "0.13.2", features = ["ecdsa", "jwk"], optional = true }
+# The DPoP key (`oauth`). On the 0.14 line, with openidconnect, so it adds
+# no copy to the tree; jsonwebtoken's `rust_crypto` backend still pins 0.13
+# and with it crypto-bigint 0.5 (RUSTSEC-2026-0387, accepted in deny.toml).
+p256 = { version = "0.14.0", features = ["ecdsa"], optional = true }
 # Hashing and verification both go through `argon2` directly, with the explicit
 # `Params` in `password.rs` for new hashes and the parameters read from the
 # stored PHC string for verification, so a release cannot move the work factors.
 argon2 = { version = "0.6.0", default-features = false, features = ["alloc", "password-hash"], optional = true }
 # 0.12 to match axess-core's pin; avoids a duplicate-major in the resolved tree
 # (openidconnect 4.1.0 -> oauth2 5.0.0 transitively pins reqwest = "0.12").
+# Held at 0.12 until oauth2 and openidconnect require reqwest 0.13: a
+# ScreenedClient is handed to openidconnect as its own reqwest client.
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "json"], optional = true }
 rustls-pki-types = { version = "1.15.1", optional = true }
 # `rc` is required by `EmailOtpConfig::email: Arc<str>` (Deserialize for
@@ -64,7 +74,9 @@ subtle = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["rt", "time", "macros", "net"], optional = true }
 tower = { version = "0.5.3", features = ["util"], optional = true }
-tracing = { workspace = true }
+# Optional: the modules that log are behind features, and a build of a
+# feature set with none of them has no use for it.
+tracing = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
 uuid = { workspace = true, features = ["v4"], optional = true }
 # `danger-allow-state-serialisation` is required to store a
@@ -80,25 +92,45 @@ zeroize = { workspace = true }
 # `axess_rng::testing::MockRng` / `axess_identity::testing::*` visible
 # during `cargo test` without forcing production consumers to compile them.
 axess-clock = { workspace = true, features = ["testing", "allow-testing-in-release"] }
-axess-identity = { workspace = true, features = ["testing"] }
+axess-identity = { workspace = true, features = ["testing", "allow-testing-in-release"] }
 axess-rng = { workspace = true, features = ["testing", "allow-testing-in-release"] }
+# The OIDC discovery document fixture, for the egress tests that stand up a
+# wiremock identity provider. A dev-dependency edge only, as the dependency
+# policy requires of this crate.
+axess-testing = { workspace = true }
+# The wipe test builds a response in process, its body in chunks, to watch
+# what each body reader frees: `http` for the response, `http-body` for the
+# chunked body (renamed, beside this crate's `http-body` feature). Both are
+# already in the graph through reqwest.
+http = "1.5.0"
+http-body-one = { package = "http-body", version = "1.1.0" }
+# The compile-fail cases under tests/ui hold `ReplayedJti` to its two
+# errors by recorded text.
+trybuild = "1.0.122"
 # rcgen mints SPIFFE-shape X509-SVID certs for mTLS resolver tests.
 rcgen = "0.14.10"
+# Held at 0.9 until openidconnect accepts rsa 0.10 and crypto-glue (through
+# webauthn-rs) moves from its rsa 0.10 release candidate to rsa 0.10.0.
 rsa = { version = "0.9.10", features = ["pkcs5"] }
 # The tests build a `Webauthn` for UV-discouraged security keys, which
 # `webauthn-rs` offers only behind this feature; adopters who want that
 # ceremony enable it in their own build. The library does not use it.
 webauthn-rs = { version = "0.6.2", features = ["danger-allow-state-serialisation", "conditional-ui", "danger-user-presence-only-security-keys"] }
 # The breached-password screening is async; its unit tests need a runtime.
-tokio = { workspace = true, features = ["rt", "macros"] }
+# `net` and `io-util` serve the TLS endpoint of the private-root test.
+tokio = { workspace = true, features = ["rt", "macros", "net", "io-util"] }
+# Terminates TLS for the test that a client trusts a private root it was
+# given: the same rustls the HTTP client links, on the ring provider.
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring"] }
 wiremock = "0.6.5"
 
 [features]
 default = ["password", "totp", "hotp", "email_otp", "recovery_code"]
 
-# Test doubles for the production surfaces (`oauth::MockOAuthProvider`).
+# Test doubles for the production surfaces (`oauth::MockOAuthProvider`, the
+# software key of `key_proof::testing`, which draws from an injected RNG).
 # Off by default so a production build does not compile or export them.
-testing = []
+testing = ["dep:axess-rng"]
 # The named opt-out for the release-build guard: with `testing` on and
 # debug assertions off the crate refuses to compile, because the feature
 # ships test doubles in a production binary. Enable this only for a build
@@ -106,24 +138,24 @@ testing = []
 allow-testing-in-release = []
 
 # Symmetric credential factors
-email_otp = ["dep:chrono"]
-hotp = ["dep:hmac", "dep:sha1", "dep:sha2", "dep:base32", "dep:subtle", "dep:chrono"]
+email_otp = ["dep:axess-clock"]
+hotp = ["dep:hmac", "dep:sha1", "dep:sha2", "dep:base32", "dep:subtle", "dep:axess-clock"]
 # `sha1` for the range protocol's split of a password's digest
 # (`password::breached::range_prefix`), not for any hashing of our own.
-password = ["dep:argon2", "dep:axess-rng", "dep:sha1"]
+password = ["dep:argon2", "dep:axess-rng", "dep:sha1", "dep:tracing"]
 # One-time fallback codes for a second factor: keyed-MAC or Argon2id stored
 # forms (the latter via `password`), generated through the injectable
 # `SecureRng`.
-recovery_code = ["password", "dep:axess-rng", "dep:chrono", "dep:hmac", "dep:sha2", "dep:subtle"]
+recovery_code = ["password", "dep:axess-rng", "dep:axess-clock", "dep:hmac", "dep:sha2", "dep:subtle"]
 # `totp` lists the HOTP computation's crates explicitly even though they
 # overlap with `hotp`; without that, totp-only builds fail to compile until
 # `hotp` is also enabled.
-totp = ["dep:axess-rng", "dep:subtle", "dep:base32", "dep:chrono", "dep:hmac", "dep:sha1", "dep:sha2"]
+totp = ["dep:axess-rng", "dep:subtle", "dep:base32", "dep:axess-clock", "dep:hmac", "dep:sha1", "dep:sha2", "dep:tracing"]
 
 # Asymmetric / transport-bound factors
-fido2 = ["dep:webauthn-rs", "dep:url", "dep:chrono", "dep:axess-identity", "dep:uuid"]
+fido2 = ["dep:webauthn-rs", "dep:url", "dep:axess-clock", "dep:uuid", "dep:tracing"]
 ldap = ["dep:ldap3", "dep:subtle", "dep:tokio", "dep:thiserror"]
-mtls = ["dep:axess-identity", "dep:rustls-pki-types", "dep:x509-parser", "dep:thiserror"]
+mtls = ["dep:rustls-pki-types", "dep:x509-parser", "dep:thiserror", "dep:tracing"]
 
 # JWT / OIDC primitives (consumed by federation adapters, bearer, oauth)
 #
@@ -138,7 +170,9 @@ mtls = ["dep:axess-identity", "dep:rustls-pki-types", "dep:x509-parser", "dep:th
 # `--all-features` is a normal CI shape and feature unification can enable the
 # second one behind an adopter's back, so `jwt::ensure_crypto_provider` settles
 # it at run time instead of the build failing on a packaging fact.
-jwt = ["dep:jsonwebtoken", "dep:axess-clock", "dep:base64", "dep:axess-identity", "dep:tokio", "dep:thiserror"]
+# No `tokio`: the verifier runs on no runtime of its own. The features whose
+# code does (`egress`, `ldap`, `oidc`, `outbound-oauth`, `social`) name it.
+jwt = ["dep:jsonwebtoken", "dep:axess-clock", "dep:base64", "dep:thiserror", "dep:tracing"]
 jwt-aws-lc = ["jwt", "jsonwebtoken?/aws_lc_rs"]
 jwt-rust-crypto = ["jwt", "jsonwebtoken?/rust_crypto"]
 # `jwt` for the backend guard, not only for the primitives: `oidc` verifies
@@ -146,16 +180,41 @@ jwt-rust-crypto = ["jwt", "jsonwebtoken?/rust_crypto"]
 # backend features and the `compile_error!` that demands one are both out of
 # scope. It resolved to `jsonwebtoken []`, no crypto at all, and panicked
 # on the first verification, which is the bug the backend features exist for.
-oidc = ["http-body", "jwt", "dep:jsonwebtoken", "dep:openidconnect", "dep:tokio", "dep:thiserror", "dep:base64", "dep:url"]
+oidc = ["egress", "http-body", "jwt", "dep:jsonwebtoken", "dep:openidconnect", "dep:tokio", "dep:thiserror", "dep:base64", "dep:url"]
+
+# Device-key proofs (`axess_factors::key_proof`): a signature by a key the
+# client holds over a server challenge, verified through `jsonwebtoken` like
+# every other JWS here, so it needs a backend beside it as `jwt` does. `p256`
+# checks that a key a proof carries is a point of the curve, and is what the
+# software key of the `testing` feature signs with.
+key-proof = ["jwt", "dep:p256", "dep:sha2", "dep:subtle"]
 
 # Bounded reads of remote HTTP response bodies (`axess_factors::http_body`).
 http-body = ["dep:reqwest"]
+
+# Where the server may connect for a URL it was handed
+# (`axess_factors::egress`): the screen every outbound client of this crate
+# builds its HTTP client through.
+egress = ["dep:reqwest", "dep:url", "dep:tokio", "dep:thiserror"]
 
 # OAuth ceremony surface. Both halves of DPoP (the client's proofs and the
 # resource server's `verify_dpop_proof`) and the FAPI 2.0 client profile sit
 # under `oauth`; `fapi` is kept as an alias for it.
 fapi = ["oauth"]
-oauth = ["oidc", "jwt", "dep:url", "dep:uuid", "dep:axum", "dep:axess-identity", "dep:axess-rng", "dep:subtle", "dep:chrono", "dep:p256", "dep:sha2"]
+oauth = ["oidc", "jwt", "dep:url", "dep:uuid", "dep:axess-rng", "dep:subtle", "dep:chrono", "dep:p256", "dep:sha2"]
+
+# Signs `private_key_jwt` client assertions (`oauth`, `outbound-oauth`) with
+# an RSA key (RS256 to RS512, PS256 to PS512) on the `jwt-rust-crypto`
+# backend, where the signature runs in rsa 0.9, the code RUSTSEC-2023-0071
+# describes (RSA private-key operations that leak timing; fixed in rsa
+# 0.10.0, which jsonwebtoken does not accept yet). Without it such a signer
+# is refused when it is built, by name, before its key is read. On
+# `jwt-aws-lc` an RSA key signs in aws-lc-rs and needs nothing, where the
+# jsonwebtoken provider in place is the aws-lc one axess installed; a
+# provider installed before axess's is refused as well. It adds no
+# dependency: the choice is the whole of it. Prefer an ES256, ES384 or
+# EdDSA client key, or `jwt-aws-lc`.
+client-assertion-rsa = []
 
 # Bearer + outbound + federation adapters (all sit on `jwt`)
 bearer = ["jwt", "dep:axum", "dep:tower", "dep:thiserror"]
@@ -165,7 +224,7 @@ bearer = ["jwt", "dep:axum", "dep:tower", "dep:thiserror"]
 # OIDC (no signed identity assertion; identity comes from a
 # TLS-trusted userinfo HTTPS GET). See `src/social.rs` module docs
 # for the full delta and when to reach for this vs OIDC.
-social = ["http-body", "dep:reqwest", "dep:sha2", "dep:base64", "dep:thiserror", "dep:axess-rng", "dep:tokio", "dep:url", "dep:subtle"]
+social = ["egress", "http-body", "dep:reqwest", "dep:sha2", "dep:base64", "dep:thiserror", "dep:axess-rng", "dep:tokio", "dep:url", "dep:subtle"]
 # SPIFFE JWT-SVID: kept separate because it implements the SPIFFE
 # *spec* (mandatory `spiffe://` URI in `sub`, trust-domain extracted
 # from the URI), not just a claim shape. The generic `WorkloadResolver`
@@ -174,7 +233,7 @@ social = ["http-body", "dep:reqwest", "dep:sha2", "dep:base64", "dep:thiserror",
 # an adopter-supplied claim parser plus mapping closure; see the
 # `axess-example-workload-identity` crate for ready-made recipes.
 jwt-svid = ["jwt", "axess-identity/serde"]
-outbound-oauth = ["http-body", "jwt", "dep:reqwest", "dep:tokio", "dep:url", "dep:uuid", "dep:axess-clock", "dep:axess-rng", "dep:chrono", "dep:base64", "dep:thiserror"]
+outbound-oauth = ["egress", "http-body", "jwt", "dep:reqwest", "dep:tokio", "dep:url", "dep:uuid", "dep:axess-clock", "dep:axess-rng", "dep:base64", "dep:thiserror"]
 
 # Umbrella over the full federation surface
 federation = ["jwt", "jwt-svid", "oauth", "bearer", "outbound-oauth"]

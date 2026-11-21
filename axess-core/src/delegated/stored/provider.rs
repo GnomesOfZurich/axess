@@ -33,7 +33,9 @@ pub struct DelegatedProvider {
     pub client_secret: ZeroizedString,
     /// The `redirect_uri` axess registered with the provider. Must
     /// match the URL the user's browser arrives at after the
-    /// IdP-side consent screen.
+    /// IdP-side consent screen. HTTPS, or HTTP to a loopback host for
+    /// local development: `begin_grant` and `complete_grant` refuse any
+    /// other, since the IdP sends the code and the `state` to it.
     pub redirect_uri: Url,
     /// Default scopes requested at `begin_grant` time when the caller
     /// doesn't override them.

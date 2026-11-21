@@ -10,7 +10,7 @@ use crate::{
         factor::FactorKind,
         ids::{DeviceId, TenantId, UserId},
     },
-    session::id::SessionId,
+    session::id::SessionKey,
 };
 use serde::{Deserialize, Serialize};
 use std::{fmt, net::IpAddr, str::FromStr};
@@ -76,8 +76,8 @@ pub struct AuditContext {
     /// The request id ties an event to one service's logs; this ties it to
     /// the trace that crosses them, which is the thread an incident
     /// responder actually pulls. Filled from
-    /// [`TraceContext`](crate::middleware::trace_id::TraceContext) under
-    /// the `trace-id` feature, and `None` without it: the id lives inside
+    /// [`TraceContext`](crate::middleware::trace_context::TraceContext) under
+    /// the `trace-context` feature, and `None` without it: the id lives inside
     /// a `traceparent` header that has to be parsed, and guessing at it
     /// would put a malformed value in a column meant for joining.
     pub trace_id: Option<String>,
@@ -86,8 +86,15 @@ pub struct AuditContext {
     /// Requires an external geo-IP lookup; left as `None` when no resolver
     /// is configured.
     pub geo_country: Option<String>,
-    /// Session ID for session-scoped audit trail.
-    pub session_id: Option<String>,
+    /// The session the request ran under, by its key, for a session-scoped
+    /// audit trail: the name the session table, the registry and the logs
+    /// give the session, never the value its cookie carries.
+    ///
+    /// A context serialised by an earlier release holds the session id
+    /// here; it reads as the key of that id
+    /// ([`SessionKey::from_recorded`]).
+    #[serde(default, deserialize_with = "SessionKey::deserialize_recorded_option")]
+    pub session_id: Option<SessionKey>,
     /// The administrator impersonating the session's user, when the request
     /// carries an impersonated session
     /// ([`AuthSession::impersonator`](crate::session::extractor::AuthSession::impersonator)).
@@ -111,14 +118,13 @@ where
     /// [`client_ip::layer`](crate::client_ip::layer) resolved,
     /// read from the extensions. No header is consulted for it, and there
     /// is no argument through which a different one could be supplied:
-    /// four free functions used to build this value, two of them took the
-    /// address straight out of `X-Real-IP`, and a consumer migrated seven
-    /// call sites onto one of those because its own documentation
-    /// recommended it.
+    /// a constructor that read the address out of a header such as
+    /// `X-Real-IP` would put what a client sent into the audit row, and a
+    /// consumer would reach for it.
     ///
     /// Everything is optional and nothing here fails. A route mounted
     /// outside the layer yields no address, a request with no session
-    /// yields no session id, and a null column is an honest record of
+    /// yields no session, and a null column is an honest record of
     /// what the request actually carried.
     ///
     /// `geo_country` stays `None`: it needs a lookup axess does not
@@ -156,12 +162,12 @@ where
         #[cfg(not(feature = "request-id"))]
         let request_id = None;
 
-        #[cfg(feature = "trace-id")]
+        #[cfg(feature = "trace-context")]
         let trace_id = parts
             .extensions
-            .get::<crate::middleware::trace_id::TraceContext>()
+            .get::<crate::middleware::trace_context::TraceContext>()
             .map(|ctx| ctx.trace_id.clone());
-        #[cfg(not(feature = "trace-id"))]
+        #[cfg(not(feature = "trace-context"))]
         let trace_id = None;
 
         // A request without a session is ordinary on a login route, which
@@ -172,7 +178,7 @@ where
         let (session_id, impersonator) =
             match crate::session::extractor::AuthSession::from_request_parts(parts, state).await {
                 Ok(session) => (
-                    Some(session.peek_session_id().await.to_string()),
+                    Some(session.peek_session_key().await),
                     session.impersonator().await,
                 ),
                 Err(_) => (None, None),
@@ -198,11 +204,19 @@ where
 /// The enum is shared vocabulary, not a list of what axess emits. Axess
 /// emits from its service layer, which is the part holding an
 /// [`IdentityAuthnLog`](super::store::IdentityAuthnLog) to write through.
-/// Six names are for glue the adopter implements and axess is not on the
-/// call path for: `MethodEnabled`, `MethodDisabled`, `SessionExpired`,
-/// `DeviceTrustGranted`, `DevicePurged` and `DeviceFingerprintMismatch`. They are declared here so every deployment
-/// spells them the same way and a shared SIEM rule matches across adopters;
-/// each is marked below. See `docs/production/audit-events.md`.
+/// Three names are for glue the adopter implements and axess is not on the
+/// call path for: `DeviceRevoked`, `DevicePurged` and
+/// `DeviceFingerprintMismatch`. Four more axess emits on some paths and
+/// leaves to the adopter on others: `MethodEnabled` and `MethodDisabled`
+/// (axess writes them for the audited provider changes), `SessionExpired`
+/// (axess writes it for the session layer's age caps) and
+/// `DeviceTrustGranted` (`DeviceLifecycleService::grant_trust` writes it,
+/// naming the user the device is trusted for, who claims a device that had
+/// no owner; a level set through the store directly is the adopter's to
+/// record).
+/// They are declared here so every deployment spells them the same way and
+/// a shared SIEM rule matches across adopters; each is marked below. See
+/// `docs/production/audit-events.md`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[cfg_attr(
     feature = "rkyv",
@@ -223,25 +237,36 @@ pub enum AuthEventType {
     FactorEnabled,
     /// Disabling an authentication factor.
     FactorDisabled,
-    /// Enabling an authentication method. **Adopter-emitted:** axess has
-    /// no method enable/disable operation.
+    /// Enabling an authentication method. Emitted by the audited provider
+    /// changes of the request-scoped authentication service (a reload that
+    /// added or replaced a provider); any other method change is
+    /// **adopter-emitted**.
     MethodEnabled,
-    /// Disabling an authentication method. **Adopter-emitted**, as
+    /// Disabling an authentication method. Emitted by the audited provider
+    /// removals, and otherwise **adopter-emitted**, as
     /// [`MethodEnabled`](Self::MethodEnabled).
     MethodDisabled,
     /// A password reset was requested (token issued).
     PasswordResetRequested,
     /// A password reset was completed (new password set).
     PasswordReset,
-    /// Session expired due to inactivity or policy. **Adopter-emitted:**
-    /// expiry is decided by the session store, and `Refresh::run` takes no
-    /// audit sink.
+    /// Session expired due to inactivity or policy. Emitted, with the
+    /// status [`Expired`](AuthEventStatus::Expired), for a session the
+    /// session layer ends because it outlived an absolute age cap, by the
+    /// layer's audit sink
+    /// ([`AuthnService::session_end_audit`](crate::authn::service::AuthnService::session_end_audit)).
+    /// A session that idles out is **adopter-emitted:** its row's TTL
+    /// removes it in the session store with no request on the call path,
+    /// and `Refresh::run` takes no audit sink.
     SessionExpired,
     /// Session was explicitly invalidated (e.g., admin logout). Emitted by
-    /// the `invalidate_session_as` and `invalidate_user_sessions_as` methods
-    /// of the request-scoped authentication service, with the acting
-    /// administrator as the actor. The plain `invalidate_*` methods write no
-    /// row, and a session ended by other means is the adopter's to record.
+    /// the `invalidate_session`, `invalidate_user_sessions` and
+    /// `invalidate_other_sessions` methods of the request-scoped
+    /// authentication service, which name the acting administrator (none
+    /// for the system), by the back-channel logout handler's audit hook, and
+    /// by the session layer's audit sink for a session the registry no
+    /// longer holds or one it ends while its id rotates. A session ended by
+    /// other means is the adopter's to record.
     SessionInvalidated,
     /// A new user account was created (signup started).
     SignupStarted,
@@ -266,25 +291,43 @@ pub enum AuthEventType {
     DeviceFirstSeen,
     /// A `Device` transitioned from `Seen` → `Trusted` via a
     /// trust ceremony, user opt-in, or admin-driven assignment.
-    /// **Adopter-emitted:** the ceremony is yours.
+    /// Written by `DeviceLifecycleService::grant_trust`; a deployment that
+    /// sets the level through the store writes the row itself.
     DeviceTrustGranted,
     /// A `Device` transitioned to `Revoked`. `error` carries
     /// the reason (`"user_action"`, `"refresh_family_revoked"`,
-    /// `"admin"`, `"fingerprint_mismatch"`).
+    /// `"admin"`, `"fingerprint_mismatch"`). **Adopter-emitted:**
+    /// `revoke_device` and the refresh-family cascade take no audit sink.
     DeviceRevoked,
     /// A `Device` row was hard-deleted (retention sweep or
     /// Art 17 erasure). `device_id` is a tombstone; the row is gone.
     /// **Adopter-emitted:** the retention sweep is yours.
     DevicePurged,
-    /// A new `DeviceBinding` (`Cookie` / `WebAuthn`) was
-    /// attached to a `Device`. `error` carries the binding kind.
+    /// A new `DeviceBinding` was attached to a `Device`. Emitted by the
+    /// device lifecycle when it adds a `WebAuthn` binding.
     DeviceBindingAdded,
     /// A request carried a valid `device_id` cookie but the
     /// recomputed `FingerprintHash` did not match. Always
     /// `Suspicious`: canonical cookie-replay signal. **Adopter-emitted:**
     /// it comes from your [`DeviceResolver`](crate::device::DeviceResolver),
-    /// which is also why `AuthEventStatus::Suspicious` is never set by axess.
+    /// and axess never writes it.
     DeviceFingerprintMismatch,
+    /// A device key was registered on a `Device` (`Success`), or a
+    /// registration was refused (`Failure`, `error` carries the reason).
+    DeviceKeyRegistered,
+    /// A proof that says something about who sent it was refused. Always
+    /// `Suspicious`: the caller holds what was copied from the device and
+    /// not the key. Written when a proof answered the device's current
+    /// challenge with a signature that is not its key's; when a keyed
+    /// device's refresh token came with no proof, with one that is not a
+    /// proof, or with one that is not the key's; when a request proof by
+    /// the key came a second time; and when a request that held a session
+    /// bound to the device carried a request proof by another key. A
+    /// device that has no key writes none, whatever came with its token.
+    DeviceKeyProofRefused,
+    /// A session became bound to a device key: at a key registration, or at
+    /// a factor verification on a request that proved the key.
+    SessionKeyBound,
 }
 
 impl AuthEventType {
@@ -317,6 +360,9 @@ impl AuthEventType {
             AuthEventType::DevicePurged => "device_purged",
             AuthEventType::DeviceBindingAdded => "device_binding_added",
             AuthEventType::DeviceFingerprintMismatch => "device_fingerprint_mismatch",
+            AuthEventType::DeviceKeyRegistered => "device_key_registered",
+            AuthEventType::DeviceKeyProofRefused => "device_key_proof_refused",
+            AuthEventType::SessionKeyBound => "session_key_bound",
         }
     }
 }
@@ -352,6 +398,9 @@ impl FromStr for AuthEventType {
             "device_purged" => Ok(AuthEventType::DevicePurged),
             "device_binding_added" => Ok(AuthEventType::DeviceBindingAdded),
             "device_fingerprint_mismatch" => Ok(AuthEventType::DeviceFingerprintMismatch),
+            "device_key_registered" => Ok(AuthEventType::DeviceKeyRegistered),
+            "device_key_proof_refused" => Ok(AuthEventType::DeviceKeyProofRefused),
+            "session_key_bound" => Ok(AuthEventType::SessionKeyBound),
             other => Err(format!("Unknown auth event type: {}", other)),
         }
     }
@@ -378,9 +427,11 @@ pub enum AuthEventStatus {
     Failure,
     /// Blocked due to lockout.
     Locked,
-    /// Failed due to expiry. **Adopter-set:** the paths where it applies,
-    /// such as `Refresh::run`, take no audit sink, so axess never writes
-    /// this.
+    /// Failed due to expiry. Set by axess on the
+    /// [`SessionExpired`](AuthEventType::SessionExpired) row of a session
+    /// the session layer ended at an age cap; otherwise **adopter-set:**
+    /// the other paths where it applies, such as `Refresh::run`, take no
+    /// audit sink.
     Expired,
     /// Flagged as suspicious (e.g., anomaly detected). **Adopter-set:** its
     /// canonical producer is
@@ -449,19 +500,24 @@ pub struct AuthEvent {
     /// `None` when the tenant could not be identified at event time.
     /// Same storage guidance as `user_id`.
     pub tenant_id: Option<TenantId>,
-    /// Optional session ID for session-related events.
-    pub session_id: Option<SessionId>,
+    /// The session of a session-related event, by its key: the 64
+    /// hexadecimal characters the session table, the registry and the logs
+    /// name the session by. It is not a credential: no cookie carries it.
+    /// An rkyv archive holds its 32 bytes.
+    ///
+    /// An event an earlier release stored holds the session id here; it
+    /// reads as the key of that id ([`SessionKey::from_recorded`]), so two
+    /// rows of one session carry one value whichever release wrote them.
+    pub session_id: Option<SessionKey>,
     /// What happened.
     pub event_type: AuthEventType,
     /// Outcome of the event.
     pub event_status: AuthEventStatus,
     /// Timestamp when the event occurred, as `i64` epoch microseconds.
     ///
-    /// Stored as `i64` rather than `chrono::DateTime<Utc>` so the event
-    /// is rkyv-archivable end-to-end (chrono 0.4 still pins rkyv 0.7
-    /// in its `rkyv-*` features, incompatible with the workspace's
-    /// rkyv 0.8). Reconstruct as needed via
-    /// `DateTime::<Utc>::from_timestamp_micros(event_time)`.
+    /// Stored as `i64` rather than `Timestamp` so the event
+    /// is rkyv-archivable end-to-end. Reconstruct as needed via
+    /// `Timestamp::from_unix_micros(event_time)`.
     pub event_time: i64,
     /// Optional kind of factor involved.
     pub factor_kind: Option<FactorKind>,
@@ -540,14 +596,16 @@ pub struct AuthEvent {
     pub factors_completed: Vec<(FactorKind, i64)>,
 }
 
-/// The stored shape of an [`AuthEvent`] as it is read: the current fields, and
-/// `factors_completed` also as the earlier plain list of kinds, which the
-/// conversion stamps with the event's own time.
+/// The stored shape of an [`AuthEvent`] as it is read: the current fields,
+/// `session_id` also as the session id an earlier release wrote there, read
+/// as the key of that id, and `factors_completed` also as the earlier plain
+/// list of kinds, which the conversion stamps with the event's own time.
 #[derive(Deserialize)]
 struct AuthEventWire {
     user_id: Option<UserId>,
     tenant_id: Option<TenantId>,
-    session_id: Option<SessionId>,
+    #[serde(default, deserialize_with = "SessionKey::deserialize_recorded_option")]
+    session_id: Option<SessionKey>,
     event_type: AuthEventType,
     event_status: AuthEventStatus,
     event_time: i64,

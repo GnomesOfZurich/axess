@@ -1,6 +1,6 @@
 //! In-memory [`Store`] backend for tests, single-process dev, and
 //! prototyping. Implements [`Store<K, V>`] over a `RwLock<HashMap>` with
-//! `chrono::DateTime<Utc>` deadlines driven by an injectable
+//! deadlines held as an `Until`, driven by an injectable
 //! [`axess_clock::Clock`] (so DST tests can advance time via
 //! `MockClock` without `tokio::time::sleep`).
 //!
@@ -10,8 +10,7 @@
 
 use crate::locked::{read, write};
 use crate::store::Store;
-use axess_clock::{Clock, SystemClock};
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use axess_clock::{Clock, SystemClock, Timestamp, Until};
 use std::collections::{HashMap, hash_map::Entry as MapEntry};
 use std::convert::Infallible;
 use std::future::Future;
@@ -48,7 +47,7 @@ where
 #[derive(Debug, Clone)]
 struct Entry<V> {
     value: V,
-    expires_at: DateTime<Utc>,
+    expires_at: Until,
 }
 
 impl<K, V> std::fmt::Debug for MemoryStore<K, V>
@@ -126,7 +125,7 @@ where
         let now = self.clock.now();
         read(&self.inner)
             .iter()
-            .filter(|(_, e)| e.expires_at > now)
+            .filter(|(_, e)| e.expires_at > Until::At(now))
             .map(|(k, e)| (k.clone(), e.value.clone()))
             .collect()
     }
@@ -140,7 +139,7 @@ where
     {
         let now = self.clock.now();
         match write(&self.inner).get_mut(key) {
-            Some(entry) if entry.expires_at > now => {
+            Some(entry) if entry.expires_at > Until::At(now) => {
                 f(&mut entry.value);
                 true
             }
@@ -154,7 +153,7 @@ where
     pub fn replace_live(&self, key: &K, value: &V, ttl: Duration) -> bool {
         let now = self.clock.now();
         match write(&self.inner).get_mut(key) {
-            Some(entry) if entry.expires_at > now => {
+            Some(entry) if entry.expires_at > Until::At(now) => {
                 entry.value = value.clone();
                 entry.expires_at = self.deadline(now, ttl);
                 true
@@ -176,7 +175,7 @@ where
     ) -> Option<bool> {
         let now = self.clock.now();
         match write(&self.inner).get_mut(key) {
-            Some(entry) if entry.expires_at > now => {
+            Some(entry) if entry.expires_at > Until::At(now) => {
                 if !matches(&entry.value) {
                     return Some(false);
                 }
@@ -194,7 +193,7 @@ where
     pub fn remove_live_if(&self, key: &K, matches: impl FnOnce(&V) -> bool) -> Option<bool> {
         let now = self.clock.now();
         match write(&self.inner).entry(key.clone()) {
-            MapEntry::Occupied(entry) if entry.get().expires_at > now => {
+            MapEntry::Occupied(entry) if entry.get().expires_at > Until::At(now) => {
                 if !matches(&entry.get().value) {
                     return Some(false);
                 }
@@ -211,16 +210,13 @@ where
         let now = self.clock.now();
         write(&self.inner)
             .remove(key)
-            .is_some_and(|entry| entry.expires_at > now)
+            .is_some_and(|entry| entry.expires_at > Until::At(now))
     }
 
-    /// The expiry instant for a TTL starting at `now`, saturating at the
-    /// far future for a TTL too large to represent.
-    fn deadline(&self, now: DateTime<Utc>, ttl: Duration) -> DateTime<Utc> {
-        ChronoDuration::from_std(ttl)
-            .ok()
-            .and_then(|d| now.checked_add_signed(d))
-            .unwrap_or(DateTime::<Utc>::MAX_UTC)
+    /// The end of a TTL starting at `now`: never, for a TTL that runs past
+    /// the range of a reading.
+    fn deadline(&self, now: Timestamp, ttl: Duration) -> Until {
+        Until::after(now, ttl)
     }
 
     /// Synchronous prune for callers that want to reclaim expired
@@ -232,7 +228,7 @@ where
         // underflows when other threads insert between them.
         let mut removed = 0u64;
         write(&self.inner).retain(|_, entry| {
-            let keep = entry.expires_at > now;
+            let keep = entry.expires_at > Until::At(now);
             if !keep {
                 removed += 1;
             }
@@ -276,7 +272,7 @@ where
         let now = self.clock.now();
         let result = read(&self.inner)
             .get(key)
-            .filter(|e| e.expires_at > now)
+            .filter(|e| e.expires_at > Until::At(now))
             .map(|e| e.value.clone());
         async move { Ok(result) }
     }
@@ -287,10 +283,8 @@ where
         value: &V,
         ttl: Duration,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        // Saturating: chrono's `Duration::from_std` errors on
-        // overflow-large values (caller passing `Duration::MAX` as
-        // an explicit "never expire" sentinel). Fall back to a far-
-        // future deadline rather than panicking.
+        // A caller passing `Duration::MAX` as an explicit "never expire"
+        // sentinel gets an entry that never ends, not a panic.
         let now = self.clock.now();
         let expires_at = self.deadline(now, ttl);
         write(&self.inner).insert(

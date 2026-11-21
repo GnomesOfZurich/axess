@@ -72,7 +72,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use axess_clock::Timestamp;
+use axess_factors::http_body::log_safe_snippet;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -178,12 +179,7 @@ impl GcpStsClient {
     /// TLS backend failed to initialise). No client with the protections
     /// missing is built in its place.
     pub fn new() -> Result<Self, GcpError> {
-        Self::from_builder(reqwest::Client::builder())
-    }
-
-    /// [`new`](Self::new) on a builder the caller started.
-    fn from_builder(builder: reqwest::ClientBuilder) -> Result<Self, GcpError> {
-        let http = crate::outbound_http::harden(builder)?;
+        let http = crate::outbound_http::hardened_client(|settings| settings)?;
         Ok(Self {
             endpoint: Arc::new(default_sts_endpoint()),
             http,
@@ -200,17 +196,31 @@ impl GcpStsClient {
         self
     }
 
-    /// Override the HTTP client: useful for proxy or outbound mTLS
-    /// configuration. The request timeout applies whichever client is used.
+    /// Add settings to the HTTP client of the request: a `User-Agent`, a
+    /// trusted root certificate, a client certificate for outbound mTLS,
+    /// timeouts.
     ///
-    /// A replacement client drops the default client's protections: it must
-    /// be built with `redirect(reqwest::redirect::Policy::none())` and a
-    /// connect timeout, or a redirect carries the credential-bearing request
-    /// to wherever it points. The endpoint check (HTTPS, or HTTP to a
-    /// loopback host) still applies.
-    pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
-        self.http = http;
-        self
+    /// The client is built again with `configure`'s settings before the
+    /// library's own, so it still follows no redirect: a
+    /// [`ClientSettings`](axess_factors::egress::ClientSettings) offers
+    /// nothing that could change that, and a whole client of the caller's
+    /// own is not taken, since a redirect it followed would carry the
+    /// credentials to wherever it points. A proxy named in the environment
+    /// (`HTTPS_PROXY`) is followed, as before. The endpoint check (HTTPS, or
+    /// HTTP to a loopback host) still applies.
+    ///
+    /// # Errors
+    ///
+    /// [`GcpError::ClientBuild`] when the client cannot be built with the
+    /// settings.
+    pub fn with_client_settings(
+        mut self,
+        configure: impl FnOnce(
+            axess_factors::egress::ClientSettings,
+        ) -> axess_factors::egress::ClientSettings,
+    ) -> Result<Self, GcpError> {
+        self.http = crate::outbound_http::hardened_client(configure)?;
+        Ok(self)
     }
 
     /// Bound each call to `timeout` (default 30 seconds). The bound applies
@@ -263,7 +273,7 @@ impl GcpStsClient {
             let body = axess_factors::http_body::read_error_snippet(&mut response).await;
             return Err(GcpError::Sts {
                 http_status: status.as_u16(),
-                body,
+                body: log_safe_snippet(&body),
             });
         }
 
@@ -273,8 +283,12 @@ impl GcpStsClient {
         )
         .await
         .map_err(|e| GcpError::MalformedResponse(format!("STS body: {e}")))?;
-        let parsed: GcpStsResponseBody = serde_json::from_slice(&body)
-            .map_err(|e| GcpError::MalformedResponse(format!("STS JSON: {e}")))?;
+        let parsed: GcpStsResponseBody = serde_json::from_slice(&body).map_err(|e| {
+            GcpError::MalformedResponse(format!(
+                "STS JSON: {}",
+                axess_factors::http_body::log_safe_parse_error(&e)
+            ))
+        })?;
         if parsed.access_token.is_empty() {
             return Err(GcpError::MalformedResponse(
                 "STS access_token field is empty".to_string(),
@@ -312,7 +326,7 @@ pub struct GcpServiceAccountToken {
     /// The SA access token. Zeroed on drop.
     pub access_token: ZeroizedString,
     /// RFC3339 timestamp when the token expires.
-    pub expire_time: DateTime<Utc>,
+    pub expire_time: Timestamp,
 }
 
 /// Step 2 client: exchanges a federated GCP access token for an
@@ -341,12 +355,7 @@ impl GcpServiceAccountImpersonator {
     /// TLS backend failed to initialise). No client with the protections
     /// missing is built in its place.
     pub fn new() -> Result<Self, GcpError> {
-        Self::from_builder(reqwest::Client::builder())
-    }
-
-    /// [`new`](Self::new) on a builder the caller started.
-    fn from_builder(builder: reqwest::ClientBuilder) -> Result<Self, GcpError> {
-        let http = crate::outbound_http::harden(builder)?;
+        let http = crate::outbound_http::hardened_client(|settings| settings)?;
         Ok(Self {
             endpoint_base: Arc::new(default_iam_credentials_base()),
             http,
@@ -368,17 +377,31 @@ impl GcpServiceAccountImpersonator {
         self
     }
 
-    /// Override the HTTP client: useful for proxy or outbound mTLS
-    /// configuration. The request timeout applies whichever client is used.
+    /// Add settings to the HTTP client of the request: a `User-Agent`, a
+    /// trusted root certificate, a client certificate for outbound mTLS,
+    /// timeouts.
     ///
-    /// A replacement client drops the default client's protections: it must
-    /// be built with `redirect(reqwest::redirect::Policy::none())` and a
-    /// connect timeout, or a redirect carries the credential-bearing request
-    /// to wherever it points. The endpoint check (HTTPS, or HTTP to a
-    /// loopback host) still applies.
-    pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
-        self.http = http;
-        self
+    /// The client is built again with `configure`'s settings before the
+    /// library's own, so it still follows no redirect: a
+    /// [`ClientSettings`](axess_factors::egress::ClientSettings) offers
+    /// nothing that could change that, and a whole client of the caller's
+    /// own is not taken, since a redirect it followed would carry the
+    /// credentials to wherever it points. A proxy named in the environment
+    /// (`HTTPS_PROXY`) is followed, as before. The endpoint check (HTTPS, or
+    /// HTTP to a loopback host) still applies.
+    ///
+    /// # Errors
+    ///
+    /// [`GcpError::ClientBuild`] when the client cannot be built with the
+    /// settings.
+    pub fn with_client_settings(
+        mut self,
+        configure: impl FnOnce(
+            axess_factors::egress::ClientSettings,
+        ) -> axess_factors::egress::ClientSettings,
+    ) -> Result<Self, GcpError> {
+        self.http = crate::outbound_http::hardened_client(configure)?;
+        Ok(self)
     }
 
     /// Bound each call to `timeout` (default 30 seconds). The bound applies
@@ -434,7 +457,7 @@ impl GcpServiceAccountImpersonator {
             let body = axess_factors::http_body::read_error_snippet(&mut response).await;
             return Err(GcpError::IamCredentials {
                 http_status: status.as_u16(),
-                body,
+                body: log_safe_snippet(&body),
             });
         }
 
@@ -444,16 +467,19 @@ impl GcpServiceAccountImpersonator {
         )
         .await
         .map_err(|e| GcpError::MalformedResponse(format!("IAM Credentials body: {e}")))?;
-        let parsed: GenerateAccessTokenResponse = serde_json::from_slice(&body)
-            .map_err(|e| GcpError::MalformedResponse(format!("IAM Credentials JSON: {e}")))?;
+        let parsed: GenerateAccessTokenResponse = serde_json::from_slice(&body).map_err(|e| {
+            GcpError::MalformedResponse(format!(
+                "IAM Credentials JSON: {}",
+                axess_factors::http_body::log_safe_parse_error(&e)
+            ))
+        })?;
         if parsed.access_token.is_empty() {
             return Err(GcpError::MalformedResponse(
                 "IAM Credentials accessToken field is empty".to_string(),
             ));
         }
-        let expire_time = DateTime::parse_from_rfc3339(&parsed.expire_time)
-            .map_err(|e| GcpError::MalformedResponse(format!("expireTime not RFC3339: {e}")))?
-            .with_timezone(&Utc);
+        let expire_time = Timestamp::parse_rfc3339(&parsed.expire_time)
+            .map_err(|e| GcpError::MalformedResponse(format!("expireTime not RFC3339: {e}")))?;
 
         Ok(GcpServiceAccountToken {
             access_token: parsed.access_token,
@@ -494,7 +520,11 @@ pub enum GcpError {
     Sts {
         /// HTTP status on the STS response.
         http_status: u16,
-        /// Raw response body.
+        /// The response body, its first KiB, with every character
+        /// [`escapes`](axess_identity::log_text::escapes) names (control
+        /// characters, the line and paragraph separators, bidirectional
+        /// controls, zero-width characters, the byte order mark, the Hangul
+        /// fillers) escaped, so it cannot forge a log line.
         body: String,
     },
     /// Stage 2 (IAM Credentials impersonation) returned non-2xx.
@@ -502,7 +532,11 @@ pub enum GcpError {
     IamCredentials {
         /// HTTP status on the IAM Credentials response.
         http_status: u16,
-        /// Raw response body.
+        /// The response body, its first KiB, with every character
+        /// [`escapes`](axess_identity::log_text::escapes) names (control
+        /// characters, the line and paragraph separators, bidirectional
+        /// controls, zero-width characters, the byte order mark, the Hangul
+        /// fillers) escaped, so it cannot forge a log line.
         body: String,
     },
     /// 2xx response that did not parse as the expected shape.

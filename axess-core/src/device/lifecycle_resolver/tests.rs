@@ -1,15 +1,15 @@
-//! `tests`: extracted from `lifecycle_resolver.rs` per the
-//! 200-LoC inline-test rule in AGENTS.md.
+//! `tests`: the unit tests of `lifecycle_resolver.rs`, kept beside it per the
+//! 200-line inline-test rule in AGENTS.md.
 
 use super::*;
 use crate::device::fingerprint::DefaultFingerprintExtractor;
 use crate::device::proof::DeviceCookieSlot;
 use crate::device::store::MemoryDeviceStore;
 use crate::device::types::DeviceTrustLevel;
+use axess_clock::Timestamp;
 use axess_clock::testing::MockClock;
 use axum::body::Body;
 use axum::http::Request;
-use chrono::{TimeZone, Utc};
 use std::net::{Ipv4Addr, SocketAddr};
 
 fn fixed_pepper() -> super::super::fingerprint::TenantPepperResolver {
@@ -23,7 +23,7 @@ fn make_resolver()
 -> LifecycleDeviceResolver<DefaultFingerprintExtractor, MemoryDeviceStore, MockClock> {
     let store = MemoryDeviceStore::new();
     let lifecycle = DeviceLifecycleService::new(store);
-    let clock = MockClock::at(Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap());
+    let clock = MockClock::at(Timestamp::from_utc(2026, 1, 1, 0, 0, 0).unwrap());
     let extractor = DefaultFingerprintExtractor::new(fixed_pepper());
     // An authenticated user on every request unless a test says otherwise:
     // devices are created for users.
@@ -61,25 +61,82 @@ fn ip_from_test_extension(parts: &Parts) -> Option<IpAddr> {
     parts.extensions.get::<TestClientIp>().map(|c| c.0.ip())
 }
 
-/// Pin: no tenant in request → resolver returns None (no device
-/// created). Devices are tenant-scoped by design.
+/// Pin: no tenant in the request creates no device, as devices are
+/// tenant-scoped by design. For a request that carries a user that is a
+/// failed resolution, so the session keeps the device it has; for a guest
+/// it is no device.
 #[tokio::test]
-async fn missing_tenant_yields_none() {
-    let resolver = make_resolver();
+async fn a_missing_tenant_creates_no_device() {
     let parts = req_with(Some("Mozilla/5.0"), None, None);
-    let resolved = resolver.resolve(&parts).await.unwrap();
-    assert_eq!(resolved, None);
+    assert!(matches!(
+        make_resolver().resolve(&parts).await,
+        Err(LifecycleResolveError::TenantMissing)
+    ));
+    let for_a_guest = make_resolver().with_user_fn(|_| None);
+    assert_eq!(for_a_guest.resolve(&parts).await.unwrap(), None);
 }
 
-/// Pin: missing User-Agent (extractor returns None) → resolver
-/// returns None without touching the store.
+/// Pin: a request the extractor cannot fingerprint (no User-Agent) is found
+/// by what it presents, and no device is created for it. A request that
+/// carries a user and neither proves a device nor keeps its session's has no
+/// device, and the first one is reported; a guest's has no device whatever
+/// it presents, and is silent.
 #[tokio::test]
-async fn missing_user_agent_yields_none() {
+async fn a_missing_user_agent_creates_no_device() {
     let resolver = make_resolver();
     let tenant = crate::authn::ids::testing::tenant("t1");
     let parts = req_with(None, Some(tenant), None);
-    let resolved = resolver.resolve(&parts).await.unwrap();
-    assert_eq!(resolved, None);
+    assert!(!resolver.reported_missing_fingerprint());
+    assert_eq!(resolver.resolve(&parts).await.unwrap(), None);
+    assert!(
+        issued_cookie(&parts).is_none(),
+        "no cookie without a fingerprint"
+    );
+    assert!(resolver.lifecycle.store().is_empty(), "nothing is written");
+    assert!(
+        resolver.reported_missing_fingerprint(),
+        "the first authenticated request given no device is reported"
+    );
+    // A clone shares the report, so it is made once per resolver.
+    assert!(resolver.clone().reported_missing_fingerprint());
+    assert!(!resolver.reported_missing_tenant());
+
+    // A device a request with a User-Agent created, and its cookie.
+    let with_agent = req_with(Some("Mozilla/5.0"), Some(tenant), None);
+    let id = resolver
+        .resolve(&with_agent)
+        .await
+        .unwrap()
+        .expect("created")
+        .id();
+    let cookie = issued_cookie(&with_agent).expect("a cookie was issued");
+
+    // Without a User-Agent the cookie's token proves the device.
+    let mut presenting = req_with(None, Some(tenant), None);
+    presenting
+        .headers
+        .insert(axum::http::header::COOKIE, cookie_header(&cookie));
+    let found = resolver.resolve(&presenting).await.unwrap();
+    assert!(
+        matches!(found, Some(BoundDevice::Proven(proof)) if proof.id() == id),
+        "the token proves the device: {found:?}"
+    );
+    // Without a token the session's device is kept, unproven.
+    let mut kept = req_with(None, Some(tenant), None);
+    kept.extensions.insert(crate::device::SessionDevice(id));
+    assert_eq!(
+        resolver.resolve(&kept).await.unwrap(),
+        Some(BoundDevice::Unproven(id))
+    );
+    assert_eq!(resolver.lifecycle.store().len(), 1, "no device is created");
+
+    // A guest's request without a User-Agent has no device, its token
+    // notwithstanding, and is not reported.
+    let guest_on_the_store = resolver.clone().with_user_fn(|_| None);
+    assert_eq!(guest_on_the_store.resolve(&presenting).await.unwrap(), None);
+    let for_a_guest = make_resolver().with_user_fn(|_| None);
+    assert_eq!(for_a_guest.resolve(&parts).await.unwrap(), None);
+    assert!(!for_a_guest.reported_missing_fingerprint());
 }
 
 /// Pin: full happy path. UA + tenant + IP + a user → resolver creates a
@@ -320,7 +377,7 @@ async fn default_client_ip_fn_returns_none_so_ip_does_not_change_fingerprint() {
 async fn create_uses_injected_clock_for_timestamps() {
     let store = MemoryDeviceStore::new();
     let lifecycle = DeviceLifecycleService::new(store);
-    let frozen = Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap();
+    let frozen = Timestamp::from_utc(2026, 6, 1, 12, 0, 0).unwrap();
     let clock = MockClock::at(frozen);
     let extractor = DefaultFingerprintExtractor::new(fixed_pepper());
     let resolver = LifecycleDeviceResolver::new(extractor, lifecycle, clock)
@@ -416,3 +473,5 @@ async fn the_default_hook_stays_quiet_when_the_client_ip_layer_ran() {
 }
 
 mod proof_tests;
+mod shared_profile_tests;
+mod tenant_tests;

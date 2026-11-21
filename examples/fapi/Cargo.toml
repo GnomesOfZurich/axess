@@ -1,6 +1,6 @@
 [package]
 name = "axess-example-fapi"
-version = "0.19.0"
+version = "0.20.0"
 edition = "2024"
 rust-version.workspace = true
 publish = false
@@ -10,12 +10,17 @@ authors = ["Gnomes"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/GnomesOfZurich/axess"
 
+[lints]
+workspace = true
+
 [dependencies]
-# Demo built on the mock stores and mock provider of `testing`: it opts out of the release-build guard by name.
-axess = { path = "../../axess", version = "=0.19.0", features = ["oauth", "fapi", "jwt-rust-crypto", "testing", "allow-testing-in-release"] }
+# Demo built on the mock stores and mock provider of `testing`: a debug demo, so a release build of it is refused by the guard.
+axess = { path = "../../axess", version = "=0.20.0", features = ["oauth", "fapi", "jwt-rust-crypto", "testing"] }
 # `Algorithm` names the signing algorithm of the `private_key_jwt` key. No
 # crypto backend here: `axess`'s `jwt-rust-crypto` feature picks the one
 # provider, and a second one makes `jsonwebtoken` refuse to choose.
+# Held at 11: jsonwebtoken 12 requires rsa ^0.10, which openidconnect and
+# crypto-glue keep out of the lock (see rsa).
 jsonwebtoken = { version = "11.1.0", default-features = false }
 axum = { version = "0.8.9", features = ["json", "form"] }
 serde = { version = "1.0.229", features = ["derive"] }

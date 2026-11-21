@@ -6,7 +6,7 @@
 //! exclusively in a separate, deletable mapping table; see the `pii` module.
 
 use crate::authn::ids::{DeviceId, TenantId, UserId};
-use chrono::{DateTime, Utc};
+use axess_clock::Timestamp;
 use serde::{Deserialize, Serialize};
 
 // ── FingerprintHash ───────────────────────────────────────────────────────────
@@ -76,9 +76,11 @@ pub enum DeviceTrustLevel {
     #[default]
     Unknown,
 
-    /// The device has been sighted across multiple sessions and presents a
-    /// stable cookie+fingerprint pair. Suitable for low-risk operations
-    /// only; not a possession factor by itself.
+    /// A user has authenticated on the device at least once
+    /// ([`promote_on_authn`](crate::device::DeviceLifecycleService::promote_on_authn)
+    /// moves `Unknown` to `Seen`), or the retention sweep demoted it from
+    /// `Trusted`. Suitable for low-risk operations only; not a possession
+    /// factor by itself.
     Seen,
 
     /// The device has completed a trust ceremony (typically a WebAuthn
@@ -97,24 +99,29 @@ pub enum DeviceTrustLevel {
 
 /// Evidence linking a [`Device`] row to a concrete authentication artefact.
 ///
-/// A device may carry multiple bindings, typically one `Cookie` issued at
-/// each fresh login, plus one `WebAuthn` per registered passkey on the
-/// physical device.
+/// A device may carry multiple bindings: typically the `Cookie` binding of
+/// the token issued when the device was created, one `WebAuthn` per passkey
+/// registered on the physical device, and one `Refresh` per refresh-token
+/// family the device takes part in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum DeviceBinding {
-    /// HMAC-SHA256 hash of a long-lived device-binding cookie. Not a
-    /// possession factor on its own; provides cookie-jar continuity so that
-    /// the same physical browser maps to the same `Device` row across
-    /// session rotations.
+    /// SHA-256 digest of the device token the browser holds in its
+    /// long-lived device cookie
+    /// ([`DeviceToken::digest`](crate::device::proof::DeviceToken::digest)):
+    /// unkeyed and domain-separated, because the token is 32 random bytes
+    /// and needs no key to resist guessing. Not a possession factor on its
+    /// own; it is what lets a later request prove it comes from the browser
+    /// the `Device` row was issued to, across session rotations.
     Cookie {
-        /// 32-byte HMAC of the cookie value, hex-encoded for transport.
+        /// The 32-byte digest of the token, hex-encoded for transport. The
+        /// field has the type of a fingerprint hash and holds none.
         token_hash: FingerprintHash,
         /// When the cookie was issued (from injected
         /// [`Clock`](axess_clock::Clock)).
-        issued_at: DateTime<Utc>,
+        issued_at: Timestamp,
         /// When the cookie was last presented and validated.
-        last_used_at: DateTime<Utc>,
+        last_used_at: Timestamp,
     },
 
     /// Reference to a FIDO2 credential registered against this device. The
@@ -129,18 +136,18 @@ pub enum DeviceBinding {
         /// PSD2 RTS Art 4 possession-factor bar; basic/attca/anonca do.
         attestation_class: AttestationClass,
         /// When the credential was registered against this device.
-        bound_at: DateTime<Utc>,
+        bound_at: Timestamp,
         /// When the credential was last used to authenticate.
-        last_used_at: DateTime<Utc>,
+        last_used_at: Timestamp,
     },
 
     /// Reference to a refresh-token family this device participates in.
     ///
     /// Recorded when a refresh-token family is created in the context of
     /// a session that already has a `device_id`. Lets
-    /// [`cascade_revoke_by_refresh_family`](super::cascade::cascade_revoke_by_refresh_family)
-    /// find every `Device` to revoke when a refresh-token-family theft is
-    /// detected (rotated-out token reuse).
+    /// [`cascade_revoke_by_refresh_family_and_tokens`](super::cascade::cascade_revoke_by_refresh_family_and_tokens)
+    /// find every `Device` to revoke, with its tokens, when a
+    /// refresh-token-family theft is detected (rotated-out token reuse).
     ///
     /// A device can carry multiple `Refresh` bindings, one per family it
     /// has been associated with, so cycling refresh-token families
@@ -155,10 +162,42 @@ pub enum DeviceBinding {
         family_id: String,
         /// When the binding was first recorded (matches the family's
         /// initial-issue instant).
-        issued_at: DateTime<Utc>,
+        issued_at: Timestamp,
         /// When a token from this family was last successfully used to
         /// refresh a session on this device.
-        last_used_at: DateTime<Utc>,
+        last_used_at: Timestamp,
+    },
+
+    /// The device's key: the public half of a key pair whose private half
+    /// the client can use and cannot read. A device has at most one.
+    ///
+    /// Unlike the cookie token, this is not a bearer value. A device that has
+    /// a key is proven, where device keys are enforced, only by a signature
+    /// of that key over the stored `challenge`, and a session
+    /// bound to the key is served only to a request that carries the
+    /// short-lived cookie such a signature buys. See
+    /// [`device_key`](crate::device_key).
+    ///
+    /// The variant is compiled whatever the features, so a row has one shape
+    /// in every build. A release before the variant existed cannot read a
+    /// row that holds one.
+    Key {
+        /// The key's RFC 7638 thumbprint.
+        thumbprint: crate::device_key::KeyThumbprint,
+        /// The public key.
+        public_key: crate::device_key::P256PublicKey,
+        /// The front-end that registered it.
+        shape: crate::device_key::KeyProofShape,
+        /// When the key was registered (from injected
+        /// [`Clock`](axess_clock::Clock)).
+        bound_at: Timestamp,
+        /// When the key last signed a challenge.
+        proven_at: Timestamp,
+        /// The challenge the next proof must answer. Replaced by the write
+        /// that accepts a proof, which is what makes it single-use.
+        challenge: crate::device_key::KeyChallenge,
+        /// When that challenge was issued.
+        challenge_issued_at: Timestamp,
     },
 }
 
@@ -186,9 +225,12 @@ pub enum AttestationClass {
 /// First-class device aggregate.
 ///
 /// Carries no PII; identifying metadata lives in `DevicePiiMapping`.
-/// `user_id` is `Option` because the system can sight a device pre-
-/// identification (e.g. failed login on a brand-new browser) and only later
-/// associate it with a user once authn completes.
+/// `user_id` is `Option` because a device can exist before it has an owner:
+/// [`ensure_device`](crate::device::DeviceLifecycleService::ensure_device)
+/// creates one for a guest's request and the first authenticated user to
+/// resolve it claims it. A device created by
+/// [`resolve_or_keep`](crate::device::DeviceLifecycleService::resolve_or_keep)
+/// always has its owner, since a guest's request creates none there.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Device {
     /// Opaque identifier for this device, scoped to the tenant.
@@ -196,23 +238,26 @@ pub struct Device {
     /// Tenant that owns this device row. Devices are tenant-scoped to
     /// prevent cross-tenant correlation.
     pub tenant_id: TenantId,
-    /// Authenticated user this device is associated with. `None` when the
-    /// device was sighted pre-identification.
+    /// Authenticated user this device is associated with. `None` for a
+    /// device created before any user was identified and not yet claimed.
     pub user_id: Option<UserId>,
     /// Current trust level. See [`DeviceTrustLevel`].
     pub trust_level: DeviceTrustLevel,
-    /// Keyed digest of the request fingerprint inputs. Used as the
-    /// fast-lookup key when an inbound request carries no `device_id`
-    /// cookie yet.
+    /// Keyed digest of the fingerprint inputs of the request the device
+    /// was created on. A hint, not an identity:
+    /// [`resolve_or_keep`](crate::device::DeviceLifecycleService::resolve_or_keep)
+    /// stores it and finds no device by it, and only
+    /// [`ensure_device`](crate::device::DeviceLifecycleService::ensure_device)
+    /// looks a device up by it.
     pub fingerprint_hash: FingerprintHash,
     /// When the device was first sighted (from injected
     /// [`Clock`](axess_clock::Clock)).
-    pub first_seen_at: DateTime<Utc>,
+    pub first_seen_at: Timestamp,
     /// When the device was last sighted. Drives the retention-sweep
     /// demotion ladder.
-    pub last_seen_at: DateTime<Utc>,
+    pub last_seen_at: Timestamp,
     /// Set when the device transitions to [`DeviceTrustLevel::Revoked`].
-    pub revoked_at: Option<DateTime<Utc>>,
+    pub revoked_at: Option<Timestamp>,
     /// Set when a `Trusted` device is moved down to [`DeviceTrustLevel::Seen`]
     /// (by the retention sweep or an explicit downgrade) and cleared by any
     /// other transition. It is what tells a `Seen` device that was never
@@ -221,8 +266,9 @@ pub struct Device {
     /// ladder reads it, nothing else does. Absent in rows written before the
     /// field existed, which then read as never trusted.
     #[serde(default)]
-    pub demoted_at: Option<DateTime<Utc>>,
-    /// Bindings attached to this device (cookie, webauthn).
+    pub demoted_at: Option<Timestamp>,
+    /// Bindings attached to this device: the cookie token's digest, WebAuthn
+    /// credentials and refresh-token families (see [`DeviceBinding`]).
     #[serde(default)]
     pub bindings: Vec<DeviceBinding>,
 }
@@ -252,17 +298,15 @@ mod tests {
         assert_eq!(DeviceTrustLevel::default(), DeviceTrustLevel::Unknown);
     }
 
-    // ── mutation-testing follow-up: nibble / hex_decode coverage ─────────────────────────
+    // ── nibble / hex_decode ──────────────────────────────────────────────
     //
-    // The original test suite only exercised lowercase `"ab"` repeating;
-    // the `b'0'..=b'9'` and `b'A'..=b'F'` arms of `fingerprint_serde::nibble`
-    // were never executed, so mutations on those arms (arm deletion, arithmetic
-    // sign flips, `b'0'`/`b'A'` substitutions) all escaped detection.
+    // The tests below decode digits, lowercase and uppercase letters, so
+    // every arm of `fingerprint_serde::nibble` runs (`b'0'..=b'9'`,
+    // `b'a'..=b'f'`, `b'A'..=b'F'`) and each arm's offset is pinned.
     //
-    // The `(hi << 4) | lo` mutation `| -> ^` is mathematically equivalent
-    // for nibble-bounded inputs (`hi << 4` only sets bits 4-7, `lo` only
-    // sets bits 0-3, so `|` and `^` produce identical results). Documented
-    // inert; no test covers it because no value distinguishes the two.
+    // In `(hi << 4) | lo`, `|` and `^` give the same result for
+    // nibble-bounded inputs (`hi << 4` only sets bits 4-7, `lo` only sets
+    // bits 0-3), so no test tells the two apart: no value can.
 
     #[test]
     fn fingerprint_hash_as_bytes_returns_stored_value() {

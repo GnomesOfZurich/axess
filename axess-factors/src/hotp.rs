@@ -10,7 +10,7 @@ use crate::otp_algorithm::OtpAlgorithm;
 pub use crate::otp_core::HotpAlgorithm;
 use crate::otp_core::hotp_value;
 use crate::{MAX_HOTP_DIGITS, MIN_OTP_DIGITS, MIN_OTP_SECRET_BYTES};
-use chrono::{DateTime, Utc};
+use axess_clock::{Timestamp, Until};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use subtle::ConstantTimeEq;
@@ -18,6 +18,13 @@ use zeroize::Zeroizing;
 
 /// Default HOTP code length in decimal digits (RFC 4226 §5.3 recommended 6).
 pub const HOTP_LENGTH: usize = 6;
+
+/// The widest look-ahead window [`verify_hotp`] accepts: one hundred
+/// counter steps. RFC 4226 §7.4 asks for a small window, since every step
+/// is one more code a guess can match; a stored `lookahead_window` above
+/// this verifies nothing until it is corrected, and a token that has
+/// drifted further is resynchronised rather than chased.
+pub const MAX_HOTP_LOOKAHEAD: u32 = 100;
 
 // ── HotpConfig ───────────────────────────────────────────────────────────────
 
@@ -79,7 +86,7 @@ pub struct HotpConfig {
 pub struct HotpThrottle {
     /// Until when verification is refused; `None` when not locked.
     #[serde(default)]
-    locked_until: Option<DateTime<Utc>>,
+    locked_until: Option<Until>,
     /// How many locks have been set since the last successful
     /// verification; drives the backoff of the next one.
     #[serde(default)]
@@ -109,13 +116,17 @@ impl HotpConfig {
 
     /// Whether verification is refused at `now` because of an earlier run
     /// of wrong codes.
-    pub fn is_locked_at(&self, now: DateTime<Utc>) -> bool {
-        self.throttle.locked_until.is_some_and(|until| now < until)
+    pub fn is_locked_at(&self, now: Timestamp) -> bool {
+        self.throttle
+            .locked_until
+            .is_some_and(|until| Until::At(now) < until)
     }
 
     /// Until when verification is refused, after `max_attempts` wrong codes
-    /// against the current counter; `None` when the factor is not locked.
-    pub fn locked_until(&self) -> Option<DateTime<Utc>> {
+    /// against the current counter; `None` when the factor is not locked. A
+    /// lock that would end past the range of the clock's readings never ends
+    /// ([`Until::Forever`]).
+    pub fn locked_until(&self) -> Option<Until> {
         self.throttle.locked_until
     }
 
@@ -127,14 +138,13 @@ impl HotpConfig {
     /// Lock the factor at `now` for the backoff its history earns, start
     /// the attempt count over for the period after it and count the lock.
     /// The counter is left where it is.
-    pub fn lock_at(&mut self, now: DateTime<Utc>) {
-        // The backoff is at most an hour, which always converts; the
-        // fallback, a lock that never ends, fails closed.
-        let for_ = chrono::Duration::from_std(Self::lock_duration_after(self.throttle.lockouts))
-            .unwrap_or(chrono::Duration::MAX);
-        self.throttle.locked_until = now
-            .checked_add_signed(for_)
-            .or(Some(DateTime::<Utc>::MAX_UTC));
+    pub fn lock_at(&mut self, now: Timestamp) {
+        // The backoff is at most an hour. A lock that would end past the
+        // range of the clock's readings never ends, which fails closed.
+        self.throttle.locked_until = Some(Until::after(
+            now,
+            Self::lock_duration_after(self.throttle.lockouts),
+        ));
         self.throttle.lockouts = self.throttle.lockouts.saturating_add(1);
         self.attempt_count = 0;
     }
@@ -161,12 +171,10 @@ impl Default for HotpConfig {
     }
 }
 
-// mutation-testing follow-up: pin the documented `max_attempts` default. A value
-// of 0 would either lock the user out instantly (no attempts allowed)
-// or never expire the counter (depending on which interpretation the
-// verify path takes). Mutation testing found the previous
-// suite didn't assert this default, so a regression bumping the value
-// to 0 or 1 would have shipped silently.
+// Pins the documented `max_attempts` default of five, and that a stored
+// config without the throttle fields reads as unlocked. A default of 0
+// would lock the user out at once or never count a failure, depending on
+// how the verify path reads it.
 #[cfg(test)]
 mod hotp_config_defaults {
     use super::{HotpConfig, default_max_hotp_attempts};
@@ -187,14 +195,15 @@ mod hotp_config_defaults {
         let cfg: HotpConfig = serde_json::from_value(json).expect("older rows still read");
         assert_eq!(cfg.locked_until(), None);
         assert_eq!(cfg.lockouts(), 0);
-        assert!(!cfg.is_locked_at(chrono::Utc::now()));
+        assert!(!cfg.is_locked_at(axess_clock::testing::MockClock::reference_time()));
     }
 }
 
 #[cfg(test)]
 mod hotp_lock_backoff {
     use super::{HOTP_LOCK_BASE, HOTP_LOCK_MAX, HotpConfig};
-    use chrono::{TimeZone, Utc};
+    use axess_clock::testing::Shift;
+    use axess_clock::{SignedDuration, Timestamp, Until};
 
     #[test]
     fn each_consecutive_lock_doubles_up_to_the_cap() {
@@ -207,7 +216,7 @@ mod hotp_lock_backoff {
 
     #[test]
     fn a_lock_holds_until_its_end_and_leaves_the_counter_alone() {
-        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+        let t0 = Timestamp::from_utc(2026, 1, 1, 12, 0, 0).unwrap();
         let mut cfg = HotpConfig {
             counter: 41,
             attempt_count: 5,
@@ -218,13 +227,46 @@ mod hotp_lock_backoff {
         assert_eq!(cfg.attempt_count, 0);
         assert_eq!(cfg.lockouts(), 1);
         assert!(cfg.is_locked_at(t0));
-        assert!(cfg.is_locked_at(t0 + chrono::Duration::seconds(59)));
-        assert!(!cfg.is_locked_at(t0 + chrono::Duration::seconds(60)));
+        assert!(cfg.is_locked_at(t0.plus(SignedDuration::seconds(59))));
+        assert!(!cfg.is_locked_at(t0.plus(SignedDuration::seconds(60))));
         cfg.lock_at(t0);
-        assert!(cfg.is_locked_at(t0 + chrono::Duration::seconds(119)));
-        assert!(!cfg.is_locked_at(t0 + chrono::Duration::seconds(120)));
+        assert!(cfg.is_locked_at(t0.plus(SignedDuration::seconds(119))));
+        assert!(!cfg.is_locked_at(t0.plus(SignedDuration::seconds(120))));
         cfg.clear_lock();
         assert_eq!((cfg.locked_until(), cfg.lockouts()), (None, 0));
+    }
+
+    #[test]
+    fn a_lock_ends_at_the_reading_its_backoff_names() {
+        let t0 = Timestamp::from_utc(2026, 1, 1, 12, 0, 0).unwrap();
+        let mut cfg = HotpConfig::default();
+        cfg.lock_at(t0);
+        assert_eq!(
+            cfg.locked_until(),
+            Some(Until::At(t0.plus(SignedDuration::seconds(60))))
+        );
+        cfg.lock_at(t0);
+        assert_eq!(
+            cfg.locked_until(),
+            Some(Until::At(t0.plus(SignedDuration::seconds(120))))
+        );
+    }
+
+    #[test]
+    fn a_lock_that_would_end_past_the_range_never_ends() {
+        // Half a minute before the last reading: the first lock, of one
+        // minute, has no reading to end at.
+        let late = Timestamp::MAX.minus(SignedDuration::seconds(30));
+        let mut cfg = HotpConfig::default();
+        cfg.lock_at(late);
+        assert_eq!(cfg.locked_until(), Some(Until::Forever));
+        assert!(cfg.is_locked_at(late));
+        assert!(cfg.is_locked_at(Timestamp::MAX));
+        // It is stored as the latest reading, as earlier releases stored it.
+        let stored = serde_json::to_value(&cfg).expect("serialises");
+        assert_eq!(stored["locked_until"], "+262142-12-31T23:59:59.999999999Z");
+        let read: HotpConfig = serde_json::from_value(stored).expect("reads back");
+        assert_eq!(read.locked_until(), Some(Until::Forever));
     }
 }
 
@@ -253,6 +295,12 @@ pub fn verify_hotp(
     // brute-forceable in a handful of attempts, and a length of 0 makes the
     // code "0" match every counter.
     if !(MIN_OTP_DIGITS..=MAX_HOTP_DIGITS).contains(&length) {
+        return None;
+    }
+    // A window past the bound verifies nothing: every step widens what a
+    // guess can match, and each costs an HMAC, so an unbounded window is
+    // both a weaker check and a way to make one verify run for ever.
+    if window > u64::from(MAX_HOTP_LOOKAHEAD) {
         return None;
     }
 

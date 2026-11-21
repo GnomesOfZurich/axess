@@ -14,11 +14,13 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use axess_clock::Timestamp;
 use axess_identity::{TenantId, UserId};
-use chrono::{DateTime, Utc};
 
 use crate::delegated::error::DelegatedError;
 use axess_factors::ZeroizedString;
+
+use super::grant::GrantRegistration;
 
 /// A stored delegated credential: the result of a completed
 /// authorization-code grant, plus everything needed to drive
@@ -31,8 +33,20 @@ use axess_factors::ZeroizedString;
 #[derive(Debug, Clone)]
 pub struct StoredDelegation {
     /// Provider this credential belongs to; matches the
-    /// `DelegatedProvider::name` field of the originating grant.
+    /// `DelegatedProvider::name` field of the originating grant. It is
+    /// the store's key, and only a label: another registration may carry
+    /// the same name.
     pub provider: String,
+    /// The registration the credential was granted through: the one
+    /// [`complete_grant`](super::grant::complete_grant) was handed, and
+    /// kept by every refresh.
+    /// [`StoredDelegationSession`](super::session::StoredDelegationSession)
+    /// uses the credential only with that registration, so a refresh token
+    /// is never sent to another provider of the same name. `None` is a
+    /// credential stored without one (by a release before 0.20.0): it is
+    /// never used, and the user grants again. A store of the adopter's own
+    /// persists it beside the other fields.
+    pub registration: Option<GrantRegistration>,
     /// Current access token. Use via
     /// [`StoredDelegationSession::get_access_token`](super::session::StoredDelegationSession::get_access_token);
     /// don't reach into `access_token` directly because the session
@@ -47,7 +61,7 @@ pub struct StoredDelegation {
     /// did not return `expires_in`; treat as "unknown, refresh on
     /// every use" (conservative) or "long-lived, never refresh"
     /// (provider-specific knowledge required).
-    pub expires_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<Timestamp>,
     /// Scopes the IdP actually granted. May be a subset of those
     /// requested at `begin_grant`; some IdPs only echo scopes the
     /// user actively consented to.
@@ -59,10 +73,12 @@ pub struct StoredDelegation {
 }
 
 impl StoredDelegation {
-    /// Whether `other` holds the same tokens, expiry, scopes and token type.
-    /// The provider name is the row's key and is compared by the caller.
+    /// Whether `other` holds the same registration, tokens, expiry, scopes
+    /// and token type. The provider name is the row's key and is compared by
+    /// the caller.
     pub fn same_as(&self, other: &StoredDelegation) -> bool {
-        *self.access_token == *other.access_token
+        self.registration == other.registration
+            && *self.access_token == *other.access_token
             && self.refresh_token.as_deref() == other.refresh_token.as_deref()
             && self.expires_at == other.expires_at
             && self.scopes == other.scopes
@@ -73,12 +89,14 @@ impl StoredDelegation {
     /// fresh against `now`. `None` `expires_at` is treated as fresh
     /// (caller decides whether to refresh proactively); a Some
     /// expiry compares directly.
-    pub fn is_fresh(&self, now: DateTime<Utc>, skew: chrono::Duration) -> bool {
-        // A negative skew would move the deadline past the expiry, and a skew
-        // beyond the representable range has no deadline: stale either way.
-        let skew = skew.max(chrono::Duration::zero());
+    pub fn is_fresh(&self, now: Timestamp, skew: std::time::Duration) -> bool {
         match self.expires_at {
-            Some(exp) => exp.checked_sub_signed(skew).is_some_and(|due| now < due),
+            // A skew too long to take from the expiry leaves no deadline:
+            // stale.
+            Some(exp) => axess_clock::SignedDuration::try_from(skew)
+                .ok()
+                .and_then(|skew| exp.checked_sub(skew))
+                .is_some_and(|due| now < due),
             None => true,
         }
     }

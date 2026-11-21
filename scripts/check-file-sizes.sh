@@ -1,12 +1,19 @@
 #!/usr/bin/env bash
-# axess: keep production files and functions from growing past a readable size.
+# axess: keep files and functions from growing past a readable size.
 #
-# Two limits, both measured on PRODUCTION code only:
+# Two limits:
 #   - a file over FILE_MAX_LINES (800) lines, and
 #   - a function over FN_MAX_LINES (150) lines.
 #
 # What is measured
-#   - Tracked `.rs` files, so build output under target/ cannot contribute.
+#   - The `.rs` files git lists (tracked, or untracked and not ignored), so
+#     build output under target/ cannot contribute, on production code
+#     only, as below.
+#   - Every shell (`.sh`) and Python (`.py`) file git lists, the scripts' own
+#     crafted cases included: a gate's cases are read as often as the gate,
+#     and grow with every form it learns. A shell function runs from its
+#     `name() {` line to the `}` that closes it at the same indentation; a
+#     Python function from its `def` line to its last line.
 #   - Test code is not production: `tests.rs`, anything under `tests/`,
 #     `benches/`, `examples/`, `testing/`, `fuzz/`, and every file that is only
 #     reached through a `#[cfg(test)] mod name;` declaration (with the files
@@ -37,7 +44,7 @@
 set -uo pipefail
 
 AXESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$AXESS_DIR"
+cd "$AXESS_DIR" || exit 1
 
 MODE=check
 case "${1:-}" in
@@ -55,21 +62,29 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
-FILE_LIST="$(git ls-files '*.rs')"
-if [ -z "$FILE_LIST" ]; then
+# Tracked files and untracked ones git does not ignore, so a file not yet
+# added is measured as well.
+FILE_LIST="$(git ls-files --cached --others --exclude-standard --deduplicate '*.rs' '*.sh' '*.py')"
+if ! grep -q '\.rs$' <<<"$FILE_LIST"; then
   echo "ERROR: git ls-files matched no Rust files: the selection is broken, not the tree." >&2
   exit 1
 fi
-if printf '%s\n' "$FILE_LIST" | grep -q '[[:space:]]'; then
-  echo "ERROR: a tracked .rs path contains whitespace; this script cannot scan it." >&2
+if ! grep -qE '\.(sh|py)$' <<<"$FILE_LIST"; then
+  echo "ERROR: git ls-files matched no shell or Python files: the selection is broken, not the tree." >&2
+  exit 1
+fi
+if grep -q '[[:space:]]' <<<"$FILE_LIST"; then
+  echo "ERROR: a listed .rs, .sh or .py path contains whitespace; this script cannot scan it." >&2
   exit 1
 fi
 
-printf '%s\n' "$FILE_LIST" | python3 -I -c '
-import os, re, sys
+python3 -I -c '
+import ast, os, re, sys
 
 mode, baseline_path, file_max, fn_max = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
-paths = [l for l in sys.stdin.read().split("\n") if l]
+listed = [l for l in sys.stdin.read().split("\n") if l]
+paths = [p for p in listed if p.endswith(".rs")]
+scripts = [p for p in listed if not p.endswith(".rs")]
 
 EXEMPT_DIRS = ("tests", "benches", "examples", "testing", "fuzz")
 CFG_TEST = re.compile(r"^\s*#\[cfg\((?:all\()?test\b")
@@ -119,6 +134,39 @@ while changed:
             for c in declared_test_siblings(p, contents[p]):
                 if c not in test_files:
                     test_files.add(c); changed = True
+
+SHELL_FN = re.compile(r"^(\s*)(?:function\s+)?([A-Za-z_][A-Za-z0-9_:-]*)\s*(?:\(\s*\))?\s*\{\s*(#.*)?$")
+
+def shell_fn_lengths(lines):
+    # A function from its `name() {` line to the `}` at its own indentation.
+    out = []
+    seen = {}
+    for i, l in enumerate(lines):
+        m = SHELL_FN.match(l)
+        if not m or ("()" not in l and not l.lstrip().startswith("function ")):
+            continue
+        indent, name = m.group(1), m.group(2)
+        end = i + 1
+        while end < len(lines) and lines[end].rstrip() != indent + "}" and not lines[end].startswith(indent + "} "):
+            end += 1
+        seen[name] = seen.get(name, 0) + 1
+        out.append((name if seen[name] == 1 else "%s#%d" % (name, seen[name]), min(end, len(lines) - 1) - i + 1))
+    return out
+
+def python_fn_lengths(text, path):
+    try:
+        tree = ast.parse(text)
+    except SyntaxError as e:
+        print("ERROR: %s does not parse as Python: %s" % (path, e), file=sys.stderr)
+        sys.exit(1)
+    out = []
+    seen = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            seen[node.name] = seen.get(node.name, 0) + 1
+            key = node.name if seen[node.name] == 1 else "%s#%d" % (node.name, seen[node.name])
+            out.append((key, node.end_lineno - node.lineno + 1))
+    return out
 
 def production_lines(lines):
     # Blank out inline `#[cfg(test)] mod x { ... }` blocks; returns the kept lines.
@@ -197,11 +245,26 @@ for p in paths:
         if ln > fn_max:
             found[("fn", p, key)] = ln
 
-print("check-file-sizes: measured %d production files and %d functions (limits: %d lines per file, %d per function)"
-      % (files_measured, fns_measured, file_max, fn_max))
-if files_measured == 0 or fns_measured == 0:
-    print("ERROR: measured nothing (files=%d, fns=%d). The selection or the matcher is broken, not the tree;"
-          % (files_measured, fns_measured), file=sys.stderr)
+scripts_measured = 0
+script_fns_measured = 0
+for p in scripts:
+    with open(p, encoding="utf-8", errors="replace") as f:
+        text = f.read()
+    lines = text.split("\n")
+    scripts_measured += 1
+    size = len(lines) - (1 if lines and lines[-1] == "" else 0)
+    if size > file_max:
+        found[("file", p, "")] = size
+    for key, ln in (python_fn_lengths(text, p) if p.endswith(".py") else shell_fn_lengths(lines)):
+        script_fns_measured += 1
+        if ln > fn_max:
+            found[("fn", p, key)] = ln
+
+print("check-file-sizes: measured %d production files and %d functions, and %d scripts and %d script functions (limits: %d lines per file, %d per function)"
+      % (files_measured, fns_measured, scripts_measured, script_fns_measured, file_max, fn_max))
+if files_measured == 0 or fns_measured == 0 or scripts_measured == 0 or script_fns_measured == 0:
+    print("ERROR: measured nothing (files=%d, fns=%d, scripts=%d, script functions=%d). The selection or the matcher is broken, not the tree;"
+          % (files_measured, fns_measured, scripts_measured, script_fns_measured), file=sys.stderr)
     print("       a pass here would be meaningless.", file=sys.stderr)
     sys.exit(1)
 
@@ -266,4 +329,4 @@ if shrunk or gone:
     print("\n".join(shrunk + ["  %s %s%s: under the limit" % (k[0], k[1], ("::" + k[2]) if k[2] else "") for k in gone]))
 print("OK: no new offenders; %d baselined (%d files, %d functions)."
       % (len(found), sum(1 for k in found if k[0] == "file"), sum(1 for k in found if k[0] == "fn")))
-' "$MODE" "$BASELINE" "$FILE_MAX_LINES" "$FN_MAX_LINES"
+' "$MODE" "$BASELINE" "$FILE_MAX_LINES" "$FN_MAX_LINES" <<<"$FILE_LIST"

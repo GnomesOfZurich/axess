@@ -1,5 +1,6 @@
 use super::*;
 use crate::authz::store::PolicyStore;
+use axess_clock::testing::Shift;
 use cedar_policy::{Entities, EntityUid, Schema};
 
 const SCHEMA_JSON: &str = r#"{
@@ -50,7 +51,7 @@ impl AuthzEntityProvider for ErroringProvider {
     async fn entities_for_tenant(
         &self,
         principal: &EntityUid,
-        _tenant: Option<&str>,
+        _: Option<&str>,
         resource_id: &Self::ResourceId,
         action: &EntityUid,
     ) -> Result<Entities, Self::Error> {
@@ -179,7 +180,7 @@ async fn a_denial_before_evaluation_emits_a_decision_event() {
         fn on_event(
             &self,
             event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
+            _: tracing_subscriber::layer::Context<'_, S>,
         ) {
             if event.metadata().target() == super::super::audit::DECISION_TARGET {
                 let mut fields = Fields(String::new());
@@ -191,7 +192,7 @@ async fn a_denial_before_evaluation_emits_a_decision_event() {
 
     let capture = Capture::default();
     let subscriber = tracing_subscriber::registry().with(capture.clone());
-    let _guard = tracing::subscriber::set_default(subscriber);
+    let guard = tracing::subscriber::set_default(subscriber);
 
     let store = tenant_store();
     let authz = store.for_user_id("alice").unwrap();
@@ -204,6 +205,7 @@ async fn a_denial_before_evaluation_emits_a_decision_event() {
             .any(|e| e.contains("invalid_resource") && e.contains("deny")),
         "events: {events:?}"
     );
+    drop(guard);
 }
 
 /// A session nobody has logged into has no principal: that is the 401
@@ -211,18 +213,7 @@ async fn a_denial_before_evaluation_emits_a_decision_event() {
 #[tokio::test]
 async fn an_unauthenticated_session_is_no_principal() {
     use crate::session::layer::{SessionHandle, SessionInner};
-    let inner = SessionInner {
-        id: crate::session::id::SessionId::new(&axess_rng::SystemRng),
-        data: crate::session::data::SessionData::default(),
-        modified: false,
-        needs_persist: false,
-        regenerate: false,
-        pre_cycle_id: None,
-        rng: Arc::new(axess_rng::SystemRng),
-        pending_fingerprint: None,
-        max_custom_bytes: 64 * 1024,
-        consume: None,
-    };
+    let inner = SessionInner::detached(Arc::new(axess_rng::SystemRng));
     let session =
         crate::session::AuthSession(SessionHandle(Arc::new(tokio::sync::RwLock::new(inner))));
     let result = tenant_store().for_session(&session, NoContext).await;
@@ -320,8 +311,8 @@ permit (
         )
         .unwrap(),
     );
-    let now = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0).unwrap();
-    let ago = |seconds: i64| now - chrono::Duration::seconds(seconds);
+    let now = axess_clock::Timestamp::from_unix_seconds(1_700_000_000).unwrap();
+    let ago = |seconds: i64| now.minus(axess_clock::SignedDuration::seconds(seconds));
     let with = |record: &[FactorAssurance]| {
         StandardRequestContext::new(false, None)
             .with_assurance(AssuranceContext::from_session(record, now))

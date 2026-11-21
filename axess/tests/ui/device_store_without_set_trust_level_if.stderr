@@ -1,0 +1,7 @@
+error[E0046]: not all trait items implemented, missing: `set_trust_level_if`
+  --> tests/ui/device_store_without_set_trust_level_if.rs:17:1
+   |
+17 | impl DeviceStore for Wrapped {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `set_trust_level_if` in implementation
+   |
+   = help: implement the missing item: `fn set_trust_level_if(&self, _: &axess_core::TenantId, _: &DeviceId, _: DeviceTrustLevel, _: DeviceTrustLevel, _: Timestamp) -> impl Future<Output = Result<TrustTransition, <Self as axess_core::DeviceStore>::Error>> + Send { todo!() }`

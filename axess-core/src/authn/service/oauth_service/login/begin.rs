@@ -38,7 +38,10 @@ where
     /// data, not sealed field by field: they are as private as the session
     /// store, which seals the whole row only when it was built with a
     /// `SessionCrypto` key. Use an encrypted store.
-    #[tracing::instrument(skip(self, options, session))]
+    #[tracing::instrument(
+        skip(self, provider_name, options, session),
+        fields(provider_name = %super::super::logged_provider_name(provider_name))
+    )]
     pub async fn begin_oauth_login(
         &self,
         provider_name: &str,
@@ -63,9 +66,7 @@ where
             .load()
             .get(provider_name)
             .cloned()
-            .ok_or_else(|| {
-                axess_factors::oauth::OAuthError::UnknownProvider(provider_name.to_string())
-            })
+            .ok_or_else(|| super::super::unknown_provider(provider_name))
     }
 
     /// The ceremony start shared by every begin: everything after the
@@ -92,11 +93,12 @@ where
             && let Some(serde_json::Value::Object(map)) =
                 session.get_custom(oauth_keys::PAR_INFLIGHT).await
             && let Some(expires_at_str) = map.get("expires_at").and_then(|v| v.as_str())
-            && let Ok(expires_at) = chrono::DateTime::parse_from_rfc3339(expires_at_str)
-            && self.inner.clock.now() < expires_at.with_timezone(&chrono::Utc)
+            && let Ok(expires_at) = axess_clock::Timestamp::parse_rfc3339(expires_at_str)
+            && axess_clock::Until::At(self.inner.clock.now())
+                < axess_clock::Until::from_timestamp(expires_at)
         {
             tracing::warn!(
-                provider = %provider_name,
+                provider = %super::super::logged_provider_name(provider_name),
                 "refusing PAR begin while a previous request_uri is still in its \
                  single-use window; clear the session ceremony state and retry"
             );
@@ -217,7 +219,7 @@ where
     async fn stash_oauth_ceremony(&self, session: &AuthSession, begun: StashedBegin<'_>) {
         use axess_factors::oauth::types::keys as oauth_keys;
         use serde_json::Value;
-        let started = self.inner.clock.now().to_rfc3339();
+        let started = self.inner.clock.now().to_rfc3339_numeric_offset();
         session
             .mutate_custom(move |obj| {
                 obj.insert(
@@ -260,10 +262,7 @@ where
     /// ~90s but the AS is authoritative; the cap exists so a
     /// configuration mistake (e.g. `ceremony_timeout = 6h`) doesn't
     /// pin the session into a single-use blocker for hours after a
-    /// stale flow. The fallback to 90s on `Duration::from_std`
-    /// failure is paranoia: `chrono::Duration::from_std` only
-    /// fails for nanoseconds-out-of-i64 inputs that
-    /// `std::time::Duration` would never produce in this branch.
+    /// stale flow.
     async fn stash_par_inflight_marker(
         &self,
         session: &AuthSession,
@@ -271,12 +270,11 @@ where
     ) {
         use axess_factors::oauth::types::keys as oauth_keys;
         let lifetime = ceremony_timeout.min(std::time::Duration::from_secs(600));
-        let expires_at = self.inner.clock.now()
-            + chrono::Duration::from_std(lifetime).unwrap_or(chrono::Duration::seconds(90));
+        let expires_at = axess_clock::Until::after(self.inner.clock.now(), lifetime);
         let mut entry = serde_json::Map::new();
         entry.insert(
             "expires_at".to_string(),
-            serde_json::Value::String(expires_at.to_rfc3339()),
+            serde_json::Value::String(expires_at.to_timestamp().to_rfc3339_numeric_offset()),
         );
         session
             .set_custom(oauth_keys::PAR_INFLIGHT, serde_json::Value::Object(entry))

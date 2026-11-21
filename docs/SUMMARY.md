@@ -41,6 +41,7 @@
 - [Schema migration](sessions/migration.md)
 - [Design: absolute times in the sealed blob](sessions/sealed-blob-times.md)
 - [Design: a MAC over refresh-token rows](sessions/refresh-row-mac.md)
+- [Design: device-bound sessions](sessions/device-bound-sessions.md)
 
 # Part VI: Identity and tenancy
 
@@ -60,6 +61,7 @@
   - [Walkthrough: AWS](workload-identity/aws.md)
   - [Outbound: OAuth](workload-identity/outbound-oauth.md)
   - [Outbound: mTLS](workload-identity/outbound-mtls.md)
+  - [SPIRE Workload API client](workload-identity/spire.md)
   - [Shared secrets: the last resort](workload-identity/shared-secrets.md)
 - [Delegated and OBO access](identity/delegated-obo.md)
 - [Local IdP](factors/local-idp.md)
@@ -75,6 +77,7 @@
 - [Behind an mTLS terminator](production/mtls.md)
 - [Operations runbook](production/operations.md)
 - [Migration guide](production/migrating.md)
+  - [0.19.0 to 0.20.0](production/migrating/0.19.0-to-0.20.0.md)
   - [0.18.0 to 0.19.0](production/migrating/0.18.0-to-0.19.0.md)
   - [0.17.0 to 0.18.0](production/migrating/0.17.0-to-0.18.0.md)
   - [0.16.0 to 0.17.0](production/migrating/0.16.0-to-0.17.0.md)
@@ -100,8 +103,8 @@
 - [Mutation testing](project/mutation-testing.md)
 - [Publishing runbook](project/publishing.md)
 - [Dependency plan](project/dependencies/README.md)
-  - [RSA verify-only](project/dependencies/rsa-verify-only.md)
+  - [RSA signing paths](project/dependencies/rsa-signing-paths.md)
   - [One JOSE verification core](project/dependencies/jose-core.md)
   - [One RustCrypto major](project/dependencies/rustcrypto-major.md)
-  - [One stored-data format](project/dependencies/stored-format.md)
+  - [Stored session formats](project/dependencies/stored-format.md)
   - [Regex validators](project/dependencies/regex-validators.md)

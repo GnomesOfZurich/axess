@@ -3,13 +3,23 @@
 //! `tenant_id = ? OR (filter.include_unscoped AND tenant_id IS NULL)`;
 //! other-tenant rows are never reachable. If you copy this pattern into a
 //! different backend, keep that invariant.
+//!
+//! A row the reader cannot read is neither returned as an event nor dropped
+//! without a trace, nor does it fail the query: the answer, an
+//! [`AuditTrail`], holds the events read and how many rows could not be
+//! read, by reason, so a page that shows the trail can say that something
+//! is missing. The text of such a row is never returned or logged: the
+//! session column may hold a value a cookie carried, and any column may hold
+//! text a writer chose.
 
+use axess::SessionKey;
+use axess::Timestamp;
 use axess::authn::{
-    AuditQuery, AuthEvent, AuthEventStatus, AuthEventType, AuthFailureReason, EventQueryFilter,
-    FactorKind, TenantId, UserId,
+    AuditQuery, AuditTrail, AuthEvent, AuthEventStatus, AuthEventType, AuthFailureReason,
+    EventQueryFilter, FactorKind, TenantId, UnreadableReason, UserId,
 };
 use axess::client_ip::Source;
-use chrono::{DateTime, Utc};
+use sqlx::sqlite::SqliteRow;
 use sqlx::{AssertSqlSafe, Row};
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -17,14 +27,12 @@ use tracing::warn;
 
 use super::{BackendError, OurBackend};
 
-impl AuditQuery for OurBackend {
-    type Error = BackendError;
-
-    async fn query_events(
+impl OurBackend {
+    async fn fetch_event_rows(
         &self,
         tenant_id: &TenantId,
         filter: &EventQueryFilter,
-    ) -> Result<Vec<AuthEvent>, Self::Error> {
+    ) -> Result<Vec<SqliteRow>, BackendError> {
         // SQLite has no real bool, so encode `include_unscoped` directly
         // into the SQL via a conditional clause. Building the WHERE string
         // from typed inputs keeps the query parameterised.
@@ -58,12 +66,12 @@ impl AuditQuery for OurBackend {
             sql.push_str(&format!(" AND event_status = ?{next}"));
             next += 1;
         }
-        let from_str = filter.from.map(|t| t.to_rfc3339());
+        let from_str = filter.from.map(|t| t.to_rfc3339_numeric_offset());
         if from_str.is_some() {
             sql.push_str(&format!(" AND event_time >= ?{next}"));
             next += 1;
         }
-        let until_str = filter.until.map(|t| t.to_rfc3339());
+        let until_str = filter.until.map(|t| t.to_rfc3339_numeric_offset());
         if until_str.is_some() {
             sql.push_str(&format!(" AND event_time < ?{next}"));
             next += 1;
@@ -96,116 +104,146 @@ impl AuditQuery for OurBackend {
         }
         q = q.bind(limit);
 
-        let rows = q.fetch_all(self.pool()).await?;
-
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            let user_id: Option<String> = row.get("user_id");
-            let tenant_id: Option<String> = row.get("tenant_id");
-            let session_id: Option<String> = row.get("session_id");
-            let event_type: String = row.get("event_type");
-            let event_status: String = row.get("event_status");
-            let event_time: String = row.get("event_time");
-            let factor_kind: Option<String> = row.get("factor_kind");
-            let ip_address: Option<String> = row.get("ip_address");
-            let ip_source: String = row.get("ip_source");
-            let user_agent: Option<String> = row.get("user_agent");
-            let request_id: Option<String> = row.get("request_id");
-            let trace_id: Option<String> = row.get("trace_id");
-            let geo_country: Option<String> = row.get("geo_country");
-            let error: Option<String> = row.get("error");
-
-            // A row that fails to parse means a writer corrupted the table
-            // or upgraded the enum; surface as a soft warn and skip rather
-            // than poisoning the entire query result.
-            let event_type = match AuthEventType::from_str(&event_type) {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!(value = %event_type, error = %e, "audit row: unknown event_type, skipping");
-                    continue;
-                }
-            };
-            let event_status = match AuthEventStatus::from_str(&event_status) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(value = %event_status, error = %e, "audit row: unknown event_status, skipping");
-                    continue;
-                }
-            };
-            let event_time = match DateTime::parse_from_rfc3339(&event_time) {
-                Ok(t) => t.with_timezone(&Utc).timestamp_micros(),
-                Err(e) => {
-                    warn!(value = %event_time, error = %e, "audit row: bad event_time, skipping");
-                    continue;
-                }
-            };
-            // FactorKind has no `FromStr`; round-trip is best-effort for
-            // the kinds the example UI exercises. Anything unrecognised
-            // becomes `None` rather than dropping the event.
-            let factor_kind = factor_kind.as_deref().and_then(parse_factor_kind);
-
-            // `ip_address` is a TEXT column, and rows written before 0.6.0
-            // hold whatever string the writer supplied -- including a value
-            // a client forged, since the field accepted arbitrary text then.
-            // An unparseable one becomes `None` rather than dropping the
-            // event: the address is optional metadata, not identity, and a
-            // null address is honest where an invented one is not.
-            let ip_address = ip_address.and_then(|s| match s.parse::<IpAddr>() {
-                Ok(ip) => Some(ip),
-                Err(e) => {
-                    warn!(value = %s, error = %e, "audit row: unparseable ip_address, storing none");
-                    None
-                }
-            });
-
-            // Infallible by design: a tag this version has no variant for
-            // becomes `AuthFailureReason::Other` rather than an error, so an
-            // audit row written by a newer or older axess still reads back
-            // with its reason intact.
-            let error = error.map(AuthFailureReason::from);
-
-            // An unrecognised value means a writer from another version, or
-            // a hand-edited row. Reading it as `Unknown` keeps the rest of
-            // the event, and claiming a provenance the row does not have
-            // would be worse than admitting none.
-            let ip_source = match ip_source.as_str() {
-                "peer" => Source::Peer,
-                "forwarded" => Source::Forwarded,
-                "supplied" => Source::Supplied,
-                other => {
-                    if other != "unknown" {
-                        warn!(value = %other, "audit row: unrecognised ip_source");
-                    }
-                    Source::Unknown
-                }
-            };
-
-            out.push(AuthEvent {
-                user_id: user_id.and_then(|u| UserId::try_new(u).ok()),
-                tenant_id: tenant_id.and_then(|t| TenantId::try_new(t).ok()),
-                session_id: session_id.and_then(|s| s.parse::<axess::SessionId>().ok()),
-                event_type,
-                event_status,
-                event_time,
-                factor_kind,
-                ip_address,
-                ip_source,
-                user_agent,
-                request_id,
-                trace_id,
-                geo_country,
-                error,
-                actor_id: None,
-                // Example backend doesn't yet read a `device_id` column
-                // from the SQLite audit table: the device subsystem is
-                // feature-gated and the example's schema predates the
-                // addition. Leave None until the example schema migrates.
-                device_id: None,
-                factors_completed: vec![],
-            });
-        }
-        Ok(out)
+        Ok(q.fetch_all(self.pool()).await?)
     }
+}
+
+impl AuditQuery for OurBackend {
+    type Error = BackendError;
+
+    /// The tenant's audit trail under `filter`: the events read, newest
+    /// first, and the count of the rows that could not be read, by reason.
+    /// The counts are also logged, without the rows' text.
+    async fn query_events(
+        &self,
+        tenant_id: &TenantId,
+        filter: &EventQueryFilter,
+    ) -> Result<AuditTrail, Self::Error> {
+        let rows = self.fetch_event_rows(tenant_id, filter).await?;
+        let mut trail = AuditTrail {
+            events: Vec::with_capacity(rows.len()),
+            ..AuditTrail::default()
+        };
+        for row in &rows {
+            match read_row(row) {
+                Ok(event) => trail.events.push(event),
+                Err(reason) => trail.unreadable.count(reason),
+            }
+        }
+        let unreadable = trail.unreadable;
+        if unreadable.total() > 0 {
+            warn!(
+                unreadable_session = unreadable.session,
+                unreadable_event_type = unreadable.event_type,
+                unreadable_other = unreadable.other,
+                "audit query: rows that could not be read were left out of the trail"
+            );
+        }
+        Ok(trail)
+    }
+}
+
+/// One audit row as an event, or the reason it cannot be read. A row that
+/// fails here means a writer corrupted the table or a newer release wrote a
+/// value this one does not know; it is counted rather than poisoning the
+/// whole query or being read as something it is not.
+fn read_row(row: &SqliteRow) -> Result<AuthEvent, UnreadableReason> {
+    let user_id: Option<String> = row.get("user_id");
+    let tenant_id: Option<String> = row.get("tenant_id");
+    let session_id: Option<String> = row.get("session_id");
+    let event_type: String = row.get("event_type");
+    let event_status: String = row.get("event_status");
+    let event_time: String = row.get("event_time");
+    let factor_kind: Option<String> = row.get("factor_kind");
+    let ip_address: Option<String> = row.get("ip_address");
+    let ip_source: String = row.get("ip_source");
+    let user_agent: Option<String> = row.get("user_agent");
+    let request_id: Option<String> = row.get("request_id");
+    let trace_id: Option<String> = row.get("trace_id");
+    let geo_country: Option<String> = row.get("geo_country");
+    let error: Option<String> = row.get("error");
+
+    let event_type =
+        AuthEventType::from_str(&event_type).map_err(|_| UnreadableReason::EventType)?;
+    let event_status =
+        AuthEventStatus::from_str(&event_status).map_err(|_| UnreadableReason::Other)?;
+    // The column holds the session's key, 64 hexadecimal characters. A row
+    // written before 0.20.0 holds the session id there, which reads as the
+    // key of that id, so an old row and a new one name one session alike.
+    // Any other text is a row a writer corrupted: it is counted, as a bad
+    // event type is, rather than read as an event of no session.
+    let session_id = session_id
+        .as_deref()
+        .map(SessionKey::from_recorded)
+        .transpose()
+        .map_err(|_| UnreadableReason::Session)?;
+    let event_time = Timestamp::parse_rfc3339(&event_time)
+        .map_err(|_| UnreadableReason::Other)?
+        .unix_micros();
+    // FactorKind has no `FromStr`; round-trip is best-effort for the kinds
+    // the example UI exercises. Anything unrecognised becomes `None` rather
+    // than dropping the event.
+    let factor_kind = factor_kind.as_deref().and_then(parse_factor_kind);
+
+    // `ip_address` is a TEXT column, and rows written before 0.6.0 hold
+    // whatever string the writer supplied -- including a value a client
+    // forged, since the field accepted arbitrary text then. An unparseable
+    // one becomes `None` rather than dropping the event: the address is
+    // optional metadata, not identity, and a null address is honest where an
+    // invented one is not. The text is not logged, for the same reason.
+    let ip_address = ip_address.and_then(|s| match s.parse::<IpAddr>() {
+        Ok(ip) => Some(ip),
+        Err(e) => {
+            warn!(error = %e, "audit row: unparseable ip_address, storing none");
+            None
+        }
+    });
+
+    // Infallible by design: a tag this version has no variant for becomes
+    // `AuthFailureReason::Other` rather than an error, so an audit row
+    // written by a newer or older axess still reads back with its reason
+    // intact.
+    let error = error.map(AuthFailureReason::from);
+
+    // An unrecognised value means a writer from another version, or a
+    // hand-edited row. Reading it as `Unknown` keeps the rest of the event,
+    // and claiming a provenance the row does not have would be worse than
+    // admitting none. The text is not logged.
+    let ip_source = match ip_source.as_str() {
+        "peer" => Source::Peer,
+        "forwarded" => Source::Forwarded,
+        "supplied" => Source::Supplied,
+        other => {
+            if other != "unknown" {
+                warn!("audit row: unrecognised ip_source");
+            }
+            Source::Unknown
+        }
+    };
+
+    Ok(AuthEvent {
+        user_id: user_id.and_then(|u| UserId::try_new(u).ok()),
+        tenant_id: tenant_id.and_then(|t| TenantId::try_new(t).ok()),
+        session_id,
+        event_type,
+        event_status,
+        event_time,
+        factor_kind,
+        ip_address,
+        ip_source,
+        user_agent,
+        request_id,
+        trace_id,
+        geo_country,
+        error,
+        actor_id: None,
+        // Example backend doesn't yet read a `device_id` column from the
+        // SQLite audit table: the device subsystem is feature-gated and the
+        // example's schema predates the addition. Leave None until the
+        // example schema migrates.
+        device_id: None,
+        factors_completed: vec![],
+    })
 }
 
 /// Recover a `FactorKind` from its `as_str()` representation. axess-core does

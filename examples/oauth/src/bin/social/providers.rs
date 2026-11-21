@@ -249,7 +249,7 @@ fn spotify_mapper(raw: &serde_json::Value) -> Result<SocialClaims, SocialError> 
 ///
 /// Scope `identity` is required for `api/v1/me`. Reddit also requires
 /// a custom `User-Agent` (per their API rules); wire one via
-/// [`SocialProvider::with_http_client_builder`].
+/// [`SocialProvider::with_client_settings`].
 pub fn reddit(
     client_id: impl Into<String>,
     client_secret: impl Into<String>,

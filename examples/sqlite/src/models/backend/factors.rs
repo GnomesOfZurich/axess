@@ -182,52 +182,84 @@ impl FactorStore for OurBackend {
         Ok(())
     }
 
+    /// Two statements, and the second decides.
+    ///
+    /// The first reads the row: its id, its version and its configuration.
+    /// The configuration is compared with `prior` as a value, read into a
+    /// `FactorConfig` by this build, and not as text. A row written by an
+    /// earlier release, or by hand, can lack a field that has a default
+    /// since (an HOTP row without `attempt_count`, a recovery-code set
+    /// without `under_previous_pepper`); its text differs from what `prior`
+    /// serialises to although nothing was spent, and a comparison of text
+    /// would answer "replay" for it on every login until the row is
+    /// rewritten.
+    ///
+    /// The second is one `UPDATE` guarded by the id and the version just
+    /// read, and its affected-row count is the answer. A trigger moves the
+    /// version on every write of `config_json` (see the migration that adds
+    /// the column), so a row that another request replaced between the two
+    /// statements is not written, and that request's swap is the one that
+    /// won. The id is in the guard because a deleted and re-created row
+    /// starts at version 0 again under a new id.
+    ///
+    /// The guard also names `enabled`. `load_factor` and `resolve_factor`
+    /// hand out enabled rows only, and disabling a row does not move its
+    /// version, so without it a factor disabled between a caller's load and
+    /// its swap would still be swapped. With it the swap answers `false` for
+    /// a row the store would no longer load, and writes nothing.
+    ///
+    /// No transaction spans the two statements, so there is no read lock to
+    /// upgrade and a request that loses the race is answered `false`, never
+    /// "database is locked".
     async fn compare_and_save_factor(
         &self,
         scope: &AuthnScope,
         prior: &FactorConfig,
         updated: FactorConfig,
     ) -> Result<bool, Self::Error> {
-        // CAS via a single UPDATE … WHERE config_json = (prior canonical
-        // JSON). When `rows_affected()` is 0 the prior value didn't match:
-        // either a concurrent writer beat us to it (TOTP/HOTP credential
-        // already spent) or the row was deleted out from under us. The
-        // example uses `serde_json::to_string`; a production backend would
-        // canonicalise to defeat key-ordering drift.
-        let kind_str = prior.kind().as_str().to_string();
-        let prior_json = serde_json::to_string(prior)?;
-        let updated_json = serde_json::to_string(&updated)?;
-
         let cols = scope.as_columns();
         let tenant_str = cols.tenant_id.to_string();
         let user_str = cols.user_id.map(|u| u.to_string());
 
         // tenant_id is always populated; only user_id needs the NULL branch.
-        let (user_clause, prior_placeholder) = if user_str.is_some() {
-            ("user_id = ?3", 5_usize)
+        let user_clause = if user_str.is_some() {
+            "user_id = ?3"
         } else {
-            ("user_id IS NULL", 4_usize)
+            "user_id IS NULL"
         };
-        let sql = format!(
-            "UPDATE factor_configs
-                SET config_json = ?1,
-                    updated_at  = datetime('now')
-              WHERE kind = ?2
-                AND {user_clause}
-                AND tenant_id = ?{tenant_placeholder}
-                AND config_json = ?{prior_placeholder}",
-            tenant_placeholder = if user_str.is_some() { 4 } else { 3 },
+        let select = format!(
+            "SELECT id, version, config_json FROM factor_configs
+              WHERE kind = ?1 AND tenant_id = ?2 AND {user_clause}
+              LIMIT 1"
         );
-
-        let mut q = sqlx::query(AssertSqlSafe(sql.as_str()))
-            .bind(&updated_json)
-            .bind(&kind_str);
+        let mut q = sqlx::query(AssertSqlSafe(select.as_str()))
+            .bind(prior.kind().as_str().to_string())
+            .bind(&tenant_str);
         if let Some(uid) = &user_str {
             q = q.bind(uid);
         }
-        q = q.bind(&tenant_str).bind(&prior_json);
+        let Some(row) = q.fetch_optional(self.pool()).await? else {
+            // No row: nothing to swap, and nothing is created.
+            return Ok(false);
+        };
+        let id: String = row.get("id");
+        let version: i64 = row.get("version");
+        let stored: FactorConfig = serde_json::from_str(&row.get::<String, _>("config_json"))?;
+        if serde_json::to_value(&stored)? != serde_json::to_value(prior)? {
+            return Ok(false);
+        }
 
-        let res = q.execute(self.pool()).await?;
+        let res = sqlx::query(
+            "UPDATE factor_configs
+                SET config_json = ?1,
+                    updated_at  = datetime('now')
+              WHERE id = ?2 AND version = ?3 AND enabled = 1",
+        )
+        .bind(serde_json::to_string(&updated)?)
+        .bind(&id)
+        .bind(version)
+        .execute(self.pool())
+        .await?;
         Ok(res.rows_affected() > 0)
     }
 
@@ -413,76 +445,49 @@ impl FactorStore for OurBackend {
         Ok(res.rows_affected() > 0)
     }
 
-    /// The passkey ids live inside `factor_configs.config_json`, so the
-    /// lookup narrows the tenant's `fido2` rows with a substring match on
-    /// the base64url id and confirms each candidate by parsing it.
-    async fn fido2_credential_holder(
-        &self,
-        tenant_id: &TenantId,
-        credential_id: &[u8],
-    ) -> Result<Option<UserId>, Self::Error> {
-        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-        let encoded = URL_SAFE_NO_PAD.encode(credential_id);
-        let rows = sqlx::query(
-            "SELECT user_id, config_json FROM factor_configs
-              WHERE kind = 'fido2' AND tenant_id = ?1 AND user_id IS NOT NULL
-                AND instr(config_json, ?2) > 0",
-        )
-        .bind(tenant_id.to_string())
-        .bind(&encoded)
-        .fetch_all(self.pool())
-        .await?;
-        for row in rows {
-            let json: String = row.get("config_json");
-            let value: serde_json::Value = serde_json::from_str(&json)?;
-            if holds_credential_id(&value, &encoded) {
-                let user: String = row.get("user_id");
-                return UserId::try_new(&user).map(Some).map_err(|e| {
-                    BackendError::Backend(format!("bad user_id in factor_configs: {e}"))
-                });
-            }
-        }
-        Ok(None)
-    }
-
     /// Claim the id in `fido2_credential_claims`, whose primary key is
-    /// `(tenant_id, credential_id)`: one conditional insert, so of two
-    /// registrations racing for one id exactly one inserts. A passkey stored
-    /// before the table existed holds its id too, which the holder lookup
-    /// finds first.
+    /// `(tenant_id, credential_id)`, with one statement: the row is inserted
+    /// when the id is free, and on a conflict the row already there is
+    /// returned. Of two registrations racing for one id exactly one inserts,
+    /// and the other is told the holder by the statement that refused it, so
+    /// no release or claim in between can change the answer. A passkey
+    /// stored before the table existed holds its id too, which the look
+    /// through the stored rows finds first.
     async fn claim_fido2_credential(
         &self,
         tenant_id: &TenantId,
         user_id: &UserId,
         credential_id: &[u8],
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<axess::authn::Fido2CredentialClaim, Self::Error> {
+        use axess::authn::Fido2CredentialClaim;
         use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-        if self
-            .fido2_credential_holder(tenant_id, credential_id)
-            .await?
-            .is_some_and(|holder| &holder != user_id)
-        {
-            return Ok(false);
-        }
         let encoded = URL_SAFE_NO_PAD.encode(credential_id);
-        sqlx::query(
-            "INSERT OR IGNORE INTO fido2_credential_claims (tenant_id, credential_id, user_id)
-             VALUES (?1, ?2, ?3)",
+        if let Some(holder) = self.stored_fido2_holder(tenant_id, &encoded).await?
+            && &holder != user_id
+        {
+            return Ok(Fido2CredentialClaim::HeldBy(holder));
+        }
+        // The update on a conflict changes nothing: it is what makes the
+        // statement return the row that was already there.
+        let holder: String = sqlx::query_scalar(
+            "INSERT INTO fido2_credential_claims (tenant_id, credential_id, user_id)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT (tenant_id, credential_id) DO UPDATE SET user_id = user_id
+             RETURNING user_id",
         )
         .bind(tenant_id.to_string())
         .bind(&encoded)
         .bind(user_id.to_string())
-        .execute(self.pool())
-        .await?;
-        let holder: String = sqlx::query_scalar(
-            "SELECT user_id FROM fido2_credential_claims
-              WHERE tenant_id = ?1 AND credential_id = ?2",
-        )
-        .bind(tenant_id.to_string())
-        .bind(&encoded)
         .fetch_one(self.pool())
         .await?;
-        Ok(holder == user_id.to_string())
+        if holder == user_id.to_string() {
+            return Ok(Fido2CredentialClaim::Claimed);
+        }
+        UserId::try_new(&holder)
+            .map(Fido2CredentialClaim::HeldBy)
+            .map_err(|e| {
+                BackendError::Backend(format!("bad user_id in fido2_credential_claims: {e}"))
+            })
     }
 
     /// Delete the user's own claim on the id; another user's claim stays.
@@ -540,6 +545,37 @@ fn decode_scope(tenant_id: &str, user_id: Option<&str>) -> Result<AuthnScope, Ba
 }
 
 impl OurBackend {
+    /// The user of the tenant whose stored passkey carries the base64url id
+    /// `encoded`. The passkey ids live inside `factor_configs.config_json`,
+    /// so the look narrows the tenant's `fido2` rows with a substring match
+    /// on the id and confirms each candidate by parsing it.
+    async fn stored_fido2_holder(
+        &self,
+        tenant_id: &TenantId,
+        encoded: &str,
+    ) -> Result<Option<UserId>, BackendError> {
+        let rows = sqlx::query(
+            "SELECT user_id, config_json FROM factor_configs
+              WHERE kind = 'fido2' AND tenant_id = ?1 AND user_id IS NOT NULL
+                AND instr(config_json, ?2) > 0",
+        )
+        .bind(tenant_id.to_string())
+        .bind(encoded)
+        .fetch_all(self.pool())
+        .await?;
+        for row in rows {
+            let json: String = row.get("config_json");
+            let value: serde_json::Value = serde_json::from_str(&json)?;
+            if holds_credential_id(&value, encoded) {
+                let user: String = row.get("user_id");
+                return UserId::try_new(&user).map(Some).map_err(|e| {
+                    BackendError::Backend(format!("bad user_id in factor_configs: {e}"))
+                });
+            }
+        }
+        Ok(None)
+    }
+
     /// Stores a first TOTP factor, the recovery codes and the upgraded
     /// `password+totp` method for a user as one transaction.
     ///

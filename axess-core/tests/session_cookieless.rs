@@ -1,13 +1,15 @@
 //! A request without a session cookie persists a session and sets a cookie
 //! only when something needs the session.
 
-#![cfg(feature = "memory")]
+#![cfg(all(feature = "memory", feature = "testing"))]
+
+use axess_core::testing::fixtures as common;
 
 use axess_core::middleware::csrf::{CsrfConfig, CsrfLayer, CsrfToken};
 use axess_core::session::{
     data::SessionData,
     extractor::AuthSession,
-    id::SessionId,
+    id::SessionKey,
     layer::SessionLayer,
     store::{CycleOutcome, MemorySessionStore, SessionStore},
 };
@@ -37,32 +39,32 @@ impl SessionStore for CountingStore {
         &self,
         _: &axess_core::authn::ids::UserId,
         _: usize,
-    ) -> Result<Vec<(SessionId, SessionData)>, Self::Error> {
+    ) -> Result<Vec<(SessionKey, SessionData)>, Self::Error> {
         Ok(Vec::new())
     }
 
-    async fn load(&self, id: &SessionId) -> Result<Option<SessionData>, Self::Error> {
-        self.inner.load(id).await
+    async fn load(&self, key: &SessionKey) -> Result<Option<SessionData>, Self::Error> {
+        self.inner.load(key).await
     }
 
     async fn save(
         &self,
-        id: &SessionId,
+        key: &SessionKey,
         d: &SessionData,
         ttl: Duration,
     ) -> Result<(), Self::Error> {
         self.writes.fetch_add(1, Ordering::SeqCst);
-        self.inner.save(id, d, ttl).await
+        self.inner.save(key, d, ttl).await
     }
 
-    async fn delete(&self, id: &SessionId) -> Result<(), Self::Error> {
-        self.inner.delete(id).await
+    async fn delete(&self, key: &SessionKey) -> Result<(), Self::Error> {
+        self.inner.delete(key).await
     }
 
     async fn cycle(
         &self,
-        old: &SessionId,
-        new: &SessionId,
+        old: &SessionKey,
+        new: &SessionKey,
         d: &SessionData,
         ttl: Duration,
         require_old: bool,
@@ -73,24 +75,24 @@ impl SessionStore for CountingStore {
 
     async fn update(
         &self,
-        id: &SessionId,
+        key: &SessionKey,
         d: &SessionData,
         ttl: Duration,
     ) -> Result<bool, Self::Error> {
         self.writes.fetch_add(1, Ordering::SeqCst);
-        self.inner.update(id, d, ttl).await
+        self.inner.update(key, d, ttl).await
     }
 
     async fn update_if_revision(
         &self,
-        id: &SessionId,
+        key: &SessionKey,
         expected_revision: u64,
         data: &SessionData,
         ttl: Duration,
     ) -> Result<axess_core::session::store::ConditionalUpdate, Self::Error> {
         self.writes.fetch_add(1, Ordering::SeqCst);
         self.inner
-            .update_if_revision(id, expected_revision, data, ttl)
+            .update_if_revision(key, expected_revision, data, ttl)
             .await
     }
     async fn prune_expired(&self) -> Result<u64, Self::Error> {
@@ -103,10 +105,11 @@ fn router(store: CountingStore) -> Router {
 }
 
 fn router_with(store: CountingStore, csrf: CsrfConfig) -> Router {
+    let clock = common::test_clock();
     let csrf = CsrfLayer::new(csrf);
     Router::new()
         .route("/plain", get(|| async { "plain" }))
-        .route("/id", get(|s: AuthSession| async move { format!("{:?}", s.session_id().await.as_bytes().len()) }))
+        .route("/id", get(|s: AuthSession| async move { format!("{:?}", s.session_key().await.as_bytes().len()) }))
         .route(
             "/set",
             get(|s: AuthSession| async move {
@@ -125,7 +128,7 @@ fn router_with(store: CountingStore, csrf: CsrfConfig) -> Router {
                 .layer(csrf),
         )
         .layer(
-            SessionLayer::new(store, axess_core::testing::test_key(42), axess_core::MemorySessionRegistry::new().handle())
+            SessionLayer::new(store, axess_core::testing::test_key(42), axess_core::MemorySessionRegistry::new().with_clock(std::sync::Arc::new(clock.clone())).handle(), std::sync::Arc::new(axess_core::session::UnrecordedSessionEnds)).with_clock(clock.clone())
                 .with_ttl(Duration::from_secs(3600))
                 .with_secure(false),
         )

@@ -47,16 +47,13 @@ impl PrincipalResolver for SessionResolver {
             .snapshot()
             .await
             .ok_or(IdentityError::NotAuthenticated)?;
-        // The prior `from_bytes` conversion
-        // between two duplicate `SessionId` types here disappeared
-        // when `axess_core::session::id::SessionId` became a
-        // re-export of `axess_identity::SessionId`. The snapshot's
-        // `session_id` is now type-identical to the field on
-        // `HumanPrincipal`; direct assignment, no byte copy.
+        // The principal names the session by its key, as every record of
+        // the session does: a principal is logged, serialised and handed to
+        // policies, and none of them may hold the value the cookie carries.
         Ok(Principal::Human(HumanPrincipal {
             user_id: snap.user_id,
             tenant_id: snap.tenant_id,
-            session_id: Some(snap.session_id),
+            session_id: Some(snap.session_key),
             impersonator: snap.impersonation.map(|i| i.admin),
             attributes: BTreeMap::new(),
         }))

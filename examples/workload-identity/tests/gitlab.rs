@@ -3,8 +3,11 @@
 //! Every refusal reuses the one recorded token under a wrong expectation and
 //! asserts the error names the claim.
 
-mod common;
+mod recorded;
+mod signing;
+mod verifier;
 
+use axess_clock::testing::MockClock;
 use axess_example_workload_identity::gitlab::{GitLabAllowlist, GitLabClaims, gitlab_mapper};
 use axess_factors::federation::workload::WorkloadResolver;
 use axess_identity::{IdentityError, Issuer, Principal, PrincipalResolver, TenantId, TrustDomain};
@@ -17,16 +20,18 @@ fn allowlist() -> GitLabAllowlist {
 }
 
 async fn resolve(
+    clock: &MockClock,
     audience: Option<&str>,
     allow: GitLabAllowlist,
 ) -> Result<Principal, IdentityError> {
-    let f = common::fixture("gitlab");
-    let verifier = common::build_verifier(f.jwks, &f.issuer, audience.unwrap_or(&f.audience));
+    let f = recorded::fixture("gitlab");
+    let verifier =
+        verifier::build_verifier(clock, f.jwks, &f.issuer, audience.unwrap_or(&f.audience));
     let trust = TrustDomain::new("gitlab.ci").unwrap();
     WorkloadResolver::<GitLabClaims, _, _>::new(
         verifier,
         trust.clone(),
-        |_slug: &str| Some(TenantId::from_bytes([9u8; 16])),
+        |_: &str| Some(TenantId::from_bytes([9u8; 16])),
         Issuer::custom("gitlab_ci").unwrap(),
         f.token,
         gitlab_mapper(allow),
@@ -36,6 +41,7 @@ async fn resolve(
 }
 
 async fn resolve_token(
+    clock: &MockClock,
     jwks: jsonwebtoken::jwk::JwkSet,
     token: String,
     allow: GitLabAllowlist,
@@ -44,9 +50,9 @@ async fn resolve_token(
 ) -> Result<Principal, IdentityError> {
     let trust = TrustDomain::new("gitlab.ci").unwrap();
     WorkloadResolver::<GitLabClaims, _, _>::new(
-        common::build_verifier(jwks, issuer, audience),
+        verifier::build_verifier(clock, jwks, issuer, audience),
         trust.clone(),
-        |_slug: &str| Some(TenantId::from_bytes([9u8; 16])),
+        |_: &str| Some(TenantId::from_bytes([9u8; 16])),
         Issuer::custom("gitlab_ci").unwrap(),
         token,
         gitlab_mapper(allow),
@@ -62,7 +68,7 @@ fn names(out: Result<Principal, IdentityError>, claim: &str) {
 
 #[test]
 fn the_fixture_names_its_source() {
-    let f = common::fixture("gitlab");
+    let f = recorded::fixture("gitlab");
     assert!(
         f.source.starts_with("https://docs.gitlab.com/"),
         "{}",
@@ -74,7 +80,8 @@ fn the_fixture_names_its_source() {
 
 #[tokio::test]
 async fn the_recorded_token_resolves_on_ids_not_paths() {
-    let Principal::Workload(w) = resolve(None, allowlist()).await.expect("resolves") else {
+    let clock = MockClock::at_reference();
+    let Principal::Workload(w) = resolve(&clock, None, allowlist()).await.expect("resolves") else {
         panic!("expected Workload");
     };
     assert_eq!(w.workload_id.as_str(), "spiffe://gitlab.ci/20/72");
@@ -94,42 +101,56 @@ async fn the_recorded_token_resolves_on_ids_not_paths() {
 
 #[tokio::test]
 async fn a_wrong_project_id_is_refused_naming_project_id() {
+    let clock = MockClock::at_reference();
     let only_others = GitLabAllowlist::new().namespace_id("72").project_id("21");
-    names(resolve(None, only_others).await, "project_id");
+    names(resolve(&clock, None, only_others).await, "project_id");
 }
 
 #[tokio::test]
 async fn a_wrong_namespace_id_is_refused_naming_namespace_id() {
+    let clock = MockClock::at_reference();
     let other = GitLabAllowlist::new().namespace_id("73").project_id("20");
-    names(resolve(None, other).await, "namespace_id");
+    names(resolve(&clock, None, other).await, "namespace_id");
     // The empty allowlist trusts nobody.
-    names(resolve(None, GitLabAllowlist::new()).await, "namespace_id");
+    names(
+        resolve(&clock, None, GitLabAllowlist::new()).await,
+        "namespace_id",
+    );
 }
 
 #[tokio::test]
 async fn an_environment_outside_the_list_is_refused_naming_environment() {
+    let clock = MockClock::at_reference();
     let staging = GitLabAllowlist::new()
         .namespace_id("72")
         .environment("staging");
-    names(resolve(None, staging).await, "environment");
+    names(resolve(&clock, None, staging).await, "environment");
 }
 
 #[tokio::test]
 async fn an_unprotected_ref_is_refused_unless_the_allowlist_opts_in() {
+    let clock = MockClock::at_reference();
     // Same token; the protected-ref requirement is what the allowlist asks.
     // The recorded token is protected, so rewrite the claim by re-reading
     // through a mapper that sees `false`.
-    let f = common::fixture("gitlab");
-    let (der, jwks) = common::rsa_keypair("gl-unprot");
-    let (now, exp) = common::now_and_exp();
+    let f = recorded::fixture("gitlab");
+    let (der, jwks) = signing::rsa_keypair("gl-unprot");
+    let (now, exp) = signing::now_and_exp();
     let claims = serde_json::json!({
         "iss": f.issuer, "aud": f.audience, "iat": now, "exp": exp,
         "namespace_id": "72", "project_id": "20",
         "ref": "feature", "ref_type": "branch", "ref_protected": "false",
     });
-    let token = common::sign(&claims, "gl-unprot", &der);
+    let token = signing::sign(&claims, "gl-unprot", &der);
     let run = |allow: GitLabAllowlist| {
-        resolve_token(jwks.clone(), token.clone(), allow, &f.issuer, &f.audience)
+        resolve_token(
+            &clock,
+            jwks.clone(),
+            token.clone(),
+            allow,
+            &f.issuer,
+            &f.audience,
+        )
     };
     names(
         run(GitLabAllowlist::new().namespace_id("72")).await,
@@ -146,10 +167,11 @@ async fn an_unprotected_ref_is_refused_unless_the_allowlist_opts_in() {
 
 #[tokio::test]
 async fn a_job_without_an_environment_is_refused_when_environments_are_listed() {
-    let f = common::fixture("gitlab");
-    let (der, jwks) = common::rsa_keypair("gl-noenv");
-    let (now, exp) = common::now_and_exp();
-    let token = common::sign(
+    let clock = MockClock::at_reference();
+    let f = recorded::fixture("gitlab");
+    let (der, jwks) = signing::rsa_keypair("gl-noenv");
+    let (now, exp) = signing::now_and_exp();
+    let token = signing::sign(
         &serde_json::json!({
             "iss": f.issuer, "aud": f.audience, "iat": now, "exp": exp,
             "namespace_id": "72", "project_id": "20", "ref_protected": "true",
@@ -157,19 +179,20 @@ async fn a_job_without_an_environment_is_refused_when_environments_are_listed() 
         "gl-noenv",
         &der,
     );
-    let out = resolve_token(jwks, token, allowlist(), &f.issuer, &f.audience).await;
+    let out = resolve_token(&clock, jwks, token, allowlist(), &f.issuer, &f.audience).await;
     names(out, "environment");
 }
 
 #[tokio::test]
 async fn a_wrong_audience_is_refused_and_the_verifier_names_aud() {
-    let out = resolve(Some("https://other.example.com"), allowlist()).await;
+    let clock = MockClock::at_reference();
+    let out = resolve(&clock, Some("https://other.example.com"), allowlist()).await;
     assert!(out.is_err(), "{out:?}");
 
     // The resolver answers every verification failure the same way; the
     // verifier underneath says which claim failed.
-    let f = common::fixture("gitlab");
-    let verifier = common::build_verifier(f.jwks, &f.issuer, "https://other.example.com");
+    let f = recorded::fixture("gitlab");
+    let verifier = verifier::build_verifier(&clock, f.jwks, &f.issuer, "https://other.example.com");
     let err = verifier
         .verify::<GitLabClaims>(&f.token)
         .await

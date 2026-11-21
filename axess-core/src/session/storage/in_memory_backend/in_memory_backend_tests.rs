@@ -1,5 +1,5 @@
-//! `in_memory_backend_tests`: extracted from `in_memory_backend.rs` per the
-//! 200-LoC inline-test rule in AGENTS.md.
+//! `in_memory_backend_tests`: the unit tests of `in_memory_backend.rs`, kept beside it per the
+//! 200-line inline-test rule in AGENTS.md.
 
 //! Drive each delegation through observable behavior so that a
 //! `Default::default()` / `Ok(None)` / `Ok(())` mutation at the
@@ -9,8 +9,10 @@ use crate::authn::event::{AuthEvent, AuthEventBuilder, AuthEventStatus, AuthEven
 use crate::authn::store::IdentityPasswordHistory;
 use crate::authn::store::{IdentityAdmin, IdentityAuthnLog, IdentityLookup, IdentityPasswordReset};
 use crate::authn::types::StatusDetail;
+use crate::session::id::{SessionId, SessionKey};
 use axess_clock::Clock as _;
-use chrono::Utc;
+use axess_clock::Timestamp;
+use axess_clock::testing::Shift;
 
 fn t() -> TenantId {
     axess_identity::testing::tenant("default")
@@ -30,7 +32,7 @@ fn user_scope() -> AuthnScope {
 fn populated_backend() -> InMemoryBackend {
     InMemoryBackend::new()
         .with_default_tenant("default", "Default Tenant")
-        .with_user_password("alice", "default", "Gnomes2+")
+        .with_user_password("alice", "default", "Sample2+")
 }
 
 #[tokio::test]
@@ -136,7 +138,7 @@ async fn create_tenant_and_create_user_persist() {
     // (both would skip the side effect; observable via the next
     // find_tenant / get_user call).
     let backend = InMemoryBackend::new();
-    let now = Utc::now();
+    let now = axess_clock::testing::MockClock::reference_time();
     let tenant = Tenant {
         id: axess_identity::testing::tenant("acme"),
         identifier: "acme".into(),
@@ -176,7 +178,8 @@ async fn create_tenant_and_create_user_persist() {
 async fn suspend_and_activate_user_change_account_status() {
     // Kills `suspend_user -> Ok(())` and `activate_user -> Ok(())`.
     let backend = populated_backend();
-    let detail = StatusDetail::administrative("test", Utc::now());
+    let detail =
+        StatusDetail::administrative("test", axess_clock::testing::MockClock::reference_time());
     backend.suspend_user(&u(), detail).await.unwrap();
     let suspended = backend.account_status(&u()).await.unwrap();
     assert!(
@@ -389,11 +392,16 @@ async fn reset_token_round_trip_through_backend() {
     let user_id = u();
     let token_hash = "sha256$abc123";
     let wrong_hash = "sha256$wrong";
-    let expires_at = Utc::now() + chrono::Duration::minutes(15);
+    let expires_at = axess_clock::testing::MockClock::reference_time()
+        .plus(axess_clock::SignedDuration::minutes(15));
 
     // Wrong hash before anything is stored; must be false.
     let pre = backend
-        .verify_reset_token(&user_id, wrong_hash, Utc::now())
+        .verify_reset_token(
+            &user_id,
+            wrong_hash,
+            axess_clock::testing::MockClock::reference_time(),
+        )
         .await
         .unwrap();
     assert!(
@@ -406,7 +414,7 @@ async fn reset_token_round_trip_through_backend() {
             &user_id,
             token_hash,
             expires_at,
-            expires_at - chrono::Duration::hours(1),
+            expires_at.minus(axess_clock::SignedDuration::hours(1)),
             3,
         )
         .await
@@ -414,14 +422,22 @@ async fn reset_token_round_trip_through_backend() {
 
     // Wrong hash against a stored token; still false (kills `Ok(true)`).
     let bad = backend
-        .verify_reset_token(&user_id, wrong_hash, Utc::now())
+        .verify_reset_token(
+            &user_id,
+            wrong_hash,
+            axess_clock::testing::MockClock::reference_time(),
+        )
         .await
         .unwrap();
     assert!(!bad, "verify_reset_token must reject a non-matching hash");
 
     // Correct hash; true (kills `Ok(false)` and `store_reset_token -> Ok(())`).
     let ok = backend
-        .verify_reset_token(&user_id, token_hash, Utc::now())
+        .verify_reset_token(
+            &user_id,
+            token_hash,
+            axess_clock::testing::MockClock::reference_time(),
+        )
         .await
         .unwrap();
     assert!(
@@ -434,13 +450,13 @@ async fn reset_token_round_trip_through_backend() {
 /// token issued on that clock expires on the instant the caller passes.
 #[tokio::test]
 async fn with_clock_stamps_records_and_judges_reset_expiry() {
-    use chrono::TimeZone;
-    let origin = Utc.with_ymd_and_hms(2031, 3, 1, 12, 0, 0).unwrap();
+    use axess_clock::Timestamp;
+    let origin = Timestamp::from_utc(2031, 3, 1, 12, 0, 0).unwrap();
     let clock = axess_clock::testing::MockClock::at(origin);
     let backend = InMemoryBackend::new()
         .with_clock(clock.clone())
         .with_default_tenant("default", "Default Tenant")
-        .with_user_password("alice", "default", "Gnomes2+");
+        .with_user_password("alice", "default", "Sample2+");
 
     let tenant = backend.find_tenant("default").await.unwrap().unwrap();
     let user = backend.get_user(&u()).await.unwrap().unwrap();
@@ -448,10 +464,16 @@ async fn with_clock_stamps_records_and_judges_reset_expiry() {
     assert_eq!(user.created_at, origin);
 
     backend
-        .store_reset_token(&u(), "h", origin + chrono::Duration::minutes(10), origin, 3)
+        .store_reset_token(
+            &u(),
+            "h",
+            origin.plus(axess_clock::SignedDuration::minutes(10)),
+            origin,
+            3,
+        )
         .await
         .unwrap();
-    clock.advance(chrono::Duration::minutes(10));
+    clock.advance(axess_clock::SignedDuration::minutes(10));
     assert!(
         !backend
             .verify_reset_token(&u(), "h", clock.now())
@@ -472,12 +494,12 @@ async fn delete_user_erases_every_trace_and_the_session() {
     let backend = InMemoryBackend::new()
         .with_session_registry(registry.clone())
         .with_default_tenant("default", "Default Tenant")
-        .with_user_password("alice", "default", "Gnomes2+")
-        .with_user_password("bob", "default", "Gnomes2+");
+        .with_user_password("alice", "default", "Sample2+")
+        .with_user_password("bob", "default", "Sample2+");
     let bob = axess_identity::testing::user("bob");
     let rng = axess_rng::SystemRng;
-    let session = crate::session::SessionId::new(&rng);
-    let bobs_session = crate::session::SessionId::new(&rng);
+    let session = SessionKey::of(&SessionId::new(&rng));
+    let bobs_session = SessionKey::of(&SessionId::new(&rng));
     registry.register(&u(), &session).await.unwrap();
     registry.register(&bob, &bobs_session).await.unwrap();
     backend
@@ -488,8 +510,9 @@ async fn delete_user_erases_every_trace_and_the_session() {
         .store_reset_token(
             &u(),
             "h",
-            Utc::now() + chrono::Duration::hours(1),
-            Utc::now(),
+            axess_clock::testing::MockClock::reference_time()
+                .plus(axess_clock::SignedDuration::hours(1)),
+            axess_clock::testing::MockClock::reference_time(),
             3,
         )
         .await
@@ -523,7 +546,7 @@ async fn delete_user_erases_every_trace_and_the_session() {
     assert!(backend.password_history(&u(), 10).await.unwrap().is_empty());
     assert!(
         !backend
-            .verify_reset_token(&u(), "h", Utc::now())
+            .verify_reset_token(&u(), "h", axess_clock::testing::MockClock::reference_time())
             .await
             .unwrap()
     );
@@ -537,8 +560,8 @@ async fn delete_user_erases_every_trace_and_the_session() {
 }
 
 /// The backend answers the tenant policies of the identity store it wraps.
-/// It used to inherit the trait's permissive defaults for them, so a policy
-/// set on the inner store was dropped; the policy methods are required now.
+/// The policy methods are required of the trait, so a backend cannot fall
+/// back on permissive defaults and drop a policy set on the inner store.
 #[tokio::test]
 async fn the_tenant_policies_come_from_the_wrapped_store() {
     let mut backend = InMemoryBackend::new();
@@ -558,11 +581,11 @@ async fn the_tenant_policies_come_from_the_wrapped_store() {
 /// stamped with it and a lockout derived from the count follows it.
 #[tokio::test]
 async fn the_backends_clock_stamps_failed_attempts() {
-    let at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("in range");
+    let at = Timestamp::from_unix_seconds(1_700_000_000).expect("in range");
     let backend = InMemoryBackend::new()
         .with_clock(axess_clock::testing::MockClock::at(at))
         .with_default_tenant("default", "Default Tenant")
-        .with_user_password("alice", "default", "Gnomes2+");
+        .with_user_password("alice", "default", "Sample2+");
     backend.record_failed_attempt(&u()).await.unwrap();
     assert_eq!(backend.failed_attempts(&u()).await.unwrap(), (1, Some(at)));
 }
@@ -573,7 +596,7 @@ async fn the_backends_clock_stamps_failed_attempts() {
 async fn one_username_in_two_tenants_is_two_users() {
     let backend = InMemoryBackend::new()
         .with_default_tenant("default", "Default Tenant")
-        .with_user_password("alice", "default", "Gnomes2+")
+        .with_user_password("alice", "default", "Sample2+")
         .with_user_password("alice", "acme", "Acme3+pass");
     let acme = axess_identity::testing::tenant("acme");
     let here = backend
@@ -602,9 +625,9 @@ async fn a_fallback_id_never_replaces_a_user_of_another_tenant() {
         .with_default_tenant("X", "X")
         .with_default_tenant("Y", "Y")
         .with_default_tenant("b", "b")
-        .with_user_password("a", "Y", "Gnomes2+")
-        .with_user_password("a@b", "X", "Gnomes2+")
-        .with_user_password("a", "b", "Gnomes2+");
+        .with_user_password("a", "Y", "Sample2+")
+        .with_user_password("a@b", "X", "Sample2+")
+        .with_user_password("a", "b", "Sample2+");
     let tenant = |name: &str| axess_identity::testing::tenant(name);
     let mut ids = std::collections::HashSet::new();
     for (identifier, home) in [("a", "Y"), ("a@b", "X"), ("a", "b")] {
@@ -627,7 +650,7 @@ async fn a_literal_username_never_replaces_a_fallback_user_of_the_same_tenant() 
     let backend = InMemoryBackend::new()
         .with_default_tenant("Y", "Y")
         .with_default_tenant("b", "b")
-        .with_user_password("a", "Y", "Gnomes2+")
+        .with_user_password("a", "Y", "Sample2+")
         // Falls back to the id of "a@b", the plain id of the next user.
         .with_user_password("a", "b", "Pw1+aaaa")
         .with_user_password("a@b", "b", "Pw2+bbbb");
@@ -661,4 +684,75 @@ async fn a_literal_username_never_replaces_a_fallback_user_of_the_same_tenant() 
             user.identifier
         );
     }
+}
+
+/// The sweep of expired candidates deletes the candidates created before the
+/// cut-off and ends their sessions. A candidate created at the cut-off is
+/// not before it, and an active account of any age is no candidate.
+#[tokio::test]
+async fn candidates_created_before_the_cut_off_are_deleted_with_their_sessions() {
+    use crate::session::store::SessionRegistry as _;
+    let registry = crate::session::MemorySessionRegistry::new();
+    let backend = InMemoryBackend::new()
+        .with_default_tenant("default", "Default Tenant")
+        .with_session_registry(registry.clone());
+    let cut_off = axess_clock::testing::MockClock::reference_time();
+    let earlier = cut_off.minus(axess_clock::SignedDuration::seconds(1));
+    let id = axess_identity::testing::user;
+    let account = |label: &str, status: EntityState, created_at| User {
+        id: id(label),
+        tenant_id: t(),
+        identifier: label.into(),
+        display_name: label.into(),
+        status,
+        webauthn_id: None,
+        created_by: UserId::system(),
+        created_at,
+        updated_by: UserId::system(),
+        updated_at: created_at,
+    };
+    for user in [
+        account("old-candidate", EntityState::Candidate, earlier),
+        account("new-candidate", EntityState::Candidate, cut_off),
+        account("old-active", EntityState::Active, earlier),
+    ] {
+        backend.create_user(user).await.unwrap();
+    }
+    let session = SessionKey::of(&SessionId::new(&crate::testing::mock_random::MockRng::new(
+        5,
+    )));
+    registry
+        .register(&id("old-candidate"), &session)
+        .await
+        .unwrap();
+
+    let deleted = backend
+        .delete_candidates_created_before(cut_off, 10)
+        .await
+        .unwrap();
+
+    let deleted: Vec<UserId> = deleted.iter().map(|user| user.id).collect();
+    assert_eq!(deleted, vec![id("old-candidate")]);
+    assert!(
+        backend
+            .get_user(&id("old-candidate"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        backend
+            .get_user(&id("new-candidate"))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(backend.get_user(&id("old-active")).await.unwrap().is_some());
+    assert!(
+        !registry
+            .is_valid(&id("old-candidate"), &session)
+            .await
+            .unwrap(),
+        "the deleted candidate's session ended"
+    );
 }

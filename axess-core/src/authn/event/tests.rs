@@ -8,6 +8,8 @@
 #![cfg(test)]
 
 use super::*;
+use crate::session::id::SessionId;
+use axess_clock::testing::Shift;
 use axum::extract::FromRequestParts;
 use axum::http::HeaderMap;
 use std::net::IpAddr;
@@ -108,9 +110,9 @@ fn event_carries_ip_and_user_agent_from_audit_context() {
 
 #[test]
 fn with_audit_context_does_not_overwrite_explicit_session() {
-    let sid = crate::session::id::SessionId::from_bytes(*uuid::Uuid::new_v4().as_bytes());
+    let sid = SessionKey::from_bytes([0x11; 32]);
     let ctx = AuditContext {
-        session_id: Some(uuid::Uuid::new_v4().to_string()),
+        session_id: Some(SessionKey::from_bytes([0x22; 32])),
         ..Default::default()
     };
 
@@ -126,6 +128,173 @@ fn with_audit_context_does_not_overwrite_explicit_session() {
 
     // The explicit session_id should be preserved, not overwritten.
     assert_eq!(event.session_id, Some(sid));
+}
+
+/// The context's session reaches the event as it is: both are keys, so
+/// nothing is parsed on the way that could drop it.
+#[test]
+fn with_audit_context_copies_the_contexts_session_key() {
+    let key = SessionKey::from_bytes([0x33; 32]);
+    let ctx = AuditContext {
+        session_id: Some(key),
+        ..Default::default()
+    };
+    let event = AuthEventBuilder::success(AuthEventType::Authenticated)
+        .with_audit_context(&ctx)
+        .build_at(at());
+    assert_eq!(event.session_id, Some(key));
+}
+
+/// A fixed instant, so no event here reads the system clock.
+fn at() -> axess_clock::Timestamp {
+    axess_clock::Timestamp::from_unix_seconds(1_800_000_000).expect("in range")
+}
+
+/// An event's stored form with `session` in its `session_id` field, or with
+/// no such field for `None`.
+fn stored_event(session: Option<serde_json::Value>) -> serde_json::Value {
+    let mut json = serde_json::to_value(
+        AuthEventBuilder::success(AuthEventType::Authenticated).build_at(at()),
+    )
+    .expect("an event serialises");
+    let fields = json.as_object_mut().expect("an object");
+    match session {
+        Some(value) => fields.insert("session_id".to_owned(), value),
+        None => fields.remove("session_id"),
+    };
+    json
+}
+
+/// The texts an earlier release may have written for `id`: the four forms
+/// `Uuid::parse_str` reads, each in lower and upper case.
+fn recorded_forms(id: &SessionId) -> Vec<String> {
+    let uuid = uuid::Uuid::from_bytes(*id.as_bytes());
+    let lower = [
+        uuid.hyphenated().to_string(),
+        uuid.simple().to_string(),
+        uuid.braced().to_string(),
+        uuid.urn().to_string(),
+    ];
+    lower
+        .iter()
+        .flat_map(|form| [form.clone(), form.to_uppercase()])
+        .collect()
+}
+
+/// Texts that name no session: an uppercase key, a key a digit short, a
+/// key with a foreign digit, a word, the empty text.
+fn no_session_texts() -> Vec<String> {
+    let key = SessionKey::from_bytes([0xab; 32]).to_string();
+    vec![
+        key.to_uppercase(),
+        key[..63].to_owned(),
+        format!("{}g", &key[..63]),
+        "not a session".to_owned(),
+        String::new(),
+    ]
+}
+
+#[test]
+fn an_event_names_its_session_by_the_64_characters_of_its_key() {
+    let key = SessionKey::from_bytes([0x5c; 32]);
+    let event = AuthEventBuilder::success(AuthEventType::Authenticated)
+        .with_session(key)
+        .build_at(at());
+    let json = serde_json::to_value(&event).expect("serialises");
+    assert_eq!(json["session_id"], serde_json::json!(key.to_string()));
+    assert_eq!(key.to_string().len(), 64);
+    let read: AuthEvent = serde_json::from_value(json).expect("reads back");
+    assert_eq!(read.session_id, Some(key));
+}
+
+#[test]
+fn an_event_an_earlier_release_stored_reads_its_session_id_as_the_key_of_that_id() {
+    let id = SessionId::from_bytes([0x17; 16]);
+    for form in recorded_forms(&id) {
+        let read: AuthEvent =
+            serde_json::from_value(stored_event(Some(serde_json::json!(form.clone()))))
+                .unwrap_or_else(|e| panic!("{form} reads: {e}"));
+        assert_eq!(
+            read.session_id,
+            Some(SessionKey::of(&id)),
+            "{form} reads as the key of its id"
+        );
+    }
+}
+
+#[test]
+fn an_event_whose_session_is_neither_a_key_nor_an_id_is_refused() {
+    for text in no_session_texts() {
+        let read = serde_json::from_value::<AuthEvent>(stored_event(Some(serde_json::json!(
+            text.clone()
+        ))));
+        assert!(read.is_err(), "{text:?} is not read as a session: {read:?}");
+    }
+}
+
+#[test]
+fn an_event_with_no_session_reads_none() {
+    for stored in [
+        stored_event(None),
+        stored_event(Some(serde_json::Value::Null)),
+    ] {
+        let read: AuthEvent = serde_json::from_value(stored).expect("reads");
+        assert_eq!(read.session_id, None);
+    }
+}
+
+/// The context's stored form with `session` in its `session_id` field, or
+/// with no such field for `None`.
+fn stored_context(session: Option<serde_json::Value>) -> serde_json::Value {
+    let mut json = serde_json::to_value(AuditContext::default()).expect("serialises");
+    let fields = json.as_object_mut().expect("an object");
+    match session {
+        Some(value) => fields.insert("session_id".to_owned(), value),
+        None => fields.remove("session_id"),
+    };
+    json
+}
+
+#[test]
+fn an_audit_context_reads_a_key_and_an_earlier_releases_session_id_as_a_key() {
+    let key = SessionKey::from_bytes([0x5c; 32]);
+    let json = serde_json::to_value(AuditContext {
+        session_id: Some(key),
+        ..Default::default()
+    })
+    .expect("serialises");
+    assert_eq!(json["session_id"], serde_json::json!(key.to_string()));
+    let read: AuditContext = serde_json::from_value(json).expect("reads back");
+    assert_eq!(read.session_id, Some(key));
+
+    let id = SessionId::from_bytes([0x17; 16]);
+    for form in recorded_forms(&id) {
+        let read: AuditContext =
+            serde_json::from_value(stored_context(Some(serde_json::json!(form.clone()))))
+                .unwrap_or_else(|e| panic!("{form} reads: {e}"));
+        assert_eq!(read.session_id, Some(SessionKey::of(&id)), "{form}");
+    }
+}
+
+#[test]
+fn an_audit_context_whose_session_is_neither_a_key_nor_an_id_is_refused() {
+    for text in no_session_texts() {
+        let read = serde_json::from_value::<AuditContext>(stored_context(Some(serde_json::json!(
+            text.clone()
+        ))));
+        assert!(read.is_err(), "{text:?} is not read as a session: {read:?}");
+    }
+}
+
+#[test]
+fn an_audit_context_with_no_session_reads_none() {
+    for stored in [
+        stored_context(None),
+        stored_context(Some(serde_json::Value::Null)),
+    ] {
+        let read: AuditContext = serde_json::from_value(stored).expect("reads");
+        assert_eq!(read.session_id, None);
+    }
 }
 
 #[test]
@@ -189,6 +358,12 @@ fn auth_event_type_as_str_pins_wire_strings() {
             AuthEventType::DeviceFingerprintMismatch,
             "device_fingerprint_mismatch",
         ),
+        (AuthEventType::DeviceKeyRegistered, "device_key_registered"),
+        (
+            AuthEventType::DeviceKeyProofRefused,
+            "device_key_proof_refused",
+        ),
+        (AuthEventType::SessionKeyBound, "session_key_bound"),
     ] {
         assert_eq!(variant.as_str(), expected);
         // FromStr round-trip: pins the as_str <-> from_str symmetry.
@@ -213,7 +388,7 @@ fn with_device_populates_device_id_and_round_trips() {
             &axess_identity::testing::tenant("t"),
         )
         .with_device(device)
-        .build_at(chrono::Utc::now());
+        .build_at(axess_clock::testing::MockClock::reference_time());
 
     assert_eq!(event.device_id.as_ref(), Some(&device));
 
@@ -300,7 +475,7 @@ fn auth_event_status_display_matches_as_str() {
     }
 }
 
-/// The extractor must propagate the session id from the session on the
+/// The extractor must propagate the session's key from the session on the
 /// request. A `Default::default()` mutation would silently lose the
 /// correlation between an event and the session that produced it.
 #[tokio::test]
@@ -309,7 +484,7 @@ async fn audit_context_carries_session_id() {
     headers.insert("user-agent", "AuditUA/1".parse().unwrap());
 
     let session = crate::testing::test_session();
-    let expected_sid = session.session_id().await.to_string();
+    let expected = session.session_key().await;
 
     let mut p = parts(headers, Some("10.1.2.3"));
     // `AuthSession` extracts the `SessionHandle` the session layer put in
@@ -317,9 +492,9 @@ async fn audit_context_carries_session_id() {
     p.extensions.insert(session.0.clone());
     let ctx = AuditContext::from_request_parts(&mut p, &()).await.unwrap();
     assert_eq!(
-        ctx.session_id.as_deref(),
-        Some(expected_sid.as_str()),
-        "the extractor must populate session_id from the session"
+        ctx.session_id,
+        Some(expected),
+        "the extractor must populate session_id from the session's key"
     );
     assert_eq!(
         ctx.ip_address.map(|ip| ip.to_string()).as_deref(),
@@ -342,9 +517,17 @@ async fn audit_context_names_the_impersonator_as_actor() {
     let tenant = crate::authn::ids::testing::tenant("t");
     let session = crate::testing::test_session();
     session
-        .set_authenticated(target, tenant, chrono::Utc::now())
+        .set_authenticated(
+            target,
+            tenant,
+            axess_clock::testing::MockClock::reference_time(),
+        )
         .await;
-    assert!(session.set_impersonator(admin, chrono::Utc::now()).await);
+    assert!(
+        session
+            .set_impersonator(admin, axess_clock::testing::MockClock::reference_time())
+            .await
+    );
 
     let mut p = parts(HeaderMap::new(), None);
     p.extensions.insert(session.0.clone());
@@ -522,14 +705,14 @@ async fn trace_id_reaches_the_event_through_the_context() {
         AuthEventStatus::Failure,
     )
     .with_audit_context(&ctx)
-    .build_at(chrono::Utc::now());
+    .build_at(axess_clock::testing::MockClock::reference_time());
     assert_eq!(
         event.trace_id.as_deref(),
         Some("4bf92f3577b34da6a3ce929d0e0e4736")
     );
 }
 
-/// Without the `trace-id` feature there is nothing typed to read, and a
+/// Without the `trace-context` feature there is nothing typed to read, and a
 /// `traceparent` header is not a trace id until it is parsed. `None` is
 /// the honest answer rather than a malformed value in a join column.
 #[tokio::test]
@@ -589,7 +772,7 @@ async fn an_oversized_user_agent_is_capped_on_every_path() {
         AuthEventStatus::Failure,
     )
     .with_user_agent(huge.clone())
-    .build_at(chrono::Utc::now());
+    .build_at(axess_clock::testing::MockClock::reference_time());
     let ua = built.user_agent.expect("present");
     assert!(ua.len() <= MAX_USER_AGENT_BYTES + 3 && ua.ends_with("..."));
     assert!(ua.is_char_boundary(ua.len() - 3));
@@ -605,7 +788,7 @@ async fn an_oversized_user_agent_is_capped_on_every_path() {
         AuthEventStatus::Failure,
     )
     .with_audit_context(&wide)
-    .build_at(chrono::Utc::now());
+    .build_at(axess_clock::testing::MockClock::reference_time());
     assert!(via_ctx.user_agent.expect("present").len() <= MAX_USER_AGENT_BYTES + 3);
 
     // A short value is untouched.
@@ -616,9 +799,12 @@ async fn an_oversized_user_agent_is_capped_on_every_path() {
 /// the event's own time; the new form round-trips.
 #[test]
 fn factors_completed_reads_a_plain_list_and_round_trips_the_timed_form() {
-    let at = chrono::Utc::now();
+    let at = axess_clock::testing::MockClock::reference_time();
     let event = AuthEventBuilder::success(AuthEventType::Authenticated)
-        .with_factors_completed(FactorKind::Password, at - chrono::Duration::hours(1))
+        .with_factors_completed(
+            FactorKind::Password,
+            at.minus(axess_clock::SignedDuration::hours(1)),
+        )
         .with_factors_completed(FactorKind::Totp, at)
         .build_at(at);
     let timed = serde_json::to_value(&event).unwrap();

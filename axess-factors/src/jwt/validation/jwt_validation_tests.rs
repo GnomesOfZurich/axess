@@ -1,10 +1,10 @@
-//! `jwt_validation_tests`: extracted from `validation.rs` per the
-//! 200-LoC inline-test rule in AGENTS.md.
+//! `jwt_validation_tests`: the unit tests of `validation.rs`, kept beside it per the
+//! 200-line inline-test rule in AGENTS.md.
 
 use super::*;
-use axess_clock::SystemClock;
+use crate::jwt::encode;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use jsonwebtoken::{EncodingKey, Header, encode};
+use jsonwebtoken::{EncodingKey, Header};
 use rsa::RsaPrivateKey;
 use rsa::pkcs1::EncodeRsaPrivateKey;
 use rsa::traits::PublicKeyParts;
@@ -49,7 +49,7 @@ fn sign_jwt(claims: &serde_json::Value, kid: &str, private_der: &[u8]) -> String
 }
 
 fn sample_claims() -> serde_json::Value {
-    let now = chrono::Utc::now().timestamp();
+    let now = axess_clock::testing::MockClock::reference_time().unix_seconds();
     serde_json::json!({
         "iss": "https://idp.example.com",
         "sub": "user-42",
@@ -81,8 +81,8 @@ fn valid_rs256_jwt_verifies() {
 /// lifetime short by `1` second.
 #[test]
 fn verify_jwt_accepts_at_exact_exp_plus_leeway_boundary() {
+    use axess_clock::Timestamp;
     use axess_clock::testing::MockClock;
-    use chrono::{TimeZone, Utc};
     let (der, jwks, kid) = rsa_keypair();
     // Token expires at t=1_000_000_100; leeway = 60; clock at
     // exp + leeway = 1_000_000_160.
@@ -91,10 +91,10 @@ fn verify_jwt_accepts_at_exact_exp_plus_leeway_boundary() {
     let now = exp + leeway as i64;
     let claims = serde_json::json!({ "iss": "x", "sub": "u", "exp": exp });
     let token = sign_jwt(&claims, &kid, &der);
-    let clock = MockClock::at(Utc.timestamp_opt(now, 0).single().unwrap());
+    let clock = MockClock::at(Timestamp::from_unix_seconds(now).unwrap());
     let cfg = ValidationConfig {
         audience: None,
-        leeway_secs: leeway,
+        leeway: std::time::Duration::from_secs(leeway),
         allow_any_audience: true,
         allow_any_issuer: true,
         ..ValidationConfig::default()
@@ -107,7 +107,7 @@ fn verify_jwt_accepts_at_exact_exp_plus_leeway_boundary() {
 
     // And one second past must reject; confirms the boundary is at
     // the right value, not shifted.
-    let clock_after = MockClock::at(Utc.timestamp_opt(now + 1, 0).single().unwrap());
+    let clock_after = MockClock::at(Timestamp::from_unix_seconds(now + 1).unwrap());
     let result_after = verify_jwt(&token, &jwks, &cfg, ALLOWED_ALGORITHMS, &clock_after);
     assert!(
         matches!(result_after, Err(JwtError::VerificationFailed(_))),
@@ -115,15 +115,15 @@ fn verify_jwt_accepts_at_exact_exp_plus_leeway_boundary() {
     );
 }
 
-/// Pin the strict-less boundary `now < nbf - leeway` on line 291
+/// Pin the strict-less boundary `now < nbf - leeway`
 /// at `now == nbf - leeway` the token must STILL be accepted
 /// (it just became valid). Kills `< → <=` which would reject
 /// tokens at the boundary, opening a 1-second blackout right at
 /// validity start.
 #[test]
 fn verify_jwt_accepts_at_exact_nbf_minus_leeway_boundary() {
+    use axess_clock::Timestamp;
     use axess_clock::testing::MockClock;
-    use chrono::{TimeZone, Utc};
     let (der, jwks, kid) = rsa_keypair();
     // Token nbf = 1_000_000_500; leeway = 60; clock at
     // nbf - leeway = 1_000_000_440 (exactly the boundary).
@@ -138,10 +138,10 @@ fn verify_jwt_accepts_at_exact_nbf_minus_leeway_boundary() {
         "exp": nbf + 3600,
     });
     let token = sign_jwt(&claims, &kid, &der);
-    let clock = MockClock::at(Utc.timestamp_opt(now, 0).single().unwrap());
+    let clock = MockClock::at(Timestamp::from_unix_seconds(now).unwrap());
     let cfg = ValidationConfig {
         audience: None,
-        leeway_secs: leeway,
+        leeway: std::time::Duration::from_secs(leeway),
         allow_any_audience: true,
         allow_any_issuer: true,
         ..ValidationConfig::default()
@@ -153,7 +153,7 @@ fn verify_jwt_accepts_at_exact_nbf_minus_leeway_boundary() {
     );
 
     // And one second before must reject.
-    let clock_before = MockClock::at(Utc.timestamp_opt(now - 1, 0).single().unwrap());
+    let clock_before = MockClock::at(Timestamp::from_unix_seconds(now - 1).unwrap());
     let result_before = verify_jwt(&token, &jwks, &cfg, ALLOWED_ALGORITHMS, &clock_before);
     assert!(
         matches!(result_before, Err(JwtError::VerificationFailed(_))),
@@ -275,15 +275,40 @@ fn unknown_kid_in_the_error_is_truncated() {
     let result = verify_jwt_signature(&token, &jwks, None, ALLOWED_ALGORITHMS);
     match result {
         Err(JwtError::UnknownKid(k)) => {
-            assert!(k.len() <= MAX_KID_ECHO_BYTES + 3, "{} bytes", k.len());
+            assert!(k.len() <= MAX_KID_ECHO_BYTES, "{} bytes", k.len());
             assert!(k.starts_with("kkkk") && k.ends_with("..."));
         }
         other => panic!("expected UnknownKid, got {other:?}"),
     }
-    assert_eq!(truncate_kid("short"), "short");
+    assert_eq!(echo_kid("short"), "short");
     // A multi-byte character is never split.
     let wide = "é".repeat(100);
-    assert!(truncate_kid(&wide).is_char_boundary(truncate_kid(&wide).len() - 3));
+    assert!(echo_kid(&wide).is_char_boundary(echo_kid(&wide).len() - 3));
+}
+
+/// The `kid` of a token nobody has verified is the sender's text: a line
+/// break, an escape sequence or a Unicode line separator in it reaches the
+/// error escaped, so it cannot forge a log line.
+#[test]
+fn unknown_kid_in_the_error_is_escaped() {
+    let (der, jwks, _) = rsa_keypair();
+    let token = sign_jwt(
+        &sample_claims(),
+        "k1\nWARN forged line\r\u{1b}[31m\u{2028}",
+        &der,
+    );
+
+    let err = verify_jwt_signature(&token, &jwks, None, ALLOWED_ALGORITHMS)
+        .expect_err("the kid names no key");
+    assert!(matches!(err, JwtError::UnknownKid(_)), "{err:?}");
+    let text = err.to_string();
+    assert!(
+        !text
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')),
+        "{text:?}"
+    );
+    assert!(text.contains("k1\\nWARN forged line\\r"), "{text}");
 }
 
 // ── Algorithm mismatch ─────────────────────────────────────────────
@@ -369,7 +394,16 @@ fn missing_exp_rejected_by_default() {
     // Only a caller that turns the requirement off takes it.
     let mut config = lax_config();
     config.require_exp = false;
-    assert!(verify_jwt(&token, &jwks, &config, ALLOWED_ALGORITHMS, &SystemClock).is_ok());
+    assert!(
+        verify_jwt(
+            &token,
+            &jwks,
+            &config,
+            ALLOWED_ALGORITHMS,
+            &axess_clock::testing::MockClock::at_reference()
+        )
+        .is_ok()
+    );
 }
 
 /// An `exp` the verifier cannot read as an integer (a float, a string) is
@@ -420,7 +454,13 @@ fn missing_iss_rejected_when_issuer_pinned() {
 
     let mut config = lax_config();
     config.issuer = Some("https://idp.example.com".to_string());
-    let result = verify_jwt(&token, &jwks, &config, ALLOWED_ALGORITHMS, &SystemClock);
+    let result = verify_jwt(
+        &token,
+        &jwks,
+        &config,
+        ALLOWED_ALGORITHMS,
+        &axess_clock::testing::MockClock::at_reference(),
+    );
     assert!(
         result.is_err(),
         "a pinned issuer must require the claim: {result:?}"
@@ -428,7 +468,16 @@ fn missing_iss_rejected_when_issuer_pinned() {
 
     // With the claim present and matching, the same config accepts it.
     let token = sign_jwt(&sample_claims(), &kid, &der);
-    assert!(verify_jwt(&token, &jwks, &config, ALLOWED_ALGORITHMS, &SystemClock).is_ok());
+    assert!(
+        verify_jwt(
+            &token,
+            &jwks,
+            &config,
+            ALLOWED_ALGORITHMS,
+            &axess_clock::testing::MockClock::at_reference()
+        )
+        .is_ok()
+    );
 }
 
 /// The same for a pinned audience.
@@ -546,7 +595,13 @@ fn verify_jwt_refuses_an_unpinned_audience_and_issuer_unless_waived() {
     claims["aud"] = serde_json::json!("svc");
     let token = sign_jwt(&claims, &kid, &der);
     let verify = |config: &ValidationConfig| {
-        verify_jwt(&token, &jwks, config, ALLOWED_ALGORITHMS, &SystemClock)
+        verify_jwt(
+            &token,
+            &jwks,
+            config,
+            ALLOWED_ALGORITHMS,
+            &axess_clock::testing::MockClock::at_reference(),
+        )
     };
 
     let none = ValidationConfig::new();
@@ -571,4 +626,63 @@ fn verify_jwt_refuses_an_unpinned_audience_and_issuer_unless_waived() {
     waived.allow_any_audience = true;
     waived.allow_any_issuer = true;
     assert!(verify(&waived).is_ok());
+}
+
+/// The leeway is bounded: a configuration whose `leeway` is above
+/// `MAX_LEEWAY` is refused before any token is read, since a large enough
+/// leeway keeps an expired token valid for as long as it says. So is one
+/// with a fraction of a second, which the whole-second `exp` and `nbf`
+/// cannot be compared with and jsonwebtoken would drop.
+#[test]
+fn a_leeway_past_the_bound_is_refused_by_name() {
+    use axess_clock::Timestamp;
+    use axess_clock::testing::MockClock;
+    use std::time::Duration;
+    let (der, jwks, kid) = rsa_keypair();
+    let now = 1_000_000_000i64;
+    let claims = serde_json::json!({ "iss": "x", "sub": "u", "exp": now + 60 });
+    let token = sign_jwt(&claims, &kid, &der);
+    let clock = MockClock::at(Timestamp::from_unix_seconds(now).unwrap());
+    let with_leeway = |leeway: Duration| ValidationConfig {
+        audience: None,
+        leeway,
+        allow_any_audience: true,
+        allow_any_issuer: true,
+        ..ValidationConfig::default()
+    };
+    let at_bound = verify_jwt(
+        &token,
+        &jwks,
+        &with_leeway(MAX_LEEWAY),
+        ALLOWED_ALGORITHMS,
+        &clock,
+    );
+    assert!(at_bound.is_ok(), "the bound itself verifies: {at_bound:?}");
+    for (leeway, says) in [
+        (MAX_LEEWAY + Duration::from_secs(1), "above the bound"),
+        (
+            Duration::from_millis(60_500),
+            "not a whole number of seconds",
+        ),
+        (
+            MAX_LEEWAY - Duration::from_nanos(1),
+            "not a whole number of seconds",
+        ),
+    ] {
+        match verify_jwt(
+            &token,
+            &jwks,
+            &with_leeway(leeway),
+            ALLOWED_ALGORITHMS,
+            &clock,
+        ) {
+            Err(JwtError::VerificationFailed(why)) => {
+                assert!(
+                    why.contains("leeway") && why.contains(says),
+                    "the refusal of {leeway:?} names the leeway and says {says:?}: {why}"
+                );
+            }
+            other => panic!("a leeway of {leeway:?} must be refused, got {other:?}"),
+        }
+    }
 }

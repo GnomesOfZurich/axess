@@ -255,10 +255,11 @@ async fn a_silent_token_endpoint_times_out() {
     let client = AzureFicClient::new("tenant", "client")
         .expect("client")
         .with_token_endpoint(endpoint(&server))
-        .with_http_client(reqwest::Client::new())
+        .with_client_settings(|settings| settings.timeout(std::time::Duration::from_secs(3600)))
+        .expect("client settings")
         .with_timeout(std::time::Duration::from_millis(150));
 
-    let started = std::time::Instant::now();
+    let started = axess_testing::stopwatch::Stopwatch::start();
     let err = client
         .acquire_token(&AzureFicRequest::new("fed").with_scope("s"))
         .await
@@ -290,13 +291,14 @@ async fn a_plain_http_remote_endpoint_is_refused_before_any_request() {
 }
 
 /// A client that cannot be built is an error, never `reqwest::Client::default()`
-/// (redirects followed, no connect timeout) in its place. A TLS configuration
-/// of a type no backend recognises is the one build failure a test can
-/// arrange whatever TLS backend the feature set resolves to.
+/// (redirects followed, no connect timeout) in its place. A `User-Agent` that
+/// is not a header value is a build failure a test can arrange whatever TLS
+/// backend the feature set resolves to.
 #[test]
 fn a_client_that_cannot_be_built_is_an_error_not_a_default_client() {
-    let unbuildable = reqwest::Client::builder().use_preconfigured_tls(());
-    let err = AzureFicClient::from_builder("tenant", "app-id", unbuildable)
+    let err = AzureFicClient::new("tenant", "app-id")
+        .expect("client")
+        .with_client_settings(|settings| settings.user_agent("not a\nheader value"))
         .err()
         .expect("a failed build must surface, not fall back to an unhardened client");
     assert!(matches!(err, AzureFicError::ClientBuild(_)), "{err:?}");
@@ -393,4 +395,56 @@ async fn a_json_error_description_with_control_characters_is_sanitized() {
     assert_log_safe(&err.to_string(), "the Display text", 768);
     assert!(error.contains("invalid_client"), "{error}");
     assert!(error_description.starts_with('x'), "{error_description}");
+}
+
+/// A refusal whose description runs past the 1 KiB kept for a message keeps
+/// its code, whichever member comes first, and the description that reaches
+/// the error is still cut.
+#[tokio::test]
+async fn a_long_error_description_keeps_the_code() {
+    let description = "d".repeat(4096);
+    for body in [
+        format!(r#"{{"error":"invalid_client","error_description":"{description}"}}"#),
+        format!(r#"{{"error_description":"{description}","error":"invalid_client"}}"#),
+    ] {
+        let err = error_for(400, body.into_bytes(), "application/json").await;
+        let AzureFicError::AzureError {
+            error,
+            error_description,
+            ..
+        } = &err
+        else {
+            panic!("expected AzureError, got {err:?}");
+        };
+        assert_eq!(error, "invalid_client");
+        assert_log_safe(error_description, "error_description", 512);
+    }
+}
+
+/// A refusal longer than the read bound does not parse whole; a code that
+/// came before the cut is still read.
+#[tokio::test]
+async fn a_refusal_cut_at_the_read_bound_keeps_a_code_before_the_cut() {
+    let description = "d".repeat(axess_factors::http_body::ERROR_BODY_PARSE_BYTES);
+    let body = format!(r#"{{"error":"invalid_client","error_description":"{description}"}}"#);
+
+    let err = error_for(400, body.into_bytes(), "application/json").await;
+
+    let AzureFicError::AzureError { error, .. } = &err else {
+        panic!("expected AzureError, got {err:?}");
+    };
+    assert_eq!(error, "invalid_client");
+}
+
+/// The request's federated token is held in a `ZeroizedString`, which wipes
+/// its buffer when the request is dropped. The request has no `Drop` of its
+/// own to keep in step with that field: taking the token out of it compiles
+/// only while it has none.
+#[test]
+fn the_federated_token_is_held_in_a_zeroizing_string() {
+    let AzureFicRequest {
+        federated_token, ..
+    } = AzureFicRequest::new("the-token");
+    let held: ZeroizedString = federated_token;
+    assert_eq!(&*held, "the-token");
 }

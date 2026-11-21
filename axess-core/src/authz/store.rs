@@ -114,6 +114,25 @@ pub trait PolicyEvaluator: Send + Sync {
         context: Context,
     ) -> AuthzDecision;
 
+    /// Whether the policy set this evaluator decides with now reads the
+    /// request `context`: for a [`PolicyStore`], what
+    /// [`PolicyStore::mentions_context`] answers, a reload included.
+    ///
+    /// [`AuthzStore`](super::session::AuthzStore) asks it before it decides
+    /// for a session that was begun without a context, and refuses when the
+    /// answer is `true`: on an empty context a `forbid` that guards an
+    /// optional attribute with `context has ..` stops applying and the
+    /// `permit` beside it allows.
+    ///
+    /// Required, with no default. A default of `false` would let an
+    /// evaluator of your own that does read `context` be decided on an empty
+    /// one without a word, and a default of `true` would refuse every
+    /// session without a context for an evaluator that reads none. Only the
+    /// evaluator knows, so it says: `false` when no request's decision can
+    /// depend on the context it is given, `true` otherwise and whenever it
+    /// cannot tell.
+    fn mentions_context(&self) -> bool;
+
     /// The Cedar schema this evaluator decides with now, if it has one. Used
     /// to validate entity providers via
     /// [`AuthzEntityProvider::validate_schema`][super::provider::AuthzEntityProvider::validate_schema].
@@ -209,7 +228,7 @@ pub struct PolicyStore {
     /// The entity types of the schema's actions. A provider entity of one
     /// of these types is an action entity and is checked against the schema.
     action_types: HashSet<EntityTypeName>,
-    /// Whether any policy mentions `context`.
+    /// Whether any policy or template reads the `context` variable.
     mentions_context: bool,
     /// The step-ups the policies' `@step_up` annotations name, weakest
     /// first, without repeats.
@@ -255,10 +274,7 @@ impl PolicyStore {
             .map(|action| action.uid().type_name().clone())
             .collect();
 
-        // A policy's text is the one place `context` can appear as a name, so
-        // the check is a text search: a false positive (the word in a
-        // comment or a string) only makes a warning fire that need not.
-        let mentions_context = policy_set.to_string().contains("context");
+        let mentions_context = context_use::reads_context(&policy_set);
         let step_ups = step_up::annotated_step_ups(&policy_set)?;
 
         Ok(Self {
@@ -289,8 +305,18 @@ impl PolicyStore {
         &self.digest
     }
 
-    /// Whether any policy mentions `context`. A request evaluated on an empty
-    /// context against such a store is probably missing its context provider.
+    /// Whether any policy or template reads the `context` variable. A request
+    /// evaluated on an empty context against such a store is missing its
+    /// context provider, which is why
+    /// [`AuthzInstallation::new`](super::installation::AuthzInstallation::new)
+    /// refuses such a store without one. The answer follows a reload, and a
+    /// `require_authz!` gate asks again per request for that reason.
+    ///
+    /// The answer comes from Cedar's syntax tree of each policy and template,
+    /// not from their text: the word in a comment, a string, an attribute
+    /// name, an entity id or an annotation is not a read, and a template
+    /// counts whether or not a policy is linked to it. A policy Cedar gives
+    /// no syntax tree for counts as a read and is named in a warning.
     pub fn mentions_context(&self) -> bool {
         match self.successor.load().as_deref() {
             Some(next) => next.mentions_context,
@@ -397,6 +423,10 @@ impl PolicyEvaluator for PolicyStore {
         }
     }
 
+    fn mentions_context(&self) -> bool {
+        PolicyStore::mentions_context(self)
+    }
+
     fn schema(&self) -> Option<Schema> {
         Some(PolicyStore::schema(self))
     }
@@ -452,7 +482,7 @@ impl PolicyStore {
         // a subscriber listens to the decision target: rendering three UIDs
         // per decision is wasted work otherwise.
         let subject = DecisionSubject::capture(&principal, &action, &resource);
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
 
         let cedar_req = match Request::new(principal, action, resource, context, Some(&self.schema))
         {
@@ -593,6 +623,7 @@ pub(super) fn make_uid(
     super::provider::make_entity_uid(namespace, type_name, id)
 }
 
+mod context_use;
 mod step_up;
 
 #[cfg(test)]
@@ -600,3 +631,6 @@ mod decision_log;
 
 #[cfg(test)]
 mod authz_store_tests;
+
+#[cfg(test)]
+mod context_use_tests;

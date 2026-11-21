@@ -17,7 +17,7 @@ fn other_tenant_id() -> TenantId {
 }
 
 fn build_user(user_id: &UserId, tenant_id: &TenantId) -> User {
-    let now = chrono::Utc::now();
+    let now = axess_clock::testing::MockClock::reference_time();
     User {
         id: *user_id,
         tenant_id: *tenant_id,
@@ -32,9 +32,9 @@ fn build_user(user_id: &UserId, tenant_id: &TenantId) -> User {
     }
 }
 
-// ── get_user_in_tenant (line 132) ────────────────────────────────
+// ── get_user_in_tenant ────────────────────────────────
 
-/// Kills line 132 `with true` / `with false` and `== → !=`:
+/// Kills the mutant `with true` / `with false` and `== → !=`:
 /// when the user's stored tenant matches `expected_tenant`,
 /// `get_user_in_tenant` returns Some.
 #[tokio::test]
@@ -71,9 +71,9 @@ async fn get_user_in_tenant_mismatched_tenant_returns_none() {
     );
 }
 
-// ── AuthMethod::factors() (line 601) ─────────────────────────────
+// ── AuthMethod::factors() ─────────────────────────────
 
-/// Kills line 601 `-> vec![]`: a method with concrete factor
+/// Kills the mutant `-> vec![]`: a method with concrete factor
 /// steps must produce a non-empty kinds list.
 #[test]
 fn auth_method_factors_extracts_kinds_from_required_steps() {

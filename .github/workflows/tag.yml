@@ -49,7 +49,7 @@ jobs:
           set -eu
           ./scripts/check-release-version.sh
           version=$(sed -n '/^\[workspace.package\]/,/^\[/p' Cargo.toml \
-            | sed -n 's/^version *= *"\([^"]*\)".*/\1/p' | head -1)
+            | sed -n 's/^version *= *"\([^"]*\)".*/\1/p' | sed -n 1p)
           [ -n "$version" ] || { echo "::error::no [workspace.package].version in Cargo.toml"; exit 1; }
           echo "tag=v$version" >> "$GITHUB_OUTPUT"
 
